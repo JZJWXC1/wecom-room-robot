@@ -1,0 +1,15 @@
+name: wecom-room-robot
+
+services:
+  robot:
+    build: .
+    container_name: wecom-room-robot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./media:/app/media
+      - ./room_database:/app/room_database
+    ports:
+      - "127.0.0.1:8000:8000"
