@@ -25,6 +25,7 @@ def prepare_wecom_video(
     *,
     force: bool = False,
     max_bytes: int = WECOM_VIDEO_MAX_BYTES,
+    timeout: int = 180,
 ) -> Path:
     if not force and not needs_wecom_video_transcode(source, max_bytes=max_bytes):
         return source
@@ -70,7 +71,10 @@ def prepare_wecom_video(
             "+faststart",
             str(tmp_output),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, check=False)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise VideoTranscodeError(f"视频转码超过 {timeout} 秒") from exc
         if result.returncode != 0:
             last_error = result.stderr[-1000:]
             logger.warning("企业微信视频转码失败: %s", last_error)
@@ -83,3 +87,17 @@ def prepare_wecom_video(
     if output.exists():
         return output
     raise VideoTranscodeError(last_error or "企业微信视频转码失败")
+
+
+def cached_wecom_video(source: Path, max_bytes: int = WECOM_VIDEO_MAX_BYTES) -> Path | None:
+    output = source.parent / ".wecom_cache" / f"{source.stem}.wecom.mp4"
+    try:
+        if (
+            output.exists()
+            and output.stat().st_mtime >= source.stat().st_mtime
+            and output.stat().st_size <= max_bytes
+        ):
+            return output
+    except OSError:
+        return None
+    return None

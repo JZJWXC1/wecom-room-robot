@@ -69,6 +69,63 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
             finally:
                 settings.room_database_path = previous_room_database_path
 
+    def test_fuzzy_matches_typoed_community_video_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                video_dir = settings.room_database_path / "video" / "永佳新苑2-703"
+                video_dir.mkdir(parents=True)
+                video = video_dir / "永佳新苑2-703.mp4"
+                video.write_bytes(b"video")
+
+                matches = MediaStore().list_room_database_videos(
+                    "永住新苑视频发一下",
+                    limit=3,
+                )
+
+                self.assertEqual(matches, [video])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
+    def test_matches_abbreviated_community_with_room_number_video_query(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                video_dir = settings.room_database_path / "video" / "华丰人家8-603"
+                video_dir.mkdir(parents=True)
+                video = video_dir / "华丰人家8-603.mp4"
+                video.write_bytes(b"video")
+
+                matches = MediaStore().list_room_database_videos(
+                    "华丰8-603有视频吗",
+                    limit=3,
+                )
+
+                self.assertEqual(matches, [video])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
+    def test_room_number_query_does_not_match_other_room_in_same_community(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                video_dir = settings.room_database_path / "video" / "皋塘运都12-1-1802"
+                video_dir.mkdir(parents=True)
+                video = video_dir / "皋塘运都12-1-1802.mp4"
+                video.write_bytes(b"video")
+
+                matches = MediaStore().list_room_database_videos(
+                    "皋塘运都12-2-401",
+                    limit=3,
+                )
+
+                self.assertEqual(matches, [])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
     def test_matches_room_database_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             previous_room_database_path = settings.room_database_path
@@ -81,6 +138,25 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
 
                 matches = MediaStore().list_room_database_images(
                     "小洋坝图片发我",
+                    limit=3,
+                )
+
+                self.assertEqual(matches, [image])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
+    def test_fuzzy_matches_typoed_community_image_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                image_dir = settings.room_database_path / "images" / "华丰人家8-603"
+                image_dir.mkdir(parents=True)
+                image = image_dir / "客厅.jpg"
+                image.write_bytes(b"image")
+
+                matches = MediaStore().list_room_database_images(
+                    "华风人家照片发我",
                     limit=3,
                 )
 

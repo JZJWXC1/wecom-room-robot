@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import tempfile
 import unittest
 from pathlib import Path
@@ -122,6 +122,44 @@ class WeComKfMediaSearchTextTests(unittest.TestCase):
                 self.assertIn("小洋坝家园", search_text)
                 self.assertIn("二区6-801-3", search_text)
                 self.assertNotIn("皋塘", search_text)
+            finally:
+                main.wecom_kf_context_store = previous_store
+                main.wecom_kf_conversation_memory.clear()
+
+    def test_polite_generic_video_followup_uses_latest_assistant_room_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_store = main.wecom_kf_context_store
+            try:
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_context_store.save(
+                    "kf_xxx:wm_xxx",
+                    {
+                        "recent_messages": [
+                            {
+                                "role": "客服",
+                                "content": (
+                                    "杨家府（兴业杨家府）我这边看到还有两套：\n"
+                                    "1. 房号10-1-304，一室一厅，押一付4500/押二付4200。\n"
+                                    "2. 房号1-202，一室一厅，押一付4200/押一付3800。"
+                                ),
+                            },
+                        ],
+                        "updated_at": 9999999999.0,
+                    },
+                )
+
+                search_text = main._kf_media_search_text(
+                    "kf_xxx",
+                    "wm_xxx",
+                    "视频麻烦发我一下",
+                )
+
+                self.assertIn("杨家府", search_text)
+                self.assertIn("10-1-304", search_text)
+                self.assertIn("1-202", search_text)
             finally:
                 main.wecom_kf_context_store = previous_store
                 main.wecom_kf_conversation_memory.clear()
@@ -604,8 +642,8 @@ class WeComKfSatisfactionPromptTests(unittest.IsolatedAsyncioTestCase):
                 return {"errcode": 0}
 
         class FakeInventory:
-            async def search(self, content: str) -> list[dict]:
-                return []
+            async def search(self, content: str, limit: int = 8) -> list[dict]:
+                return [{"小区": "小洋坝家园", "房号": "二区6-801-3"}]
 
             def format_rows(self, rows: list[dict]) -> str:
                 return ""
@@ -760,8 +798,12 @@ class WeComKfContextMemoryTests(unittest.IsolatedAsyncioTestCase):
                 return {"errcode": 0}
 
         class FakeInventory:
-            async def search(self, content: str) -> list[dict]:
-                return []
+            async def search(self, content: str, limit: int = 8) -> list[dict]:
+                if "华丰人家" in content:
+                    return [{"小区": "华丰人家", "房号": "8-603"}]
+                return [
+                    {"小区": "永佳新苑", "房号": "2-703"},
+                ]
 
             def format_rows(self, rows: list[dict]) -> str:
                 return ""
@@ -831,7 +873,7 @@ class WeComKfContextMemoryTests(unittest.IsolatedAsyncioTestCase):
                         "external_userid": "wm_xxx",
                         "origin": 3,
                         "msgtype": "text",
-                        "text": {"content": "视频发我一下"},
+                        "text": {"content": "那星桥价格多少"},
                     }
                 )
 
@@ -839,7 +881,7 @@ class WeComKfContextMemoryTests(unittest.IsolatedAsyncioTestCase):
                 latest_context = fake_reply_generator.contexts[-1]
                 self.assertIn("星桥有房子吗", latest_context)
                 self.assertIn("回复:星桥有房子吗", latest_context)
-                self.assertIn("视频发我一下", latest_context)
+                self.assertIn("那星桥价格多少", latest_context)
             finally:
                 main.wecom_kf = previous_client
                 main.wecom_kf_context_store = previous_store
@@ -903,6 +945,592 @@ class WeComKfContextMemoryTests(unittest.IsolatedAsyncioTestCase):
                 main.wecom_kf_conversation_memory.clear()
                 main.wecom_kf_idle_sequences.clear()
 
+    async def test_original_video_followup_sends_direct_link(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            fake_client = FakeKfClient()
+            try:
+                main.wecom_kf = fake_client
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.wecom_kf_conversation_memory.clear()
+                main._remember_kf_media_context(
+                    "kf_xxx",
+                    "wm_xxx",
+                    video_urls=["https://example.com/original.mp4"],
+                )
+
+                for content in ("有没有更清楚的原视频", "有没有清楚一点的"):
+                    await main.handle_kf_message(
+                        {
+                            "msgid": f"msg-{len(fake_client.texts) + 1}",
+                            "open_kfid": "kf_xxx",
+                            "external_userid": "wm_xxx",
+                            "origin": 3,
+                            "msgtype": "text",
+                            "text": {"content": content},
+                        }
+                    )
+
+                self.assertEqual(len(fake_client.texts), 2)
+                self.assertTrue(all("原视频直达链接" in text for text in fake_client.texts))
+                self.assertTrue(
+                    all("https://example.com/original.mp4" in text for text in fake_client.texts)
+                )
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_send_followup_after_original_video_prompt_sends_direct_link(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            fake_client = FakeKfClient()
+            try:
+                main.wecom_kf = fake_client
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.wecom_kf_conversation_memory.clear()
+                main._remember_kf_media_context(
+                    "kf_xxx",
+                    "wm_xxx",
+                    video_urls=["https://example.com/original.mp4"],
+                )
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "发我吧"},
+                    }
+                )
+
+                self.assertEqual(len(fake_client.texts), 1)
+                self.assertIn("https://example.com/original.mp4", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_viewing_followup_after_video_uses_recent_room_context(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            fake_client = FakeKfClient()
+            video_path = Path("room_database/video/房源素材/诸葛龙吟院13-1101/视频.mp4")
+            try:
+                main.wecom_kf = fake_client
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.wecom_kf_conversation_memory.clear()
+                main._remember_kf_media_context(
+                    "kf_xxx",
+                    "wm_xxx",
+                    video_paths=[video_path],
+                    video_urls=["https://example.com/video.mp4"],
+                )
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "怎么看房"},
+                    }
+                )
+
+                self.assertEqual(len(fake_client.texts), 1)
+                self.assertIn("诸葛龙吟院13-1101", fake_client.texts[0])
+                self.assertIn("18758141785", fake_client.texts[0])
+                self.assertIn("13282125992", fake_client.texts[0])
+                self.assertIn("19941091943", fake_client.texts[0])
+                self.assertNotIn("你把小区或房号", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_viewing_followup_after_video_replies_room_password_first(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                self.query = query
+                return [
+                    {
+                        "小区": "诸葛龙吟院",
+                        "房号": "13-1101",
+                        "密码": "336699#",
+                    }
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            fake_client = FakeKfClient()
+            fake_inventory = FakeInventory()
+            video_path = Path("room_database/video/房源素材/诸葛龙吟院13-1101/视频.mp4")
+            try:
+                main.wecom_kf = fake_client
+                main.inventory = fake_inventory
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.wecom_kf_conversation_memory.clear()
+                main._remember_kf_media_context(
+                    "kf_xxx",
+                    "wm_xxx",
+                    video_paths=[video_path],
+                    video_urls=["https://example.com/video.mp4"],
+                )
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "怎么看房"},
+                    }
+                )
+
+                self.assertEqual(len(fake_client.texts), 1)
+                self.assertIn("诸葛龙吟院13-1101看房密码是：336699#", fake_client.texts[0])
+                self.assertIn("如果现场密码不对", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_explicit_viewing_query_without_video_context_queries_password(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                return [{"小区": "长木府", "房号": "3-1002B", "密码": "123456#"}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            try:
+                main.wecom_kf = FakeKfClient()
+                main.inventory = FakeInventory()
+                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
+                main.wecom_kf_conversation_memory.clear()
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "长木府3-1002B怎么看房"},
+                    }
+                )
+
+                self.assertIn("长木府3-1002B看房密码是：123456#", main.wecom_kf.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_generic_viewing_query_without_room_asks_for_room_before_llm(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            try:
+                main.wecom_kf = FakeKfClient()
+                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
+                main.wecom_kf_conversation_memory.clear()
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "怎么看房"},
+                    }
+                )
+
+                self.assertEqual(len(main.wecom_kf.texts), 1)
+                self.assertIn("小区和房号", main.wecom_kf.texts[0])
+                self.assertIn("先查房源表里的看房密码", main.wecom_kf.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_wrong_password_followup_sends_contact_numbers(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            fake_client = FakeKfClient()
+            video_path = Path("room_database/video/房源素材/诸葛龙吟院13-1101/视频.mp4")
+            try:
+                main.wecom_kf = fake_client
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.wecom_kf_conversation_memory.clear()
+                main._remember_kf_media_context(
+                    "kf_xxx",
+                    "wm_xxx",
+                    video_paths=[video_path],
+                    video_urls=["https://example.com/video.mp4"],
+                )
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "密码不对，开不了门"},
+                    }
+                )
+
+                self.assertEqual(len(fake_client.texts), 1)
+                self.assertIn("看房密码建议直接联系", fake_client.texts[0])
+                self.assertIn("18758141785", fake_client.texts[0])
+                self.assertIn("13282125992", fake_client.texts[0])
+                self.assertIn("19941091943", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_explicit_viewing_query_overrides_recent_video_context(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                if "香柠颜家府" in query or "2-2-1401B" in query:
+                    return [
+                        {
+                            "小区": "香柠颜家府",
+                            "房号": "2-2-1401B",
+                            "密码": "88888888#",
+                        }
+                    ]
+                return [
+                    {
+                        "小区": "诸葛龙吟院",
+                        "房号": "13-1101",
+                        "密码": "336699#",
+                    }
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            fake_client = FakeKfClient()
+            video_path = Path("room_database/video/房源素材/诸葛龙吟院13-1101/视频.mp4")
+            try:
+                main.wecom_kf = fake_client
+                main.inventory = FakeInventory()
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.wecom_kf_conversation_memory.clear()
+                main._remember_kf_media_context(
+                    "kf_xxx",
+                    "wm_xxx",
+                    video_paths=[video_path],
+                    video_urls=["https://example.com/video.mp4"],
+                )
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "香柠颜家府2-2-1401B怎么看房"},
+                    }
+                )
+
+                self.assertEqual(len(fake_client.texts), 1)
+                self.assertIn("香柠颜家府2-2-1401B看房密码是：88888888#", fake_client.texts[0])
+                self.assertNotIn("诸葛龙吟院", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_generic_viewing_followup_after_multiple_videos_lists_all_passwords(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                return [
+                    {"小区": "香柠颜家府", "房号": "2-2-1401B", "密码": "218619#"},
+                    {"小区": "香柠颜家府", "房号": "3-1-701A", "密码": "336699#"},
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            fake_client = FakeKfClient()
+            try:
+                main.wecom_kf = fake_client
+                main.inventory = FakeInventory()
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.wecom_kf_conversation_memory.clear()
+                main._remember_kf_media_context(
+                    "kf_xxx",
+                    "wm_xxx",
+                    video_paths=[
+                        Path("room_database/video/香柠颜家府2-2-1401B/视频.mp4"),
+                        Path("room_database/video/香柠颜家府3-1-701A/视频.mp4"),
+                    ],
+                    video_urls=[
+                        "https://example.com/2-2-1401B.mp4",
+                        "https://example.com/3-1-701A.mp4",
+                    ],
+                )
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "怎么看房的"},
+                    }
+                )
+
+                self.assertEqual(len(fake_client.texts), 1)
+                self.assertIn("香柠颜家府2-2-1401B：218619#", fake_client.texts[0])
+                self.assertIn("香柠颜家府3-1-701A：336699#", fake_client.texts[0])
+                self.assertIn("刚发的这几套", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_dynamic_password_viewing_query_sends_contact_numbers(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                return [{"小区": "诸葛龙吟院", "房号": "13-1101", "密码": "动态密码"}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            try:
+                main.wecom_kf = FakeKfClient()
+                main.inventory = FakeInventory()
+                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
+                main.wecom_kf_conversation_memory.clear()
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "诸葛怎么看房的"},
+                    }
+                )
+
+                self.assertIn("诸葛龙吟院13-1101是动态密码", main.wecom_kf.texts[0])
+                self.assertIn("18758141785", main.wecom_kf.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_not_vacant_password_field_sends_booking_contact(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                return [{"小区": "长木府", "房号": "3-1002B", "密码": "6.14空出"}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            try:
+                main.wecom_kf = FakeKfClient()
+                main.inventory = FakeInventory()
+                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
+                main.wecom_kf_conversation_memory.clear()
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "长木府3-1002B怎么看房"},
+                    }
+                )
+
+                self.assertIn("长木府3-1002B6.14空出", main.wecom_kf.texts[0])
+                self.assertIn("目前还未空出", main.wecom_kf.texts[0])
+                self.assertIn("预约", main.wecom_kf.texts[0])
+                self.assertIn("19941091943", main.wecom_kf.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
     async def test_correction_followup_reuses_persisted_video_paths(self) -> None:
         class FakeKfClient:
             def __init__(self) -> None:
@@ -927,9 +1555,24 @@ class WeComKfContextMemoryTests(unittest.IsolatedAsyncioTestCase):
                 self.texts.append(content)
                 return {"errcode": 0}
 
+        class FakeInventory:
+            async def search(self, content: str, limit: int = 8) -> list[dict]:
+                return [{"小区": "小洋坝", "房号": "三区12-1003-2"}]
+
+        class FakeMediaStore:
+            def __init__(self, video_path: Path) -> None:
+                self.video_path = video_path
+
+            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
+                if "小洋坝" in query and "三区12-1003-2" in query:
+                    return [self.video_path]
+                return []
+
         with tempfile.TemporaryDirectory() as directory:
             previous_client = main.wecom_kf
             previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            previous_media_store = main.media_store
             previous_delay = main.settings.wecom_kf_satisfaction_delay_seconds
             fake_client = FakeKfClient()
             video_path = Path("room_database/video/小洋坝三区12-1003-2/微信视频.mp4")
@@ -938,6 +1581,8 @@ class WeComKfContextMemoryTests(unittest.IsolatedAsyncioTestCase):
                 main.wecom_kf_context_store = WeComKfContextStore(
                     path=Path(directory) / "context.json"
                 )
+                main.inventory = FakeInventory()
+                main.media_store = FakeMediaStore(video_path)
                 main.settings.wecom_kf_satisfaction_delay_seconds = 999
                 main.wecom_kf_conversation_memory.clear()
                 main.wecom_kf_context_store.save(
@@ -965,6 +1610,8 @@ class WeComKfContextMemoryTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 main.wecom_kf = previous_client
                 main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.media_store = previous_media_store
                 main.settings.wecom_kf_satisfaction_delay_seconds = previous_delay
                 main.wecom_kf_conversation_memory.clear()
                 main.wecom_kf_idle_sequences.clear()
@@ -1241,8 +1888,8 @@ class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
                 return {"errcode": 0}
 
         class FakeInventory:
-            async def search(self, content: str) -> list[dict]:
-                return []
+            async def search(self, content: str, limit: int = 8) -> list[dict]:
+                return [{"小区": "小洋坝家园", "房号": "二区6-801-3"}]
 
             def format_rows(self, rows: list[dict]) -> str:
                 return ""
@@ -1330,6 +1977,410 @@ class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
                 main.wecom_kf_conversation_memory.clear()
                 main.wecom_kf_idle_sequences.clear()
 
+    async def test_video_correction_uses_latest_room_detail_before_cached_images(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.videos: list[Path] = []
+                self.texts: list[str] = []
+
+            async def send_video(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                video_path: Path,
+            ) -> dict:
+                self.videos.append(video_path)
+                return {"errcode": 0}
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            async def search(self, content: str, limit: int = 8) -> list[dict]:
+                return [{"小区": "华丰人家", "房号": "8-603"}]
+
+        class FakeMediaStore:
+            def __init__(self, video_path: Path) -> None:
+                self.video_path = video_path
+                self.queries: list[str] = []
+
+            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
+                self.queries.append(query)
+                if "华丰人家" in query and "8-603" in query:
+                    return [self.video_path]
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            previous_media_store = main.media_store
+            fake_client = FakeKfClient()
+            video_path = Path("room_database/video/华丰人家8-603/视频.mp4")
+            fake_media_store = FakeMediaStore(video_path)
+            try:
+                main.wecom_kf = fake_client
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.inventory = FakeInventory()
+                main.media_store = fake_media_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_context_store.save(
+                    "kf_xxx:wm_xxx",
+                    {
+                        "image_paths": [str(Path("room_database/inventory_1.png"))],
+                        "recent_messages": [
+                            {
+                                "role": "客服",
+                                "content": (
+                                    "华丰人家 8-603 这套是 65㎡法式中古风一室一厅，"
+                                    "我这边暂时没有这套的视频。"
+                                ),
+                            },
+                        ],
+                        "updated_at": 9999999999.0,
+                    },
+                )
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "你明明有这个视频啊"},
+                    }
+                )
+
+                self.assertEqual(fake_client.texts, ["这是华丰人家8-603的视频。"])
+                self.assertEqual(fake_client.videos, [video_path])
+                self.assertIn("华丰人家", fake_media_store.queries[0])
+                self.assertIn("8-603", fake_media_store.queries[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.media_store = previous_media_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_video_request_checks_inventory_before_room_database_media(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.videos: list[Path] = []
+                self.texts: list[str] = []
+
+            async def send_video(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                video_path: Path,
+            ) -> dict:
+                self.videos.append(video_path)
+                return {"errcode": 0}
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+                self.limits: list[int] = []
+
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                self.queries.append(query)
+                self.limits.append(limit)
+                return [
+                    {"小区": "棠润府", "房号": "1-602B", "价格": "1700"},
+                    {"小区": "棠润府", "房号": "12-2-1202A", "价格": "1700"},
+                ]
+
+        class FakeMediaStore:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+                self.old = Path("room_database/video/棠润府10-1004C/视频.mp4")
+                self.first = Path("room_database/video/棠润府1-602B/视频.mp4")
+                self.second = Path("room_database/video/棠润府12-2-1202A/视频.mp4")
+
+            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
+                self.queries.append(query)
+                if "10-1004C" in query:
+                    return [self.old]
+                if "1-602B" in query:
+                    return [self.first]
+                if "12-2-1202A" in query:
+                    return [self.second]
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            previous_media_store = main.media_store
+            fake_client = FakeKfClient()
+            fake_inventory = FakeInventory()
+            fake_media_store = FakeMediaStore()
+            try:
+                main.wecom_kf = fake_client
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.inventory = fake_inventory
+                main.media_store = fake_media_store
+                main.wecom_kf_conversation_memory.clear()
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "棠润府1700的视频发一下啊"},
+                    }
+                )
+
+                self.assertEqual(fake_inventory.limits, [main.KF_VIDEO_SEND_LIMIT])
+                self.assertEqual(fake_client.videos, [fake_media_store.first, fake_media_store.second])
+                self.assertIn("棠润府1-602B", fake_media_store.queries)
+                self.assertIn("棠润府12-2-1202A", fake_media_store.queries)
+                self.assertNotIn(fake_media_store.old, fake_client.videos)
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.media_store = previous_media_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_community_video_request_checks_five_inventory_rooms(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.videos: list[Path] = []
+                self.texts: list[str] = []
+
+            async def send_video(self, open_kfid: str, external_userid: str, video_path: Path) -> dict:
+                self.videos.append(video_path)
+                return {"errcode": 0}
+
+            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            def __init__(self) -> None:
+                self.limits: list[int] = []
+
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                self.limits.append(limit)
+                return [
+                    {"小区": "皋塘运都", "房号": "12-1-1802"},
+                    {"小区": "皋塘运都", "房号": "12-2-401"},
+                    {"小区": "皋塘运都", "房号": "16-1-804"},
+                    {"小区": "皋塘运都", "房号": "16-1-805"},
+                    {"小区": "皋塘运都", "房号": "16-1-1003"},
+                ][:limit]
+
+        class FakeMediaStore:
+            def __init__(self) -> None:
+                self.paths = {
+                    room: Path(f"room_database/video/皋塘运都{room}/视频.mp4")
+                    for room in ("12-1-1802", "16-1-804", "16-1-805", "16-1-1003")
+                }
+
+            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
+                for room, path in self.paths.items():
+                    if room in query:
+                        return [path]
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            previous_media_store = main.media_store
+            fake_client = FakeKfClient()
+            fake_inventory = FakeInventory()
+            fake_media_store = FakeMediaStore()
+            try:
+                main.wecom_kf = fake_client
+                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
+                main.inventory = fake_inventory
+                main.media_store = fake_media_store
+                main.wecom_kf_conversation_memory.clear()
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "皋塘运都视频发一下"},
+                    }
+                )
+
+                self.assertEqual(fake_inventory.limits, [main.KF_VIDEO_SEND_LIMIT])
+                self.assertEqual(
+                    fake_client.videos,
+                    [
+                        fake_media_store.paths["12-1-1802"],
+                        fake_media_store.paths["16-1-804"],
+                        fake_media_store.paths["16-1-805"],
+                        fake_media_store.paths["16-1-1003"],
+                    ],
+                )
+                self.assertIn("这些房源表里还在，其中皋塘运都12-2-401视频暂时没有。", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.media_store = previous_media_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_video_request_replies_rented_out_when_inventory_has_no_match(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.videos: list[Path] = []
+                self.texts: list[str] = []
+
+            async def send_video(self, open_kfid: str, external_userid: str, video_path: Path) -> dict:
+                self.videos.append(video_path)
+                return {"errcode": 0}
+
+            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                return []
+
+        class FakeMediaStore:
+            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
+                return [Path("room_database/video/棠润府10-1004C/视频.mp4")]
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            previous_media_store = main.media_store
+            fake_client = FakeKfClient()
+            try:
+                main.wecom_kf = fake_client
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.inventory = FakeInventory()
+                main.media_store = FakeMediaStore()
+                main.wecom_kf_conversation_memory.clear()
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "棠润府10-1004C视频发一下"},
+                    }
+                )
+
+                self.assertEqual(fake_client.videos, [])
+                self.assertEqual(len(fake_client.texts), 1)
+                self.assertIn("已经租掉了", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.media_store = previous_media_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
+    async def test_yanglefu_video_request_does_not_send_stale_media_when_not_in_inventory(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.videos: list[Path] = []
+                self.texts: list[str] = []
+
+            async def send_video(self, open_kfid: str, external_userid: str, video_path: Path) -> dict:
+                self.videos.append(video_path)
+                return {"errcode": 0}
+
+            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                return []
+
+        class FakeMediaStore:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+                self.stale_video = Path("room_database/video/杨乐府1-101/视频.mp4")
+
+            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
+                self.queries.append(query)
+                if "杨乐府" in query:
+                    return [self.stale_video]
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            previous_media_store = main.media_store
+            fake_client = FakeKfClient()
+            fake_media_store = FakeMediaStore()
+            try:
+                main.wecom_kf = fake_client
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.inventory = FakeInventory()
+                main.media_store = fake_media_store
+                main.wecom_kf_conversation_memory.clear()
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "杨乐府的视频发一下"},
+                    }
+                )
+
+                self.assertEqual(fake_client.videos, [])
+                self.assertEqual(fake_media_store.queries, [])
+                self.assertEqual(len(fake_client.texts), 1)
+                self.assertIn("杨乐府", fake_client.texts[0])
+                self.assertIn("已经租掉了", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.media_store = previous_media_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
     async def test_plural_send_followup_sends_two_recent_room_videos(self) -> None:
         class FakeKfClient:
             def __init__(self) -> None:
@@ -1382,8 +2433,12 @@ class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
                 return {"errcode": 0}
 
         class FakeInventory:
-            async def search(self, content: str) -> list[dict]:
-                return []
+            async def search(self, content: str, limit: int = 8) -> list[dict]:
+                if "华丰人家" in content:
+                    return [{"小区": "华丰人家", "房号": "8-603"}]
+                return [
+                    {"小区": "永佳新苑", "房号": "2-703"},
+                ]
 
             def format_rows(self, rows: list[dict]) -> str:
                 return ""
@@ -1470,6 +2525,132 @@ class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
                 main.wecom_kf_conversation_memory.clear()
                 main.wecom_kf_idle_sequences.clear()
 
+    async def test_polite_video_followup_sends_recent_listed_room_videos(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.videos: list[Path] = []
+                self.texts: list[str] = []
+
+            async def send_video(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                video_path: Path,
+            ) -> dict:
+                self.videos.append(video_path)
+                return {"errcode": 0}
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        class FakeInventory:
+            async def search(self, content: str, limit: int = 8) -> list[dict]:
+                if "杨家府" not in content and "10-1-304" not in content and "1-202" not in content:
+                    return []
+                return [
+                    {"小区": "杨家府（兴业杨家府）", "房号": "10-1-304"},
+                    {"小区": "杨家府（兴业杨家府）", "房号": "1-202"},
+                ][:limit]
+
+            def format_rows(self, rows: list[dict]) -> str:
+                return ""
+
+            async def snapshot(self) -> str:
+                return "暂无"
+
+        class FakeMediaStore:
+            def __init__(self) -> None:
+                self.links = ["https://example.com/old-original.mp4"]
+                self.room_10304 = Path("room_database/video/杨家府10-1-304/视频.mp4")
+                self.room_1202 = Path("room_database/video/杨家府1-202/视频.mp4")
+
+            def list_for_rooms(self, rooms: list[dict]) -> list:
+                return []
+
+            def public_urls(self, media: list) -> tuple[list[str], list[str]]:
+                return [], []
+
+            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
+                paths = []
+                if "10-1-304" in query:
+                    paths.append(self.room_10304)
+                if "1-202" in query:
+                    paths.append(self.room_1202)
+                return paths[:limit]
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
+            previous_media_store = main.media_store
+            fake_client = FakeKfClient()
+            fake_media_store = FakeMediaStore()
+            try:
+                main.wecom_kf = fake_client
+                main.wecom_kf_context_store = WeComKfContextStore(
+                    path=Path(directory) / "context.json"
+                )
+                main.inventory = FakeInventory()
+                main.media_store = fake_media_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_context_store.save(
+                    "kf_xxx:wm_xxx",
+                    {
+                        "video_urls": ["https://example.com/old-original.mp4"],
+                        "recent_messages": [
+                            {"role": "客户", "content": "杨家府的还在吗"},
+                            {
+                                "role": "客服",
+                                "content": (
+                                    "杨家府（兴业杨家府）我这边看到还有两套：\n"
+                                    "1. 房号10-1-304，一室一厅，押一付4500/押二付4200，密码88888888#，民用水电。\n"
+                                    "2. 房号1-202，一室一厅，押一付4200/押一付3800，密码336699#，民用水电。\n"
+                                    "这两套都是65㎡整租，一年起租。需要看视频或者具体细节直接说，我发你。"
+                                ),
+                            },
+                        ],
+                        "updated_at": 9999999999.0,
+                    },
+                )
+
+                await main.handle_kf_message(
+                    {
+                        "msgid": "msg-1",
+                        "open_kfid": "kf_xxx",
+                        "external_userid": "wm_xxx",
+                        "origin": 3,
+                        "msgtype": "text",
+                        "text": {"content": "视频麻烦发我一下"},
+                    }
+                )
+
+                self.assertEqual(
+                    fake_client.texts,
+                    [
+                        "这是杨家府10-1-304的视频。",
+                        "这是杨家府1-202的视频。",
+                    ],
+                )
+                self.assertEqual(
+                    fake_client.videos,
+                    [fake_media_store.room_10304, fake_media_store.room_1202],
+                )
+                self.assertNotIn("old-original.mp4", "\n".join(fake_client.texts))
+                self.assertNotIn("已经租掉了", "\n".join(fake_client.texts))
+            finally:
+                main.wecom_kf = previous_client
+                main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
+                main.media_store = previous_media_store
+                main.wecom_kf_conversation_memory.clear()
+                main.wecom_kf_idle_sequences.clear()
+
     async def test_sends_room_database_videos_as_native_videos(self) -> None:
         class FakeKfClient:
             def __init__(self) -> None:
@@ -1537,14 +2718,14 @@ class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
 
         previous_client = main.wecom_kf
         previous_needs = main.needs_wecom_video_transcode
-        previous_prepare = main.prepare_wecom_video
+        previous_cached = main.cached_wecom_video
         fake_client = FakeKfClient()
         original = Path("room_database/video/华丰人家8-603/original.mp4")
         compressed = Path("room_database/video/华丰人家8-603/.wecom_cache/original.wecom.mp4")
         try:
             main.wecom_kf = fake_client
             main.needs_wecom_video_transcode = lambda path: True
-            main.prepare_wecom_video = lambda path, force=False: compressed
+            main.cached_wecom_video = lambda path: compressed
 
             sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [original])
 
@@ -1554,6 +2735,110 @@ class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
         finally:
             main.wecom_kf = previous_client
             main.needs_wecom_video_transcode = previous_needs
+            main.cached_wecom_video = previous_cached
+
+    async def test_large_uncached_video_falls_back_to_link_after_transcode_timeout(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_needs = main.needs_wecom_video_transcode
+            previous_cached = main.cached_wecom_video
+            previous_prepare = main.prepare_wecom_video
+            previous_root = main.settings.room_database_path
+            previous_base_url = main.settings.public_base_url
+            fake_client = FakeKfClient()
+            video_path = Path(directory) / "video" / "诸葛龙吟院13-1101" / "视频.mp4"
+            video_path.parent.mkdir(parents=True)
+            video_path.write_bytes(b"video")
+            try:
+                main.wecom_kf = fake_client
+                main.needs_wecom_video_transcode = lambda path: True
+                main.cached_wecom_video = lambda path: None
+                main.prepare_wecom_video = lambda path, force=False, timeout=180: (_ for _ in ()).throw(
+                    TimeoutError(f"timeout={timeout}")
+                )
+                main.settings.room_database_path = Path(directory)
+                main.settings.public_base_url = "https://example.com"
+
+                sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [video_path])
+
+                self.assertTrue(sent)
+                self.assertEqual(len(fake_client.texts), 1)
+                self.assertIn("视频直发失败", fake_client.texts[0])
+                self.assertIn("https://example.com/room-database/video/", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.needs_wecom_video_transcode = previous_needs
+                main.cached_wecom_video = previous_cached
+                main.prepare_wecom_video = previous_prepare
+                main.settings.room_database_path = previous_root
+                main.settings.public_base_url = previous_base_url
+
+    async def test_large_uncached_video_waits_for_quick_transcode_then_sends_native_video(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.videos: list[Path] = []
+                self.texts: list[str] = []
+
+            async def send_video(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                video_path: Path,
+            ) -> dict:
+                self.videos.append(video_path)
+                return {"errcode": 0}
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        previous_client = main.wecom_kf
+        previous_needs = main.needs_wecom_video_transcode
+        previous_cached = main.cached_wecom_video
+        previous_prepare = main.prepare_wecom_video
+        fake_client = FakeKfClient()
+        original = Path("room_database/video/诸葛龙吟院13-1101/original.mp4")
+        compressed = Path("room_database/video/诸葛龙吟院13-1101/.wecom_cache/original.wecom.mp4")
+        seen_timeouts: list[int] = []
+        try:
+            main.wecom_kf = fake_client
+            main.needs_wecom_video_transcode = lambda path: True
+            main.cached_wecom_video = lambda path: None
+
+            def quick_prepare(path: Path, force: bool = False, timeout: int = 180) -> Path:
+                seen_timeouts.append(timeout)
+                return compressed
+
+            main.prepare_wecom_video = quick_prepare
+
+            sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [original])
+
+            self.assertTrue(sent)
+            self.assertEqual(fake_client.videos, [compressed])
+            self.assertEqual(fake_client.texts, ["这是诸葛龙吟院13-1101的视频。"])
+            self.assertEqual(seen_timeouts, [main.KF_VIDEO_TRANSCODE_WAIT_SECONDS])
+        finally:
+            main.wecom_kf = previous_client
+            main.needs_wecom_video_transcode = previous_needs
+            main.cached_wecom_video = previous_cached
             main.prepare_wecom_video = previous_prepare
 
     async def test_retries_video_upload_with_transcoded_copy_after_upload_error(self) -> None:
@@ -1600,7 +2885,7 @@ class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
         try:
             main.wecom_kf = fake_client
             main.needs_wecom_video_transcode = lambda path: False
-            main.prepare_wecom_video = lambda path, force=False: compressed
+            main.prepare_wecom_video = lambda path, force=False, timeout=180: compressed
 
             sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [original])
 
@@ -1648,7 +2933,7 @@ class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
                 main.wecom_kf = fake_client
                 main.settings.room_database_path = Path(directory)
                 main.settings.public_base_url = "https://example.com"
-                main.prepare_wecom_video = lambda path, force=False: (_ for _ in ()).throw(
+                main.prepare_wecom_video = lambda path, force=False, timeout=180: (_ for _ in ()).throw(
                     RuntimeError("transcode failed")
                 )
                 video_path = Path(directory) / "video" / "琬秋铭府1-1803" / "视频.mp4"

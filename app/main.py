@@ -17,7 +17,11 @@ from app.services.inventory import InventoryService
 from app.services.inventory_image_sync import InventoryImageSyncer
 from app.services.llm import ReplyGenerator
 from app.services.media_store import GENERIC_MEDIA_WORDS, MediaStore
-from app.services.video_transcoder import needs_wecom_video_transcode, prepare_wecom_video
+from app.services.video_transcoder import (
+    cached_wecom_video,
+    needs_wecom_video_transcode,
+    prepare_wecom_video,
+)
 from app.services.feishu import FeishuClient
 from app.services.wecom import WeComClient
 from app.services.wecom_kf import (
@@ -45,6 +49,29 @@ wecom_kf_conversation_memory: dict[str, dict[str, Any]] = {}
 wecom_kf_sync_lock = asyncio.Lock()
 
 VIDEO_KEYWORDS = ("\u89c6\u9891", "\u5b9e\u62cd", "\u770b\u623f\u89c6\u9891", "\u5185\u90e8\u89c6\u9891", "\u623f\u95f4\u89c6\u9891", "\u7b14\u8bb0")
+ORIGINAL_VIDEO_LINK_KEYWORDS = (
+    "原视频",
+    "原版视频",
+    "源视频",
+    "原文件",
+    "原片",
+    "更清楚",
+    "清楚一点",
+    "清楚一些",
+    "清楚点",
+    "清楚点的",
+    "再清楚",
+    "清晰",
+    "更清晰",
+    "高清",
+    "画质",
+    "太糊",
+    "有点糊",
+    "不够清楚",
+    "模糊",
+    "无压缩",
+    "没压缩",
+)
 INVENTORY_IMAGE_KEYWORDS = ("\u623f\u6e90\u8868", "\u8868\u683c", "\u622a\u56fe", "\u56fe\u7247", "\u7167\u7247")
 INVENTORY_TABLE_SHORT_EXCLUSIONS = (
     "发表",
@@ -86,8 +113,9 @@ DISSATISFACTION_KEYWORDS = (
     "\u4e0d\u5c31\u662f",
 )
 SATISFACTION_KEYWORDS = ("\u6ee1\u610f", "\u8fd8\u53ef\u4ee5", "\u53ef\u4ee5\u4e86", "\u53ef\u4ee5\u7684", "\u884c\u4e86", "\u597d\u7684", "\u597d")
-KF_VIDEO_SEND_LIMIT = 3
+KF_VIDEO_SEND_LIMIT = 5
 KF_INVENTORY_IMAGE_SEND_LIMIT = 5
+KF_VIDEO_TRANSCODE_WAIT_SECONDS = 15
 KF_CONTEXT_TTL_SECONDS = 30 * 60
 CONTRACT_CONTACT_NUMBERS = ("18758141785", "13282125992", "19941091943")
 CONTRACT_CONTACT_KEYWORDS = (
@@ -144,6 +172,9 @@ MEDIA_FOLLOWUP_FILLER_WORDS = (
     "吧",
     "两套",
     "几套",
+    "麻烦",
+    "顺便",
+    "帮忙",
 )
 MEDIA_SEND_FOLLOWUP_WORDS = (
     "发我",
@@ -155,6 +186,18 @@ MEDIA_SEND_FOLLOWUP_WORDS = (
     "马上发",
     "给我发",
     "要",
+)
+VIDEO_CONTEXT_REFERENCE_WORDS = (
+    "这个视频",
+    "这个有视频",
+    "这套有视频",
+    "那套有视频",
+    "有视频吗",
+    "视频呢",
+    "明明有",
+    "不是有",
+    "怎么说没有",
+    "怎么说没",
 )
 MEDIA_SEARCH_ALIASES = (
     ("晚秋铭府", "琬秋铭府"),
@@ -186,6 +229,10 @@ app.mount("/room-database", StaticFiles(directory=settings.room_database_path), 
 
 def _wants_video(text: str) -> bool:
     return any(keyword in text for keyword in VIDEO_KEYWORDS)
+
+
+def _wants_original_video_link(text: str) -> bool:
+    return any(keyword in text for keyword in ORIGINAL_VIDEO_LINK_KEYWORDS)
 
 
 def _wants_context_video(open_kfid: str, external_userid: str, content: str) -> bool:
@@ -390,15 +437,286 @@ def _replace_missing_video_claim(reply_text: str) -> str:
 def _needs_viewing_contact_guidance(customer_text: str, reply_text: str) -> bool:
     if any(number in reply_text for number in CONTRACT_CONTACT_NUMBERS):
         return False
-    asks_viewing = any(
-        keyword in customer_text
-        for keyword in ("看房", "能看", "现在看", "预约", "联系一下", "帮我联系", "安排看")
-    )
+    asks_viewing = _wants_viewing_appointment(customer_text)
     not_vacant = any(
         keyword in reply_text
         for keyword in ("暂时看不了", "还没空出", "没空出", "未空出", "才空出", "等空出", "空出来")
     )
     return asks_viewing and not_vacant
+
+
+def _wants_viewing_appointment(text: str) -> bool:
+    return any(
+        keyword in text
+        for keyword in (
+            "看房",
+            "怎么看",
+            "怎么去看",
+            "能看",
+            "现在看",
+            "预约",
+            "约看",
+            "联系一下",
+            "帮我联系",
+            "安排看",
+            "实地看",
+            "现场看",
+        )
+    )
+
+
+def _reports_wrong_viewing_password(text: str) -> bool:
+    return any(
+        keyword in text
+        for keyword in (
+            "密码错",
+            "密码不对",
+            "密码错误",
+            "密码打不开",
+            "打不开门",
+            "开不了门",
+            "进不去",
+            "门打不开",
+            "不对啊",
+        )
+    )
+
+
+def _recent_video_room_label(context: dict[str, Any] | None) -> str:
+    labels = _recent_video_room_labels(context)
+    return labels[-1] if labels else ""
+
+
+def _recent_video_room_labels(context: dict[str, Any] | None) -> list[str]:
+    if not context:
+        return []
+    video_paths = [Path(item) for item in context.get("video_paths") or [] if item]
+    return _dedupe([_room_video_label(path) for path in video_paths])
+
+
+def _password_contact_reply(label: str = "") -> str:
+    subject = f"{label}的" if label else ""
+    return (
+        f"{subject}看房密码建议直接联系下面三个号码确认：\n"
+        + "\n".join(CONTRACT_CONTACT_NUMBERS)
+        + "\n\n你把小区和房号发给他们，他们会帮你确认最新密码。"
+    )
+
+
+def _viewing_need_room_reference_reply() -> str:
+    return "你把要看的小区和房号发我，我先查房源表里的看房密码，再告诉你怎么去看。"
+
+
+def _row_value(row: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = str(row.get(key, "")).strip()
+        if value:
+            return value
+    return ""
+
+
+def _looks_like_missing_or_contact_password(password: str) -> bool:
+    if not password:
+        return True
+    return any(
+        keyword in password
+        for keyword in (
+            "联系",
+            "预约",
+            "动态",
+            "空出",
+            "没锁",
+            "无锁",
+            "看房",
+            "待定",
+            "暂无",
+            "没有",
+        )
+    )
+
+
+def _is_dynamic_password(password: str) -> bool:
+    return "动态" in password
+
+
+def _vacancy_text_from_password(password: str) -> str:
+    if "空出" not in password:
+        return ""
+    match = re.search(r"(\d{1,2}(?:[./月-]\d{1,2})?\s*(?:号|日)?\s*空出)", password)
+    if match:
+        return match.group(1).strip()
+    return password.strip()
+
+
+def _normalize_room_reference(text: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", text).lower()
+
+
+def _select_viewing_row(rows: list[dict[str, Any]], fallback_label: str = "") -> dict[str, Any] | None:
+    if not rows:
+        return None
+    target = _normalize_room_reference(fallback_label)
+    if not target:
+        return rows[0]
+
+    best_row = rows[0]
+    best_score = -1
+    for row in rows:
+        community = _row_value(row, "小区", "社区", "楼盘")
+        room_no = _row_value(row, "房号", "房间号", "room_id", "RoomID", "编号")
+        row_label = _normalize_room_reference(f"{community}{room_no}")
+        room_norm = _normalize_room_reference(room_no)
+        score = 0
+        if room_norm and room_norm in target:
+            score += 100 + len(room_norm)
+        if row_label and row_label in target:
+            score += 50 + len(row_label)
+        community_norm = _normalize_room_reference(community)
+        if community_norm and community_norm in target:
+            score += 10
+        if score > best_score:
+            best_score = score
+            best_row = row
+    return best_row
+
+
+async def _recent_video_viewing_reply(context: dict[str, Any] | None) -> str:
+    labels = _recent_video_room_labels(context)
+    if not labels:
+        return _password_contact_reply()
+    if len(labels) > 1:
+        return await _multiple_recent_video_viewing_reply(labels)
+
+    label = labels[0]
+    rows = await inventory.search(label, limit=3)
+    return _viewing_reply_for_rows(rows, label)
+
+
+async def _multiple_recent_video_viewing_reply(labels: list[str]) -> str:
+    lines: list[str] = []
+    needs_contact = False
+    for index, label in enumerate(labels, start=1):
+        rows = await inventory.search(label, limit=3)
+        room_label, password, password_status = _room_label_and_password(rows, label)
+        needs_contact = needs_contact or password_status != "valid"
+        value = _viewing_password_list_value(password, password_status)
+        lines.append(f"{index}. {room_label}：{value}")
+
+    reply = "刚发的这几套，看房密码如下：\n" + "\n".join(lines)
+    if needs_contact:
+        reply += "\n\n有密码需要确认的，直接联系下面三个号码：\n" + "\n".join(CONTRACT_CONTACT_NUMBERS)
+    else:
+        reply += "\n\n你可以先按对应密码去看。现场密码不对的话，再联系下面三个号码确认最新看房密码：\n" + "\n".join(
+            CONTRACT_CONTACT_NUMBERS
+        )
+    return reply
+
+
+async def _explicit_viewing_reply(content: str) -> str:
+    rows = await inventory.search(content, limit=3)
+    return _viewing_reply_for_rows(rows, content)
+
+
+def _viewing_reply_for_rows(rows: list[dict[str, Any]], fallback_label: str = "") -> str:
+    if not rows:
+        return _password_contact_reply(fallback_label)
+
+    room_label, password, password_status = _room_label_and_password(rows, fallback_label)
+    if password_status == "dynamic":
+        return _dynamic_password_reply(room_label)
+    if password_status == "not_vacant":
+        return _not_vacant_password_reply(room_label, password)
+    if password_status == "missing":
+        return _password_contact_reply(room_label)
+
+    return (
+        f"{room_label}看房密码是：{password}\n"
+        "你可以先按这个密码去看。"
+        "\n\n如果现场密码不对，直接联系下面三个号码确认最新看房密码：\n"
+        + "\n".join(CONTRACT_CONTACT_NUMBERS)
+    )
+
+
+def _room_label_and_password(
+    rows: list[dict[str, Any]],
+    fallback_label: str = "",
+) -> tuple[str, str, str]:
+    if not rows:
+        return fallback_label, "", "missing"
+    room = _select_viewing_row(rows, fallback_label) or rows[0]
+    community = _row_value(room, "小区", "社区", "楼盘")
+    room_no = _row_value(room, "房号", "房间号", "room_id", "RoomID", "编号")
+    password = _row_value(room, "密码", "看房密码", "门锁密码")
+    room_label = "".join(part for part in (community, room_no) if part) or fallback_label
+    if _is_dynamic_password(password):
+        return room_label, password, "dynamic"
+    if _vacancy_text_from_password(password):
+        return room_label, password, "not_vacant"
+    if _looks_like_missing_or_contact_password(password):
+        return room_label, password, "missing"
+    return room_label, password, "valid"
+
+
+def _viewing_password_list_value(password: str, status: str) -> str:
+    if status == "valid":
+        return password
+    if status == "dynamic":
+        return "动态密码，需要联系获取"
+    if status == "not_vacant":
+        vacancy_text = _vacancy_text_from_password(password) or password
+        return f"{vacancy_text}，还未空出，需要预约看房"
+    return "密码需要联系确认"
+
+
+def _dynamic_password_reply(room_label: str) -> str:
+    return (
+        f"{room_label}是动态密码，需要联系下面三个号码获取最新看房密码：\n"
+        + "\n".join(CONTRACT_CONTACT_NUMBERS)
+    )
+
+
+def _not_vacant_password_reply(room_label: str, password: str) -> str:
+    vacancy_text = _vacancy_text_from_password(password) or password
+    return (
+        f"{room_label}{vacancy_text}，目前还未空出。\n"
+        "要看房需要提前联系下面三个号码预约：\n"
+        + "\n".join(CONTRACT_CONTACT_NUMBERS)
+    )
+
+
+def _recent_video_password_problem_reply(context: dict[str, Any] | None) -> str:
+    return _password_contact_reply(_recent_video_room_label(context))
+
+
+def _has_explicit_room_reference(text: str) -> bool:
+    if re.search(r"\d+[-－—]\d+(?:[-－—]?[A-Za-z0-9]+)?", text):
+        return True
+    cleaned = text.strip()
+    for word in (
+        "怎么看房",
+        "怎么去看",
+        "看房",
+        "能看吗",
+        "能不能看",
+        "预约",
+        "约看",
+        "现在看",
+        "联系一下",
+        "帮我联系",
+        "安排看",
+        "实地看",
+        "现场看",
+        "这套",
+        "这个",
+        "房子",
+        "房间",
+        "吗",
+        "呢",
+        "？",
+        "?",
+    ):
+        cleaned = cleaned.replace(word, "")
+    return len(re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", cleaned)) >= 2
 
 
 def _viewing_contact_guidance() -> str:
@@ -500,11 +818,24 @@ async def _send_kf_room_database_videos(
     failed_paths: list[Path] = []
     for video_path in video_paths:
         try:
-            send_path = (
-                prepare_wecom_video(video_path)
-                if needs_wecom_video_transcode(video_path)
-                else video_path
-            )
+            if needs_wecom_video_transcode(video_path):
+                send_path = cached_wecom_video(video_path)
+                if send_path is None:
+                    try:
+                        send_path = await _prepare_wecom_video(
+                            video_path,
+                            timeout=KF_VIDEO_TRANSCODE_WAIT_SECONDS,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "微信客服视频 15 秒内未压缩完成，改发链接兜底: %s",
+                            video_path,
+                            exc_info=True,
+                        )
+                        failed_paths.append(video_path)
+                        continue
+            else:
+                send_path = video_path
             try:
                 await _send_kf_room_database_video(open_kfid, external_userid, send_path, video_path)
             except WeComKfSendLimitError:
@@ -512,7 +843,11 @@ async def _send_kf_room_database_videos(
             except Exception:
                 if send_path != video_path:
                     raise
-                retry_path = prepare_wecom_video(video_path, force=True)
+                retry_path = await _prepare_wecom_video(
+                    video_path,
+                    force=True,
+                    timeout=KF_VIDEO_TRANSCODE_WAIT_SECONDS,
+                )
                 await _send_kf_room_database_video(open_kfid, external_userid, retry_path, video_path)
         except WeComKfSendLimitError:
             logger.warning("微信客服发送次数已达上限，停止继续发送房源视频")
@@ -534,6 +869,147 @@ async def _send_kf_room_database_videos(
                 logger.warning("微信客服发送次数已达上限，停止发送视频兜底链接")
                 return False
     return True
+
+
+async def _try_send_kf_room_database_videos_for_content(
+    open_kfid: str,
+    external_userid: str,
+    content: str,
+) -> bool:
+    search_texts = _kf_media_search_texts(open_kfid, external_userid, content)
+    if not _has_video_inventory_search_anchor(content, search_texts):
+        reply_text = "你把想看的小区、房号或价格发我，我先查房源表，确认还在租再发视频。"
+        await wecom_kf.send_text(open_kfid, external_userid, reply_text)
+        _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
+        return True
+
+    video_paths: list[Path] = []
+    rented_out_labels: list[str] = []
+    missing_video_labels: list[str] = []
+    seen_labels: set[str] = set()
+    seen_paths: set[str] = set()
+    requested_count = _media_followup_requested_count(content)
+
+    for search_text in search_texts:
+        row_limit = _video_inventory_search_limit(search_text, requested_count, len(search_texts))
+        rows = await inventory.search(search_text, limit=row_limit)
+        if not rows:
+            rented_out_labels.append(_video_request_label(search_text))
+            continue
+        for row in rows[:row_limit]:
+            label = _room_label_from_inventory_row(row, search_text)
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            matched_paths = media_store.list_room_database_videos(label, limit=1)
+            if not matched_paths:
+                missing_video_labels.append(label)
+                continue
+            for path in matched_paths:
+                key = str(path)
+                if key not in seen_paths:
+                    video_paths.append(path)
+                    seen_paths.add(key)
+            if len(video_paths) >= KF_VIDEO_SEND_LIMIT:
+                break
+        if len(video_paths) >= KF_VIDEO_SEND_LIMIT:
+            break
+
+    if not video_paths:
+        reply_text = _no_validated_video_reply(rented_out_labels, missing_video_labels)
+        await wecom_kf.send_text(open_kfid, external_userid, reply_text)
+        _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
+        return True
+
+    if rented_out_labels or missing_video_labels:
+        reply_text = _partial_validated_video_reply(rented_out_labels, missing_video_labels)
+        await wecom_kf.send_text(open_kfid, external_userid, reply_text)
+        _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
+
+    video_paths = video_paths[:KF_VIDEO_SEND_LIMIT]
+    video_urls = _room_database_public_urls(video_paths)
+    _remember_kf_media_context(
+        open_kfid,
+        external_userid,
+        video_paths=video_paths,
+        video_urls=video_urls,
+    )
+    sent = await _send_kf_room_database_videos(open_kfid, external_userid, video_paths)
+    if sent:
+        _append_kf_dialog_message(open_kfid, external_userid, "客服", "已直接发送相关视频。")
+    return True
+
+
+def _has_video_inventory_search_anchor(content: str, search_texts: list[str]) -> bool:
+    content_search = _normalize_media_search_aliases(content.strip())
+    if any(search_text.strip() != content_search for search_text in search_texts):
+        return True
+    cleaned = content
+    for word in (*MEDIA_FOLLOWUP_FILLER_WORDS, "有", "吗", "嘛", "呢", "啊", "呀", "哈"):
+        cleaned = cleaned.replace(word, " ")
+    return len(re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", cleaned)) >= 2
+
+
+def _video_inventory_search_limit(
+    search_text: str,
+    requested_count: int,
+    search_text_count: int,
+) -> int:
+    if search_text_count > 1:
+        return 1
+    if _is_specific_room_video_query(search_text):
+        return 1
+    return min(KF_VIDEO_SEND_LIMIT, max(requested_count, KF_VIDEO_SEND_LIMIT))
+
+
+def _room_label_from_inventory_row(row: dict[str, Any], fallback_label: str = "") -> str:
+    community = _row_value(row, "小区", "社区", "楼盘")
+    room_no = _row_value(row, "房号", "房间号", "room_id", "RoomID", "编号")
+    return "".join(part for part in (community, room_no) if part) or fallback_label
+
+
+def _video_request_label(search_text: str) -> str:
+    label = search_text
+    for word in (*GENERIC_MEDIA_WORDS, "吗", "呢", "啊", "呀", "吧"):
+        label = label.replace(word, " ")
+    label = re.sub(r"\s+", "", label).strip()
+    return label or "这个房源"
+
+
+def _no_validated_video_reply(
+    rented_out_labels: list[str],
+    missing_video_labels: list[str],
+) -> str:
+    if rented_out_labels and not missing_video_labels:
+        labels = "、".join(_dedupe(rented_out_labels))
+        return f"{labels}房源表里查不到了，应该已经租掉了。"
+    if missing_video_labels and not rented_out_labels:
+        labels = "、".join(_dedupe(missing_video_labels))
+        return f"{labels}房源表里还在，视频暂时没有。"
+    return _partial_validated_video_reply(rented_out_labels, missing_video_labels)
+
+
+def _partial_validated_video_reply(
+    rented_out_labels: list[str],
+    missing_video_labels: list[str],
+) -> str:
+    lines: list[str] = []
+    rented_out = _dedupe(rented_out_labels)
+    missing_video = _dedupe(missing_video_labels)
+    if rented_out:
+        lines.append("房源表里查不到这些，应该已经租掉了：" + "、".join(rented_out))
+    if missing_video:
+        lines.append("这些房源表里还在，其中" + "、".join(missing_video) + "视频暂时没有。")
+    return "\n".join(lines) or "这套房源表里查不到了，应该已经租掉了。"
+
+
+async def _prepare_wecom_video(
+    video_path: Path,
+    *,
+    force: bool = False,
+    timeout: int = 180,
+) -> Path:
+    return await asyncio.to_thread(prepare_wecom_video, video_path, force=force, timeout=timeout)
 
 
 async def _send_kf_room_database_video(
@@ -701,7 +1177,10 @@ def _kf_media_search_text(open_kfid: str, external_userid: str, content: str) ->
 
 def _kf_media_search_texts(open_kfid: str, external_userid: str, content: str) -> list[str]:
     context = _recent_kf_media_context(open_kfid, external_userid) or {}
-    if not _is_generic_media_followup(content):
+    if not (
+        _is_generic_media_followup(content)
+        or _should_use_recent_room_context_for_media(content)
+    ):
         return [_normalize_media_search_aliases(content.strip())]
 
     recent_messages = list(context.get("recent_messages") or [])[-10:]
@@ -732,6 +1211,22 @@ def _is_generic_media_followup(content: str) -> bool:
     for word in MEDIA_FOLLOWUP_FILLER_WORDS:
         cleaned = cleaned.replace(word, " ")
     return not re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", cleaned)
+
+
+def _should_use_recent_room_context_for_media(content: str) -> bool:
+    if not _wants_video(content):
+        return False
+    if _has_room_number_reference(content):
+        return False
+    return any(word in content for word in VIDEO_CONTEXT_REFERENCE_WORDS)
+
+
+def _has_room_number_reference(text: str) -> bool:
+    return bool(_room_number_references(text))
+
+
+def _room_number_references(text: str) -> list[str]:
+    return re.findall(r"\d+[-－—]\d+(?:[-－—]?[A-Za-z0-9]+)?", text)
 
 
 def _media_followup_requested_count(content: str) -> int:
@@ -815,9 +1310,11 @@ def _looks_like_room_detail(text: str) -> bool:
 def _is_specific_room_video_query(text: str) -> bool:
     if not _wants_video(text):
         return False
+    if len(_room_number_references(text)) > 1:
+        return False
     if any(marker in text for marker in ("房号", "小区：", "户型：")):
         return True
-    return bool(re.search(r"\d+[-栋幢区]\d+(?:[-栋幢区]\d+)*(?:[A-Za-z])?", text))
+    return bool(_room_number_references(text))
 
 
 def _next_kf_idle_sequence(open_kfid: str, external_userid: str) -> int:
@@ -856,6 +1353,42 @@ async def _send_kf_video_links(
         external_userid,
         "\n".join(urls),
     )
+
+
+def _recent_context_has_video(context: dict[str, Any] | None) -> bool:
+    if not context:
+        return False
+    return bool(context.get("video_urls") or context.get("video_paths"))
+
+
+def _wants_recent_video_link(content: str, context: dict[str, Any] | None) -> bool:
+    if not _recent_context_has_video(context):
+        return False
+    if _wants_original_video_link(content):
+        return True
+    if _wants_video(content):
+        return False
+    return _is_generic_media_followup(content) and any(
+        word in content for word in MEDIA_SEND_FOLLOWUP_WORDS
+    )
+
+
+async def _send_recent_video_links_if_available(
+    open_kfid: str,
+    external_userid: str,
+    context: dict[str, Any] | None = None,
+) -> bool:
+    context = context or _recent_kf_media_context(open_kfid, external_userid) or {}
+    urls = list(context.get("video_urls") or [])
+    if not urls and context.get("video_paths"):
+        urls = _room_database_public_urls([Path(item) for item in context.get("video_paths") or []])
+    urls = _dedupe(urls)
+    if not urls:
+        return False
+    reply_text = "原视频直达链接发你，点开可以看更清楚的版本：\n" + "\n".join(urls)
+    await wecom_kf.send_text(open_kfid, external_userid, reply_text)
+    _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
+    return True
 
 
 @app.on_event("startup")
@@ -1031,6 +1564,7 @@ async def handle_kf_message(kf_message: dict) -> None:
         external_userid,
         content,
     )
+    recent_context = _recent_kf_media_context(open_kfid, external_userid)
     if _is_greeting_only(content):
         reply_text = _greeting_reply()
         await wecom_kf.send_text(open_kfid, external_userid, reply_text)
@@ -1055,8 +1589,46 @@ async def handle_kf_message(kf_message: dict) -> None:
         _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
         return
 
+    if _wants_recent_video_link(content, recent_context):
+        if await _send_recent_video_links_if_available(
+            open_kfid,
+            external_userid,
+            recent_context,
+        ):
+            return
+
+    if _reports_wrong_viewing_password(content) and (
+        _has_explicit_room_reference(content) or _recent_context_has_video(recent_context)
+    ):
+        reply_text = (
+            _password_contact_reply(content)
+            if _has_explicit_room_reference(content)
+            else _recent_video_password_problem_reply(recent_context)
+        )
+        await wecom_kf.send_text(open_kfid, external_userid, reply_text)
+        _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
+        return
+
+    if _wants_viewing_appointment(content):
+        if _has_explicit_room_reference(content):
+            reply_text = await _explicit_viewing_reply(content)
+        elif _recent_context_has_video(recent_context):
+            reply_text = await _recent_video_viewing_reply(recent_context)
+        else:
+            reply_text = _viewing_need_room_reference_reply()
+        await wecom_kf.send_text(open_kfid, external_userid, reply_text)
+        _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
+        return
+
+    if wants_video and await _try_send_kf_room_database_videos_for_content(
+        open_kfid,
+        external_userid,
+        content,
+    ):
+        return
+
     if _is_dissatisfied_or_correction(content):
-        context = _recent_kf_media_context(open_kfid, external_userid)
+        context = recent_context
         if context:
             image_paths = list(context.get("image_paths") or [])
             video_paths = list(context.get("video_paths") or [])

@@ -12,6 +12,7 @@ import pandas as pd
 from app.config import settings
 from app.services.config_check import is_missing_or_placeholder
 from app.services.feishu import FeishuClient
+from app.services.fuzzy_match import fuzzy_contains_score
 
 
 GENERIC_QUERY_WORDS = (
@@ -133,11 +134,21 @@ class InventoryService:
             for gram in self._char_grams(token.lower()):
                 if gram in merged:
                     score += len(gram)
+            community = self._community_name(row)
+            if community:
+                score += fuzzy_contains_score(token, community)
         for value in row.values():
             value_text = str(value).strip().lower()
             if len(value_text) >= 2 and value_text in search_text:
                 score += 3
         return score
+
+    def _community_name(self, row: dict[str, Any]) -> str:
+        for key in ("小区", "社区", "楼盘"):
+            value = str(row.get(key, "")).strip()
+            if value:
+                return value
+        return ""
 
     def _filter_scored_rows(
         self, scored: list[tuple[int, dict[str, Any]]]

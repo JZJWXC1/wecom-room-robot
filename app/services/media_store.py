@@ -3,6 +3,7 @@ import re
 
 from app.config import settings
 from app.models import RoomMedia
+from app.services.fuzzy_match import fuzzy_contains_score, normalize_search_text
 
 
 GENERIC_MEDIA_WORDS = (
@@ -149,9 +150,22 @@ class MediaStore:
         if not query_norm or not target_norm:
             return 0
 
+        query_room_tokens = set(self._room_tokens(query_text))
+        target_room_tokens = set(self._room_tokens(target_text))
+        if query_room_tokens and not query_room_tokens.intersection(target_room_tokens):
+            return 0
+
         score = 0
         if query_norm in target_norm:
             score += 120
+
+        if query_room_tokens & target_room_tokens:
+            score += 90
+
+        for chinese_token in re.findall(r"[\u4e00-\u9fff]{2,}", query_text):
+            token_norm = self._normalize_text(chinese_token)
+            if len(token_norm) >= 2 and token_norm in target_norm:
+                score += 30 + len(token_norm)
 
         for token in self._query_tokens(query_text):
             token_norm = self._normalize_text(token)
@@ -164,6 +178,11 @@ class MediaStore:
             loose_token = self._loose_room_token(token_norm)
             if len(loose_token) >= 4 and loose_token in target_norm:
                 score += 35 + len(loose_token)
+                continue
+
+            fuzzy_score = fuzzy_contains_score(token_norm, target_norm)
+            if fuzzy_score:
+                score += fuzzy_score
 
         for gram in self._char_grams(query_norm):
             if gram in target_norm:
@@ -184,12 +203,16 @@ class MediaStore:
         return list(dict.fromkeys(tokens))
 
     def _normalize_text(self, text: str) -> str:
-        return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", text).lower()
+        return normalize_search_text(text)
 
     def _loose_room_token(self, token: str) -> str:
         if re.search(r"\d", token) and len(token) >= 5 and token[-1].isalnum():
             return token[:-1]
         return token
+
+    def _room_tokens(self, text: str) -> list[str]:
+        tokens = re.findall(r"\d+[-－—]\d+(?:[-－—]?[a-zA-Z0-9]+)?", text)
+        return [self._normalize_text(token) for token in tokens]
 
     def _char_grams(self, text: str) -> list[str]:
         grams: list[str] = []
