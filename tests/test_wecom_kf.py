@@ -162,6 +162,20 @@ class WeComKfMediaSearchTextTests(unittest.TestCase):
         self.assertIn("小洋坝", search_text)
         self.assertNotIn("小样吧", search_text)
 
+    def test_normalizes_wanqiu_aliases_for_media_search(self) -> None:
+        self.assertEqual(
+            main._normalize_media_search_aliases("晚秋视频发一下"),
+            "琬秋铭府视频发一下",
+        )
+        self.assertEqual(
+            main._normalize_media_search_aliases("婉秋视频发一下"),
+            "琬秋铭府视频发一下",
+        )
+        self.assertEqual(
+            main._normalize_media_search_aliases("琬秋铭府视频发一下"),
+            "琬秋铭府视频发一下",
+        )
+
     def test_plural_video_followup_uses_recent_two_room_details(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             previous_store = main.wecom_kf_context_store
@@ -328,6 +342,16 @@ class WeComKfVideoHelperTests(unittest.TestCase):
         self.assertIn("19941091943", reply)
         self.assertNotIn("？。", reply)
         self.assertIn("房间详细信息吗？\n\n这类还没空出的房子", reply)
+
+    def test_polishes_missing_video_claim_when_material_exists(self) -> None:
+        reply = main._polish_kf_reply_text(
+            "琬秋",
+            "琬秋铭府3-702B目前没视频，看房要提前联系。你是想约时间看这套吗？",
+            has_available_video=True,
+        )
+
+        self.assertIn("我这边有对应视频", reply)
+        self.assertNotIn("没视频", reply)
 
     def test_detects_video_context_correction(self) -> None:
         self.assertTrue(
@@ -1535,18 +1559,27 @@ class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
     async def test_retries_video_upload_with_transcoded_copy_after_upload_error(self) -> None:
         class FakeKfClient:
             def __init__(self) -> None:
-                self.videos: list[Path] = []
+                self.uploads: list[Path] = []
+                self.media_ids: list[str] = []
                 self.texts: list[str] = []
 
-            async def send_video(
+            async def upload_media(
+                self,
+                video_path: Path,
+                media_type: str = "video",
+            ) -> str:
+                self.uploads.append(video_path)
+                if len(self.uploads) == 1:
+                    raise RuntimeError("invalid video size")
+                return "media_xxx"
+
+            async def send_video_media(
                 self,
                 open_kfid: str,
                 external_userid: str,
-                video_path: Path,
+                media_id: str,
             ) -> dict:
-                self.videos.append(video_path)
-                if len(self.videos) == 1:
-                    raise RuntimeError("invalid video size")
+                self.media_ids.append(media_id)
                 return {"errcode": 0}
 
             async def send_text(
@@ -1572,12 +1605,67 @@ class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
             sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [original])
 
             self.assertTrue(sent)
-            self.assertEqual(fake_client.videos, [original, compressed])
+            self.assertEqual(fake_client.uploads, [original, compressed])
+            self.assertEqual(fake_client.media_ids, ["media_xxx"])
             self.assertEqual(fake_client.texts, ["这是华丰人家8-603的视频。"])
         finally:
             main.wecom_kf = previous_client
             main.needs_wecom_video_transcode = previous_needs
             main.prepare_wecom_video = previous_prepare
+
+    async def test_does_not_send_room_label_when_video_upload_fails(self) -> None:
+        class FakeKfClient:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            async def upload_media(self, video_path: Path, media_type: str = "video") -> str:
+                raise RuntimeError("upload failed")
+
+            async def send_video_media(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                media_id: str,
+            ) -> dict:
+                return {"errcode": 0}
+
+            async def send_text(
+                self,
+                open_kfid: str,
+                external_userid: str,
+                content: str,
+            ) -> dict:
+                self.texts.append(content)
+                return {"errcode": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            previous_client = main.wecom_kf
+            previous_root = main.settings.room_database_path
+            previous_base_url = main.settings.public_base_url
+            previous_prepare = main.prepare_wecom_video
+            fake_client = FakeKfClient()
+            try:
+                main.wecom_kf = fake_client
+                main.settings.room_database_path = Path(directory)
+                main.settings.public_base_url = "https://example.com"
+                main.prepare_wecom_video = lambda path, force=False: (_ for _ in ()).throw(
+                    RuntimeError("transcode failed")
+                )
+                video_path = Path(directory) / "video" / "琬秋铭府1-1803" / "视频.mp4"
+                video_path.parent.mkdir(parents=True)
+                video_path.write_bytes(b"not-a-real-video")
+
+                sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [video_path])
+
+                self.assertTrue(sent)
+                self.assertEqual(len(fake_client.texts), 1)
+                self.assertIn("视频直发失败", fake_client.texts[0])
+                self.assertNotIn("这是琬秋铭府1-1803的视频", fake_client.texts[0])
+            finally:
+                main.wecom_kf = previous_client
+                main.settings.room_database_path = previous_root
+                main.settings.public_base_url = previous_base_url
+                main.prepare_wecom_video = previous_prepare
 
 
 class WeComKfInventoryImageSendTests(unittest.IsolatedAsyncioTestCase):

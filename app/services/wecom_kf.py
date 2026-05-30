@@ -283,6 +283,14 @@ class WeComKfClient:
         video_path: Path,
     ) -> dict[str, Any]:
         media_id = await self.upload_media(video_path, "video")
+        return await self.send_video_media(open_kfid, external_userid, media_id)
+
+    async def send_video_media(
+        self,
+        open_kfid: str,
+        external_userid: str,
+        media_id: str,
+    ) -> dict[str, Any]:
         access_token = await self._get_access_token()
         url = f"https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token={access_token}"
         payload = self.build_video_payload(open_kfid, external_userid, media_id)

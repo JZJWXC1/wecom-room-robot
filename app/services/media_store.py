@@ -81,7 +81,9 @@ class MediaStore:
         candidates = [
             path
             for path in media_root.rglob("*")
-            if path.is_file() and path.suffix.lower() in extensions
+            if path.is_file()
+            and path.suffix.lower() in extensions
+            and ".wecom_cache" not in path.parts
         ]
         scored: list[tuple[int, str, Path]] = []
         for path in candidates:

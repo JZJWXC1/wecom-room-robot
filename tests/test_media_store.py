@@ -49,6 +49,26 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
             finally:
                 settings.room_database_path = previous_room_database_path
 
+    def test_ignores_wecom_transcode_cache_videos(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                video_dir = settings.room_database_path / "video" / "琬秋铭府1-1803"
+                cache_dir = video_dir / ".wecom_cache"
+                video_dir.mkdir(parents=True)
+                cache_dir.mkdir(parents=True)
+                original = video_dir / "琬秋铭府1-1803.mp4"
+                cached = cache_dir / "琬秋铭府1-1803.wecom.mp4"
+                original.write_bytes(b"video")
+                cached.write_bytes(b"cached")
+
+                matches = MediaStore().list_room_database_videos("琬秋铭府视频发一下", limit=3)
+
+                self.assertEqual(matches, [original])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
     def test_matches_room_database_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             previous_room_database_path = settings.room_database_path

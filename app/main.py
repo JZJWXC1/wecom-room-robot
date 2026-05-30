@@ -157,6 +157,11 @@ MEDIA_SEND_FOLLOWUP_WORDS = (
     "要",
 )
 MEDIA_SEARCH_ALIASES = (
+    ("晚秋铭府", "琬秋铭府"),
+    ("晚秋", "琬秋铭府"),
+    ("婉秋铭府", "琬秋铭府"),
+    ("婉秋", "琬秋铭府"),
+    ("琬秋", "琬秋铭府"),
     ("小样坝家园", "小洋坝家园"),
     ("小样坝", "小洋坝"),
     ("小样吧家园", "小洋坝家园"),
@@ -336,7 +341,12 @@ def _is_satisfied_feedback(text: str) -> bool:
     return any(keyword in stripped for keyword in SATISFACTION_KEYWORDS)
 
 
-def _polish_kf_reply_text(customer_text: str, reply_text: str) -> str:
+def _polish_kf_reply_text(
+    customer_text: str,
+    reply_text: str,
+    *,
+    has_available_video: bool = False,
+) -> str:
     polished = reply_text.strip()
     replacements = (
         ("详细笔记", "房间详细信息"),
@@ -345,6 +355,8 @@ def _polish_kf_reply_text(customer_text: str, reply_text: str) -> str:
     )
     for source, target in replacements:
         polished = polished.replace(source, target)
+    if has_available_video:
+        polished = _replace_missing_video_claim(polished)
     if _needs_viewing_contact_guidance(customer_text, polished):
         polished = polished.rstrip()
         if polished.endswith(("。", "！", "？", "?", "!")):
@@ -352,6 +364,27 @@ def _polish_kf_reply_text(customer_text: str, reply_text: str) -> str:
         else:
             polished = polished + "。\n\n" + _viewing_contact_guidance()
     return polished
+
+
+def _replace_missing_video_claim(reply_text: str) -> str:
+    replaced = reply_text
+    missing_video_phrases = (
+        "我手头暂时没有现成的视频链接",
+        "手头暂时没有现成的视频链接",
+        "我这边暂时没有视频",
+        "这边暂时没有视频",
+        "我这边目前没有视频",
+        "目前没有视频",
+        "暂时没有视频",
+        "我这边暂时没视频",
+        "这边暂时没视频",
+        "我这边目前没视频",
+        "目前没视频",
+        "没视频",
+    )
+    for phrase in missing_video_phrases:
+        replaced = replaced.replace(phrase, "我这边有对应视频")
+    return replaced
 
 
 def _needs_viewing_contact_guidance(customer_text: str, reply_text: str) -> bool:
@@ -390,6 +423,18 @@ def _room_database_public_urls(paths: list[Path]) -> list[str]:
 
 def _dedupe(items: list[str]) -> list[str]:
     return list(dict.fromkeys(item for item in items if item))
+
+
+def _has_room_database_video_material(content: str, room_snapshot: str = "") -> bool:
+    queries = [
+        _normalize_media_search_aliases(content.strip()),
+        _normalize_media_search_aliases(room_snapshot.strip()),
+    ]
+    return any(
+        media_store.list_room_database_videos(query, limit=1)
+        for query in queries
+        if query
+    )
 
 
 def _inventory_image_paths() -> list[Path]:
@@ -455,25 +500,20 @@ async def _send_kf_room_database_videos(
     failed_paths: list[Path] = []
     for video_path in video_paths:
         try:
-            await wecom_kf.send_text(
-                open_kfid,
-                external_userid,
-                f"这是{_room_video_label(video_path)}的视频。",
-            )
             send_path = (
                 prepare_wecom_video(video_path)
                 if needs_wecom_video_transcode(video_path)
                 else video_path
             )
             try:
-                await wecom_kf.send_video(open_kfid, external_userid, send_path)
+                await _send_kf_room_database_video(open_kfid, external_userid, send_path, video_path)
             except WeComKfSendLimitError:
                 raise
             except Exception:
                 if send_path != video_path:
                     raise
                 retry_path = prepare_wecom_video(video_path, force=True)
-                await wecom_kf.send_video(open_kfid, external_userid, retry_path)
+                await _send_kf_room_database_video(open_kfid, external_userid, retry_path, video_path)
         except WeComKfSendLimitError:
             logger.warning("微信客服发送次数已达上限，停止继续发送房源视频")
             return False
@@ -494,6 +534,30 @@ async def _send_kf_room_database_videos(
                 logger.warning("微信客服发送次数已达上限，停止发送视频兜底链接")
                 return False
     return True
+
+
+async def _send_kf_room_database_video(
+    open_kfid: str,
+    external_userid: str,
+    send_path: Path,
+    original_path: Path,
+) -> None:
+    if hasattr(wecom_kf, "upload_media") and hasattr(wecom_kf, "send_video_media"):
+        media_id = await wecom_kf.upload_media(send_path, "video")
+        await wecom_kf.send_text(
+            open_kfid,
+            external_userid,
+            f"这是{_room_video_label(original_path)}的视频。",
+        )
+        await wecom_kf.send_video_media(open_kfid, external_userid, media_id)
+        return
+
+    await wecom_kf.send_text(
+        open_kfid,
+        external_userid,
+        f"这是{_room_video_label(original_path)}的视频。",
+    )
+    await wecom_kf.send_video(open_kfid, external_userid, send_path)
 
 
 def _room_video_label(video_path: Path) -> str:
@@ -657,6 +721,8 @@ def _kf_media_search_texts(open_kfid: str, external_userid: str, content: str) -
 def _normalize_media_search_aliases(text: str) -> str:
     normalized = text
     for source, target in MEDIA_SEARCH_ALIASES:
+        if source in target and target in normalized:
+            continue
         normalized = normalized.replace(source, target)
     return normalized
 
@@ -1102,7 +1168,11 @@ async def handle_kf_message(kf_message: dict) -> None:
         videos,
         conversation_context=conversation_context,
     )
-    reply.text = _polish_kf_reply_text(content, reply.text)
+    reply.text = _polish_kf_reply_text(
+        content,
+        reply.text,
+        has_available_video=_has_room_database_video_material(content, snapshot),
+    )
     await wecom_kf.send_text(open_kfid, external_userid, reply.text)
     _append_kf_dialog_message(open_kfid, external_userid, "客服", reply.text)
     for image in reply.images:
