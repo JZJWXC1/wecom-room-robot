@@ -586,6 +586,7 @@ def _select_viewing_row(rows: list[dict[str, Any]], fallback_label: str = "") ->
     target = _normalize_room_reference(fallback_label)
     if not target:
         return rows[0]
+    target_has_room = bool(_room_number_references(fallback_label))
 
     best_row = rows[0]
     best_score = -1
@@ -605,6 +606,8 @@ def _select_viewing_row(rows: list[dict[str, Any]], fallback_label: str = "") ->
         if score > best_score:
             best_score = score
             best_row = row
+    if target_has_room and best_score < 100:
+        return None
     return best_row
 
 
@@ -671,7 +674,9 @@ def _room_label_and_password(
 ) -> tuple[str, str, str]:
     if not rows:
         return fallback_label, "", "missing"
-    room = _select_viewing_row(rows, fallback_label) or rows[0]
+    room = _select_viewing_row(rows, fallback_label)
+    if room is None:
+        return fallback_label, "", "missing"
     community = _row_value(room, "小区", "社区", "楼盘")
     room_no = _row_value(room, "房号", "房间号", "room_id", "RoomID", "编号")
     password = _row_value(room, "密码", "看房密码", "门锁密码")

@@ -1240,13 +1240,25 @@ class WeComKfContextMemoryTests(unittest.IsolatedAsyncioTestCase):
                 self.texts.append(content)
                 return {"errcode": 0}
 
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 8) -> list[dict]:
+                return [
+                    {
+                        "小区": "诸葛龙吟院",
+                        "房号": "10-601A",
+                        "密码": "联系确认",
+                    }
+                ]
+
         with tempfile.TemporaryDirectory() as directory:
             previous_client = main.wecom_kf
             previous_store = main.wecom_kf_context_store
+            previous_inventory = main.inventory
             fake_client = FakeKfClient()
             video_path = Path("room_database/video/房源素材/诸葛龙吟院13-1101/视频.mp4")
             try:
                 main.wecom_kf = fake_client
+                main.inventory = FakeInventory()
                 main.wecom_kf_context_store = WeComKfContextStore(
                     path=Path(directory) / "context.json"
                 )
@@ -1275,9 +1287,11 @@ class WeComKfContextMemoryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("13282125992", fake_client.texts[0])
                 self.assertIn("19941091943", fake_client.texts[0])
                 self.assertNotIn("你把小区或房号", fake_client.texts[0])
+                self.assertNotIn("10-601A", fake_client.texts[0])
             finally:
                 main.wecom_kf = previous_client
                 main.wecom_kf_context_store = previous_store
+                main.inventory = previous_inventory
                 main.wecom_kf_conversation_memory.clear()
                 main.wecom_kf_idle_sequences.clear()
 
