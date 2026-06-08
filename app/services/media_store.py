@@ -9,6 +9,7 @@ from app.services.fuzzy_match import fuzzy_contains_score, normalize_search_text
 GENERIC_MEDIA_WORDS = (
     "微信视频",
     "视频",
+    "视屏",
     "图片",
     "照片",
     "房源",
@@ -211,8 +212,21 @@ class MediaStore:
         return token
 
     def _room_tokens(self, text: str) -> list[str]:
-        tokens = re.findall(r"\d+[-－—]\d+(?:[-－—]?[a-zA-Z0-9]+)?", text)
-        return [self._normalize_text(token) for token in tokens]
+        tokens = re.findall(r"\d+(?:[-－—]\d+)+(?:[-－—]?[a-zA-Z])?", text)
+        expanded: list[str] = []
+        for token in tokens:
+            expanded.append(token)
+            expanded.extend(self._room_token_aliases(token))
+        return [self._normalize_text(token) for token in dict.fromkeys(expanded)]
+
+    def _room_token_aliases(self, token: str) -> list[str]:
+        normalized = re.sub(r"[－—]", "-", token)
+        aliases: list[str] = []
+        if re.search(r"-1$", normalized):
+            aliases.append(re.sub(r"-1$", "A", normalized))
+        if re.search(r"(?i)A$", normalized):
+            aliases.append(f"{normalized[:-1]}-1")
+        return aliases
 
     def _char_grams(self, text: str) -> list[str]:
         grams: list[str] = []

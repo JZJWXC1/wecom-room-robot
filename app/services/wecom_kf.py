@@ -121,13 +121,26 @@ class WeComKfContextStore:
                     "created_at": float(item.get("created_at") or time.time()),
                 }
             )
-        return {
+        normalized = {
             "image_paths": [str(item) for item in context.get("image_paths") or [] if item],
             "video_paths": [str(item) for item in context.get("video_paths") or [] if item],
             "video_urls": [str(item) for item in context.get("video_urls") or [] if item],
             "recent_messages": recent_messages[-10:],
             "updated_at": float(context.get("updated_at") or time.time()),
         }
+        send_limited = context.get("send_limited")
+        if isinstance(send_limited, dict):
+            video_urls = [
+                str(item)
+                for item in send_limited.get("video_urls") or []
+                if item
+            ]
+            normalized["send_limited"] = {
+                "triggered_at": float(send_limited.get("triggered_at") or time.time()),
+                "summary": str(send_limited.get("summary") or "")[:500],
+                "video_urls": video_urls[:20],
+            }
+        return normalized
 
     def _write(self, contexts: dict[str, dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

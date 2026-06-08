@@ -126,6 +126,44 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
             finally:
                 settings.room_database_path = previous_room_database_path
 
+    def test_matches_room_number_with_or_without_suffix_hyphen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                video_dir = settings.room_database_path / "video" / "金昌苑2-2-1601E"
+                video_dir.mkdir(parents=True)
+                video = video_dir / "cc2b5e46a7b5c9ee3c653f8c78699761.mp4"
+                video.write_bytes(b"video")
+
+                matches = MediaStore().list_room_database_videos(
+                    "金昌苑2-2-1601-E视频发一下",
+                    limit=3,
+                )
+
+                self.assertEqual(matches, [video])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
+    def test_matches_room_letter_a_with_legacy_dash_one_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                video_dir = settings.room_database_path / "video" / "孔家埭和府1-1-901A"
+                video_dir.mkdir(parents=True)
+                video = video_dir / "e0f3564a3e5273e1af26a6d9673e3e3b.mp4"
+                video.write_bytes(b"video")
+
+                matches = MediaStore().list_room_database_videos(
+                    "孔家埭和府1-1-901-1视频发一下",
+                    limit=3,
+                )
+
+                self.assertEqual(matches, [video])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
     def test_matches_room_database_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             previous_room_database_path = settings.room_database_path

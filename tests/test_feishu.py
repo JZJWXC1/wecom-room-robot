@@ -67,6 +67,59 @@ class FeishuClientTests(unittest.IsolatedAsyncioTestCase):
             settings.feishu_bitable_app_token = previous_app_token
             settings.feishu_bitable_table_id = previous_table_id
 
+    async def test_retries_when_tenant_access_token_is_invalid(self) -> None:
+        previous_app_id = settings.feishu_app_id
+        previous_secret = settings.feishu_app_secret
+        previous_sheet_token = settings.feishu_inventory_sheet_token
+        try:
+            settings.feishu_app_id = "cli_xxx"
+            settings.feishu_app_secret = "secret_xxx"
+            settings.feishu_inventory_sheet_token = "sheet_token"
+            auth_tokens = ["old_token", "new_token"]
+            auth_calls = 0
+            query_tokens: list[str] = []
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                nonlocal auth_calls
+                if request.url.path.endswith("/auth/v3/tenant_access_token/internal"):
+                    token = auth_tokens[auth_calls]
+                    auth_calls += 1
+                    return httpx.Response(
+                        200,
+                        json={"code": 0, "tenant_access_token": token},
+                    )
+                query_tokens.append(request.headers["Authorization"])
+                if query_tokens[-1] == "Bearer old_token":
+                    return httpx.Response(
+                        400,
+                        json={
+                            "code": 99991663,
+                            "msg": "Invalid access token for authorization.",
+                        },
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "code": 0,
+                        "data": {
+                            "sheets": [
+                                {"sheet_id": "sheet_1", "title": "总", "index": 0}
+                            ]
+                        },
+                    },
+                )
+
+            client = FeishuClient(transport=httpx.MockTransport(handler))
+            sheets = await client.list_spreadsheet_sheets()
+
+            self.assertEqual(sheets[0]["sheet_id"], "sheet_1")
+            self.assertEqual(auth_calls, 2)
+            self.assertEqual(query_tokens, ["Bearer old_token", "Bearer new_token"])
+        finally:
+            settings.feishu_app_id = previous_app_id
+            settings.feishu_app_secret = previous_secret
+            settings.feishu_inventory_sheet_token = previous_sheet_token
+
     async def test_syncs_drive_media_to_room_database(self) -> None:
         previous_app_id = settings.feishu_app_id
         previous_secret = settings.feishu_app_secret

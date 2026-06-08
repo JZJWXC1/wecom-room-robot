@@ -13,6 +13,15 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v"}
 MAX_SHEET_SYNC_COLUMNS = 50
 MAX_SHEET_SYNC_ROWS = 1000
+INVALID_ACCESS_TOKEN_CODES = {99991663}
+
+
+def _is_invalid_access_token_response(data: dict[str, Any]) -> bool:
+    code = data.get("code")
+    if code in INVALID_ACCESS_TOKEN_CODES:
+        return True
+    message = str(data.get("msg") or data.get("message") or "").lower()
+    return "invalid access token" in message
 
 
 class FeishuClient:
@@ -51,26 +60,32 @@ class FeishuClient:
         auth: bool = True,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        headers = kwargs.pop("headers", {})
-        if auth:
-            token = await self._get_tenant_access_token()
-            headers["Authorization"] = f"Bearer {token}"
+        base_headers = dict(kwargs.pop("headers", {}))
         async with httpx.AsyncClient(
             base_url=FEISHU_BASE_URL,
             timeout=60,
             transport=self._transport,
         ) as client:
-            response = await client.request(method, path, headers=headers, **kwargs)
-            try:
-                data = response.json()
-            except ValueError:
-                response.raise_for_status()
-                raise
-            if response.status_code >= 400:
-                raise RuntimeError(f"Feishu API failed: {data}")
-        if data.get("code", 0) != 0:
-            raise RuntimeError(f"Feishu API failed: {data}")
-        return data
+            for attempt in range(2):
+                headers = dict(base_headers)
+                if auth:
+                    token = await self._get_tenant_access_token()
+                    headers["Authorization"] = f"Bearer {token}"
+                response = await client.request(method, path, headers=headers, **kwargs)
+                try:
+                    data = response.json()
+                except ValueError:
+                    response.raise_for_status()
+                    raise
+                if auth and attempt == 0 and _is_invalid_access_token_response(data):
+                    self._tenant_access_token = ""
+                    continue
+                if response.status_code >= 400:
+                    raise RuntimeError(f"Feishu API failed: {data}")
+                if data.get("code", 0) != 0:
+                    raise RuntimeError(f"Feishu API failed: {data}")
+                return data
+        raise RuntimeError("Feishu API failed after token refresh retry")
 
     async def list_bitable_records(
         self,

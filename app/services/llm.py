@@ -35,6 +35,9 @@ class ReplyGenerator:
             "可以说“这套”“我这边看到”“我把视频发你”这类自然口语。"
             "客户只是说你好、您好、在吗这类问候时，要像真人客服一样回应并引导对方直接问小区、房号、价格、视频或房源表。"
             "不要说“笔记”，我们没有笔记，只有视频和房间详细信息；客户说笔记时统一理解为房间详细信息或视频资料。"
+            "除房源表 PNG 外，不发送房间图片、照片、实拍图；客户要房间图片或照片时，不要承诺发图片，"
+            "只引导对方发小区和房号，我方按房源表查详情和视频。"
+            "客户要视频时，只有在可发送视频链接里确实有对应素材，才可以说有视频或我把视频发你；没有素材时只能说需要再确认。"
             "如果客户询问还没空出的房子能不能看、帮忙联系或预约看房，必须引导客户联系 18758141785 / 13282125992 / 19941091943 预约。"
             "客户问免押金、免押、无忧住、芝麻信用时，必须说明免押是支付宝无忧住信用免押服务，"
             "需要符合芝麻信用风控并支付押金金额5.5%-8%的免押服务费，不要说成完全免押或只要一年起租就行。"
@@ -47,13 +50,14 @@ class ReplyGenerator:
 实时房源库存：
 {inventory_snapshot}
 
-可发送图片链接：
+可发送房源表图片链接（仅客户明确要房源表时才可提及；不要当作房间照片发送）：
 {chr(10).join(media_images) if media_images else "暂无"}
 
 可发送视频链接：
 {chr(10).join(media_videos) if media_videos else "暂无"}
 
-请生成一条企业微信回复。需要图片或视频时，在文本里自然说明“我把图片/视频发你”。
+请生成一条企业微信回复。需要视频时，在文本里自然说明“我把视频发你”。
+不要说“我把图片发你”“我把照片发你”，除非客户明确要的是房源表。
 """
         if conversation_context:
             user_prompt += f"\n\n最近10条对话上下文：\n{conversation_context}"
@@ -66,4 +70,12 @@ class ReplyGenerator:
             temperature=0.3,
         )
         text = response.choices[0].message.content or settings.default_fallback_reply
-        return ReplyPlan(text=text.strip(), images=media_images[:3], videos=media_videos[:1])
+        allow_inventory_images = any(
+            keyword in (message.content or "")
+            for keyword in ("房源表", "表格", "空房表", "在租表")
+        )
+        return ReplyPlan(
+            text=text.strip(),
+            images=media_images[:3] if allow_inventory_images else [],
+            videos=media_videos[:1],
+        )

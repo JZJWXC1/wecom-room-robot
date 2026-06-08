@@ -17,6 +17,7 @@ from app.services.inventory import InventoryService
 from app.services.inventory_image_sync import InventoryImageSyncer
 from app.services.llm import ReplyGenerator
 from app.services.media_store import GENERIC_MEDIA_WORDS, MediaStore
+from app.services.reply_validator import ReplyValidationDraft, ReplyValidator
 from app.services.video_transcoder import (
     cached_wecom_video,
     needs_wecom_video_transcode,
@@ -41,6 +42,7 @@ inventory = InventoryService()
 inventory_image_syncer = InventoryImageSyncer()
 media_store = MediaStore()
 reply_generator = ReplyGenerator()
+reply_validator = ReplyValidator()
 wecom = WeComClient()
 wecom_kf = WeComKfClient()
 wecom_kf_context_store = WeComKfContextStore()
@@ -48,7 +50,15 @@ wecom_kf_idle_sequences: dict[str, int] = {}
 wecom_kf_conversation_memory: dict[str, dict[str, Any]] = {}
 wecom_kf_sync_lock = asyncio.Lock()
 
-VIDEO_KEYWORDS = ("\u89c6\u9891", "\u5b9e\u62cd", "\u770b\u623f\u89c6\u9891", "\u5185\u90e8\u89c6\u9891", "\u623f\u95f4\u89c6\u9891", "\u7b14\u8bb0")
+VIDEO_KEYWORDS = (
+    "\u89c6\u9891",
+    "\u89c6\u5c4f",
+    "\u5b9e\u62cd",
+    "\u770b\u623f\u89c6\u9891",
+    "\u5185\u90e8\u89c6\u9891",
+    "\u623f\u95f4\u89c6\u9891",
+    "\u7b14\u8bb0",
+)
 ORIGINAL_VIDEO_LINK_KEYWORDS = (
     "原视频",
     "原版视频",
@@ -72,7 +82,7 @@ ORIGINAL_VIDEO_LINK_KEYWORDS = (
     "无压缩",
     "没压缩",
 )
-INVENTORY_IMAGE_KEYWORDS = ("\u623f\u6e90\u8868", "\u8868\u683c", "\u622a\u56fe", "\u56fe\u7247", "\u7167\u7247")
+INVENTORY_IMAGE_KEYWORDS = ("\u623f\u6e90\u8868", "\u623f\u6e90\u8868\u56fe", "\u8868\u683c", "\u7a7a\u623f\u8868", "\u5728\u79df\u8868", "\u6700\u65b0\u8868")
 INVENTORY_TABLE_SHORT_EXCLUSIONS = (
     "发表",
     "表达",
@@ -94,7 +104,7 @@ INVENTORY_TABLE_SHORT_PATTERNS = (
     r"(?:给|传|来|看)(?:我|一下|下|个|一份|张|份|最新)?(?:房源)?表",
     r"(?:房源|租房|空房|在租|最新)表(?:格)?",
 )
-ROOM_IMAGE_KEYWORDS = ("\u5b9e\u62cd\u56fe", "\u623f\u95f4\u56fe", "\u56fe\u7247", "\u7167\u7247")
+ROOM_IMAGE_KEYWORDS = ("\u5b9e\u62cd\u56fe", "\u623f\u95f4\u56fe", "\u623f\u6e90\u56fe\u7247", "\u56fe\u7247", "\u7167\u7247", "\u76f8\u7247")
 DISSATISFACTION_KEYWORDS = (
     "\u4e0d\u6ee1\u610f",
     "\u4e0d\u5bf9",
@@ -114,6 +124,7 @@ DISSATISFACTION_KEYWORDS = (
 )
 SATISFACTION_KEYWORDS = ("\u6ee1\u610f", "\u8fd8\u53ef\u4ee5", "\u53ef\u4ee5\u4e86", "\u53ef\u4ee5\u7684", "\u884c\u4e86", "\u597d\u7684", "\u597d")
 KF_VIDEO_SEND_LIMIT = 5
+KF_NATIVE_VIDEO_SEND_LIMIT = 2
 KF_INVENTORY_IMAGE_SEND_LIMIT = 5
 KF_VIDEO_TRANSCODE_WAIT_SECONDS = 15
 KF_CONTEXT_TTL_SECONDS = 30 * 60
@@ -268,7 +279,17 @@ def _wants_inventory_image(text: str) -> bool:
 
 
 def _wants_room_image(text: str) -> bool:
+    if _wants_inventory_image(text):
+        return False
     return any(keyword in text for keyword in ROOM_IMAGE_KEYWORDS)
+
+
+def _room_image_disabled_reply() -> str:
+    return (
+        "房间图片这边不单独发送了，素材现在只发视频。"
+        "你把小区和房号发我，我先查房源表；有视频的话我直接发你，"
+        "也可以把房间详细信息发你。"
+    )
 
 
 def _wants_contract_contact(text: str) -> bool:
@@ -397,8 +418,15 @@ def _polish_kf_reply_text(
     polished = reply_text.strip()
     replacements = (
         ("详细笔记", "房间详细信息"),
-        ("笔记图", "房间图片"),
+        ("笔记图", "房间详细信息"),
         ("笔记", "房间详细信息"),
+        ("图片或视频", "视频"),
+        ("图片/视频", "视频"),
+        ("图片、视频", "视频"),
+        ("图片和视频", "视频"),
+        ("照片或视频", "视频"),
+        ("照片/视频", "视频"),
+        ("实拍图或视频", "视频"),
     )
     for source, target in replacements:
         polished = polished.replace(source, target)
@@ -743,6 +771,18 @@ def _dedupe(items: list[str]) -> list[str]:
     return list(dict.fromkeys(item for item in items if item))
 
 
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
+
+
 def _has_room_database_video_material(content: str, room_snapshot: str = "") -> bool:
     queries = [
         _normalize_media_search_aliases(content.strip()),
@@ -755,18 +795,165 @@ def _has_room_database_video_material(content: str, room_snapshot: str = "") -> 
     )
 
 
+def _video_search_queries_for_inventory_row(
+    row: dict[str, Any],
+    fallback_label: str = "",
+) -> list[str]:
+    community = _row_value(row, "小区", "社区", "楼盘")
+    room_no = _row_value(row, "房号", "房间号", "room_id", "RoomID", "编号")
+    row_text = " ".join(str(value).strip() for value in row.values() if str(value).strip())
+    candidates = [
+        "".join(part for part in (community, room_no) if part),
+        " ".join(part for part in (community, room_no) if part),
+        row_text,
+        fallback_label,
+    ]
+    queries = [
+        _normalize_media_search_aliases(query.strip())
+        for query in candidates
+        if query and query.strip()
+    ]
+    return list(dict.fromkeys(queries))
+
+
+def _video_paths_for_inventory_row(
+    row: dict[str, Any],
+    fallback_label: str = "",
+    *,
+    limit: int = 1,
+) -> list[Path]:
+    paths: list[Path] = []
+    for query in _video_search_queries_for_inventory_row(row, fallback_label):
+        paths.extend(media_store.list_room_database_videos(query, limit=limit))
+    return _dedupe_paths(paths)[:limit]
+
+
+def _available_video_paths_for_validation(
+    customer_text: str,
+    reply_text: str = "",
+    rows: list[dict[str, Any]] | None = None,
+    *,
+    existing_paths: list[Path] | None = None,
+    conversation_context: str = "",
+) -> list[Path]:
+    paths = list(existing_paths or [])
+    if not rows and not paths:
+        return []
+    for row in rows or []:
+        label = _room_label_from_inventory_row(row)
+        if label:
+            paths.extend(_video_paths_for_inventory_row(row, label, limit=1))
+    for query in (reply_text, customer_text, conversation_context):
+        normalized_query = _normalize_media_search_aliases(query.strip())
+        if normalized_query:
+            paths.extend(media_store.list_room_database_videos(normalized_query, limit=KF_VIDEO_SEND_LIMIT))
+    return _dedupe_paths(paths)[:KF_VIDEO_SEND_LIMIT]
+
+
+async def _validate_kf_reply_draft(
+    *,
+    customer_text: str,
+    reply_text: str = "",
+    inventory_rows: list[dict[str, Any]] | None = None,
+    reference_inventory_rows: list[dict[str, Any]] | None = None,
+    available_video_paths: list[Path] | None = None,
+    available_image_paths: list[Path] | None = None,
+    send_video_paths: list[Path] | None = None,
+    send_image_paths: list[Path] | None = None,
+    conversation_context: str = "",
+):
+    rows = inventory_rows or []
+    available_videos = available_video_paths
+    if available_videos is None:
+        available_videos = _available_video_paths_for_validation(
+            customer_text,
+            reply_text,
+            rows,
+            existing_paths=send_video_paths,
+            conversation_context=conversation_context,
+        )
+    return await reply_validator.validate(
+        ReplyValidationDraft(
+            customer_text=customer_text,
+            reply_text=reply_text,
+            inventory_rows=rows,
+            reference_inventory_rows=reference_inventory_rows or rows,
+            available_video_paths=available_videos,
+            available_image_paths=available_image_paths or [],
+            send_video_paths=send_video_paths or [],
+            send_image_paths=send_image_paths or [],
+            conversation_context=conversation_context,
+        )
+    )
+
+
+async def _inventory_rows_for_final_validation(
+    matched_rows: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    rows = list(matched_rows or [])
+    try:
+        rows.extend(await inventory.search("", limit=200))
+    except Exception:
+        logger.exception("读取最终验证房源表失败，降级使用本次命中房源")
+    return _dedupe_inventory_rows(rows)
+
+
+def _dedupe_inventory_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        key = "|".join(
+            str(row.get(field, "")).strip().lower()
+            for field in ("区域", "小区", "社区", "楼盘", "房号", "房间号")
+        )
+        if not key.strip("|"):
+            key = repr(sorted(row.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
 def _inventory_image_paths() -> list[Path]:
-    paths = sorted(settings.room_database_path.parent.glob(settings.inventory_image_glob))
+    glob_path = Path(settings.inventory_image_glob)
+    if glob_path.is_absolute():
+        if any(char in glob_path.name for char in "*?[]"):
+            paths = sorted(glob_path.parent.glob(glob_path.name))
+        else:
+            paths = [glob_path]
+    else:
+        paths = sorted(settings.room_database_path.parent.glob(settings.inventory_image_glob))
     if not paths and settings.inventory_image_path.exists():
         paths = [settings.inventory_image_path]
     return [path for path in paths if path.exists()][:KF_INVENTORY_IMAGE_SEND_LIMIT]
 
 
-async def _refresh_inventory_images_if_needed() -> None:
+def _filter_inventory_image_paths(image_paths: list[Path]) -> list[Path]:
+    allowed = {str(path.resolve()) for path in _inventory_image_paths() if path.exists()}
+    filtered: list[Path] = []
+    for image_path in image_paths:
+        if image_path.exists() and str(image_path.resolve()) in allowed:
+            filtered.append(image_path)
+            continue
+        if image_path.name.startswith("inventory_") or image_path.name == settings.inventory_image_path.name:
+            filtered.append(image_path)
+    return _dedupe_paths(filtered)[:KF_INVENTORY_IMAGE_SEND_LIMIT]
+
+
+INVENTORY_IMAGE_SYNC_FAILED_TEXT = (
+    "房源表刚更新，我这边同步失败了，先不发旧表。"
+    "我马上重新同步，稍后再发你最新房源表。"
+)
+
+
+async def _refresh_inventory_images_if_needed() -> bool:
     try:
         await inventory_image_syncer.refresh_if_changed()
     except Exception:
         logger.exception("Feishu inventory sheet image refresh failed")
+        return False
+    return True
 
 
 async def _send_kf_inventory_images(
@@ -807,16 +994,67 @@ async def _send_kf_room_database_images(
     external_userid: str,
     image_paths: list[Path],
 ) -> bool:
-    return await _send_kf_inventory_images(open_kfid, external_userid, image_paths)
+    logger.info("已停止发送房间图片素材，本次跳过: %s", image_paths)
+    return False
 
 
 async def _send_kf_room_database_videos(
     open_kfid: str,
     external_userid: str,
     video_paths: list[Path],
+    *,
+    customer_text: str = "",
+    inventory_rows: list[dict[str, Any]] | None = None,
+    conversation_context: str = "",
 ) -> bool:
+    validation = await _validate_kf_reply_draft(
+        customer_text=customer_text,
+        reply_text="已直接发送相关视频。" if video_paths else "",
+        inventory_rows=inventory_rows or [],
+        available_video_paths=video_paths,
+        send_video_paths=video_paths,
+        conversation_context=conversation_context,
+    )
+    if not validation.ok:
+        try:
+            await wecom_kf.send_text(open_kfid, external_userid, validation.reply_text)
+        except WeComKfSendLimitError:
+            _record_kf_send_limit(
+                open_kfid,
+                external_userid,
+                summary="发送视频验证兜底话术时触发发送次数上限",
+                video_paths=video_paths,
+            )
+            logger.warning("微信客服发送次数已达上限，停止发送视频验证兜底话术")
+            return False
+        return True
+
+    native_video_paths = video_paths[:KF_NATIVE_VIDEO_SEND_LIMIT]
+    delayed_video_paths = video_paths[KF_NATIVE_VIDEO_SEND_LIMIT:]
+    sent_native_count = 0
+    delayed_count = len(delayed_video_paths)
     failed_paths: list[Path] = []
-    for video_path in video_paths:
+    if delayed_video_paths:
+        try:
+            warning_text = "视频比较多，一次发太多容易触发微信客服发送限制。我先发前两套，剩下的你5分钟后再跟我要。"
+            await wecom_kf.send_text(open_kfid, external_userid, warning_text)
+            _append_kf_dialog_message(open_kfid, external_userid, "客服", warning_text)
+        except WeComKfSendLimitError:
+            _record_kf_send_limit(
+                open_kfid,
+                external_userid,
+                summary=f"批量视频预告触发发送次数上限，原计划发送 {len(video_paths)} 个视频",
+            )
+            logger.warning(
+                "wecom_kf_video_send send_limited=true open_kfid=%s external_userid=%s requested=%s sent_native=0 delayed_count=%s",
+                open_kfid,
+                external_userid,
+                len(video_paths),
+                delayed_count,
+            )
+            return False
+
+    for index, video_path in enumerate(native_video_paths):
         try:
             if needs_wecom_video_transcode(video_path):
                 send_path = cached_wecom_video(video_path)
@@ -828,7 +1066,7 @@ async def _send_kf_room_database_videos(
                         )
                     except Exception:
                         logger.warning(
-                            "微信客服视频 15 秒内未压缩完成，改发链接兜底: %s",
+                            "微信客服视频 15 秒内未压缩完成，提示客户稍后再要: %s",
                             video_path,
                             exc_info=True,
                         )
@@ -838,6 +1076,7 @@ async def _send_kf_room_database_videos(
                 send_path = video_path
             try:
                 await _send_kf_room_database_video(open_kfid, external_userid, send_path, video_path)
+                sent_native_count += 1
             except WeComKfSendLimitError:
                 raise
             except Exception:
@@ -849,25 +1088,49 @@ async def _send_kf_room_database_videos(
                     timeout=KF_VIDEO_TRANSCODE_WAIT_SECONDS,
                 )
                 await _send_kf_room_database_video(open_kfid, external_userid, retry_path, video_path)
+                sent_native_count += 1
         except WeComKfSendLimitError:
+            _record_kf_send_limit(
+                open_kfid,
+                external_userid,
+                summary=f"发送房源视频时触发发送次数上限，原计划发送 {len(video_paths)} 个视频，已原生发送 {sent_native_count} 个",
+            )
             logger.warning("微信客服发送次数已达上限，停止继续发送房源视频")
+            logger.warning(
+                "wecom_kf_video_send send_limited=true open_kfid=%s external_userid=%s requested=%s sent_native=%s delayed_count=%s",
+                open_kfid,
+                external_userid,
+                len(video_paths),
+                sent_native_count,
+                delayed_count,
+            )
             return False
         except Exception:
             failed_paths.append(video_path)
             logger.exception("微信客服房源视频发送失败: %s", video_path)
 
     if failed_paths:
-        video_urls = _room_database_public_urls(failed_paths)
-        if video_urls:
-            try:
-                await wecom_kf.send_text(
-                    open_kfid,
-                    external_userid,
-                    "视频直发失败，我先把可打开的视频链接发你：\n" + "\n".join(video_urls),
-                )
-            except WeComKfSendLimitError:
-                logger.warning("微信客服发送次数已达上限，停止发送视频兜底链接")
-                return False
+        try:
+            failure_text = "视频直发失败，我这边先不发链接，避免触发微信客服限制。你5分钟后再把这套房号发我，我继续给你发。"
+            await wecom_kf.send_text(open_kfid, external_userid, failure_text)
+            _append_kf_dialog_message(open_kfid, external_userid, "客服", failure_text)
+        except WeComKfSendLimitError:
+            _record_kf_send_limit(
+                open_kfid,
+                external_userid,
+                summary=f"发送视频失败说明时触发发送次数上限，原计划发送 {len(video_paths)} 个视频",
+            )
+            logger.warning("微信客服发送次数已达上限，停止发送视频失败说明")
+            return False
+    logger.info(
+        "wecom_kf_video_send send_limited=false open_kfid=%s external_userid=%s requested=%s sent_native=%s delayed_count=%s failed=%s",
+        open_kfid,
+        external_userid,
+        len(video_paths),
+        sent_native_count,
+        delayed_count,
+        len(failed_paths),
+    )
     return True
 
 
@@ -886,9 +1149,11 @@ async def _try_send_kf_room_database_videos_for_content(
     video_paths: list[Path] = []
     rented_out_labels: list[str] = []
     missing_video_labels: list[str] = []
+    validated_rows: list[dict[str, Any]] = []
     seen_labels: set[str] = set()
     seen_paths: set[str] = set()
     requested_count = _media_followup_requested_count(content)
+    conversation_context = _format_kf_dialog_context(open_kfid, external_userid)
 
     for search_text in search_texts:
         row_limit = _video_inventory_search_limit(search_text, requested_count, len(search_texts))
@@ -896,12 +1161,13 @@ async def _try_send_kf_room_database_videos_for_content(
         if not rows:
             rented_out_labels.append(_video_request_label(search_text))
             continue
+        validated_rows.extend(rows[:row_limit])
         for row in rows[:row_limit]:
             label = _room_label_from_inventory_row(row, search_text)
             if label in seen_labels:
                 continue
             seen_labels.add(label)
-            matched_paths = media_store.list_room_database_videos(label, limit=1)
+            matched_paths = _video_paths_for_inventory_row(row, label, limit=1)
             if not matched_paths:
                 missing_video_labels.append(label)
                 continue
@@ -917,12 +1183,47 @@ async def _try_send_kf_room_database_videos_for_content(
 
     if not video_paths:
         reply_text = _no_validated_video_reply(rented_out_labels, missing_video_labels)
+        validation = await _validate_kf_reply_draft(
+            customer_text=content,
+            reply_text=reply_text,
+            inventory_rows=validated_rows,
+            conversation_context=conversation_context,
+        )
+        reply_text = validation.reply_text
         await wecom_kf.send_text(open_kfid, external_userid, reply_text)
         _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
+        if validation.extra_video_paths:
+            video_paths = validation.extra_video_paths[:KF_VIDEO_SEND_LIMIT]
+            video_urls = _room_database_public_urls(video_paths)
+            _remember_kf_media_context(
+                open_kfid,
+                external_userid,
+                video_paths=video_paths,
+                video_urls=video_urls,
+            )
+            sent = await _send_kf_room_database_videos(
+                open_kfid,
+                external_userid,
+                video_paths,
+                customer_text=content,
+                inventory_rows=validated_rows,
+                conversation_context=conversation_context,
+            )
+            if sent:
+                _append_kf_dialog_message(open_kfid, external_userid, "客服", "已直接发送相关视频。")
         return True
 
     if rented_out_labels or missing_video_labels:
         reply_text = _partial_validated_video_reply(rented_out_labels, missing_video_labels)
+        validation = await _validate_kf_reply_draft(
+            customer_text=content,
+            reply_text=reply_text,
+            inventory_rows=validated_rows,
+            available_video_paths=video_paths,
+            send_video_paths=video_paths,
+            conversation_context=conversation_context,
+        )
+        reply_text = validation.reply_text
         await wecom_kf.send_text(open_kfid, external_userid, reply_text)
         _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
 
@@ -934,7 +1235,14 @@ async def _try_send_kf_room_database_videos_for_content(
         video_paths=video_paths,
         video_urls=video_urls,
     )
-    sent = await _send_kf_room_database_videos(open_kfid, external_userid, video_paths)
+    sent = await _send_kf_room_database_videos(
+        open_kfid,
+        external_userid,
+        video_paths,
+        customer_text=content,
+        inventory_rows=validated_rows,
+        conversation_context=conversation_context,
+    )
     if sent:
         _append_kf_dialog_message(open_kfid, external_userid, "客服", "已直接发送相关视频。")
     return True
@@ -1060,13 +1368,21 @@ def _normalize_kf_media_context(context: dict[str, Any]) -> dict[str, Any]:
                     "created_at": float(item.get("created_at") or time.time()),
                 }
             )
-    return {
+    normalized = {
         "image_paths": [Path(item) for item in context.get("image_paths") or []],
         "video_paths": [Path(item) for item in context.get("video_paths") or []],
         "video_urls": list(context.get("video_urls") or []),
         "recent_messages": recent_messages[-10:],
         "updated_at": float(context.get("updated_at") or time.time()),
     }
+    send_limited = context.get("send_limited")
+    if isinstance(send_limited, dict):
+        normalized["send_limited"] = {
+            "triggered_at": float(send_limited.get("triggered_at") or time.time()),
+            "summary": str(send_limited.get("summary") or "")[:500],
+            "video_urls": _dedupe([str(item) for item in send_limited.get("video_urls") or [] if item])[:20],
+        }
+    return normalized
 
 
 def _remember_kf_media_context(
@@ -1128,6 +1444,61 @@ def _save_kf_context(open_kfid: str, external_userid: str, context: dict[str, An
         wecom_kf_context_store.save(key, context)
     except Exception:
         logger.exception("WeCom KF context save failed")
+
+
+def _record_kf_send_limit(
+    open_kfid: str,
+    external_userid: str,
+    *,
+    summary: str = "",
+    video_paths: list[Path] | None = None,
+    video_urls: list[str] | None = None,
+) -> None:
+    context = _recent_kf_media_context(open_kfid, external_userid) or {
+        "image_paths": [],
+        "video_paths": [],
+        "video_urls": [],
+        "recent_messages": [],
+    }
+    previous = context.get("send_limited") if isinstance(context.get("send_limited"), dict) else {}
+    pending_urls = _dedupe(
+        list(previous.get("video_urls") or [])
+        + list(video_urls or [])
+        + _room_database_public_urls(video_paths or [])
+    )[:20]
+    context["send_limited"] = {
+        "triggered_at": time.time(),
+        "summary": (summary or previous.get("summary") or "微信客服发送次数到上限")[:500],
+        "video_urls": pending_urls,
+    }
+    _save_kf_context(open_kfid, external_userid, context)
+    logger.warning(
+        "wecom_kf_send_limited send_limited=true open_kfid=%s external_userid=%s pending_urls=%s summary=%s",
+        open_kfid,
+        external_userid,
+        len(pending_urls),
+        context["send_limited"]["summary"],
+    )
+
+
+def _clear_kf_send_limit(open_kfid: str, external_userid: str) -> None:
+    context = _recent_kf_media_context(open_kfid, external_userid)
+    if not context or "send_limited" not in context:
+        return
+    context.pop("send_limited", None)
+    _save_kf_context(open_kfid, external_userid, context)
+
+
+async def _send_kf_limit_recovery_if_needed(open_kfid: str, external_userid: str) -> bool:
+    context = _recent_kf_media_context(open_kfid, external_userid) or {}
+    send_limited = context.get("send_limited")
+    if not isinstance(send_limited, dict):
+        return False
+    reply_text = "刚才微信客服发送次数到上限了，部分内容没能发出去。你5分钟后再把要看的小区或房号发我，我继续给你发。"
+    await wecom_kf.send_text(open_kfid, external_userid, reply_text)
+    _clear_kf_send_limit(open_kfid, external_userid)
+    _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
+    return True
 
 
 def _append_kf_dialog_message(
@@ -1544,6 +1915,14 @@ async def _handle_kf_event_locked(open_kfid: str, token: str) -> None:
                 if should_auto_reply_kf_message(message):
                     await handle_kf_message(message)
                 wecom_kf.state_store.mark_processed(msgid)
+            except WeComKfSendLimitError:
+                _record_kf_send_limit(
+                    open_kfid,
+                    str(message.get("external_userid", "")),
+                    summary=f"回复客户消息时触发发送次数上限：{extract_kf_text(message)}",
+                )
+                wecom_kf.state_store.mark_processed(msgid)
+                logger.warning("微信客服消息发送次数受限，已跳过本条避免堵塞后续消息: %s", msgid)
             except Exception:
                 all_handled = False
                 logger.exception("微信客服消息处理失败: %s", msgid)
@@ -1565,6 +1944,8 @@ async def handle_kf_message(kf_message: dict) -> None:
         content,
     )
     recent_context = _recent_kf_media_context(open_kfid, external_userid)
+    if await _send_kf_limit_recovery_if_needed(open_kfid, external_userid):
+        return
     if _is_greeting_only(content):
         reply_text = _greeting_reply()
         await wecom_kf.send_text(open_kfid, external_userid, reply_text)
@@ -1596,6 +1977,16 @@ async def handle_kf_message(kf_message: dict) -> None:
             recent_context,
         ):
             return
+
+    if (
+        _wants_original_video_link(content)
+        and not _recent_context_has_video(recent_context)
+        and not _has_room_number_reference(content)
+    ):
+        reply_text = "你把小区和房号发我，我重新查对应原视频；房源表里还在且素材库有视频的话，我直接发你。"
+        await wecom_kf.send_text(open_kfid, external_userid, reply_text)
+        _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
+        return
 
     if _reports_wrong_viewing_password(content) and (
         _has_explicit_room_reference(content) or _recent_context_has_video(recent_context)
@@ -1630,7 +2021,9 @@ async def handle_kf_message(kf_message: dict) -> None:
     if _is_dissatisfied_or_correction(content):
         context = recent_context
         if context:
-            image_paths = list(context.get("image_paths") or [])
+            image_paths = _filter_inventory_image_paths(
+                [Path(item) for item in context.get("image_paths") or [] if item]
+            )
             video_paths = list(context.get("video_paths") or [])
             video_urls = list(context.get("video_urls") or [])
             if image_paths:
@@ -1656,29 +2049,17 @@ async def handle_kf_message(kf_message: dict) -> None:
                 _append_kf_dialog_message(open_kfid, external_userid, "客服", "\n".join(video_urls))
                 return
 
-    if _wants_room_image(content) and not wants_video:
-        search_text = _kf_media_search_text(open_kfid, external_userid, content)
-        room_database_image_paths = media_store.list_room_database_images(
-            search_text,
-            limit=KF_INVENTORY_IMAGE_SEND_LIMIT,
-        )
-        if room_database_image_paths:
-            _remember_kf_media_context(
-                open_kfid,
-                external_userid,
-                image_paths=room_database_image_paths,
-            )
-            sent = await _send_kf_room_database_images(
-                open_kfid,
-                external_userid,
-                room_database_image_paths,
-            )
-            if sent:
-                _append_kf_dialog_message(open_kfid, external_userid, "客服", "已直接发送相关图片。")
-            return
-
     if _wants_inventory_image(content) and not wants_video:
-        await _refresh_inventory_images_if_needed()
+        inventory_images_refreshed = await _refresh_inventory_images_if_needed()
+        if not inventory_images_refreshed:
+            await wecom_kf.send_text(open_kfid, external_userid, INVENTORY_IMAGE_SYNC_FAILED_TEXT)
+            _append_kf_dialog_message(
+                open_kfid,
+                external_userid,
+                "客服",
+                INVENTORY_IMAGE_SYNC_FAILED_TEXT,
+            )
+            return
         image_paths = _inventory_image_paths()
         if image_paths:
             _remember_kf_media_context(
@@ -1691,6 +2072,12 @@ async def handle_kf_message(kf_message: dict) -> None:
                 _append_kf_dialog_message(open_kfid, external_userid, "客服", "已直接发送房源表图片。")
             return
 
+    if _wants_room_image(content) and not wants_video:
+        reply_text = _room_image_disabled_reply()
+        await wecom_kf.send_text(open_kfid, external_userid, reply_text)
+        _append_kf_dialog_message(open_kfid, external_userid, "客服", reply_text)
+        return
+
     message = IncomingMessage(
         source="wecom_kf",
         user_id=str(kf_message.get("external_userid", "")),
@@ -1702,6 +2089,7 @@ async def handle_kf_message(kf_message: dict) -> None:
     snapshot = inventory.format_rows(rooms) or await inventory.snapshot()
     media = media_store.list_for_rooms(rooms)
     images, videos = media_store.public_urls(media)
+    images = []
     room_database_video_urls: list[str] = []
     if wants_video:
         room_database_video_paths = _collect_kf_room_database_video_paths(
@@ -1745,11 +2133,45 @@ async def handle_kf_message(kf_message: dict) -> None:
         reply.text,
         has_available_video=_has_room_database_video_material(content, snapshot),
     )
+    reference_rows = await _inventory_rows_for_final_validation(rooms)
+    validation = await _validate_kf_reply_draft(
+        customer_text=content,
+        reply_text=reply.text,
+        inventory_rows=rooms,
+        reference_inventory_rows=reference_rows,
+        available_video_paths=_available_video_paths_for_validation(
+            content,
+            reply.text,
+            rooms,
+            existing_paths=room_database_video_paths if wants_video else [],
+            conversation_context=conversation_context,
+        ),
+        available_image_paths=[Path(image) for image in images if image],
+        send_video_paths=room_database_video_paths if wants_video else [],
+        conversation_context=conversation_context,
+    )
+    reply.text = validation.reply_text
+    if validation.extra_video_paths:
+        extra_video_urls = _room_database_public_urls(validation.extra_video_paths)
+        _remember_kf_media_context(
+            open_kfid,
+            external_userid,
+            video_paths=validation.extra_video_paths,
+            video_urls=extra_video_urls,
+        )
     await wecom_kf.send_text(open_kfid, external_userid, reply.text)
     _append_kf_dialog_message(open_kfid, external_userid, "客服", reply.text)
-    for image in reply.images:
-        await wecom_kf.send_text(open_kfid, external_userid, image)
-        _append_kf_dialog_message(open_kfid, external_userid, "客服", image)
+    if validation.extra_video_paths:
+        sent = await _send_kf_room_database_videos(
+            open_kfid,
+            external_userid,
+            validation.extra_video_paths,
+            customer_text=content,
+            inventory_rows=rooms,
+            conversation_context=conversation_context,
+        )
+        if sent:
+            _append_kf_dialog_message(open_kfid, external_userid, "客服", "已直接发送相关视频。")
     await _send_kf_video_links(open_kfid, external_userid, reply.videos + room_database_video_urls)
     if reply.videos or room_database_video_urls:
         _append_kf_dialog_message(
@@ -1775,17 +2197,11 @@ async def debug_message(payload: dict) -> dict:
     media = media_store.list_for_rooms(rooms)
     images, videos = media_store.public_urls(media)
     if _wants_inventory_image(message.content) and not _wants_video(message.content):
-        images = _dedupe(images + _room_database_public_urls(_inventory_image_paths()))
-    if _wants_room_image(message.content) and not _wants_video(message.content):
-        images = _dedupe(
-            images
-            + _room_database_public_urls(
-                media_store.list_room_database_images(
-                    message.content,
-                    limit=KF_INVENTORY_IMAGE_SEND_LIMIT,
-                )
-            )
-        )
+        images = _room_database_public_urls(_inventory_image_paths())
+    elif _wants_room_image(message.content) and not _wants_video(message.content):
+        images = []
+    else:
+        images = []
     if _wants_video(message.content):
         videos = _dedupe(
             videos

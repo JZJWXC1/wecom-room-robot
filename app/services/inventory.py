@@ -2,6 +2,7 @@ from io import BytesIO, StringIO
 import base64
 import mimetypes
 import re
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -55,6 +56,7 @@ class InventoryService:
         self._cache: pd.DataFrame | None = None
         self._image_text: str = ""
         self._last_error: str = ""
+        self._last_refresh_at: float = 0.0
 
     @property
     def last_error(self) -> str:
@@ -64,38 +66,38 @@ class InventoryService:
         if settings.inventory_source == "local_image":
             self._image_text = await self._read_image_inventory_text()
             frame = pd.DataFrame()
-            self._cache = frame
+            self._set_cache(frame)
             self._last_error = ""
             return frame
         if settings.inventory_source == "local_cache":
             frame = self._read_cache()
-            self._cache = frame
+            self._set_cache(frame)
             self._last_error = ""
             return frame
-        if settings.inventory_source == "feishu_bitable":
+        if settings.inventory_source in ("feishu_bitable", "feishu_sheet", "feishu_spreadsheet"):
             try:
-                frame = await FeishuClient().read_bitable_dataframe()
+                frame = await self._read_feishu_inventory_dataframe()
                 frame = self._normalize(frame)
                 self._save_cache(frame)
-                self._cache = frame
+                self._set_cache(frame)
                 self._last_error = ""
                 return frame
             except Exception as exc:
                 self._last_error = str(exc)
                 frame = self._read_cache()
-                self._cache = frame
+                self._set_cache(frame)
                 return frame
         try:
             frame = await self._read_public_document(settings.kdocs_public_url)
             frame = self._normalize(frame)
             self._save_cache(frame)
-            self._cache = frame
+            self._set_cache(frame)
             self._last_error = ""
             return frame
         except Exception as exc:
             self._last_error = str(exc)
             frame = self._read_cache()
-            self._cache = frame
+            self._set_cache(frame)
             return frame
 
     async def search(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
@@ -112,7 +114,7 @@ class InventoryService:
                     scored.append((score, row))
             scored = self._filter_scored_rows(scored)
             return [row for _, row in scored[:limit]]
-        frame = self._cache if self._cache is not None else await self.refresh()
+        frame = await self._current_frame()
         if frame.empty:
             return []
         text = query.lower()
@@ -182,7 +184,7 @@ class InventoryService:
                 f"{settings.inventory_image_path}\u3002"
                 "\u5c1a\u672a\u63d0\u53d6\u6210\u7ed3\u6784\u5316\u5e93\u5b58\u6570\u636e\u3002"
             )
-        frame = self._cache if self._cache is not None else await self.refresh()
+        frame = await self._current_frame()
         if frame.empty:
             return "\u5f53\u524d\u6ca1\u6709\u53ef\u7528\u623f\u6e90\u5e93\u5b58\u6570\u636e\u3002"
         records = frame.fillna("").head(limit).to_dict(orient="records")
@@ -193,6 +195,27 @@ class InventoryService:
             )
             lines.append(f"{index}. {compact}")
         return "\n".join(lines)
+
+    async def _current_frame(self) -> pd.DataFrame:
+        if self._should_refresh_cache():
+            return await self.refresh()
+        return self._cache if self._cache is not None else pd.DataFrame()
+
+    def _should_refresh_cache(self) -> bool:
+        if settings.inventory_source == "local_cache":
+            return self._cache is None
+        if settings.inventory_source == "local_image":
+            return not self._image_text
+        if self._cache is None:
+            return True
+        interval = settings.inventory_refresh_seconds
+        if interval <= 0:
+            return True
+        return time.time() - self._last_refresh_at >= interval
+
+    def _set_cache(self, frame: pd.DataFrame) -> None:
+        self._cache = frame
+        self._last_refresh_at = time.time()
 
     async def _read_image_inventory_text(self) -> str:
         image_paths = self._image_paths()
@@ -357,6 +380,76 @@ class InventoryService:
         if not tables:
             raise ValueError("No table found in public KDocs page")
         return tables[0]
+
+    async def _read_feishu_inventory_dataframe(self) -> pd.DataFrame:
+        client = FeishuClient()
+        if settings.feishu_inventory_sheet_token:
+            data = await client.read_spreadsheet_values()
+            frame = self._spreadsheet_values_to_dataframe(data.get("values") or [])
+            if not frame.empty or settings.inventory_source in ("feishu_sheet", "feishu_spreadsheet"):
+                return frame
+        return await client.read_bitable_dataframe()
+
+    def _spreadsheet_values_to_dataframe(self, values: list[list[Any]]) -> pd.DataFrame:
+        header_aliases = {
+            "区域": "区域",
+            "小区": "小区",
+            "社区": "小区",
+            "楼盘": "小区",
+            "房号": "房号",
+            "房间号": "房号",
+            "户型": "户型",
+            "户型分类": "户型分类",
+            "押一付": "押一付",
+            "押一付一": "押一付",
+            "押二付": "押二付",
+            "押二付一": "押二付",
+            "密码": "密码",
+            "看房密码": "密码",
+            "备注": "备注",
+        }
+        expected_headers = ["区域", "小区", "房号", "户型", "户型分类", "押一付", "押二付", "密码", "备注"]
+        header_indexes: dict[str, int] = {}
+        data_start = 0
+        for index, row in enumerate(values):
+            cells = [self._clean_sheet_cell(cell) for cell in row]
+            mapped = {
+                header_aliases[cell]: cell_index
+                for cell_index, cell in enumerate(cells)
+                if cell in header_aliases
+            }
+            if {"小区", "房号", "户型"}.issubset(mapped):
+                header_indexes = mapped
+                data_start = index + 1
+                break
+        if not header_indexes:
+            return pd.DataFrame()
+
+        rows: list[dict[str, str]] = []
+        current_area = ""
+        current_community = ""
+        for raw_row in values[data_start:]:
+            row = {
+                header: self._clean_sheet_cell(
+                    raw_row[column_index] if column_index < len(raw_row) else ""
+                )
+                for header, column_index in header_indexes.items()
+            }
+            if row.get("区域"):
+                current_area = row["区域"]
+            if row.get("小区"):
+                current_community = row["小区"]
+            if not row.get("房号"):
+                continue
+            row["区域"] = row.get("区域") or current_area
+            row["小区"] = row.get("小区") or current_community
+            rows.append({header: row.get(header, "") for header in expected_headers})
+        return pd.DataFrame(rows, columns=expected_headers)
+
+    def _clean_sheet_cell(self, value: Any) -> str:
+        text = str(value or "").replace("\r", "\n")
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
 
     def _normalize(self, frame: pd.DataFrame) -> pd.DataFrame:
         frame = frame.dropna(how="all").copy()
