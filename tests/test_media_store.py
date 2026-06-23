@@ -126,6 +126,25 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
             finally:
                 settings.room_database_path = previous_room_database_path
 
+    def test_parent_room_match_allows_legacy_filename_room_format(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                video_dir = settings.room_database_path / "video" / "杨家新雅苑15-603"
+                video_dir.mkdir(parents=True)
+                video = video_dir / "杨家新雅苑15-1-603.mp4"
+                video.write_bytes(b"video")
+
+                matches = MediaStore().list_room_database_videos(
+                    "杨家新雅苑15-603视频发我",
+                    limit=3,
+                )
+
+                self.assertEqual(matches, [video])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
     def test_matches_room_number_with_or_without_suffix_hyphen(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             previous_room_database_path = settings.room_database_path

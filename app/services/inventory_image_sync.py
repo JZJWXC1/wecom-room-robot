@@ -132,7 +132,10 @@ class InventoryImageSyncer:
         libreoffice = shutil.which("libreoffice") or shutil.which("soffice")
         pdftoppm = shutil.which("pdftoppm")
         if not libreoffice or not pdftoppm:
-            raise RuntimeError("Missing LibreOffice or pdftoppm for exact spreadsheet rendering")
+            try:
+                return self.render_xlsx_to_inventory_images(xlsx_path)
+            except Exception:
+                return self.render_values_to_inventory_images(values)
 
         rows = [[str(cell or "").strip() for cell in row] for row in values]
         bounds = self._matrix_content_bounds(rows)
@@ -235,7 +238,7 @@ class InventoryImageSyncer:
     def render_xlsx_to_inventory_images(self, xlsx_path: Path) -> RenderedSheet:
         from PIL import Image, ImageDraw, ImageFont
 
-        workbook = load_workbook(xlsx_path, data_only=True)
+        workbook = self._load_workbook_for_render(xlsx_path)
         sheet = workbook.active
         bounds = self._content_bounds(sheet)
         if bounds is None:
@@ -307,6 +310,46 @@ class InventoryImageSyncer:
             rows=max_row - min_row + 1,
             columns=max_col - min_col + 1,
         )
+
+    def _load_workbook_for_render(self, xlsx_path: Path) -> Any:
+        try:
+            return load_workbook(xlsx_path, data_only=True)
+        except ValueError as exc:
+            if "could not read stylesheet" not in str(exc):
+                raise
+            with tempfile.TemporaryDirectory() as directory:
+                sanitized_path = Path(directory) / "inventory-sanitized.xlsx"
+                self._write_xlsx_with_sanitized_styles(xlsx_path, sanitized_path)
+                return load_workbook(sanitized_path, data_only=True)
+
+    def _write_xlsx_with_sanitized_styles(self, source_path: Path, target_path: Path) -> None:
+        with zipfile.ZipFile(source_path, "r") as source, zipfile.ZipFile(
+            target_path,
+            "w",
+            zipfile.ZIP_DEFLATED,
+        ) as target:
+            for info in source.infolist():
+                content = source.read(info.filename)
+                if info.filename == "xl/styles.xml":
+                    content = self._sanitize_styles_xml(content)
+                target.writestr(info, content)
+
+    def _sanitize_styles_xml(self, styles_xml: bytes) -> bytes:
+        text = styles_xml.decode("utf-8", errors="replace")
+
+        def replace_rgb(match: re.Match[str]) -> str:
+            red, green, blue = (
+                max(0, min(255, int(match.group(name))))
+                for name in ("red", "green", "blue")
+            )
+            return f'rgb="FF{red:02X}{green:02X}{blue:02X}"'
+
+        text = re.sub(
+            r'rgb="(?:FF)?RGB\(\s*(?P<red>\d+)\s*,\s*(?P<green>\d+)\s*,\s*(?P<blue>\d+)\s*\)"',
+            replace_rgb,
+            text,
+        )
+        return text.encode("utf-8")
 
     def _render_matrix_to_inventory_images(self, matrix: list[list[str]]) -> RenderedSheet:
         from PIL import Image, ImageDraw, ImageFont
@@ -430,11 +473,46 @@ class InventoryImageSyncer:
         image = Image.new("RGB", (total_width, total_height), "white")
         draw = ImageDraw.Draw(image)
 
+        column_offsets = self._offsets(column_widths)
+        row_offsets = self._offsets(page_row_heights)
         y = 0
         for row_number in range(page_start_row, page_end_row + 1):
             row_height = row_heights[row_number - min_row]
             x = 0
             for col_number in range(min_col, max_col + 1):
+                merged_range = self._merged_range_for_cell(sheet, row_number, col_number)
+                if merged_range is not None:
+                    if (
+                        row_number != merged_range.min_row
+                        or col_number != merged_range.min_col
+                        or merged_range.min_row < page_start_row
+                    ):
+                        x += column_widths[col_number - min_col]
+                        continue
+                    draw_min_col = max(merged_range.min_col, min_col)
+                    draw_max_col = min(merged_range.max_col, max_col)
+                    draw_min_row = max(merged_range.min_row, page_start_row)
+                    draw_max_row = min(merged_range.max_row, page_end_row)
+                    cell_x = column_offsets[draw_min_col - min_col]
+                    cell_y = row_offsets[draw_min_row - page_start_row]
+                    merged_width = sum(
+                        column_widths[draw_min_col - min_col : draw_max_col - min_col + 1]
+                    )
+                    merged_height = sum(
+                        row_heights[draw_min_row - min_row : draw_max_row - min_row + 1]
+                    )
+                    self._draw_cell(
+                        draw,
+                        sheet.cell(row=merged_range.min_row, column=merged_range.min_col),
+                        cell_x,
+                        cell_y,
+                        merged_width,
+                        merged_height,
+                        font,
+                        bold_font,
+                    )
+                    x += column_widths[col_number - min_col]
+                    continue
                 cell = sheet.cell(row=row_number, column=col_number)
                 col_width = column_widths[col_number - min_col]
                 self._draw_cell(
@@ -453,6 +531,23 @@ class InventoryImageSyncer:
         output_path = output_dir / f"inventory_{page_number:02d}.png"
         image.save(output_path, "PNG")
         return output_path
+
+    def _merged_range_for_cell(self, sheet: Any, row_number: int, col_number: int) -> Any | None:
+        for merged_range in sheet.merged_cells.ranges:
+            if (
+                merged_range.min_row <= row_number <= merged_range.max_row
+                and merged_range.min_col <= col_number <= merged_range.max_col
+            ):
+                return merged_range
+        return None
+
+    def _offsets(self, sizes: list[int]) -> list[int]:
+        offsets: list[int] = []
+        position = 0
+        for size in sizes:
+            offsets.append(position)
+            position += size
+        return offsets
 
     def _draw_cell(
         self,
@@ -473,16 +568,64 @@ class InventoryImageSyncer:
         active_font = bold_font if cell.font and cell.font.bold else font
         text_color = self._font_color(cell)
         lines = self._wrap_text(draw, value, active_font, max(width - CELL_PADDING_X * 2, 20))
-        text = "\n".join(lines[:4])
-        draw.multiline_text(
-            (x + CELL_PADDING_X, y + CELL_PADDING_Y),
-            text,
-            fill=text_color,
-            font=active_font,
-            spacing=2,
+        self._draw_aligned_text(
+            draw,
+            lines[:4],
+            x,
+            y,
+            width,
+            height,
+            active_font,
+            text_color,
+            horizontal=str(cell.alignment.horizontal or ""),
+            vertical=str(cell.alignment.vertical or ""),
         )
 
+    def _draw_aligned_text(
+        self,
+        draw: Any,
+        lines: list[str],
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        font: Any,
+        fill: str,
+        *,
+        horizontal: str = "",
+        vertical: str = "",
+    ) -> None:
+        if not lines:
+            return
+        line_height = self._text_height(draw, font)
+        spacing = 2
+        text_height = len(lines) * line_height + max(0, len(lines) - 1) * spacing
+        if vertical in {"center", "middle", "distributed"}:
+            text_y = y + max(CELL_PADDING_Y, (height - text_height) // 2)
+        elif vertical == "bottom":
+            text_y = y + max(CELL_PADDING_Y, height - text_height - CELL_PADDING_Y)
+        else:
+            text_y = y + CELL_PADDING_Y
+        for line in lines:
+            line_width = draw.textlength(line, font=font)
+            if horizontal in {"center", "centerContinuous", "distributed"}:
+                text_x = x + max(CELL_PADDING_X, (width - int(line_width)) // 2)
+            elif horizontal == "right":
+                text_x = x + max(CELL_PADDING_X, width - int(line_width) - CELL_PADDING_X)
+            else:
+                text_x = x + CELL_PADDING_X
+            draw.text((text_x, text_y), line, fill=fill, font=font)
+            text_y += line_height + spacing
+
+    def _text_height(self, draw: Any, font: Any) -> int:
+        bbox = draw.textbbox((0, 0), "国", font=font)
+        return max(1, bbox[3] - bbox[1])
+
     def _content_bounds(self, sheet: Any) -> tuple[int, int, int, int] | None:
+        header_bounds = self._inventory_header_bounds(sheet)
+        if header_bounds is not None:
+            return header_bounds
+
         min_row = min_col = 10**9
         max_row = max_col = 0
         for row in sheet.iter_rows():
@@ -495,6 +638,37 @@ class InventoryImageSyncer:
         if max_row == 0:
             return None
         return min_row, max_row, min_col, max_col
+
+    def _inventory_header_bounds(self, sheet: Any) -> tuple[int, int, int, int] | None:
+        for row_number in range(1, sheet.max_row + 1):
+            cells = [
+                self._cell_text(sheet.cell(row=row_number, column=column_number))
+                for column_number in range(1, min(sheet.max_column, 50) + 1)
+            ]
+            if "小区" not in cells or "房号" not in cells:
+                continue
+            header_columns = [
+                index
+                for index, value in enumerate(cells, start=1)
+                if value.strip()
+            ]
+            if not header_columns:
+                continue
+            min_col = min(header_columns)
+            max_col = max(header_columns)
+            min_row = 10**9
+            max_row = 0
+            for data_row in range(1, sheet.max_row + 1):
+                has_content = any(
+                    self._cell_text(sheet.cell(row=data_row, column=column_number))
+                    for column_number in range(min_col, max_col + 1)
+                )
+                if has_content:
+                    min_row = min(min_row, data_row)
+                    max_row = max(max_row, data_row)
+            if max_row:
+                return min_row, max_row, min_col, max_col
+        return None
 
     def _column_widths(self, sheet: Any, min_col: int, max_col: int) -> list[int]:
         widths: list[int] = []

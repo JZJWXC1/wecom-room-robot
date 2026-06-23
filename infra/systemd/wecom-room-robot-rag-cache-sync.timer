@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh RAG inventory cache three times per day
+
+[Timer]
+OnCalendar=*-*-* 08:05:00
+OnCalendar=*-*-* 13:05:00
+OnCalendar=*-*-* 19:05:00
+Persistent=true
+Unit=wecom-room-robot-rag-cache-sync.service
+
+[Install]
+WantedBy=timers.target

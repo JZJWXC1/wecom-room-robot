@@ -1,23 +1,607 @@
-﻿import asyncio
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import app.main as main
 from app.models import ReplyPlan
+from app.services import kf_context_memory
+from app.services.rewrite_inventory_index import FIELD_SEMANTICS, build_rewrite_inventory_index
 from app.services.wecom_kf import (
     WeComKfClient,
     WeComKfContextStore,
-    WeComKfSendLimitError,
     WeComKfStateStore,
+    extract_kf_external_userid,
+    extract_kf_open_kfid,
     extract_kf_text,
+    extract_kf_welcome_code,
+    is_kf_enter_session_event,
     is_kf_message_event,
+    kf_callback_payload_event_message,
     should_auto_reply_kf_message,
 )
 
 
+class MainUnderstandingGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deposit_question_does_not_need_room_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "contract",
+                    "rewritten_query": "用户咨询免押和服务费",
+                    "query_state": {"intent": "contract"},
+                    "needs_clarification": True,
+                    "clarification_text": "请问哪套房源？",
+                }
+
+        original = main.reply_generator
+        main.reply_generator = FakeReplyGenerator()
+        try:
+            understanding = await main._understand_message(
+                content="能免押吗？客户问服务费怎么算。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("能免押吗？客户问服务费怎么算。"),
+            )
+        finally:
+            main.reply_generator = original
+
+        self.assertEqual(understanding["intent"], "deposit")
+        self.assertFalse(understanding["needs_clarification"])
+        self.assertEqual(understanding["clarification_text"], "")
+        self.assertTrue(understanding["query_state"]["wants_deposit"])
+        self.assertIn("免押", understanding["effective_query"])
+        self.assertNotIn("请问哪套房源", understanding["effective_query"])
+
+    async def test_inventory_sheet_signal_replaces_bad_rewrite_query(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory_sheet",
+                    "rewritten_query": "用户缺少区域、预算和户型，无法生成有效房源表。",
+                    "effective_query": "用户缺少区域、预算和户型，无法生成有效房源表。",
+                    "query_state": {"intent": "inventory_sheet"},
+                    "needs_clarification": True,
+                    "clarification_text": "请问想看哪个小区或什么价位的房源表？",
+                }
+
+        original = main.reply_generator
+        main.reply_generator = FakeReplyGenerator()
+        try:
+            understanding = await main._understand_message(
+                content="那房源表也发我一份。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("那房源表也发我一份。"),
+            )
+        finally:
+            main.reply_generator = original
+
+        self.assertEqual(understanding["intent"], "inventory_sheet")
+        self.assertFalse(understanding["needs_clarification"])
+        self.assertEqual(understanding["clarification_text"], "")
+        self.assertTrue(understanding["query_state"]["wants_inventory_sheet"])
+        self.assertIn("最新房源表 PNG", understanding["effective_query"])
+        self.assertNotIn("无法生成有效房源表", understanding["effective_query"])
+
+    def test_unasked_deposit_context_is_removed_from_rewrite(self) -> None:
+        result = {
+            "intent": "inventory",
+            "rewritten_query": "用户在拱墅万达寻找2000以内一室一厅，并隐含希望了解免押及服务费政策。",
+            "effective_query": "用户在拱墅万达寻找2000以内一室一厅，并隐含希望了解免押及服务费政策。",
+            "query_state": {"intent": "inventory", "wants_deposit": True},
+        }
+
+        cleaned = main._strip_unasked_deposit_from_understanding(
+            "拱墅万达这边有没有2000以内的一室一厅？",
+            result,
+            {"wants_deposit": False},
+        )
+
+        self.assertNotIn("免押", cleaned["effective_query"])
+        self.assertNotIn("服务费", cleaned["effective_query"])
+        self.assertNotIn("wants_deposit", cleaned["query_state"])
+        self.assertTrue(cleaned["query_state"]["unasked_deposit_context_removed"])
+
+    def test_unasked_media_context_is_removed_from_rewrite(self) -> None:
+        result = {
+            "intent": "media",
+            "rewritten_query": "在拱墅万达区域，预算2000以内筛选一室一厅，并优先发送前几套房源的视频供用户筛选。",
+            "effective_query": "在拱墅万达区域，预算2000以内筛选一室一厅，并优先发送前几套房源的视频供用户筛选。",
+            "query_state": {"intent": "media", "wants_video": True, "pending_video_action": "hold"},
+            "candidate_action": "select",
+            "selected_indices": [1],
+        }
+
+        cleaned = main._strip_unasked_media_from_understanding(
+            "拱墅万达这边有没有2000以内的一室一厅？",
+            result,
+            main._deterministic_signals("拱墅万达这边有没有2000以内的一室一厅？"),
+        )
+
+        self.assertEqual(cleaned["intent"], "inventory")
+        self.assertNotIn("视频", cleaned["effective_query"])
+        self.assertNotIn("wants_video", cleaned["query_state"])
+        self.assertEqual(cleaned["selected_indices"], [])
+        self.assertTrue(cleaned["query_state"]["unasked_media_context_removed"])
+
+    def test_target_rows_select_exact_room_from_multiple_search_results(self) -> None:
+        rows = [
+            {"小区": "华丰欣苑", "房号": "14-2-901"},
+            {"小区": "华丰欣苑", "房号": "19-3-1104"},
+        ]
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "用户请求发送华丰欣苑14-2-901的房源视频",
+                "context_reference": False,
+            },
+            {},
+            rows,
+        )
+
+        self.assertEqual(target_rows, [{"小区": "华丰欣苑", "房号": "14-2-901"}])
+
+    def test_effective_query_preserves_room_ref_from_constraint_proof(self) -> None:
+        effective_query = main._enforce_effective_query(
+            content="华丰欣苑14-2-901视频发我，客户想看看装修。",
+            understanding={
+                "effective_query": "查询石桥街道华丰附近一室一厅视频",
+                "rewritten_query": "查询石桥街道华丰附近一室一厅视频",
+            },
+            constraint_proof={
+                "communities": ["华丰欣苑"],
+                "room_refs": ["14-2-901"],
+                "wants_video": True,
+            },
+        )
+
+        self.assertIn("华丰欣苑", effective_query)
+        self.assertIn("14-2-901", effective_query)
+
+    def test_explicit_room_ref_beats_stale_confirmed_context_for_media(self) -> None:
+        rows = [
+            {"小区": "华丰欣苑", "房号": "14-2-901"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+        ]
+        context = {
+            "confirmed_room": {
+                "row": {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+                "label": "星桥锦绣嘉苑20-1606A",
+            }
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "查询石桥街道华丰附近一室一厅视频",
+                "rewritten_query": "查询石桥街道华丰附近一室一厅视频",
+                "context_reference": True,
+                "constraint_proof": {"room_refs": ["14-2-901"], "wants_video": True},
+                "structured_task": {
+                    "original_text": "华丰欣苑14-2-901视频发我，客户想看看装修。",
+                    "effective_query": "查询石桥街道华丰附近一室一厅视频",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            rows,
+        )
+
+        self.assertEqual(target_rows, [{"小区": "华丰欣苑", "房号": "14-2-901"}])
+
+    def test_room_ref_mismatch_clarification_keeps_raw_community_hint(self) -> None:
+        entity_resolution = main._build_entity_resolution("皋塘运都9-2-402B视频发我", [])
+
+        clarification = main._room_ref_mismatch_clarification(
+            "皋塘运都9-2-402B视频发我",
+            entity_resolution,
+            [],
+        )
+
+        self.assertIn("皋塘运都", clarification)
+        self.assertIn("9-2-402B", clarification)
+        self.assertNotIn("确认下小区+房号", clarification)
+
+    def test_explicit_room_ref_beats_stale_candidate_index_for_media(self) -> None:
+        rows = [
+            {"小区": "华丰欣苑", "房号": "14-2-901"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+        ]
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "query": "旧的万达候选列表",
+            "candidates": [{"小区": "星桥锦绣嘉苑", "房号": "20-1606A"}],
+            "shown_count": 1,
+            "total_count": 1,
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "在石桥街道华丰区域，查询华丰欣苑14-2-901的视频",
+                "rewritten_query": "查询华丰欣苑14-2-901视频",
+                "context_reference": True,
+                "candidate_action": "select",
+                "selected_indices": [1],
+                "constraint_proof": {
+                    "communities": ["华丰欣苑"],
+                    "room_refs": ["14-2-901"],
+                    "wants_video": True,
+                },
+                "structured_task": {
+                    "original_text": "华丰欣苑14-2-901视频发我，客户想看看装修。",
+                    "effective_query": "查询华丰欣苑14-2-901视频",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            rows,
+        )
+
+        self.assertEqual(target_rows, [{"小区": "华丰欣苑", "房号": "14-2-901"}])
+
+    def test_new_scoped_inventory_query_does_not_use_stale_confirmed_room(self) -> None:
+        context = {
+            "confirmed_room": {
+                "row": {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+                "label": "星桥锦绣嘉苑20-1606A",
+            }
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "在石桥街道华丰石桥永佳半山区域，查询5000左右两室整租",
+                "rewritten_query": "石桥附近5000左右两室整租在租房源",
+                "context_reference": True,
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                    "budget_range": [4500, 5500],
+                    "layout": "两室",
+                    "wants_video": False,
+                    "wants_image": False,
+                },
+                "structured_task": {
+                    "original_text": "石桥附近5000左右有两室吗？最好整租。",
+                    "effective_query": "石桥附近5000左右两室整租在租房源",
+                    "tool_requirements": {"needs_inventory_search": True},
+                },
+            },
+            context,
+            [],
+        )
+
+        self.assertEqual(target_rows, [])
+
+    def test_context_followup_video_request_can_use_confirmed_room(self) -> None:
+        confirmed = {"小区": "棠润府", "房号": "15-2-801B"}
+        context = {
+            "confirmed_room": {
+                "row": confirmed,
+                "label": "棠润府15-2-801B",
+            }
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "这套视频发我",
+                "rewritten_query": "发送上一套已确认房源的视频",
+                "context_reference": True,
+                "intent": "media",
+                "constraint_proof": {"wants_video": True},
+                "structured_task": {
+                    "original_text": "视频发我",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            [],
+        )
+
+        self.assertEqual(target_rows, [confirmed])
+
+    def test_plain_previous_reference_can_use_confirmed_room(self) -> None:
+        confirmed = {"小区": "棠润府", "房号": "15-2-801B"}
+        context = {
+            "confirmed_room": {
+                "row": confirmed,
+                "label": "棠润府15-2-801B",
+            }
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "上一个视频发我",
+                "rewritten_query": "发送上一套已确认房源的视频",
+                "context_reference": True,
+                "intent": "media",
+                "constraint_proof": {"wants_video": True},
+                "structured_task": {
+                    "original_text": "上一个视频发我",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            [],
+        )
+
+        self.assertEqual(target_rows, [confirmed])
+
+    def test_candidate_context_reference_can_bind_by_community_hint(self) -> None:
+        star_row = {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"}
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达2000以内一室",
+            "candidates": [
+                {"小区": "棠润府", "房号": "15-2-801B"},
+                star_row,
+            ],
+            "shown_count": 2,
+            "total_count": 2,
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "星桥那个视频发我",
+                "rewritten_query": "发送上一轮候选里星桥锦绣嘉苑那套视频",
+                "context_reference": True,
+                "intent": "media",
+                "constraint_proof": {"wants_video": True},
+                "structured_task": {
+                    "original_text": "星桥那个视频发我",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            [],
+        )
+
+        self.assertEqual(target_rows, [star_row])
+
+    def test_candidate_context_reference_can_bind_fuzzy_community_hint(self) -> None:
+        tangrun_row = {"小区": "棠润府", "房号": "15-2-801B"}
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达2000以内一室",
+            "candidates": [
+                tangrun_row,
+                {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+            ],
+            "shown_count": 2,
+            "total_count": 2,
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "棠闰府那套视频发我",
+                "rewritten_query": "发送上一轮候选里棠润府15-2-801B的视频",
+                "context_reference": True,
+                "intent": "media",
+                "constraint_proof": {"communities": ["棠润府"], "wants_video": True},
+                "structured_task": {
+                    "original_text": "棠闰府那套视频发我",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            [],
+        )
+
+        self.assertEqual(target_rows, [tangrun_row])
+
+    def test_candidate_indices_bind_selected_media_rows(self) -> None:
+        rows = [
+            {"小区": "棠润府", "房号": "15-2-801B"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+            {"小区": "合峙悦府", "房号": "6-1-1204B"},
+            {"小区": "荣润府", "房号": "10-1004C"},
+            {"小区": "大华海派风景", "房号": "2-1-402A"},
+        ]
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达2000以内一室",
+            "candidates": rows,
+            "shown_count": 5,
+            "total_count": 5,
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "1和5视频",
+                "rewritten_query": "发送候选第1和第5套视频",
+                "context_reference": True,
+                "intent": "media",
+                "selected_indices": [1, 5],
+                "constraint_proof": {"selected_indices": [1, 5], "wants_video": True},
+                "structured_task": {
+                    "original_text": "1和5视频",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            [],
+        )
+
+        self.assertEqual(target_rows, [rows[0], rows[4]])
+
+    def test_single_room_pronoun_prefers_confirmed_room_over_llm_selected_index(self) -> None:
+        confirmed = {"小区": "兴业杨家府", "房号": "4-1502"}
+        stale_candidates = [
+            {"小区": "石桥铭苑", "房号": "6-1102"},
+            {"小区": "华丰欣苑", "房号": "14-2-901"},
+        ]
+        context = kf_context_memory.empty_context()
+        context["confirmed_room"] = {
+            "row": confirmed,
+            "label": "兴业杨家府4-1502",
+        }
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "被媒体/看房临时搜索污染的候选",
+            "candidates": stale_candidates,
+            "shown_count": 2,
+            "total_count": 2,
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "这套今天能看吗？",
+                "rewritten_query": "查询上一套已确认房源的看房方式",
+                "context_reference": True,
+                "intent": "viewing",
+                "selected_indices": [1],
+                "constraint_proof": {"selected_indices": [1]},
+                "structured_task": {
+                    "original_text": "这套今天能看吗？",
+                    "tool_requirements": {"needs_viewing_policy": True},
+                },
+            },
+            context,
+            stale_candidates,
+        )
+
+        self.assertEqual(target_rows, [confirmed])
+
+    def test_short_password_followup_binds_confirmed_room_without_context_flag(self) -> None:
+        confirmed = {"小区": "兴业杨家府", "房号": "4-1502"}
+        context = kf_context_memory.empty_context()
+        context["confirmed_room"] = {
+            "row": confirmed,
+            "label": "兴业杨家府4-1502",
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "密码是多少？",
+                "rewritten_query": "查询上一套已确认房源的看房密码",
+                "context_reference": False,
+                "intent": "viewing",
+                "constraint_proof": {},
+                "structured_task": {
+                    "original_text": "密码是多少？",
+                    "tool_requirements": {"needs_viewing_policy": True},
+                },
+            },
+            context,
+            [{"小区": "永佳新苑", "房号": "3-702"}],
+        )
+
+        self.assertEqual(target_rows, [confirmed])
+
+    def test_short_price_followup_binds_confirmed_room_without_context_flag(self) -> None:
+        confirmed = {"小区": "兴业杨家府", "房号": "4-1502", "押一付一": "4500", "押二付一": "4200"}
+        context = kf_context_memory.empty_context()
+        context["confirmed_room"] = {
+            "row": confirmed,
+            "label": "兴业杨家府4-1502",
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "押一付一和押二付一分别多少钱？ 石桥街道 华丰 石桥 永佳 半山 一室一厅",
+                "rewritten_query": "查询上一套已确认房源的两种付款方式月租价格",
+                "context_reference": False,
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道\n华丰 石桥\n永佳 半山",
+                    "layout": "一室一厅",
+                },
+                "structured_task": {
+                    "original_text": "押一付一和押二付一分别多少钱？",
+                    "tool_requirements": {"needs_inventory_search": True},
+                },
+            },
+            context,
+            [{"小区": "永佳新苑", "房号": "3-702"}],
+        )
+
+        self.assertEqual(target_rows, [confirmed])
+
+    def test_short_utilities_followup_binds_confirmed_room_without_context_flag(self) -> None:
+        confirmed = {"小区": "兴业杨家府", "房号": "4-1502", "备注": "民用水电"}
+        context = kf_context_memory.empty_context()
+        context["confirmed_room"] = {
+            "row": confirmed,
+            "label": "兴业杨家府4-1502",
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "水电费怎么算？ 石桥街道 华丰 石桥 永佳 半山 一室一厅",
+                "rewritten_query": "查询上一套已确认房源的水电费",
+                "context_reference": False,
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道\n华丰 石桥\n永佳 半山",
+                    "layout": "一室一厅",
+                    "wants_utilities": True,
+                },
+                "structured_task": {
+                    "original_text": "水电费怎么算？",
+                    "tool_requirements": {
+                        "needs_inventory_search": True,
+                        "needs_utilities": True,
+                    },
+                },
+            },
+            context,
+            [{"小区": "永佳新苑", "房号": "3-702"}],
+        )
+
+        self.assertEqual(target_rows, [confirmed])
+
+    def test_unverified_inventory_not_found_clarification_is_routed_to_tools(self) -> None:
+        result = {
+            "intent": "media",
+            "rewritten_query": "查询华丰欣苑14-2-901房源并发送视频",
+            "query_state": {"intent": "media", "wants_video": True},
+            "needs_clarification": True,
+            "clarification_text": "未在房源表中找到“华丰欣苑14-2-901”的确切匹配，请确认小区名称或房号是否正确？",
+        }
+
+        routed = main._route_unverified_not_found_to_tools(result, planner_feedback=None)
+
+        self.assertFalse(routed["needs_clarification"])
+        self.assertEqual(routed["clarification_text"], "")
+        self.assertTrue(routed["rewrite_layer_not_found_claim_routed_to_tools"])
+        self.assertTrue(routed["query_state"]["needs_tool_verification"])
+
+    def test_planner_feedback_clarification_is_preserved(self) -> None:
+        result = {
+            "intent": "media",
+            "needs_clarification": True,
+            "clarification_text": "未在房源表中找到，需要确认。",
+        }
+
+        routed = main._route_unverified_not_found_to_tools(
+            result,
+            planner_feedback={"need_rewrite_clarification": True},
+        )
+
+        self.assertTrue(routed["needs_clarification"])
+        self.assertEqual(routed["clarification_text"], "未在房源表中找到，需要确认。")
+
+
 class WeComKfStateStoreTests(unittest.TestCase):
-    def test_persists_cursor_and_processed_msgids(self) -> None:
+    def test_sync_messages_saves_next_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = WeComKfStateStore(path=Path(directory) / "state.json")
+            client = WeComKfClient(state_store=store)
+
+            async def fake_sync_pages(open_kfid: str, token: str, cursor: str):
+                self.assertEqual(open_kfid, "kf_xxx")
+                self.assertEqual(token, "token_xxx")
+                self.assertEqual(cursor, "")
+                return ([{"msgid": "msg-1", "msgtype": "event"}], "cursor-next")
+
+            client._sync_message_pages = fake_sync_pages  # type: ignore[method-assign]
+            messages = asyncio.run(client.sync_messages("kf_xxx", "token_xxx"))
+
+            self.assertEqual(messages, [{"msgid": "msg-1", "msgtype": "event"}])
+            self.assertEqual(store.load()["cursor"], "cursor-next")
+
+    def test_persists_cursor_processed_msgids_and_welcome_timestamps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             store = WeComKfStateStore(path=path, max_msgids=2)
@@ -26,3774 +610,8720 @@ class WeComKfStateStoreTests(unittest.TestCase):
             store.mark_processed("msg-1")
             store.mark_processed("msg-2")
             store.mark_processed("msg-3")
+            store.mark_welcome_sent("kf:wm", sent_at=123)
 
-            self.assertEqual(store.load()["cursor"], "cursor-1")
-            self.assertFalse(store.is_processed("msg-1"))
-            self.assertTrue(store.is_processed("msg-2"))
-            self.assertTrue(store.is_processed("msg-3"))
+            reloaded = WeComKfStateStore(path=path, max_msgids=2)
+            self.assertEqual(reloaded.load()["cursor"], "cursor-1")
+            self.assertFalse(reloaded.is_processed("msg-1"))
+            self.assertTrue(reloaded.is_processed("msg-2"))
+            self.assertTrue(reloaded.is_processed("msg-3"))
+            self.assertEqual(reloaded.last_welcome_sent_at("kf:wm"), 123)
+
+
+class WeComKfPayloadTests(unittest.TestCase):
+    def test_builds_text_payloads_and_extracts_kf_fields(self) -> None:
+        client = WeComKfClient()
+        payload = client.build_text_payload("kf_xxx", "wm_xxx", "你好")
+
+        self.assertEqual(payload["touser"], "wm_xxx")
+        self.assertEqual(payload["open_kfid"], "kf_xxx")
+        self.assertEqual(payload["msgtype"], "text")
+        self.assertEqual(payload["text"]["content"], "你好")
+
+        message = {
+            "msgtype": "text",
+            "origin": 3,
+            "open_kfid": "kf_xxx",
+            "external_userid": "wm_xxx",
+            "text": {"content": "房源表发一下"},
+        }
+        self.assertTrue(should_auto_reply_kf_message(message))
+        self.assertEqual(extract_kf_text(message), "房源表发一下")
+        self.assertEqual(extract_kf_open_kfid(message), "kf_xxx")
+        self.assertEqual(extract_kf_external_userid(message), "wm_xxx")
+
+    def test_detects_enter_session_welcome_event(self) -> None:
+        message = {
+            "msgtype": "event",
+            "event": {
+                "event_type": "enter_session",
+                "welcome_code": "welcome-code",
+                "open_kfid": "kf_xxx",
+                "external_userid": "wm_xxx",
+            },
+        }
+
+        self.assertTrue(is_kf_enter_session_event(message))
+        self.assertEqual(extract_kf_welcome_code(message), "welcome-code")
+        self.assertEqual(extract_kf_open_kfid(message), "kf_xxx")
+        self.assertEqual(extract_kf_external_userid(message), "wm_xxx")
+
+    def test_normalizes_direct_callback_enter_session_payload(self) -> None:
+        message = kf_callback_payload_event_message(
+            {
+                "MsgType": "event",
+                "Event": "enter_session",
+                "WelcomeCode": "welcome-code",
+                "OpenKfId": "kf_xxx",
+                "ExternalUserID": "wm_xxx",
+            }
+        )
+
+        self.assertTrue(is_kf_enter_session_event(message))
+        self.assertEqual(extract_kf_welcome_code(message), "welcome-code")
+        self.assertEqual(extract_kf_open_kfid(message), "kf_xxx")
+        self.assertEqual(extract_kf_external_userid(message), "wm_xxx")
+
+    def test_detects_kf_message_event(self) -> None:
+        self.assertTrue(is_kf_message_event({"Event": "kf_msg_or_event", "Token": "next-token"}))
+        self.assertFalse(is_kf_message_event({"msgtype": "text"}))
 
 
 class WeComKfContextStoreTests(unittest.TestCase):
-    def test_persists_media_context(self) -> None:
+    def test_persists_structured_memory_active_query_and_candidate_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "context.json"
-            store = WeComKfContextStore(path=path)
-
-            store.save(
-                "kf_xxx:wm_xxx",
-                {
-                    "image_paths": [Path("room_database/inventory_1.png")],
-                    "video_paths": [Path("room_database/video/x/video.mp4")],
-                    "video_urls": ["https://example.com/video.mp4"],
-                    "updated_at": 123.0,
+            store = WeComKfContextStore(path=Path(directory) / "context.json")
+            context = kf_context_memory.empty_context(now=lambda: 100.0)
+            context["active_query_state"] = {
+                "intent": "media",
+                "area": "拱墅万达",
+                "budget": "1500左右",
+            }
+            context["last_candidate_set"] = {
+                "intent": "inventory",
+                "query": "拱墅万达1500左右",
+                "candidates": [{"小区": "荣润府", "房号": "15-2-801B"}],
+                "shown_count": 1,
+                "total_count": 6,
+                "created_at": 100.0,
+            }
+            context = kf_context_memory.start_structured_turn(
+                context,
+                state={
+                    "intent": "media",
+                    "effective_query": "1和5视频",
+                    "selected_indices": [1, 5],
                 },
+                user_input={"content": "1和5视频"},
+                rewrite_result={
+                    "intent": "media",
+                    "rewritten_query": "发送候选第1和第5套视频",
+                },
+                now=lambda: 101.0,
             )
 
+            store.save("kf:wm", context)
+            loaded = store.get("kf:wm") or {}
+
+            self.assertEqual(loaded["active_query_state"]["area"], "拱墅万达")
+            self.assertEqual(loaded["last_candidate_set"]["shown_count"], 1)
+            self.assertEqual(loaded["last_candidate_set"]["total_count"], 6)
+            memory = loaded["structured_memory"]
+            self.assertNotIn("state", memory)
             self.assertEqual(
-                store.get("kf_xxx:wm_xxx"),
-                {
-                    "image_paths": [str(Path("room_database/inventory_1.png"))],
-                    "video_paths": [str(Path("room_database/video/x/video.mp4"))],
-                    "video_urls": ["https://example.com/video.mp4"],
-                    "recent_messages": [],
-                    "updated_at": 123.0,
-                },
-            )
-
-    def test_keeps_recent_ten_dialog_messages(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "context.json"
-            store = WeComKfContextStore(path=path)
-
-            store.save(
-                "kf_xxx:wm_xxx",
-                {
-                    "recent_messages": [
-                        {"role": "客户", "content": f"消息{index}", "created_at": float(index)}
-                        for index in range(12)
-                    ],
-                    "updated_at": 123.0,
-                },
-            )
-
-            messages = store.get("kf_xxx:wm_xxx")["recent_messages"]
-            self.assertEqual(len(messages), 10)
-            self.assertEqual(messages[0]["content"], "消息2")
-            self.assertEqual(messages[-1]["content"], "消息11")
-
-    def test_persists_send_limited_context(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "context.json"
-            store = WeComKfContextStore(path=path)
-
-            store.save(
-                "kf_xxx:wm_xxx",
-                {
-                    "send_limited": {
-                        "triggered_at": 123.0,
-                        "summary": "批量视频触发限流",
-                        "video_urls": ["https://example.com/video-1.mp4"],
-                    },
-                    "updated_at": 124.0,
-                },
-            )
-
-            context = store.get("kf_xxx:wm_xxx")
-
-            self.assertEqual(
-                context["send_limited"],
-                {
-                    "triggered_at": 123.0,
-                    "summary": "批量视频触发限流",
-                    "video_urls": ["https://example.com/video-1.mp4"],
-                },
+                memory["turn_records"][-1]["rewritten_query"],
+                "发送候选第1和第5套视频",
             )
 
 
-class WeComKfMediaSearchTextTests(unittest.TestCase):
-    def test_generic_video_followup_uses_latest_assistant_room_detail(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            previous_store = main.wecom_kf_context_store
-            try:
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_context_store.save(
-                    "kf_xxx:wm_xxx",
-                    {
-                        "recent_messages": [
-                            {"role": "客户", "content": "皋塘还有房子吗？"},
-                            {"role": "客服", "content": "皋塘运都16-1-1003还有。"},
-                            {"role": "客户", "content": "我要小样坝的"},
-                            {
-                                "role": "客服",
-                                "content": (
-                                    "小样坝这边我查到一套：\n"
-                                    "小区：小洋坝家园\n"
-                                    "房号：二区6-801-3\n"
-                                    "户型：一室独立厨卫带阳台"
-                                ),
-                            },
-                            {"role": "客户", "content": "视频发我一下吧"},
-                        ],
-                        "updated_at": 9999999999.0,
-                    },
-                )
-
-                search_text = main._kf_media_search_text(
-                    "kf_xxx",
-                    "wm_xxx",
-                    "视频发我一下吧",
-                )
-
-                self.assertIn("小洋坝家园", search_text)
-                self.assertIn("二区6-801-3", search_text)
-                self.assertNotIn("皋塘", search_text)
-            finally:
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-
-    def test_polite_generic_video_followup_uses_latest_assistant_room_detail(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            previous_store = main.wecom_kf_context_store
-            try:
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_context_store.save(
-                    "kf_xxx:wm_xxx",
-                    {
-                        "recent_messages": [
-                            {
-                                "role": "客服",
-                                "content": (
-                                    "杨家府（兴业杨家府）我这边看到还有两套：\n"
-                                    "1. 房号10-1-304，一室一厅，押一付4500/押二付4200。\n"
-                                    "2. 房号1-202，一室一厅，押一付4200/押一付3800。"
-                                ),
-                            },
-                        ],
-                        "updated_at": 9999999999.0,
-                    },
-                )
-
-                search_text = main._kf_media_search_text(
-                    "kf_xxx",
-                    "wm_xxx",
-                    "视频麻烦发我一下",
-                )
-
-                self.assertIn("杨家府", search_text)
-                self.assertIn("10-1-304", search_text)
-                self.assertIn("1-202", search_text)
-            finally:
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-
-    def test_explicit_video_query_does_not_reuse_old_context(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            previous_store = main.wecom_kf_context_store
-            try:
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_context_store.save(
-                    "kf_xxx:wm_xxx",
-                    {
-                        "recent_messages": [
-                            {"role": "客户", "content": "皋塘还有房子吗？"},
-                            {"role": "客服", "content": "皋塘运都16-1-1003还有。"},
-                        ],
-                        "updated_at": 9999999999.0,
-                    },
-                )
-
-                search_text = main._kf_media_search_text(
-                    "kf_xxx",
-                    "wm_xxx",
-                    "万达视频发我一下",
-                )
-
-                self.assertEqual(search_text, "万达视频发我一下")
-            finally:
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-
-    def test_normalizes_xiaoyangba_typos_for_media_search(self) -> None:
-        search_text = main._kf_media_search_text("kf_xxx", "wm_xxx", "小样吧视频发我一下")
-
-        self.assertIn("小洋坝", search_text)
-        self.assertNotIn("小样吧", search_text)
-
-    def test_normalizes_wanqiu_aliases_for_media_search(self) -> None:
-        self.assertEqual(
-            main._normalize_media_search_aliases("晚秋视频发一下"),
-            "琬秋铭府视频发一下",
-        )
-        self.assertEqual(
-            main._normalize_media_search_aliases("婉秋视频发一下"),
-            "琬秋铭府视频发一下",
-        )
-        self.assertEqual(
-            main._normalize_media_search_aliases("琬秋铭府视频发一下"),
-            "琬秋铭府视频发一下",
-        )
-
-    def test_plural_video_followup_uses_recent_two_room_details(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            previous_store = main.wecom_kf_context_store
-            try:
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_context_store.save(
-                    "kf_xxx:wm_xxx",
-                    {
-                        "recent_messages": [
-                            {
-                                "role": "客服",
-                                "content": "小区：永佳新苑\n房号：2-703\n户型：一室一厅",
-                            },
-                            {
-                                "role": "客服",
-                                "content": "小区：华丰人家\n房号：8-603\n户型：整租一室一厅",
-                            },
-                            {"role": "客户", "content": "这两套视频发一下"},
-                        ],
-                        "updated_at": 9999999999.0,
-                    },
-                )
-
-                search_texts = main._kf_media_search_texts(
-                    "kf_xxx",
-                    "wm_xxx",
-                    "这两套视频发一下",
-                )
-
-                self.assertEqual(len(search_texts), 2)
-                self.assertIn("永佳新苑", search_texts[0])
-                self.assertIn("2-703", search_texts[0])
-                self.assertIn("华丰人家", search_texts[1])
-                self.assertIn("8-603", search_texts[1])
-            finally:
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-
-
-class WeComKfMessageTests(unittest.TestCase):
-    def test_filters_customer_text_messages(self) -> None:
-        message = {
-            "msgid": "msg-1",
-            "open_kfid": "kf_xxx",
-            "external_userid": "wm_xxx",
-            "origin": 3,
-            "msgtype": "text",
-            "text": {"content": "还有一室一厅吗"},
+class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
+    def test_first_stage_planner_reply_is_audit_only_until_tools_finish(self) -> None:
+        planner = {
+            "actions": ["search_inventory", "generate_reply"],
+            "reply_text": "有的，我先给你列几套。",
+            "confidence": 0.9,
+            "source": "test_planner",
         }
 
-        self.assertEqual(extract_kf_text(message), "还有一室一厅吗")
-        self.assertTrue(should_auto_reply_kf_message(message))
+        result = main._ensure_planner_action_contract(
+            planner,
+            understanding={
+                "intent": "inventory",
+                "structured_task": {"intent": "inventory"},
+            },
+            signals={},
+        )
 
-    def test_rejects_non_customer_or_empty_messages(self) -> None:
-        self.assertFalse(
-            should_auto_reply_kf_message(
-                {
-                    "open_kfid": "kf_xxx",
-                    "external_userid": "wm_xxx",
-                    "origin": 4,
-                    "msgtype": "text",
-                    "text": {"content": "内部回复"},
+        self.assertEqual(result["actions"], ["search_inventory", "generate_reply"])
+        self.assertEqual(result["reply_text"], "")
+        self.assertEqual(result["pre_tool_reply_text"], "有的，我先给你列几套。")
+        self.assertIn("action_contract", result["source"])
+
+    def test_inventory_sheet_request_does_not_swallow_video_action(self) -> None:
+        result = main._ensure_required_actions(
+            {"actions": ["send_inventory_sheet"], "source": "test"},
+            understanding={
+                "intent": "inventory_sheet",
+                "constraint_proof": {"wants_inventory_sheet": True, "wants_video": True},
+                "structured_task": {
+                    "intent": "inventory_sheet",
+                    "tool_requirements": {
+                        "needs_inventory_sheet": True,
+                        "needs_video": True,
+                    },
+                },
+            },
+            signals={"wants_inventory_sheet": True, "wants_video": True},
+        )
+
+        self.assertIn("send_inventory_sheet", result["actions"])
+        self.assertIn("search_inventory", result["actions"])
+        self.assertIn("send_video", result["actions"])
+        self.assertIn("generate_reply", result["actions"])
+
+    def test_planner_unrequested_viewing_and_deposit_actions_are_removed(self) -> None:
+        result = main._ensure_required_actions(
+            {
+                "actions": [
+                    "search_inventory",
+                    "send_inventory_sheet",
+                    "explain_unavailable_viewing",
+                    "send_deposit_policy",
+                ],
+                "source": "test",
+            },
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"room_refs": ["3-1002A", "3-1002B"]},
+                "structured_task": {"intent": "inventory", "tool_requirements": {"needs_inventory_search": True}},
+            },
+            signals={},
+        )
+
+        self.assertEqual(result["actions"], ["search_inventory", "compact_listing", "generate_reply"])
+        self.assertNotIn("send_inventory_sheet", result["actions"])
+        self.assertNotIn("send_deposit_policy", result["actions"])
+        self.assertNotIn("explain_unavailable_viewing", result["actions"])
+
+    def test_viewing_signal_recognizes_today_wants_to_view(self) -> None:
+        self.assertTrue(main._content_wants_viewing("客户今天想看，能自己看吗？"))
+        self.assertTrue(main._content_wants_viewing("客户比较急，有没有马上空出来的？"))
+
+    def test_price_comparison_selfcheck_requires_direct_conclusion(self) -> None:
+        rows = [
+            {"小区": "新柠长木府", "房号": "3-1002A", "押一付一": "4600", "押二付一": "4300"},
+            {"小区": "新柠长木府", "房号": "3-1002B", "押一付一": "3500", "押二付一": "3200"},
+        ]
+
+        result = main._constraint_consistency_selfcheck(
+            content="新柠长木府3-1002A和3-1002B价格一样吗？",
+            draft_reply=(
+                "新柠长木府3-1002A押一付一4600，押二付一4300。\n"
+                "新柠长木府3-1002B押一付一3500，押二付一3200。"
+            ),
+            understanding={"intent": "inventory", "constraint_proof": {"room_refs": ["3-1002A", "3-1002B"]}},
+            tool_evidence={"actions": ["search_inventory", "generate_reply"], "inventory_rows": rows},
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("直接对比结论", result["reason"])
+
+    def test_media_existence_selfcheck_allows_fulfilled_send_action(self) -> None:
+        row = {"小区": "杨家新雅苑", "房号": "49-1102", "户型分类": "一室一厅"}
+
+        result = main._constraint_consistency_selfcheck(
+            content="杨家新雅苑49-1102视频有吗？先发我。",
+            draft_reply="杨家新雅苑49-1102的视频发你了，这是杨家新雅苑49-1102的视频，你可以先看一下。",
+            understanding={
+                "intent": "media",
+                "constraint_proof": {
+                    "communities": ["杨家新雅苑"],
+                    "room_refs": ["49-1102"],
+                    "wants_video": True,
+                },
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "target_rows": [row],
+                "video_paths": ["room_database/video/杨家新雅苑49-1102/demo.mp4"],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_clarification_selfcheck_does_not_require_inventory_answer(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="杨家府附近还有房子吗？客户名字可能说得不准。",
+            draft_reply=(
+                "你说的“杨家府”我这边有几个相近小区：兴业杨家府、杨乐府、"
+                "杨家新雅苑、杨乐府北区。你确认下是哪一个，我再按最新房源表查。"
+            ),
+            understanding={
+                "intent": "inventory",
+                "entity_resolution": {
+                    "community_options": [
+                        {
+                            "raw_text": "杨家府",
+                            "options": ["兴业杨家府", "杨乐府", "杨家新雅苑", "杨乐府北区"],
+                        }
+                    ]
+                },
+                "constraint_proof": {
+                    "areas": ["石桥街道/华丰/石桥/永佳/半山"],
+                    "communities": ["杨家府"],
+                },
+            },
+            tool_evidence={
+                "actions": ["clarification"],
+                "deterministic_reply_source": "rewrite_clarification",
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result.get("scope"), "clarification")
+
+    def test_clarification_selfcheck_requires_real_options_and_clear_request(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="杨家府附近还有房子吗？客户名字可能说得不准。",
+            draft_reply="我先查一下。",
+            understanding={
+                "intent": "inventory",
+                "entity_resolution": {
+                    "community_options": [
+                        {
+                            "raw_text": "杨家府",
+                            "options": ["兴业杨家府", "杨乐府", "杨家新雅苑", "杨乐府北区"],
+                        }
+                    ]
+                },
+                "constraint_proof": {
+                    "areas": ["石桥街道/华丰/石桥/永佳/半山"],
+                    "communities": ["杨家府"],
+                },
+            },
+            tool_evidence={
+                "actions": ["clarification"],
+                "deterministic_reply_source": "rewrite_clarification",
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("真实候选小区", result["reason"])
+        self.assertIn("补充或确认", result["reason"])
+
+    def test_community_correction_selfcheck_requires_transparent_reply(self) -> None:
+        row = {"小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅"}
+
+        result = main._constraint_consistency_selfcheck(
+            content="荣润府15-2-801B还在吗？1600那套视频发我。",
+            draft_reply="有的，棠润府15-2-801B还在，这是这套的视频，发你了。",
+            understanding={
+                "intent": "media",
+                "entity_resolution": {
+                    "community_corrections": [
+                        {"raw_text": "荣润府", "canonical": "棠润府", "reason": "unique_room_ref"}
+                    ]
+                },
+                "constraint_proof": {
+                    "communities": ["棠润府"],
+                    "room_refs": ["15-2-801b"],
+                    "wants_video": True,
+                },
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "target_rows": [row],
+                "video_paths": ["room_database/video/棠润府15-2-801B/demo.mp4"],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("透明说明", result["reason"])
+
+    def test_payment_selfcheck_accepts_price_before_payment_field(self) -> None:
+        row = {"小区": "棠润府", "房号": "15-2-801B", "押一付一": "1600", "押二付一": "1400"}
+
+        result = main._constraint_consistency_selfcheck(
+            content="棠润府15-2-801B还在吗？1600那套视频发我。",
+            draft_reply="还在的，这套是1600押一付一，1400押二付一，视频发你了。",
+            understanding={
+                "intent": "media",
+                "constraint_proof": {"communities": ["棠润府"], "room_refs": ["15-2-801b"], "wants_video": True},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "target_rows": [row],
+                "video_paths": ["room_database/video/棠润府15-2-801B/demo.mp4"],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_payment_selfcheck_rejects_wrong_price_before_payment_field(self) -> None:
+        failures = main._payment_field_consistency_failures(
+            "棠润府15-2-801B这套是1400押一付一，1600押二付一。",
+            [{"小区": "棠润府", "房号": "15-2-801B", "押一付一": "1600", "押二付一": "1400"}],
+        )
+
+        self.assertTrue(failures)
+        self.assertIn("押一付一应为1600", failures[0])
+
+    def test_payment_selfcheck_does_not_treat_room_no_as_price_before_field(self) -> None:
+        failures = main._payment_field_consistency_failures(
+            "石桥铭苑6-1102押一付一月租4800元。",
+            [{"小区": "石桥铭苑", "房号": "6-1102", "押一付一": "4800", "押二付一": "4300"}],
+        )
+
+        self.assertEqual(failures, [])
+
+    def test_budget_selfcheck_rejects_over_budget_wording_for_in_budget_price(self) -> None:
+        failures = main._budget_payment_scope_failures(
+            reply_text="大华海派风景2-1-402A押一付一1600元也刚过预算。",
+            evidence_rows=[
+                {"小区": "大华海派风景", "房号": "2-1-402A", "押一付一": "1600", "押二付一": "1500"}
+            ],
+            budget_range=[0, 1800],
+        )
+
+        self.assertTrue(failures)
+        self.assertIn("不能说超预算", failures[0])
+
+    def test_budget_selfcheck_rejects_exceed_wording_for_in_budget_price(self) -> None:
+        failures = main._budget_payment_scope_failures(
+            reply_text="大华海派风景2-1-402A押一付一1600元超出预算，押二付一1500元在预算内。",
+            evidence_rows=[
+                {"小区": "大华海派风景", "房号": "2-1-402A", "押一付一": "1600", "押二付一": "1500"}
+            ],
+            budget_range=[0, 1800],
+        )
+
+        self.assertTrue(failures)
+        self.assertIn("不能说超预算", failures[0])
+
+    async def test_exact_room_ref_falls_back_to_user_raw_when_rewrite_corrupts_room_no(self) -> None:
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 8):
+                self.last_query = query
+                return []
+
+            async def all_rows(self, *, limit: int = 500, refresh_if_needed: bool = True):
+                return [
+                    {
+                        "小区": "杨家新雅苑",
+                        "房号": "15-1-603",
+                        "户型分类": "三室一厅",
+                        "押一付一": "5300",
+                        "押二付一": "5000",
+                    }
+                ]
+
+        class FakeMediaStore:
+            def list_room_database_videos(self, query: str, limit: int = 6):
+                if "杨家新雅苑15-1-603" in query:
+                    return [Path("room_database/video/杨家新雅苑15-1-603/demo.mp4")]
+                return []
+
+            def list_room_database_images(self, query: str, limit: int = 6):
+                return []
+
+        originals = {"inventory": main.inventory, "media_store": main.media_store}
+        main.inventory = FakeInventory()
+        main.media_store = FakeMediaStore()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                content="杨家新雅苑15-1-603有没有视频？客户预算5300左右。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "杨家新雅苑15-603 视频",
+                    "rewritten_query": "杨家新雅苑15-603 视频",
+                    "constraint_proof": {"wants_video": True, "room_refs": ["15-603"]},
+                    "structured_task": {
+                        "intent": "media",
+                        "original_text": "杨家新雅苑15-1-603有没有视频？客户预算5300左右。",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = originals["inventory"]
+            main.media_store = originals["media_store"]
+
+        self.assertEqual(evidence["target_rows"][0]["房号"], "15-1-603")
+        self.assertEqual(
+            [path.replace("\\", "/") for path in evidence["video_paths"]],
+            ["room_database/video/杨家新雅苑15-1-603/demo.mp4"],
+        )
+
+    async def test_room_ref_mismatch_in_exact_community_asks_similar_room_confirmation(self) -> None:
+        class FakeInventory:
+            async def all_rows(self, *, limit: int = 500, refresh_if_needed: bool = True):
+                return [
+                    {"区域": "石桥街道\n华丰 石桥\n永佳 半山", "小区": "杨家新雅苑", "房号": "15-603"},
+                    {"区域": "石桥街道\n华丰 石桥\n永佳 半山", "小区": "杨家新雅苑", "房号": "49-1102"},
+                ]
+
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "media",
+                    "rewritten_query": "杨家新雅苑15-1-603视频",
+                    "effective_query": "杨家新雅苑15-1-603视频",
+                    "query_state": {"intent": "media", "layout": "一室一厅", "wants_video": True},
+                    "needs_clarification": False,
+                    "clarification_text": "",
                 }
+
+        originals = {"inventory": main.inventory, "reply_generator": main.reply_generator}
+        main.inventory = FakeInventory()
+        main.reply_generator = FakeReplyGenerator()
+        try:
+            result = await main._understand_message(
+                content="杨家新雅苑15-1-603有没有视频？客户预算5300左右。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("杨家新雅苑15-1-603有没有视频？客户预算5300左右。"),
             )
-        )
-        self.assertFalse(
-            should_auto_reply_kf_message(
-                {
-                    "open_kfid": "kf_xxx",
-                    "external_userid": "wm_xxx",
-                    "origin": 3,
-                    "msgtype": "image",
+        finally:
+            main.inventory = originals["inventory"]
+            main.reply_generator = originals["reply_generator"]
+
+        self.assertTrue(result["needs_clarification"])
+        self.assertIn("杨家新雅苑15-603", result["clarification_text"])
+        self.assertIn("确认是不是这套", result["clarification_text"])
+
+    async def test_risky_similar_community_asks_confirmation_instead_of_not_found(self) -> None:
+        class FakeInventory:
+            async def all_rows(self, *, limit: int = 500, refresh_if_needed: bool = True):
+                return [
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "棠润府",
+                        "房号": "15-2-801B",
+                        "押一付一": "1600",
+                        "押二付一": "1400",
+                    }
+                ]
+
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "荣润府有没有押一付一的？预算1600到1800。",
+                    "effective_query": "荣润府有没有押一付一的？预算1600到1800。",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": False,
+                    "clarification_text": "",
                 }
+
+        originals = {"inventory": main.inventory, "reply_generator": main.reply_generator}
+        main.inventory = FakeInventory()
+        main.reply_generator = FakeReplyGenerator()
+        try:
+            result = await main._understand_message(
+                content="荣润府有没有押一付一的？预算1600到1800。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("荣润府有没有押一付一的？预算1600到1800。"),
             )
-        )
+        finally:
+            main.inventory = originals["inventory"]
+            main.reply_generator = originals["reply_generator"]
 
-    def test_detects_kf_message_event(self) -> None:
-        self.assertTrue(
-            is_kf_message_event(
-                {"Event": "kf_msg_or_event", "Token": "callback-token"}
-            )
-        )
-        self.assertFalse(is_kf_message_event({"Event": "change_external_contact"}))
+        self.assertTrue(result["needs_clarification"])
+        self.assertIn("棠润府", result["clarification_text"])
+        self.assertIn("你说的是", result["clarification_text"])
+        self.assertNotIn("暂时没查到荣润府", result["clarification_text"])
 
-    def test_builds_send_text_payload(self) -> None:
-        client = WeComKfClient()
-        self.assertEqual(
-            client.build_text_payload("kf_xxx", "wm_xxx", "你好"),
-            {
-                "touser": "wm_xxx",
-                "open_kfid": "kf_xxx",
-                "msgtype": "text",
-                "text": {"content": "你好"},
-            },
-        )
+    async def test_collect_room_media_syncs_current_room_from_feishu_when_local_missing(self) -> None:
+        class FakeMediaStore:
+            def __init__(self) -> None:
+                self.synced = False
+                self.path = Path("room_database/video/棠润府15-2-801B/demo.mp4")
 
-    def test_builds_send_image_payload(self) -> None:
-        client = WeComKfClient()
-        self.assertEqual(
-            client.build_image_payload("kf_xxx", "wm_xxx", "media_xxx"),
-            {
-                "touser": "wm_xxx",
-                "open_kfid": "kf_xxx",
-                "msgtype": "image",
-                "image": {"media_id": "media_xxx"},
-            },
-        )
+            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
+                return [self.path] if self.synced and "棠润府15-2-801B" in query else []
 
-    def test_builds_send_video_payload(self) -> None:
-        client = WeComKfClient()
-        self.assertEqual(
-            client.build_video_payload("kf_xxx", "wm_xxx", "media_xxx"),
-            {
-                "touser": "wm_xxx",
-                "open_kfid": "kf_xxx",
-                "msgtype": "video",
-                "video": {"media_id": "media_xxx"},
-            },
-        )
+            def list_room_database_images(self, query: str, limit: int = 6) -> list[Path]:
+                return []
 
+        class FakeFeishuClient:
+            sync_calls: list[dict] = []
 
-class WeComKfVideoHelperTests(unittest.TestCase):
-    def test_detects_video_requests(self) -> None:
-        self.assertTrue(main._wants_video("小洋坝视频发一下"))
-        self.assertTrue(main._wants_video("小洋坝视屏发一下"))
-        self.assertTrue(main._wants_video("这套有实拍吗"))
-        self.assertTrue(main._wants_video("华丰人家603笔记发一下"))
-        self.assertFalse(main._wants_video("小洋坝还有房子吗"))
+            async def sync_media_for_rooms(self, rows, *, media_kind=None, target_root=None):
+                self.sync_calls.append({"source": "all", "rows": rows, "media_kind": media_kind})
+                return {"downloaded": [], "skipped": [], "missing": []}
 
-    def test_detects_inventory_image_requests(self) -> None:
-        self.assertTrue(main._wants_inventory_image("我要的是房源表"))
-        self.assertFalse(main._wants_inventory_image("一张图片"))
-        self.assertFalse(main._wants_inventory_image("照片发一下"))
-        self.assertTrue(main._wants_inventory_image("表发一下"))
-        self.assertTrue(main._wants_inventory_image("发一下表"))
-        self.assertTrue(main._wants_inventory_image("给我最新表"))
-        self.assertFalse(main._wants_inventory_image("小洋坝视频发一下"))
-        self.assertFalse(main._wants_inventory_image("我只是发表一下意见"))
-        self.assertFalse(main._wants_inventory_image("电表怎么看"))
-
-    def test_detects_satisfied_feedback_without_questions(self) -> None:
-        self.assertTrue(main._is_satisfied_feedback("这个视频还可以"))
-        self.assertTrue(main._is_satisfied_feedback("满意"))
-        self.assertFalse(main._is_satisfied_feedback("不满意"))
-        self.assertFalse(main._is_satisfied_feedback("能短租吗？"))
-        self.assertFalse(main._is_satisfied_feedback("你好"))
-
-    def test_detects_greeting_only(self) -> None:
-        self.assertTrue(main._is_greeting_only("你好"))
-        self.assertTrue(main._is_greeting_only("您好呀～"))
-        self.assertFalse(main._is_greeting_only("你好，永佳还有房吗"))
-
-    def test_polishes_note_wording_and_unavailable_viewing_contact(self) -> None:
-        reply = main._polish_kf_reply_text(
-            "永佳这套现在能看房吗，帮我联系一下",
-            "永佳新苑2-703现在暂时看不了，6月2号才空出。需要我再发下详细笔记吗？",
-        )
-
-        self.assertIn("房间详细信息", reply)
-        self.assertNotIn("笔记", reply)
-        self.assertIn("18758141785", reply)
-        self.assertIn("13282125992", reply)
-        self.assertIn("19941091943", reply)
-        self.assertNotIn("？。", reply)
-        self.assertIn("房间详细信息吗？\n\n这类还没空出的房子", reply)
-
-    def test_polishes_missing_video_claim_when_material_exists(self) -> None:
-        reply = main._polish_kf_reply_text(
-            "琬秋",
-            "琬秋铭府3-702B目前没视频，看房要提前联系。你是想约时间看这套吗？",
-            has_available_video=True,
-        )
-
-        self.assertIn("我这边有对应视频", reply)
-        self.assertNotIn("没视频", reply)
-
-    def test_detects_video_context_correction(self) -> None:
-        self.assertTrue(
-            main._is_dissatisfied_or_correction(
-                "你这个视频存放的文件夹名字不就是小区和房间号吗，"
-                "你怎么还问我要看哪个小区？"
-            )
-        )
-
-    def test_does_not_treat_availability_question_as_dissatisfaction(self) -> None:
-        self.assertFalse(main._is_dissatisfied_or_correction("万达还有没有带阳台的房间"))
-        self.assertFalse(main._is_dissatisfied_or_correction("这个可以短租吗"))
-        self.assertTrue(main._is_dissatisfied_or_correction("不满意，没有直接把视频发给我"))
-
-    def test_builds_room_database_public_video_urls(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            previous_root = main.settings.room_database_path
-            previous_base_url = main.settings.public_base_url
-            try:
-                main.settings.room_database_path = Path(directory)
-                main.settings.public_base_url = "https://example.com/"
-                video_path = Path(directory) / "video" / "小洋坝二区6-901-4" / "微信视频.mp4"
-                video_path.parent.mkdir(parents=True)
-                video_path.write_bytes(b"video")
-
-                self.assertEqual(
-                    main._room_database_public_urls([video_path]),
-                    [
-                        "https://example.com/room-database/video/"
-                        "%E5%B0%8F%E6%B4%8B%E5%9D%9D%E4%BA%8C%E5%8C%BA6-901-4/"
-                        "%E5%BE%AE%E4%BF%A1%E8%A7%86%E9%A2%91.mp4"
-                    ],
+            async def sync_drive_media_for_rooms(self, rows, *, media_kind=None, folder_token=None, target_root=None):
+                fake_media_store.synced = True
+                self.sync_calls.append(
+                    {
+                        "source": "region_drive",
+                        "rows": rows,
+                        "media_kind": media_kind,
+                        "folder_token": folder_token,
+                    }
                 )
-            finally:
-                main.settings.room_database_path = previous_root
-                main.settings.public_base_url = previous_base_url
+                return {"downloaded": [str(fake_media_store.path)], "skipped": [], "missing": []}
 
+        fake_media_store = FakeMediaStore()
+        original_media_store = main.media_store
+        original_client = main.FeishuClient
+        original_region_token = main.settings.feishu_region_sync_target_drive_folder_token
+        main.media_store = fake_media_store
+        main.FeishuClient = FakeFeishuClient
+        main.settings.feishu_region_sync_target_drive_folder_token = "region-token"
+        try:
+            paths, rows, missing, sync_result = await main._collect_room_media(
+                [{"小区": "棠润府", "房号": "15-2-801B"}],
+                media_kind="video",
+            )
+        finally:
+            main.media_store = original_media_store
+            main.FeishuClient = original_client
+            main.settings.feishu_region_sync_target_drive_folder_token = original_region_token
 
-class WeComKfEventHandlingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_saves_cursor_after_successful_processing(self) -> None:
-        class FakeStateStore:
+        self.assertEqual(paths, [Path("room_database/video/棠润府15-2-801B/demo.mp4")])
+        self.assertEqual(rows, [{"小区": "棠润府", "房号": "15-2-801B"}])
+        self.assertEqual(missing, [])
+        self.assertIn("region_drive", sync_result)
+        self.assertEqual(FakeFeishuClient.sync_calls[-1]["folder_token"], "region-token")
+
+    async def test_collect_room_media_returns_local_hits_without_blocking_missing_sync(self) -> None:
+        class FakeMediaStore:
+            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
+                if "棠润府15-2-801B" in query:
+                    return [Path("room_database/video/棠润府15-2-801B/demo.mp4")]
+                return []
+
+            def list_room_database_images(self, query: str, limit: int = 6) -> list[Path]:
+                return []
+
+        class FakeFeishuClient:
+            sync_calls: list[dict] = []
+
+            async def sync_media_for_rooms(self, rows, *, media_kind=None, target_root=None):
+                self.sync_calls.append({"source": "all", "rows": rows, "media_kind": media_kind})
+                return {"downloaded": [], "skipped": [], "missing": []}
+
+        rows = [
+            {"小区": "棠润府", "房号": "15-2-801B"},
+            {"小区": "星桥锦绣嘉苑", "房号": "17-503B"},
+        ]
+        originals = {
+            "media_store": main.media_store,
+            "FeishuClient": main.FeishuClient,
+            "region_token": main.settings.feishu_region_sync_target_drive_folder_token,
+        }
+        main.media_store = FakeMediaStore()
+        main.FeishuClient = FakeFeishuClient
+        main.settings.feishu_region_sync_target_drive_folder_token = ""
+        try:
+            paths, matched_rows, missing, sync_result = await main._collect_room_media(
+                rows,
+                media_kind="video",
+            )
+        finally:
+            main.media_store = originals["media_store"]
+            main.FeishuClient = originals["FeishuClient"]
+            main.settings.feishu_region_sync_target_drive_folder_token = originals["region_token"]
+
+        self.assertEqual(paths, [Path("room_database/video/棠润府15-2-801B/demo.mp4")])
+        self.assertEqual(matched_rows, [rows[0]])
+        self.assertEqual(missing, ["星桥锦绣嘉苑17-503B"])
+        self.assertEqual(sync_result, {})
+        self.assertEqual(FakeFeishuClient.sync_calls, [])
+
+    async def test_inventory_sheet_signal_overrides_llm_clarification(self) -> None:
+        class FakeReplyGenerator:
             def __init__(self) -> None:
-                self.processed: list[str] = []
-                self.cursor = ""
+                self.kwargs: dict = {}
 
-            def mark_processed(self, msgid: str) -> None:
-                self.processed.append(msgid)
+            async def rewrite_kf_message(self, **kwargs):
+                self.kwargs = kwargs
+                return {
+                    "intent": "unclear",
+                    "rewritten_query": "房源表发一下",
+                    "query_state": {"intent": "unclear"},
+                    "needs_clarification": True,
+                    "clarification_text": "你想看哪个小区？",
+                }
 
-            def save_cursor(self, cursor: str) -> None:
-                self.cursor = cursor
-
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.state_store = FakeStateStore()
-                self.last_next_cursor = "cursor-next"
-
-            async def sync_messages(self, open_kfid: str, token: str) -> list[dict]:
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
                 return [
                     {
-                        "msgid": "msg-1",
-                        "open_kfid": open_kfid,
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "表发一下"},
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "合幢悦府",
+                        "房号": "6-1-1204B",
                     }
                 ]
 
-        previous_client = main.wecom_kf
-        previous_handler = main.handle_kf_message
-        fake_client = FakeKfClient()
-        handled: list[str] = []
+            def cache_meta(self) -> dict:
+                return {"status": "success", "row_count": 1}
 
-        async def fake_handler(message: dict) -> None:
-            handled.append(message["msgid"])
-
+        fake = FakeReplyGenerator()
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = fake
+        main.inventory = FakeInventory()
         try:
-            main.wecom_kf = fake_client
-            main.handle_kf_message = fake_handler
-            await main.handle_kf_event({"OpenKfId": "kf_xxx", "Token": "token"})
-
-            self.assertEqual(handled, ["msg-1"])
-            self.assertEqual(fake_client.state_store.processed, ["msg-1"])
-            self.assertEqual(fake_client.state_store.cursor, "cursor-next")
+            result = await main._understand_message(
+                content="房源表发一下",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("房源表发一下"),
+            )
         finally:
-            main.wecom_kf = previous_client
-            main.handle_kf_message = previous_handler
+            for name, value in originals.items():
+                setattr(main, name, value)
 
-    async def test_keeps_cursor_when_processing_fails(self) -> None:
-        class FakeStateStore:
+        self.assertEqual(result["intent"], "inventory_sheet")
+        self.assertFalse(result["needs_clarification"])
+        self.assertTrue(result["query_state"]["wants_inventory_sheet"])
+        inventory_index = fake.kwargs["inventory_index"]
+        self.assertTrue(inventory_index["sheet_request"])
+        self.assertEqual(inventory_index["row_count"], 1)
+        self.assertEqual(inventory_index["communities"][0]["name"], "合幢悦府")
+
+    async def test_rewrite_layer_receives_latest_inventory_fact_index(self) -> None:
+        class FakeReplyGenerator:
             def __init__(self) -> None:
-                self.processed: list[str] = []
-                self.cursor = ""
+                self.kwargs: dict = {}
 
-            def mark_processed(self, msgid: str) -> None:
-                self.processed.append(msgid)
+            async def rewrite_kf_message(self, **kwargs):
+                self.kwargs = kwargs
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "万达1500左右有哪些",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": False,
+                }
 
-            def save_cursor(self, cursor: str) -> None:
-                self.cursor = cursor
-
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.state_store = FakeStateStore()
-                self.last_next_cursor = "cursor-next"
-
-            async def sync_messages(self, open_kfid: str, token: str) -> list[dict]:
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
                 return [
                     {
-                        "msgid": "msg-1",
-                        "open_kfid": open_kfid,
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "表发一下"},
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "合幢悦府",
+                        "房号": "6-1-1204B",
+                        "户型": "一室一厅",
+                        "押一付": "1500",
+                    },
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "荣润府",
+                        "房号": "15-2-801B",
+                        "户型": "一室一厅",
+                        "押一付": "1600",
+                    },
+                ]
+
+            def cache_meta(self) -> dict:
+                return {"status": "success", "row_count": 2}
+
+        fake = FakeReplyGenerator()
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = fake
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="万达1500左右有哪些",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("万达1500左右有哪些"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        inventory_index = fake.kwargs["inventory_index"]
+        self.assertEqual(inventory_index["row_count"], 2)
+        self.assertIn("区域", inventory_index["field_catalog"])
+        self.assertEqual(inventory_index["exact_area_hits"][0]["canonical"], "拱墅万达\n北部软件园\n城北万象城")
+        community_names = {item["name"] for item in inventory_index["communities"]}
+        self.assertEqual(community_names, {"合幢悦府", "荣润府"})
+        self.assertEqual(result["constraint_proof"]["area"], "拱墅万达\n北部软件园\n城北万象城")
+
+    async def test_contextual_followup_replaces_budget_and_keeps_area_layout(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "unclear",
+                    "rewritten_query": "4000-5000 的呢",
+                    "query_state": {"intent": "unclear"},
+                    "needs_clarification": True,
+                    "clarification_text": "你确认下小区+房号，我再查。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "东新园\n杭氧\n新天地",
+                        "小区": "新柠长木府",
+                        "房号": "3-1002A",
+                        "户型分类": "两室一厅",
+                        "押一付一": "4600",
+                        "押二付一": "4300",
+                    },
+                    {
+                        "区域": "东新园\n杭氧\n新天地",
+                        "小区": "长浜龙吟轩",
+                        "房号": "11-1603",
+                        "户型分类": "两室一厅",
+                        "押一付一": "4200",
+                        "押二付一": "3900",
+                    },
+                ]
+
+            def cache_meta(self) -> dict:
+                return {"status": "success", "row_count": 2}
+
+        previous_reply = (
+            "有的，东新园、杭氧、新天地、3500-4500左右、两室我查到这些还在租：\n"
+            "1. 诸葛龙吟院10-601A，两室一厅，押一付一3700，押二付一3400\n"
+            "2. 长浜龙吟轩11-1603，两室一厅，押一付一4200，押二付一3900\n"
+            "你要视频、图片或者看房方式的话，直接回序号或小区+房号就行。"
+        )
+        context = kf_context_memory.empty_context()
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="user",
+            content="新天地有什么4000左右的两室",
+        )
+        context = kf_context_memory.start_structured_turn(
+            context,
+            state={},
+            user_input={"content": "新天地有什么4000左右的两室"},
+            rewrite_result={
+                "intent": "inventory",
+                "rewritten_query": "东新园/杭氧/新天地 3500-4500 两室 在租房源",
+                "query_state": {
+                    "intent": "inventory",
+                    "area": "东新园\n杭氧\n新天地",
+                    "budget_range": [3500, 4500],
+                    "layout": "两室",
+                },
+            },
+        )
+        context = kf_context_memory.record_structured_assistant_output(
+            context,
+            final_reply=previous_reply,
+        )
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="assistant",
+            content=previous_reply,
+        )
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="4000-5000 的呢",
+                context=context,
+                signals=main._deterministic_signals("4000-5000 的呢"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["intent"], "inventory")
+        self.assertIn("东新园", result["effective_query"])
+        self.assertIn("4000-5000", result["effective_query"])
+        self.assertIn("两室", result["effective_query"])
+        self.assertEqual(result["query_state"]["budget_range"], [4000, 5000])
+        self.assertEqual(result["query_state"]["layout"], "两室")
+        self.assertEqual(result["constraint_proof"]["budget_range"], [4000, 5000])
+        self.assertEqual(result["constraint_proof"]["layout"], "两室")
+
+    async def test_contextual_followup_inventory_index_uses_blackbox_constraints_before_llm(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                captured.update(kwargs)
+                return {
+                    "intent": "unclear",
+                    "rewritten_query": "4000-5000 \u7684\u5462",
+                    "query_state": {"intent": "unclear"},
+                    "needs_clarification": True,
+                    "clarification_text": "\u4f60\u786e\u8ba4\u4e0b\u5c0f\u533a+\u623f\u53f7\uff0c\u6211\u518d\u67e5\u3002",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "\u533a\u57df": "\u4e1c\u65b0\u56ed\n\u676d\u6c27\n\u65b0\u5929\u5730",
+                        "\u5c0f\u533a": "\u65b0\u67e0\u957f\u6728\u5e9c",
+                        "\u623f\u53f7": "3-1002A",
+                        "\u6237\u578b\u5206\u7c7b": "\u4e24\u5ba4\u4e00\u5385",
+                        "\u62bc\u4e00\u4ed8\u4e00": "4600",
+                        "\u62bc\u4e8c\u4ed8\u4e00": "4300",
                     }
                 ]
 
-        previous_client = main.wecom_kf
-        previous_handler = main.handle_kf_message
-        fake_client = FakeKfClient()
+            def cache_meta(self) -> dict:
+                return {"status": "success", "row_count": 1}
 
-        async def failing_handler(message: dict) -> None:
-            raise RuntimeError("send failed")
+        previous_reply = (
+            "\u6709\u7684\uff0c\u4e1c\u65b0\u56ed\u3001\u676d\u6c27\u3001\u65b0\u5929\u5730\u3001"
+            "3500-4500\u5de6\u53f3\u3001\u4e24\u5ba4\u6211\u67e5\u5230\u8fd9\u4e9b\u8fd8\u5728\u79df\uff1a\n"
+            "1. \u65b0\u67e0\u957f\u6728\u5e9c3-1002A\uff0c\u4e24\u5ba4\u4e00\u5385\uff0c\u62bc\u4e00\u4ed8\u4e004600\uff0c\u62bc\u4e8c\u4ed8\u4e004300\n"
+            "\u4f60\u8981\u89c6\u9891\u3001\u56fe\u7247\u6216\u8005\u770b\u623f\u65b9\u5f0f\u7684\u8bdd\uff0c\u76f4\u63a5\u56de\u5e8f\u53f7\u6216\u5c0f\u533a+\u623f\u53f7\u5c31\u884c\u3002"
+        )
+        context = kf_context_memory.empty_context()
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="user",
+            content="\u65b0\u5929\u5730\u6709\u4ec0\u4e483500\u5de6\u53f3\u7684\u4e24\u5ba4\uff1f",
+        )
+        context = kf_context_memory.start_structured_turn(
+            context,
+            state={},
+            user_input={"content": "\u65b0\u5929\u5730\u6709\u4ec0\u4e483500\u5de6\u53f3\u7684\u4e24\u5ba4\uff1f"},
+            rewrite_result={
+                "intent": "inventory",
+                "rewritten_query": "\u4e1c\u65b0\u56ed/\u676d\u6c27/\u65b0\u5929\u5730 3500-4500 \u4e24\u5ba4 \u5728\u79df\u623f\u6e90",
+                "query_state": {
+                    "intent": "inventory",
+                    "area": "\u4e1c\u65b0\u56ed\n\u676d\u6c27\n\u65b0\u5929\u5730",
+                    "budget_range": [3500, 4500],
+                    "layout": "\u4e24\u5ba4",
+                },
+            },
+        )
+        context = kf_context_memory.record_structured_assistant_output(
+            context,
+            final_reply=previous_reply,
+        )
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="assistant",
+            content=previous_reply,
+        )
 
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
         try:
-            main.wecom_kf = fake_client
-            main.handle_kf_message = failing_handler
-            await main.handle_kf_event({"OpenKfId": "kf_xxx", "Token": "token"})
-
-            self.assertEqual(fake_client.state_store.processed, [])
-            self.assertEqual(fake_client.state_store.cursor, "")
+            await main._understand_message(
+                content="4000-5000 \u7684\u5462",
+                context=context,
+                signals=main._deterministic_signals("4000-5000 \u7684\u5462"),
+            )
         finally:
-            main.wecom_kf = previous_client
-            main.handle_kf_message = previous_handler
+            for name, value in originals.items():
+                setattr(main, name, value)
 
-    async def test_skips_send_limit_message_and_saves_cursor(self) -> None:
-        class FakeStateStore:
-            def __init__(self) -> None:
-                self.processed: list[str] = []
-                self.cursor = ""
+        inventory_index = captured["inventory_index"]
+        self.assertIn("4000-5000", inventory_index["rewrite_index_query"])
+        self.assertIn("\u65b0\u5929\u5730", inventory_index["rewrite_index_query"])
+        self.assertIn("\u4e24\u5ba4", inventory_index["rewrite_index_query"])
+        self.assertTrue(
+            any(
+                "\u65b0\u5929\u5730" in str(item.get("canonical") or "")
+                for item in inventory_index["exact_area_hits"]
+            )
+        )
 
-            def mark_processed(self, msgid: str) -> None:
-                self.processed.append(msgid)
+    async def test_contextual_followup_prefers_blackbox_context_over_wrong_llm_guess(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "拱墅万达 4000-5000 一室 在租房源",
+                    "query_state": {
+                        "intent": "inventory",
+                        "area": "拱墅万达\n北部软件园\n城北万象城",
+                        "budget_range": [4000, 5000],
+                        "layout": "一室",
+                    },
+                    "needs_clarification": False,
+                    "clarification_text": "",
+                }
 
-            def save_cursor(self, cursor: str) -> None:
-                self.cursor = cursor
-
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.state_store = FakeStateStore()
-                self.last_next_cursor = "cursor-next"
-
-            async def sync_messages(self, open_kfid: str, token: str) -> list[dict]:
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
                 return [
                     {
-                        "msgid": "msg-1",
-                        "open_kfid": open_kfid,
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "石桥铭苑6-1102"},
+                        "区域": "东新园\n杭氧\n新天地",
+                        "小区": "新柠长木府",
+                        "房号": "3-1002A",
+                        "户型分类": "两室一厅",
+                        "押一付一": "4600",
+                        "押二付一": "4300",
+                    },
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "荣润府",
+                        "房号": "15-2-801B",
+                        "户型分类": "一室一厅",
+                        "押一付一": "1600",
+                        "押二付一": "1400",
+                    },
+                ]
+
+            def cache_meta(self) -> dict:
+                return {"status": "success", "row_count": 2}
+
+        previous_reply = (
+            "有的，东新园、杭氧、新天地、3500-4500左右、两室我查到这些还在租：\n"
+            "1. 长浜龙吟轩11-1603，两室一厅，押一付一4200，押二付一3900\n"
+            "2. 新柠长木府3-1002A，两室一厅，押一付一4600，押二付一4300\n"
+            "你要视频、图片或者看房方式的话，直接回序号或小区+房号就行。"
+        )
+        context = kf_context_memory.empty_context()
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="user",
+            content="新天地有什么4000左右的两室",
+        )
+        context = kf_context_memory.start_structured_turn(
+            context,
+            state={},
+            user_input={"content": "新天地有什么4000左右的两室"},
+            rewrite_result={
+                "intent": "inventory",
+                "rewritten_query": "东新园/杭氧/新天地 3500-4500 两室 在租房源",
+                "query_state": {
+                    "intent": "inventory",
+                    "area": "东新园\n杭氧\n新天地",
+                    "budget_range": [3500, 4500],
+                    "layout": "两室",
+                },
+            },
+        )
+        context = kf_context_memory.record_structured_assistant_output(
+            context,
+            final_reply=previous_reply,
+        )
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="assistant",
+            content=previous_reply,
+        )
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="4000-5000 的呢",
+                context=context,
+                signals=main._deterministic_signals("4000-5000 的呢"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["intent"], "inventory")
+        self.assertIn("东新园", result["effective_query"])
+        self.assertIn("4000-5000", result["effective_query"])
+        self.assertIn("两室", result["effective_query"])
+        self.assertNotIn("拱墅万达", result["effective_query"])
+        self.assertEqual(result["query_state"]["area"], "东新园\n杭氧\n新天地")
+        self.assertEqual(result["query_state"]["layout"], "两室")
+        self.assertEqual(result["constraint_proof"]["area"], "东新园\n杭氧\n新天地")
+        self.assertEqual(result["constraint_proof"]["layout"], "两室")
+
+    async def test_new_explicit_area_query_drops_unasked_inherited_budget(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "石桥街道/华丰/石桥/永佳/半山 4800-5800 带燃气一室一厅 在租房源",
+                    "query_state": {
+                        "intent": "inventory",
+                        "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "budget_range": [4800, 5800],
+                        "budget": "4800-5800",
+                        "layout": "一室一厅",
+                        "features": ["燃气"],
+                    },
+                    "needs_clarification": False,
+                    "clarification_text": "",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "小区": "华丰欣苑",
+                        "房号": "14-2-901",
+                        "户型描述": "一室一厅带燃气",
+                        "户型分类": "一室一厅",
+                        "押一付一": "4200",
+                        "押二付一": "3900",
                     }
                 ]
 
-        previous_client = main.wecom_kf
-        previous_handler = main.handle_kf_message
-        previous_store = main.wecom_kf_context_store
-        fake_client = FakeKfClient()
+            def cache_meta(self) -> dict:
+                return {"status": "success", "row_count": 1}
 
-        async def send_limited_handler(message: dict) -> None:
-            raise WeComKfSendLimitError("send msg count limit")
+        previous_reply = "还在，石桥铭苑6-1102一室一厅，押一付一4800元，押二付一4300元，民用水电。"
+        context = kf_context_memory.empty_context()
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="user",
+            content="石桥铭苑6-1102还在吗？押一押二价格发下。",
+        )
+        context = kf_context_memory.start_structured_turn(
+            context,
+            state={},
+            user_input={"content": "石桥铭苑6-1102还在吗？押一押二价格发下。"},
+            rewrite_result={
+                "intent": "inventory",
+                "rewritten_query": "石桥铭苑6-1102 价格",
+                "query_state": {"intent": "inventory"},
+                "needs_clarification": True,
+            },
+        )
+        context = kf_context_memory.record_structured_assistant_output(
+            context,
+            final_reply="最新房源表没查到杨家新雅苑15-1-603这套，只匹配到相近房号：杨家新雅苑15-603。你确认是不是这套？",
+        )
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="assistant",
+            content="最新房源表没查到杨家新雅苑15-1-603这套，只匹配到相近房号：杨家新雅苑15-603。你确认是不是这套？",
+        )
 
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
         try:
-            with tempfile.TemporaryDirectory() as directory:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
-                main.wecom_kf_conversation_memory.clear()
-                main.handle_kf_message = send_limited_handler
-                await main.handle_kf_event({"OpenKfId": "kf_xxx", "Token": "token"})
-
-                self.assertEqual(fake_client.state_store.processed, ["msg-1"])
-                self.assertEqual(fake_client.state_store.cursor, "cursor-next")
-                context = main.wecom_kf_context_store.get("kf_xxx:wm_xxx")
-                self.assertIn("send_limited", context)
-                self.assertIn("石桥铭苑6-1102", context["send_limited"]["summary"])
+            result = await main._understand_message(
+                content="华丰附近有没有带燃气的一室一厅？",
+                context=context,
+                signals=main._deterministic_signals("华丰附近有没有带燃气的一室一厅？"),
+            )
         finally:
-            main.wecom_kf = previous_client
-            main.wecom_kf_context_store = previous_store
-            main.wecom_kf_conversation_memory.clear()
-            main.handle_kf_message = previous_handler
+            for name, value in originals.items():
+                setattr(main, name, value)
 
-    async def test_serializes_concurrent_kf_callbacks(self) -> None:
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["intent"], "inventory")
+        self.assertNotIn("4800", result["effective_query"])
+        self.assertNotIn("5800", result["effective_query"])
+        self.assertNotIn("budget_range", result["query_state"])
+        self.assertNotIn("budget_range", result["constraint_proof"])
+        self.assertEqual(result["constraint_proof"]["area"], "石桥街道\n华丰\n石桥\n永佳\n半山")
+        self.assertEqual(result["constraint_proof"]["layout"], "一室一厅")
+        self.assertIn("燃气", result["constraint_proof"]["features"])
+
+    def test_candidate_hint_returns_multiple_rows_for_explicit_same_community(self) -> None:
+        candidates = [
+            {"小区": "兴业杨家府", "房号": "3-601"},
+            {"小区": "兴业杨家府", "房号": "10-1-304"},
+            {"小区": "杨家新雅苑", "房号": "15-1-603"},
+        ]
+
+        rows = main._candidate_rows_from_context_hint(
+            candidates=candidates,
+            query_text="兴业杨家府的呢",
+            proof={"communities": ["兴业杨家府"]},
+            context_reference=True,
+        )
+
+        self.assertEqual([row["房号"] for row in rows], ["3-601", "10-1-304"])
+
+    def test_candidate_hint_all_returns_previous_candidates(self) -> None:
+        candidates = [
+            {"小区": "兴业杨家府", "房号": "3-601"},
+            {"小区": "杨家新雅苑", "房号": "15-1-603"},
+        ]
+
+        rows = main._candidate_rows_from_context_hint(
+            candidates=candidates,
+            query_text="这两个都发我",
+            proof={},
+            context_reference=True,
+        )
+
+        self.assertEqual(rows, candidates)
+
+    async def test_candidate_selection_media_followup_does_not_become_community_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "media",
+                    "rewritten_query": "拱墅万达/北部软件园/城北万象城 0-2000 一室 视频",
+                    "query_state": {
+                        "intent": "media",
+                        "area": "拱墅万达\n北部软件园\n城北万象城",
+                        "budget": "0-2000",
+                        "layout": "一室",
+                        "wants_video": True,
+                    },
+                    "needs_clarification": True,
+                    "clarification_text": "最新房源表里暂时没查到前两套这个小区。",
+                }
+
+        candidates = [
+            {"区域": "拱墅万达\n北部软件园\n城北万象城", "小区": "瑷颐湾", "房号": "13-1-402A", "户型分类": "一室", "押一付一": "600"},
+            {"区域": "拱墅万达\n北部软件园\n城北万象城", "小区": "大华海派风景", "房号": "2-1-402A", "户型分类": "一室", "押一付一": "1600"},
+            {"区域": "拱墅万达\n北部软件园\n城北万象城", "小区": "星桥锦绣嘉苑", "房号": "20-1606A", "户型分类": "一室一厅", "押一付一": "1900"},
+        ]
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return candidates
+
+            def cache_meta(self) -> dict:
+                return {"status": "success", "row_count": len(candidates)}
+
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "拱墅万达 0-2000 一室",
+            "candidates": candidates,
+            "shown_count": 3,
+            "total_count": 3,
+        }
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="前两套视频先发我，我给客户筛一下。",
+                context=context,
+                signals=main._deterministic_signals("前两套视频先发我，我给客户筛一下。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["selected_indices"], [1, 2])
+        self.assertEqual(result["constraint_proof"]["selected_indices"], [1, 2])
+        self.assertNotIn("room_refs", result["constraint_proof"])
+        rows = main._target_rows_from_understanding(result, context, candidates)
+        self.assertEqual([row["小区"] for row in rows], ["瑷颐湾", "大华海派风景"])
+
+    async def test_bound_room_followup_does_not_become_community_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "皋塘运都9-402B 水电",
+                    "query_state": {"intent": "inventory", "wants_utilities": True},
+                    "needs_clarification": True,
+                    "clarification_text": "最新房源表里暂时没查到水电怎么收这个小区。",
+                }
+
+        row = {
+            "区域": "闸弄口\n新塘\n元宝塘\n东站",
+            "小区": "皋塘运都",
+            "房号": "9-402B",
+            "户型分类": "一室一厅",
+            "押一付一": "2600",
+            "备注": "水30/月，电1元/度",
+        }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [row]
+
+            def cache_meta(self) -> dict:
+                return {"status": "success", "row_count": 1}
+
+        context = kf_context_memory.empty_context()
+        context["confirmed_room"] = {"row": row, "label": "皋塘运都9-402B", "intent": "details"}
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="这套水电怎么收？",
+                context=context,
+                signals=main._deterministic_signals("这套水电怎么收？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        rows = main._target_rows_from_understanding(result, context, [row])
+        self.assertEqual(rows, [row])
+
+    def test_constraint_proof_keeps_multiple_resolved_areas(self) -> None:
+        proof = main._build_constraint_proof(
+            content="万达、东新园两边都可以，3000以内有什么能住的？",
+            effective_query="万达和东新园两边，预算3000以内，查询在租房源。",
+            understanding={"intent": "inventory", "query_state": {"intent": "inventory"}},
+            entity_resolution={
+                "status": "resolved",
+                "areas": [
+                    {"raw_text": "万达", "canonical": "拱墅万达\n北部软件园\n城北万象城"},
+                    {"raw_text": "东新园", "canonical": "东新园\n杭氧\n新天地"},
+                ],
+            },
+            signals=main._deterministic_signals("万达、东新园两边都可以，3000以内有什么能住的？"),
+        )
+
+        self.assertIn("拱墅万达", proof["area"])
+        self.assertIn("东新园", proof["area"])
+        self.assertEqual(proof["budget_range"], [0, 3000])
+
+    def test_constraint_proof_normalizes_llm_area_list_artifact(self) -> None:
+        proof = main._build_constraint_proof(
+            content="4000-5000的呢？",
+            effective_query="['东新园\\n杭氧\\n新天地'] 4000-5000 两室一厅 在租房源",
+            understanding={
+                "intent": "inventory",
+                "query_state": {
+                    "intent": "inventory",
+                    "area": ["东新园\n杭氧\n新天地"],
+                    "layout": "两室一厅",
+                },
+            },
+            entity_resolution={"status": "resolved", "areas": []},
+            signals=main._deterministic_signals("4000-5000的呢？"),
+        )
+        effective = main._enforce_effective_query(
+            content="4000-5000的呢？",
+            understanding={
+                "effective_query": "['东新园\\n杭氧\\n新天地'] 4000-5000 两室一厅 在租房源",
+                "rewritten_query": "['东新园\\n杭氧\\n新天地'] 4000-5000 两室一厅 在租房源",
+            },
+            constraint_proof=proof,
+        )
+
+        self.assertEqual(proof["area"], "东新园\n杭氧\n新天地")
+        self.assertNotIn("[", proof["area"])
+        self.assertNotIn("[", effective)
+        self.assertIn("东新园", effective)
+        self.assertIn("4000-5000", effective)
+
+    def test_unasked_llm_inferred_layout_is_dropped_for_new_budget_query(self) -> None:
+        result = {
+            "intent": "inventory",
+            "effective_query": "查询闸弄口东站附近预算1500到1800元的在租房源，包含一室和一室一厅户型。",
+            "rewritten_query": "查询闸弄口东站附近预算1500到1800元的在租房源，包含一室和一室一厅户型。",
+            "query_state": {"intent": "inventory", "layout": "一室一厅"},
+        }
+        content = "闸弄口东站附近1500到1800的还有吗？"
+
+        self.assertTrue(main._should_drop_unasked_llm_inferred_layout_features(content, result["effective_query"]))
+        cleaned = main._drop_unasked_llm_inferred_layout_features(result, content=content)
+
+        self.assertEqual(cleaned["effective_query"], content)
+        self.assertNotIn("layout", cleaned["query_state"])
+
+    def test_unasked_layout_in_query_state_is_dropped_even_if_effective_query_is_clean(self) -> None:
+        result = {
+            "intent": "inventory",
+            "effective_query": "查询闸弄口东站附近预算1500到1800元的在租房源。",
+            "rewritten_query": "查询闸弄口东站附近预算1500到1800元的在租房源。",
+            "query_state": {"intent": "inventory", "layout": "一室"},
+        }
+        content = "闸弄口东站附近1500到1800的还有吗？"
+
+        self.assertTrue(
+            main._should_drop_unasked_llm_inferred_layout_features(
+                content,
+                result["effective_query"],
+                result["query_state"],
+            )
+        )
+        cleaned = main._drop_unasked_llm_inferred_layout_features(result, content=content)
+
+        self.assertEqual(cleaned["effective_query"], content)
+        self.assertNotIn("layout", cleaned["query_state"])
+
+    async def test_planner_missing_evidence_returns_to_rewrite_layer(self) -> None:
         class FakeStateStore:
             def __init__(self) -> None:
                 self.processed: list[str] = []
-                self.cursor = ""
 
             def is_processed(self, msgid: str) -> bool:
                 return msgid in self.processed
 
             def mark_processed(self, msgid: str) -> None:
-                if msgid not in self.processed:
-                    self.processed.append(msgid)
+                self.processed.append(msgid)
 
-            def save_cursor(self, cursor: str) -> None:
-                self.cursor = cursor
-
-        class FakeKfClient:
+        class FakeWeComKf:
             def __init__(self) -> None:
                 self.state_store = FakeStateStore()
-                self.last_next_cursor = "cursor-next"
-                self.sync_calls = 0
+                self.texts: list[str] = []
 
-            async def sync_messages(self, open_kfid: str, token: str) -> list[dict]:
-                self.sync_calls += 1
-                await asyncio.sleep(0.01)
-                if self.state_store.is_processed("msg-1"):
-                    return []
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+        class FakeContextStore:
+            def __init__(self) -> None:
+                self.data: dict[str, dict] = {}
+
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
+
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.rewrite_calls: list[dict] = []
+                self.plan_calls = 0
+
+            async def rewrite_kf_message(self, **kwargs):
+                self.rewrite_calls.append(kwargs)
+                if kwargs.get("planner_feedback"):
+                    return {
+                        "intent": "media",
+                        "rewritten_query": "根据上一轮候选发送视频",
+                        "effective_query": "根据上一轮候选发送视频",
+                        "query_state": {"intent": "media", "wants_video": True},
+                        "context_reference": True,
+                        "selected_indices": [],
+                        "needs_clarification": False,
+                    }
+                return {
+                    "intent": "media",
+                    "rewritten_query": "视频发我",
+                    "effective_query": "视频发我",
+                    "query_state": {"intent": "media", "wants_video": True},
+                    "context_reference": True,
+                    "selected_indices": [],
+                    "needs_clarification": False,
+                }
+
+            async def plan_kf_tool_actions(self, **kwargs):
+                self.plan_calls += 1
+                if self.plan_calls == 1:
+                    return {
+                        "actions": [],
+                        "need_rewrite_clarification": True,
+                        "missing_evidence": "缺少上下文绑定证据",
+                    }
+                return {"actions": ["generate_reply"], "confidence": 0.9}
+
+            async def generate(
+                self,
+                message,
+                inventory_snapshot: str,
+                media_images: list[str],
+                media_videos: list[str],
+                conversation_context: str = "",
+                knowledge_context: str = "",
+            ) -> ReplyPlan:
+                return ReplyPlan(text="我按刚才那套重新查了。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs) -> list[dict]:
+                return []
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return []
+
+            async def snapshot(self, limit: int = 20) -> str:
+                return "暂无房源"
+
+            def format_rows(self, rows: list[dict], limit: int = 10) -> str:
+                return ""
+
+            def cache_meta(self) -> dict:
+                return {}
+
+        class FakeAgenticRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", evidence=[], dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", reason="", fallback_reply="")
+
+        fake_wecom = FakeWeComKf()
+        fake_context_store = FakeContextStore()
+        fake_reply_generator = FakeReplyGenerator()
+        originals = {
+            "wecom_kf": main.wecom_kf,
+            "wecom_kf_context_store": main.wecom_kf_context_store,
+            "reply_generator": main.reply_generator,
+            "inventory": main.inventory,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.wecom_kf = fake_wecom
+        main.wecom_kf_context_store = fake_context_store
+        main.reply_generator = fake_reply_generator
+        main.inventory = FakeInventory()
+        main.agentic_rag = FakeAgenticRag()
+        try:
+            await main._handle_text_message(
+                {
+                    "msgid": "msg-1",
+                    "msgtype": "text",
+                    "origin": 3,
+                    "open_kfid": "kf",
+                    "external_userid": "wm",
+                    "text": {"content": "视频发我"},
+                }
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertEqual(fake_reply_generator.plan_calls, 2)
+        self.assertEqual(len(fake_reply_generator.rewrite_calls), 2)
+        self.assertEqual(
+            fake_reply_generator.rewrite_calls[1]["planner_feedback"]["missing_evidence"],
+            "缺少上下文绑定证据",
+        )
+        self.assertIn("不能乱发视频", fake_wecom.texts[-1])
+        self.assertIn("小区名+房号", fake_wecom.texts[-1])
+        saved_context = fake_context_store.data["kf:wm"]
+        record = saved_context["structured_memory"]["turn_records"][-1]
+        self.assertEqual(record["assistant_sent_summary"]["final_reply"], fake_wecom.texts[-1])
+        self.assertEqual(record["intent"], "media")
+        self.assertNotIn("planner_feedback", record)
+
+    async def test_understanding_adds_entity_resolution_and_constraint_proof(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "鑫天地4000左右两室在租房源",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": False,
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
                 return [
                     {
-                        "msgid": "msg-1",
-                        "open_kfid": open_kfid,
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "发我一下"},
+                        "区域": "东新园\n杭氧\n新天地",
+                        "小区": "新柠长木府",
+                        "房号": "3-1002B",
+                        "户型分类": "两室一厅",
+                        "押一付": "3500",
                     }
                 ]
 
-        previous_client = main.wecom_kf
-        previous_handler = main.handle_kf_message
-        fake_client = FakeKfClient()
-        handled: list[str] = []
-
-        async def fake_handler(message: dict) -> None:
-            handled.append(message["msgid"])
-
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
         try:
-            main.wecom_kf = fake_client
-            main.handle_kf_message = fake_handler
-            await asyncio.gather(
-                main.handle_kf_event({"OpenKfId": "kf_xxx", "Token": "token"}),
-                main.handle_kf_event({"OpenKfId": "kf_xxx", "Token": "token"}),
+            result = await main._understand_message(
+                content="鑫天地有没有4000左右的两室",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("鑫天地有没有4000左右的两室"),
             )
-
-            self.assertEqual(handled, ["msg-1"])
-            self.assertEqual(fake_client.state_store.processed, ["msg-1"])
-            self.assertEqual(fake_client.sync_calls, 2)
         finally:
-            main.wecom_kf = previous_client
-            main.handle_kf_message = previous_handler
+            for name, value in originals.items():
+                setattr(main, name, value)
 
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["areas"][0]["canonical"], "东新园\n杭氧\n新天地")
+        self.assertEqual(result["constraint_proof"]["budget_range"], [3500, 4500])
+        self.assertEqual(result["constraint_proof"]["layout"], "两室")
+        self.assertIn("东新园", result["effective_query"])
+        self.assertEqual(result["structured_task"]["constraint_proof"]["layout"], "两室")
 
-class WeComKfSatisfactionPromptTests(unittest.IsolatedAsyncioTestCase):
-    async def test_greeting_gets_human_guidance_reply(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        fake_client = FakeKfClient()
-        try:
-            main.wecom_kf = fake_client
-            main.wecom_kf_idle_sequences.clear()
-
-            await main.handle_kf_message(
-                {
-                    "msgid": "msg-1",
-                    "open_kfid": "kf_xxx",
-                    "external_userid": "wm_xxx",
-                    "origin": 3,
-                    "msgtype": "text",
-                    "text": {"content": "你好"},
-                }
-            )
-
-            self.assertEqual(len(fake_client.texts), 1)
-            self.assertIn("我在的", fake_client.texts[0])
-            self.assertIn("价格", fake_client.texts[0])
-            self.assertIn("视频", fake_client.texts[0])
-        finally:
-            main.wecom_kf = previous_client
-            main.wecom_kf_idle_sequences.clear()
-
-    async def test_plain_text_reply_does_not_schedule_satisfaction_prompt(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, content: str, limit: int = 8) -> list[dict]:
-                return [{"小区": "小洋坝家园", "房号": "二区6-801-3"}]
-
-            def format_rows(self, rows: list[dict]) -> str:
-                return ""
-
-            async def snapshot(self) -> str:
-                return "暂无"
-
-        class FakeMediaStore:
-            def list_for_rooms(self, rooms: list[dict]) -> list:
-                return []
-
-            def public_urls(self, media: list) -> tuple[list[str], list[str]]:
-                return [], []
-
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                return []
-
+    async def test_constraint_proof_keeps_broad_one_room_from_user_text(self) -> None:
         class FakeReplyGenerator:
-            async def generate(
-                self,
-                message,
-                inventory_snapshot: str,
-                media_images: list[str],
-                media_videos: list[str],
-                conversation_context: str = "",
-            ) -> ReplyPlan:
-                return ReplyPlan(text="永佳新苑还有两套。")
-
-        scheduled: list[tuple[str, str, int]] = []
-
-        def fake_schedule(open_kfid: str, external_userid: str, sequence: int) -> None:
-            scheduled.append((open_kfid, external_userid, sequence))
-
-        previous_client = main.wecom_kf
-        previous_inventory = main.inventory
-        previous_media_store = main.media_store
-        previous_reply_generator = main.reply_generator
-        previous_schedule = main._schedule_kf_satisfaction_prompt
-        try:
-            main.wecom_kf = FakeKfClient()
-            main.inventory = FakeInventory()
-            main.media_store = FakeMediaStore()
-            main.reply_generator = FakeReplyGenerator()
-            main._schedule_kf_satisfaction_prompt = fake_schedule
-            main.wecom_kf_idle_sequences.clear()
-
-            await main.handle_kf_message(
-                {
-                    "msgid": "msg-1",
-                    "open_kfid": "kf_xxx",
-                    "external_userid": "wm_xxx",
-                    "origin": 3,
-                    "msgtype": "text",
-                    "text": {"content": "永佳新苑房子还有吗"},
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "在拱墅万达/北部软件园/城北万象城区域，2000以下的一室或一室一厅房源",
+                    "query_state": {
+                        "intent": "inventory",
+                        "area": "拱墅万达/北部软件园/城北万象城",
+                        "budget": "2000以下",
+                        "layout": "一室（宽匹配）",
+                    },
+                    "needs_clarification": False,
                 }
-            )
-
-            self.assertEqual(scheduled, [])
-        finally:
-            main.wecom_kf = previous_client
-            main.inventory = previous_inventory
-            main.media_store = previous_media_store
-            main.reply_generator = previous_reply_generator
-            main._schedule_kf_satisfaction_prompt = previous_schedule
-            main.wecom_kf_idle_sequences.clear()
-
-    async def test_final_validation_blocks_stale_available_room_from_context(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
 
         class FakeInventory:
-            async def search(self, content: str, limit: int = 8) -> list[dict]:
-                if not content.strip():
-                    return [
-                        {"小区": "棠润府", "房号": "1-602A"},
-                        {"小区": "长木府", "房号": "3-1002B"},
-                    ][:limit]
+            async def all_rows(self, **kwargs):
                 return []
 
-            def format_rows(self, rows: list[dict]) -> str:
-                return ""
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="万达有什么2000以下的一室",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("万达有什么2000以下的一室"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
 
-            async def snapshot(self) -> str:
-                return "棠润府1-602A；长木府3-1002B"
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["constraint_proof"]["layout"], "一室")
+        self.assertEqual(result["structured_task"]["constraint_proof"]["layout"], "一室")
 
-        class FakeMediaStore:
-            def list_for_rooms(self, rooms: list[dict]) -> list:
-                return []
-
-            def public_urls(self, media: list) -> tuple[list[str], list[str]]:
-                return [], []
-
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                return []
-
+    async def test_constraint_proof_keeps_feature_constraints_from_user_text(self) -> None:
         class FakeReplyGenerator:
-            async def generate(
-                self,
-                message,
-                inventory_snapshot: str,
-                media_images: list[str],
-                media_videos: list[str],
-                conversation_context: str = "",
-            ) -> ReplyPlan:
-                return ReplyPlan(text="星桥目前就锦绣嘉苑这套21-1801-2在租，押一付1880。")
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            previous_reply_generator = main.reply_generator
-            previous_key = main.settings.dashscope_api_key
-            fake_client = FakeKfClient()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = FakeInventory()
-                main.media_store = FakeMediaStore()
-                main.reply_generator = FakeReplyGenerator()
-                main.settings.dashscope_api_key = ""
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "星桥还有房子吗"},
-                    }
-                )
-
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("最新房源表里查不到", fake_client.texts[0])
-                self.assertNotIn("21-1801-2在租", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.reply_generator = previous_reply_generator
-                main.settings.dashscope_api_key = previous_key
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_satisfaction_prompt_sender_is_disabled(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.sent: list[tuple[str, str, str]] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.sent.append((open_kfid, external_userid, content))
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        previous_delay = main.settings.wecom_kf_satisfaction_delay_seconds
-        fake_client = FakeKfClient()
-        try:
-            main.wecom_kf = fake_client
-            main.settings.wecom_kf_satisfaction_delay_seconds = 0
-            main.wecom_kf_idle_sequences.clear()
-            sequence = main._next_kf_idle_sequence("kf_xxx", "wm_xxx")
-
-            await main._send_kf_satisfaction_prompt_after_idle(
-                "kf_xxx",
-                "wm_xxx",
-                sequence,
-            )
-
-            self.assertEqual(fake_client.sent, [])
-        finally:
-            main.wecom_kf = previous_client
-            main.settings.wecom_kf_satisfaction_delay_seconds = previous_delay
-            main.wecom_kf_idle_sequences.clear()
-
-    async def test_skips_stale_satisfaction_prompt(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.sent: list[tuple[str, str, str]] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.sent.append((open_kfid, external_userid, content))
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        previous_delay = main.settings.wecom_kf_satisfaction_delay_seconds
-        fake_client = FakeKfClient()
-        try:
-            main.wecom_kf = fake_client
-            main.settings.wecom_kf_satisfaction_delay_seconds = 0
-            main.wecom_kf_idle_sequences.clear()
-            stale_sequence = main._next_kf_idle_sequence("kf_xxx", "wm_xxx")
-            main._next_kf_idle_sequence("kf_xxx", "wm_xxx")
-
-            await main._send_kf_satisfaction_prompt_after_idle(
-                "kf_xxx",
-                "wm_xxx",
-                stale_sequence,
-            )
-
-            self.assertEqual(fake_client.sent, [])
-        finally:
-            main.wecom_kf = previous_client
-            main.settings.wecom_kf_satisfaction_delay_seconds = previous_delay
-            main.wecom_kf_idle_sequences.clear()
-
-
-class WeComKfContextMemoryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_reply_generator_receives_recent_dialog_context(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "华丰附近带燃气的一室一厅在租房源",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": False,
+                }
 
         class FakeInventory:
-            async def search(self, content: str, limit: int = 8) -> list[dict]:
-                if "华丰人家" in content:
-                    return [{"小区": "华丰人家", "房号": "8-603"}]
+            async def all_rows(self, **kwargs):
+                return []
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="华丰附近有没有带燃气的一室一厅？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("华丰附近有没有带燃气的一室一厅？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["constraint_proof"]["layout"], "一室一厅")
+        self.assertEqual(result["constraint_proof"]["features"], ["燃气"])
+        self.assertEqual(result["structured_task"]["constraint_proof"]["features"], ["燃气"])
+
+    def test_entity_resolution_matches_letter_prefix_room_ref_from_community(self) -> None:
+        result = main._build_entity_resolution(
+            "东方茂T3-1540是不是一室一厅？价格多少？",
+            [{"小区": "东方茂商业中心T", "房号": "3-1540", "区域": "东新园\n杭氧\n新天地"}],
+        )
+
+        self.assertEqual(result["communities"][0]["canonical"], "东方茂商业中心T")
+        self.assertEqual(result["room_ref_hits"][0]["room_no"], "3-1540")
+
+    async def test_ambiguous_community_generates_real_candidate_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "杨家府有吗",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": False,
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
                 return [
-                    {"小区": "永佳新苑", "房号": "2-703"},
+                    {"小区": "杨乐府", "房号": "1-101"},
+                    {"小区": "杨家新雅苑", "房号": "2-202"},
+                    {"小区": "兴业杨家府", "房号": "3-303"},
                 ]
 
-            def format_rows(self, rows: list[dict]) -> str:
-                return ""
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="杨家府有吗",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("杨家府有吗"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
 
-            async def snapshot(self) -> str:
-                return "暂无"
+        self.assertTrue(result["needs_clarification"])
+        self.assertIn("杨乐府", result["clarification_text"])
+        self.assertIn("兴业杨家府", result["clarification_text"])
+        self.assertEqual(result["entity_resolution"]["status"], "ambiguous")
 
-        class FakeMediaStore:
-            def list_for_rooms(self, rooms: list[dict]) -> list:
-                return []
+    async def test_unique_room_ref_does_not_override_conflicting_unknown_community(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "media",
+                    "rewritten_query": "荣润府15-2-801B还在吗，1600那套视频",
+                    "query_state": {"intent": "media", "wants_video": True},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是棠润府吗？我先确认一下小区名。",
+                }
 
-            def public_urls(self, media: list) -> tuple[list[str], list[str]]:
-                return [], []
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "棠润府",
+                        "房号": "15-2-801B",
+                        "户型分类": "一室一厅",
+                        "押一付一": "1600",
+                    }
+                ]
 
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                return []
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="荣润府15-2-801B还在吗？1600那套视频发我。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("荣润府15-2-801B还在吗？1600那套视频发我。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
 
+        self.assertTrue(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["status"], "needs_confirmation")
+        self.assertEqual(result["entity_resolution"]["communities"], [])
+        self.assertEqual(result["entity_resolution"]["community_options"][0]["reason"], "room_ref_community_mismatch")
+        self.assertIn("棠润府", result["clarification_text"])
+        self.assertIn("确认", result["clarification_text"])
+
+    async def test_unique_room_ref_allows_configured_community_typo_alias(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "media",
+                    "rewritten_query": "棠闰府15-2-801B视频",
+                    "query_state": {"intent": "media", "wants_video": True},
+                    "needs_clarification": False,
+                    "clarification_text": "",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "棠润府",
+                        "房号": "15-2-801B",
+                        "户型分类": "一室一厅",
+                        "押一付一": "1600",
+                    }
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="棠闰府15-2-801B视频发我。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("棠闰府15-2-801B视频发我。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["status"], "resolved")
+        self.assertEqual(result["constraint_proof"]["communities"], ["棠润府"])
+        self.assertIn("15-2-801b", result["constraint_proof"]["room_refs"])
+
+    async def test_confirmed_context_allows_low_similarity_community_reuse(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "media",
+                    "rewritten_query": "荣润府15-2-801B视频",
+                    "query_state": {"intent": "media", "wants_video": True},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是棠润府吗？我先确认一下小区名。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "棠润府",
+                        "房号": "15-2-801B",
+                        "户型分类": "一室一厅",
+                        "押一付一": "1600",
+                    }
+                ]
+
+        context = kf_context_memory.empty_context()
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="user",
+            content="荣润府15-2-801B还在吗？",
+        )
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="assistant",
+            content="你说的应该是棠润府15-2-801B，还在的，押一付一1600。",
+        )
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="荣润府15-2-801B视频发我。",
+                context=context,
+                signals=main._deterministic_signals("荣润府15-2-801B视频发我。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["status"], "resolved")
+        self.assertEqual(result["entity_resolution"]["communities"][0]["source"], "conversation_memory")
+        self.assertEqual(result["constraint_proof"]["communities"], ["棠润府"])
+        self.assertIn("15-2-801b", result["constraint_proof"]["room_refs"])
+
+    async def test_suggested_context_allows_low_similarity_community_reuse(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "荣润府有没有押一付一的，预算1600到1800",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是棠润府吗？我先确认一下小区名。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "棠润府",
+                        "房号": "15-2-801B",
+                        "户型分类": "一室一厅",
+                        "押一付一": "1600",
+                    }
+                ]
+
+        context = kf_context_memory.empty_context()
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="user",
+            content="荣润府15-2-801B还在吗？1600那套视频发我。",
+        )
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="assistant",
+            content="你说的是棠润府吗？我先确认一下小区名。",
+        )
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="荣润府有没有押一付一的？预算1600到1800。",
+                context=context,
+                signals=main._deterministic_signals("荣润府有没有押一付一的？预算1600到1800。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["status"], "resolved")
+        self.assertEqual(result["entity_resolution"]["communities"][0]["source"], "conversation_memory")
+        self.assertEqual(result["constraint_proof"]["communities"], ["棠润府"])
+
+    async def test_three_character_unknown_community_asks_confirmation_without_auto_resolve(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "荣润府有没有押一付一的，预算1600到1800",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是棠润府吗？我先确认一下小区名。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "棠润府",
+                        "房号": "15-2-801B",
+                        "户型分类": "一室一厅",
+                        "押一付一": "1600",
+                    }
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="荣润府有没有押一付一的？预算1600到1800。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("荣润府有没有押一付一的？预算1600到1800。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertTrue(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["communities"], [])
+        self.assertNotIn("棠润府", result["constraint_proof"].get("communities") or [])
+        self.assertIn("你说的是棠润府吗", result["clarification_text"])
+
+    async def test_contextual_community_correction_reuses_previous_typo_resolution(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "杨家府有没有押一付一的，预算4500左右",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是杨乐府、杨家新雅苑还是兴业杨家府？",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "小区": "杨乐府",
+                        "房号": "9-1002",
+                        "户型分类": "一室一厅",
+                        "押一付一": "4800",
+                    },
+                    {
+                        "区域": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "小区": "杨家新雅苑",
+                        "房号": "49-1102",
+                        "户型分类": "一室一厅",
+                        "押一付一": "4500",
+                    },
+                    {
+                        "区域": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "小区": "兴业杨家府",
+                        "房号": "3-601",
+                        "户型分类": "一室一厅",
+                        "押一付一": "4500",
+                        "押二付一": "4200",
+                    }
+                ]
+
+        context = kf_context_memory.empty_context()
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="user",
+            content="杨家府3-601还在吗？视频发我。",
+        )
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="assistant",
+            content="你说的应该是兴业杨家府3-601，还在的，有的，这是兴业杨家府3-601的视频。",
+        )
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="杨家府有没有押一付一的？预算4500左右。",
+                context=context,
+                signals=main._deterministic_signals("杨家府有没有押一付一的？预算4500左右。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["status"], "resolved")
+        self.assertEqual(result["entity_resolution"]["communities"][0]["source"], "conversation_memory")
+        self.assertEqual(result["constraint_proof"]["communities"], ["兴业杨家府"])
+        self.assertEqual(
+            result["entity_resolution"]["community_corrections"][-1]["reason"],
+            "conversation_memory",
+        )
+
+    async def test_contextual_community_correction_reads_turn_records_beyond_raw_dialog(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "杨家府有没有押一付一的，预算4500左右",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是杨乐府、杨家新雅苑还是兴业杨家府？",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "小区": "杨乐府",
+                        "房号": "9-1002",
+                        "户型分类": "一室一厅",
+                        "押一付一": "4800",
+                    },
+                    {
+                        "区域": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "小区": "杨家新雅苑",
+                        "房号": "49-1102",
+                        "户型分类": "一室一厅",
+                        "押一付一": "4500",
+                    },
+                    {
+                        "区域": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "小区": "兴业杨家府",
+                        "房号": "3-601",
+                        "户型分类": "一室一厅",
+                        "押一付一": "4500",
+                        "押二付一": "4200",
+                    }
+                ]
+
+        context = kf_context_memory.empty_context()
+        context["structured_memory"] = {
+            "raw_dialog_context": [
+                {"role": "user", "content": "万达附近的房源表发我一下"},
+                {"role": "assistant", "content": "拱墅万达附近的房源表发你了。"},
+            ],
+            "turn_records": [
+                {
+                    "turn_id": "turn-2",
+                    "turn_index": 2,
+                    "user_raw": "杨家府3-601还在吗？视频发我。",
+                    "rewrite_result": {
+                        "rewritten_query": "兴业杨家府3-601还在吗，视频发我",
+                        "intent": "media",
+                    },
+                    "assistant_sent_summary": {
+                        "final_reply": "你说的应该是兴业杨家府3-601，还在，有的，这是兴业杨家府3-601的视频。"
+                    },
+                },
+                {
+                    "turn_id": "turn-7",
+                    "turn_index": 7,
+                    "user_raw": "万达附近的房源表发我一下",
+                    "rewrite_result": {
+                        "rewritten_query": "拱墅万达附近的房源表发我一下",
+                        "intent": "inventory_sheet",
+                    },
+                    "assistant_sent_summary": {
+                        "final_reply": "拱墅万达附近的房源表发你了。"
+                    },
+                },
+            ],
+        }
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="杨家府有没有押一付一的？预算4500左右。",
+                context=context,
+                signals=main._deterministic_signals("杨家府有没有押一付一的？预算4500左右。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["communities"][0]["source"], "conversation_memory")
+        self.assertEqual(result["constraint_proof"]["communities"], ["兴业杨家府"])
+
+    async def test_rewrite_clarification_cannot_reference_stale_community(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "viewing",
+                    "rewritten_query": "合峙悦府6-1-1204B是不是1500，今天能看吗",
+                    "query_state": {"intent": "viewing"},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是合嵣悦府吗？我先确认一下小区名。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"小区": "棠润府", "房号": "15-2-801B"},
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="合峙悦府6-1-1204B是不是1500？今天能看吗？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("合峙悦府6-1-1204B是不是1500？今天能看吗？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertTrue(result["needs_clarification"])
+        self.assertNotIn("合嵣悦府", result["clarification_text"])
+        self.assertIn("最新房源表没查到", result["clarification_text"])
+        self.assertIn(
+            result["structured_task"]["clarification"]["reason"],
+            {"clarification_rebased_to_current_inventory", "room_ref_not_found_in_current_inventory"},
+        )
+
+    async def test_rewrite_drops_stale_room_ref_when_current_query_has_no_room_ref(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "皋塘运都9-2-402B是否有两室户型？预算4500以内。",
+                    "effective_query": "皋塘运都9-2-402B是否有两室户型？预算4500以内。 闸弄口 新塘 元宝塘 东站",
+                    "query_state": {"intent": "inventory", "layout": "两室"},
+                    "needs_clarification": True,
+                    "clarification_text": "最新房源表中未查到皋塘运都9-2-402B这套房，您确认下是否为标准房号？",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"区域": "闸弄口\n新塘\n元宝塘\n东站", "小区": "骏塘名庭", "房号": "8-1101A", "户型分类": "一室"},
+                    {"区域": "闸弄口\n新塘\n元宝塘\n东站", "小区": "京漾东韵府", "房号": "4-2-601D", "户型分类": "一室"},
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="皋塘运都有没有两室？预算4500以内。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("皋塘运都有没有两室？预算4500以内。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertNotIn("9-2-402", result["effective_query"])
+        self.assertNotIn("room_refs", result["constraint_proof"])
+        self.assertTrue(result.get("dropped_inherited_room_refs"))
+
+    async def test_similar_community_with_unmatched_room_ref_mentions_room_missing(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "viewing",
+                    "rewritten_query": "合峙悦府6-1-1204B是不是1500，今天能看吗",
+                    "query_state": {"intent": "viewing"},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是合嵣悦府吗？我先确认一下小区名。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"小区": "合嵣悦府", "房号": "20-1-2604A", "押一付": "2700"},
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="合峙悦府6-1-1204B是不是1500？今天能看吗？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("合峙悦府6-1-1204B是不是1500？今天能看吗？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertTrue(result["needs_clarification"])
+        self.assertIn("合嵣悦府", result["clarification_text"])
+        self.assertIn("6-1-1204B", result["clarification_text"])
+        self.assertIn("没查到", result["clarification_text"])
+
+    async def test_alias_community_with_matching_room_ref_resolves_without_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "viewing",
+                    "rewritten_query": "合峙悦府6-1-1204B是不是1500，今天能看吗",
+                    "query_state": {"intent": "viewing"},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是合嵣悦府吗？我先确认一下小区名。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "拱墅万达 北部软件园 城北万象城",
+                        "小区": "合嵣悦府",
+                        "房号": "6-1-1204B",
+                        "押一付一": "1500",
+                        "押二付一": "1300",
+                        "看房方式密码": "6.19空出 看房提前联系",
+                    },
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="合峙悦府6-1-1204B是不是1500？今天能看吗？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("合峙悦府6-1-1204B是不是1500？今天能看吗？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["constraint_proof"]["communities"], ["合嵣悦府"])
+        self.assertIn("6-1-1204b", [str(item).lower() for item in result["constraint_proof"]["room_refs"]])
+
+    async def test_planner_receives_structured_task_contract_not_full_context(self) -> None:
         class FakeReplyGenerator:
             def __init__(self) -> None:
-                self.contexts: list[str] = []
+                self.kwargs: dict = {}
 
-            async def generate(
-                self,
-                message,
-                inventory_snapshot: str,
-                media_images: list[str],
-                media_videos: list[str],
-                conversation_context: str = "",
-            ) -> ReplyPlan:
-                self.contexts.append(conversation_context)
-                return ReplyPlan(text=f"回复:{message.content}")
+            async def plan_kf_tool_actions(self, **kwargs):
+                self.kwargs = kwargs
+                return {"actions": ["search_inventory", "generate_reply"], "confidence": 0.9}
 
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            previous_reply_generator = main.reply_generator
-            previous_delay = main.settings.wecom_kf_satisfaction_delay_seconds
-            fake_client = FakeKfClient()
-            fake_reply_generator = FakeReplyGenerator()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = FakeInventory()
-                main.media_store = FakeMediaStore()
-                main.reply_generator = fake_reply_generator
-                main.settings.wecom_kf_satisfaction_delay_seconds = 999
-                main.wecom_kf_conversation_memory.clear()
+        fake = FakeReplyGenerator()
+        original = main.reply_generator
+        main.reply_generator = fake
+        try:
+            result = await main._plan_actions(
+                content="新天地4000左右两室",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "新天地4000左右两室",
+                    "query_state": {"intent": "inventory"},
+                    "structured_task": {"intent": "inventory", "effective_query": "新天地4000左右两室"},
+                    "entity_resolution": {"status": "resolved"},
+                    "constraint_proof": {"area": "东新园\n杭氧\n新天地", "budget_range": [3500, 4500], "layout": "两室"},
+                },
+                signals=main._deterministic_signals("新天地4000左右两室"),
+            )
+        finally:
+            main.reply_generator = original
 
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "星桥有房子吗"},
-                    }
-                )
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-2",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "那星桥价格多少"},
-                    }
-                )
+        self.assertIn("structured_task", fake.kwargs)
+        self.assertIn("constraint_proof", fake.kwargs)
+        self.assertNotIn("planner_memory", fake.kwargs)
+        self.assertNotIn("candidate_set", fake.kwargs)
+        self.assertNotIn("recent_context", fake.kwargs)
+        self.assertNotIn("conversation_context", fake.kwargs)
+        self.assertFalse(result.get("need_rewrite_clarification"))
+        self.assertEqual(result.get("reply_text"), "")
+        self.assertIn("search_inventory", result.get("actions", []))
+        self.assertIn("generate_reply", result.get("actions", []))
+        self.assertFalse(result.get("planner_missing_reply"))
 
-                self.assertEqual(len(fake_reply_generator.contexts), 2)
-                latest_context = fake_reply_generator.contexts[-1]
-                self.assertIn("星桥有房子吗", latest_context)
-                self.assertIn("回复:星桥有房子吗", latest_context)
-                self.assertIn("那星桥价格多少", latest_context)
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.reply_generator = previous_reply_generator
-                main.settings.wecom_kf_satisfaction_delay_seconds = previous_delay
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
+    async def test_planner_clarification_keeps_reply_text_empty(self) -> None:
+        class FakeReplyGenerator:
+            async def plan_kf_tool_actions(self, **kwargs):
+                return {
+                    "actions": [],
+                    "need_rewrite_clarification": True,
+                    "missing_evidence": "小区名可能指杨家新雅苑或兴业杨家府，需要意图层追问。",
+                    "reply_text": "请问你说的是哪个杨家府？",
+                }
 
-    async def test_dissatisfied_followup_reuses_last_video_urls(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
+        original = main.reply_generator
+        main.reply_generator = FakeReplyGenerator()
+        try:
+            result = await main._plan_actions(
+                content="杨家府还有房子吗",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "杨家府还有房子吗",
+                    "query_state": {"intent": "inventory", "community": "杨家府"},
+                    "structured_task": {"intent": "inventory", "effective_query": "杨家府还有房子吗"},
+                    "entity_resolution": {"status": "ambiguous"},
+                    "constraint_proof": {"communities": ["杨家府"]},
+                },
+                signals=main._deterministic_signals("杨家府还有房子吗"),
+            )
+        finally:
+            main.reply_generator = original
 
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
+        self.assertTrue(result.get("need_rewrite_clarification"))
+        self.assertEqual(result.get("reply_text"), "")
+        self.assertIn("missing_evidence", result)
 
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_delay = main.settings.wecom_kf_satisfaction_delay_seconds
-            fake_client = FakeKfClient()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.settings.wecom_kf_satisfaction_delay_seconds = 999
-                main.wecom_kf_conversation_memory.clear()
-                main._remember_kf_media_context(
-                    "kf_xxx",
-                    "wm_xxx",
-                    video_urls=["https://example.com/video-1.mp4", "https://example.com/video-2.mp4"],
-                )
+    async def test_planner_reply_enters_selfcheck_when_it_satisfies_constraints(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="查到了，这几套都还不错。")
 
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "你明明有啊"},
-                    }
-                )
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
 
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("video-1.mp4", fake_client.texts[0])
-                self.assertIn("video-2.mp4", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.settings.wecom_kf_satisfaction_delay_seconds = previous_delay
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
+        class FakeInventory:
+            async def snapshot(self, limit: int = 20) -> str:
+                return "新柠长木府3-1002B 两室一厅 3500"
 
-    async def test_original_video_followup_sends_direct_link(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
+            def format_rows(self, rows: list[dict], limit: int = 10) -> str:
+                return "新柠长木府3-1002B 两室一厅 3500"
 
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
+        class FakeAgenticRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", evidence=[], dynamic_evidence=[])
 
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            fake_client = FakeKfClient()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main._remember_kf_media_context(
-                    "kf_xxx",
-                    "wm_xxx",
-                    video_urls=["https://example.com/original.mp4"],
-                )
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_reply="")
 
-                for content in ("有没有更清楚的原视频", "有没有清楚一点的"):
-                    await main.handle_kf_message(
+        originals = {
+            "reply_generator": main.reply_generator,
+            "inventory": main.inventory,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        main.agentic_rag = FakeAgenticRag()
+        try:
+            result = await main._generate_reply_result(
+                content="新天地有没有4000左右的两室",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "东新园 杭氧 新天地 3500到4500预算 两室",
+                    "query_state": {"intent": "inventory"},
+                    "structured_task": {"intent": "inventory"},
+                    "constraint_proof": {
+                        "area": "东新园\n杭氧\n新天地",
+                        "budget_range": [3500, 4500],
+                        "layout": "两室",
+                    },
+                },
+                planner_result={
+                    "actions": ["search_inventory", "generate_reply"],
+                    "reply_text": "有的，新天地4000左右两室我查到这套还在租：新柠长木府3-1002B，押一付一3500。",
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "generate_reply"],
+                    "inventory_rows": [
                         {
-                            "msgid": f"msg-{len(fake_client.texts) + 1}",
-                            "open_kfid": "kf_xxx",
-                            "external_userid": "wm_xxx",
-                            "origin": 3,
-                            "msgtype": "text",
-                            "text": {"content": content},
+                            "区域": "东新园\n杭氧\n新天地",
+                            "小区": "新柠长木府",
+                            "房号": "3-1002B",
+                            "户型分类": "两室一厅",
+                            "押一付": "3500",
                         }
-                    )
+                    ],
+                    "target_rows": [],
+                    "image_paths": [],
+                    "video_paths": [],
+                    "missing_media": [],
+                },
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
 
-                self.assertEqual(len(fake_client.texts), 2)
-                self.assertTrue(all("原视频直达链接" in text for text in fake_client.texts))
-                self.assertTrue(
-                    all("https://example.com/original.mp4" in text for text in fake_client.texts)
-                )
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("有的", result["reply"])
+        self.assertIn("新天地", result["reply"])
+        self.assertIn("3500", result["reply"])
+        self.assertIn("两室", result["reply"])
+        self.assertIn("新柠长木府3-1002B", result["reply"])
 
-    async def test_send_followup_after_original_video_prompt_sends_direct_link(self) -> None:
-        class FakeKfClient:
+    async def test_tool_grounded_selfcheck_retry_returns_to_planner_in_full_flow(self) -> None:
+        class FakeStateStore:
             def __init__(self) -> None:
+                self.processed: list[str] = []
+
+            def is_processed(self, msgid: str) -> bool:
+                return msgid in self.processed
+
+            def mark_processed(self, msgid: str) -> None:
+                self.processed.append(msgid)
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
                 self.texts: list[str] = []
 
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
                 return {"errcode": 0}
 
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            fake_client = FakeKfClient()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main._remember_kf_media_context(
-                    "kf_xxx",
-                    "wm_xxx",
-                    video_urls=["https://example.com/original.mp4"],
-                )
+        class FakeContextStore:
+            def __init__(self) -> None:
+                self.data: dict[str, dict] = {}
 
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "发我吧"},
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
+
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.plan_calls: list[dict] = []
+                self.reply_calls: list[dict] = []
+                self.generate_calls = 0
+                self.selfcheck_calls = 0
+
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "拱墅万达1500左右在租房源",
+                    "effective_query": "拱墅万达1500左右在租房源",
+                    "query_state": {"intent": "inventory", "area": "拱墅万达", "budget": "1500左右"},
+                    "needs_clarification": False,
+                }
+
+            async def plan_kf_tool_actions(self, **kwargs):
+                self.plan_calls.append(kwargs)
+                if len(self.plan_calls) == 1:
+                    return {
+                        "actions": ["generate_reply"],
+                        "confidence": 0.9,
+                        "reason": "模拟 Planner 首次只规划回复动作",
                     }
-                )
+                retry_reason = kwargs.get("planner_retry_reason") or ""
+                assert "original_content" in retry_reason
+                assert "effective_query" in retry_reason
+                assert "tool_evidence" in retry_reason
+                assert "draft_reply" in retry_reason
+                assert "llm_selfcheck" in retry_reason
+                return {
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "confidence": 0.95,
+                    "reason": "根据自检证据重规划房源列表回复",
+                }
 
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("https://example.com/original.mp4", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
+            async def plan_kf_reply_text(self, **kwargs):
+                self.reply_calls.append(kwargs)
+                if len(self.reply_calls) == 1:
+                    return {
+                        "reply_text": "免押是支付宝无忧住，服务费5.5%-8%。",
+                        "need_rewrite_clarification": False,
+                        "reason": "模拟工具后 Planner 首次生成了答非所问的草稿",
+                    }
+                return {
+                    "reply_text": "有的，拱墅万达1500左右目前查到合幢悦府6-1-1204B还在，押一付一1500。",
+                    "need_rewrite_clarification": False,
+                    "reason": "根据工具结果重新生成房源列表回复",
+                }
 
-    async def test_viewing_followup_after_video_uses_recent_room_context(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
+            async def assess_kf_final_reply(self, **kwargs):
+                self.selfcheck_calls += 1
+                if self.selfcheck_calls == 1:
+                    return {
+                        "status": "retry",
+                        "reason": "客户要查房源，草稿却回答免押，答非所问",
+                        "planner_retry_reason": "重新按拱墅万达1500左右查房源并生成列表回复",
+                    }
+                return {"status": "pass"}
 
         class FakeInventory:
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
+            async def all_rows(self, **kwargs) -> list[dict]:
                 return [
                     {
-                        "小区": "诸葛龙吟院",
-                        "房号": "10-601A",
-                        "密码": "联系确认",
+                        "区域": "拱墅万达",
+                        "小区": "合幢悦府",
+                        "房号": "6-1-1204B",
+                        "户型": "一室一厅",
+                        "押一付": "1500",
                     }
                 ]
 
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            fake_client = FakeKfClient()
-            video_path = Path("room_database/video/房源素材/诸葛龙吟院13-1101/视频.mp4")
-            try:
-                main.wecom_kf = fake_client
-                main.inventory = FakeInventory()
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main._remember_kf_media_context(
-                    "kf_xxx",
-                    "wm_xxx",
-                    video_paths=[video_path],
-                    video_urls=["https://example.com/video.mp4"],
-                )
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "怎么看房"},
-                    }
-                )
-
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("诸葛龙吟院13-1101", fake_client.texts[0])
-                self.assertIn("18758141785", fake_client.texts[0])
-                self.assertIn("13282125992", fake_client.texts[0])
-                self.assertIn("19941091943", fake_client.texts[0])
-                self.assertNotIn("你把小区或房号", fake_client.texts[0])
-                self.assertNotIn("10-601A", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_viewing_followup_after_video_replies_room_password_first(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
-                self.query = query
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
                 return [
                     {
-                        "小区": "诸葛龙吟院",
-                        "房号": "13-1101",
-                        "密码": "336699#",
+                        "区域": "拱墅万达",
+                        "小区": "合幢悦府",
+                        "房号": "6-1-1204B",
+                        "户型": "一室一厅",
+                        "押一付": "1500",
                     }
                 ]
 
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            fake_client = FakeKfClient()
-            fake_inventory = FakeInventory()
-            video_path = Path("room_database/video/房源素材/诸葛龙吟院13-1101/视频.mp4")
-            try:
-                main.wecom_kf = fake_client
-                main.inventory = fake_inventory
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main._remember_kf_media_context(
-                    "kf_xxx",
-                    "wm_xxx",
-                    video_paths=[video_path],
-                    video_urls=["https://example.com/video.mp4"],
-                )
+            async def snapshot(self, limit: int = 20) -> str:
+                return "合幢悦府6-1-1204B 一室一厅 押一1500"
 
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "怎么看房"},
-                    }
-                )
+            def format_rows(self, rows: list[dict], limit: int = 10) -> str:
+                return "合幢悦府6-1-1204B 一室一厅 押一1500"
 
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("诸葛龙吟院13-1101看房密码是：336699#", fake_client.texts[0])
-                self.assertIn("如果现场密码不对", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
+            def cache_meta(self) -> dict:
+                return {}
 
-    async def test_explicit_viewing_query_without_video_context_queries_password(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
+        class FakeAgenticRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", evidence=[], dynamic_evidence=[])
 
-            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_reply="")
 
-        class FakeInventory:
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
-                return [{"小区": "长木府", "房号": "3-1002B", "密码": "123456#"}]
+        fake_wecom = FakeWeComKf()
+        fake_context_store = FakeContextStore()
+        fake_reply_generator = FakeReplyGenerator()
+        originals = {
+            "wecom_kf": main.wecom_kf,
+            "wecom_kf_context_store": main.wecom_kf_context_store,
+            "reply_generator": main.reply_generator,
+            "inventory": main.inventory,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.wecom_kf = fake_wecom
+        main.wecom_kf_context_store = fake_context_store
+        main.reply_generator = fake_reply_generator
+        main.inventory = FakeInventory()
+        main.agentic_rag = FakeAgenticRag()
+        try:
+            await main._handle_text_message(
+                {
+                    "msgid": "msg-selfcheck-retry",
+                    "msgtype": "text",
+                    "origin": 3,
+                    "open_kfid": "kf",
+                    "external_userid": "wm",
+                    "text": {"content": "万达1500左右有哪些"},
+                }
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
 
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            try:
-                main.wecom_kf = FakeKfClient()
-                main.inventory = FakeInventory()
-                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
-                main.wecom_kf_conversation_memory.clear()
+        self.assertEqual(len(fake_reply_generator.plan_calls), 2)
+        self.assertEqual(len(fake_reply_generator.reply_calls), 2)
+        self.assertEqual(fake_reply_generator.selfcheck_calls, 0)
+        self.assertIn("合幢悦府6-1-1204B", fake_wecom.texts[-1])
+        self.assertNotIn("免押", fake_wecom.texts[-1])
+        saved_context = fake_context_store.data["kf:wm"]
+        record = saved_context["structured_memory"]["turn_records"][-1]
+        self.assertNotIn("selfcheck_result", record)
+        self.assertEqual(record["assistant_sent_summary"]["final_reply"], fake_wecom.texts[-1])
 
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "长木府3-1002B怎么看房"},
-                    }
-                )
+    async def test_non_deterministic_final_selfcheck_failure_returns_full_evidence_to_planner(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="免押是支付宝无忧住，服务费5.5%-8%。")
 
-                self.assertIn("长木府3-1002B看房密码是：123456#", main.wecom_kf.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_generic_viewing_query_without_room_asks_for_room_before_llm(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            try:
-                main.wecom_kf = FakeKfClient()
-                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "怎么看房"},
-                    }
-                )
-
-                self.assertEqual(len(main.wecom_kf.texts), 1)
-                self.assertIn("小区和房号", main.wecom_kf.texts[0])
-                self.assertIn("先查房源表里的看房密码", main.wecom_kf.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_wrong_password_followup_sends_contact_numbers(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            fake_client = FakeKfClient()
-            video_path = Path("room_database/video/房源素材/诸葛龙吟院13-1101/视频.mp4")
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main._remember_kf_media_context(
-                    "kf_xxx",
-                    "wm_xxx",
-                    video_paths=[video_path],
-                    video_urls=["https://example.com/video.mp4"],
-                )
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "密码不对，开不了门"},
-                    }
-                )
-
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("看房密码建议直接联系", fake_client.texts[0])
-                self.assertIn("18758141785", fake_client.texts[0])
-                self.assertIn("13282125992", fake_client.texts[0])
-                self.assertIn("19941091943", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_explicit_viewing_query_overrides_recent_video_context(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
+            async def assess_kf_final_reply(self, **kwargs):
+                return {
+                    "status": "retry",
+                    "reason": "客户要查房源，草稿却回答免押，答非所问",
+                    "planner_retry_reason": "重新按拱墅万达1500左右查房源并生成列表回复",
+                }
 
         class FakeInventory:
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
-                if "香柠颜家府" in query or "2-2-1401B" in query:
+            async def snapshot(self, limit: int = 20) -> str:
+                return "合幢悦府6-1-1204B 一室一厅 押一1500"
+
+            def format_rows(self, rows: list[dict], limit: int = 10) -> str:
+                return ""
+
+        class FakeAgenticRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", evidence=[], dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_reply="")
+
+        originals = {
+            "reply_generator": main.reply_generator,
+            "inventory": main.inventory,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        main.agentic_rag = FakeAgenticRag()
+        try:
+            result = await main._generate_reply_result(
+                content="万达1500左右有哪些",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "general",
+                    "effective_query": "万达1500左右有哪些",
+                    "query_state": {"intent": "general"},
+                    "structured_task": {"intent": "general"},
+                    "constraint_proof": {},
+                },
+                planner_result={
+                    "actions": ["generate_reply"],
+                    "reply_text": "免押是支付宝无忧住，服务费5.5%-8%。",
+                },
+                tool_evidence={
+                    "actions": ["generate_reply"],
+                    "inventory_rows": [],
+                    "target_rows": [],
+                    "image_paths": [],
+                    "video_paths": [],
+                    "missing_media": [],
+                },
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertTrue(result["needs_planner_retry"])
+        retry_reason = result["planner_retry_reason"]
+        self.assertIn("original_content", retry_reason)
+        self.assertIn("effective_query", retry_reason)
+        self.assertIn("tool_evidence", retry_reason)
+        self.assertIn("draft_reply", retry_reason)
+        self.assertIn("llm_selfcheck", retry_reason)
+
+    async def test_planner_reply_timeout_uses_tool_grounded_inventory_reply(self) -> None:
+        class FakeReplyGenerator:
+            async def plan_kf_reply_text(self, **kwargs):
+                raise TimeoutError()
+
+            async def assess_kf_final_reply(self, **kwargs):
+                raise AssertionError("常规工具证据回复不应该再阻塞式调用 LLM 终检")
+
+        class FakeInventory:
+            async def snapshot(self, limit: int = 20) -> str:
+                return "皋塘运都9-402B 一室一厅"
+
+            def format_rows(self, rows: list[dict], limit: int = 10) -> str:
+                return "皋塘运都9-402B 一室一厅"
+
+        class FakeAgenticRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", evidence=[], dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_reply="")
+
+        row = {
+            "区域": "闸弄口 新塘 元宝塘 东站",
+            "小区": "皋塘运都",
+            "房号": "9-402B",
+            "户型描述": "一室一厅朝南带阳台，独立厨卫",
+            "户型分类": "一室一厅",
+            "押一付一": "2600",
+            "押二付一": "2400",
+            "备注": "民用水电",
+        }
+        originals = {
+            "reply_generator": main.reply_generator,
+            "inventory": main.inventory,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        main.agentic_rag = FakeAgenticRag()
+        try:
+            result = await main._generate_reply_result(
+                content="有带独厨卫的吗？",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "有带独厨卫的吗？ 闸弄口 新塘 元宝塘 东站 一室一厅",
+                    "query_state": {"intent": "inventory"},
+                    "structured_task": {"intent": "inventory"},
+                    "constraint_proof": {
+                        "intent": "inventory",
+                        "area": "闸弄口\n新塘\n元宝塘\n东站",
+                        "layout": "一室一厅",
+                        "features": ["独立厨卫"],
+                    },
+                },
+                planner_result={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "reply_text": "",
+                    "need_rewrite_clarification": False,
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "inventory_rows": [row],
+                    "target_rows": [row],
+                    "image_paths": [],
+                    "video_paths": [],
+                    "missing_media": [],
+                },
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("皋塘运都9-402B", result["reply"])
+        self.assertIn("独立厨卫", result["reply"])
+        self.assertIn("押一付一2600", result["reply"])
+
+    async def test_execute_tools_accepts_inventory_cache_meta_property(self) -> None:
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return [
+                    {
+                        "区域": "拱墅万达",
+                        "小区": "合嵣悦府",
+                        "房号": "6-1-1204B",
+                        "户型": "一室一厅",
+                        "押一付": "1500",
+                    }
+                ]
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "compact_listing"],
+                content="万达1500左右有哪些",
+                context=context,
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "拱墅万达 1500预算",
+                    "constraint_proof": {"area": "拱墅万达"},
+                    "query_state": {"intent": "inventory"},
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(len(evidence["inventory_rows"]), 1)
+        self.assertEqual(context["last_candidate_set"]["inventory_cache_meta"]["source"], "test_property")
+
+    async def test_execute_tools_does_not_fallback_search_when_candidate_index_out_of_range(self) -> None:
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return [
+                    {"小区": "永佳新苑", "房号": "16-1001A"},
+                    {"小区": "华丰欣苑", "房号": "14-2-901"},
+                ]
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "query": "新天地4000左右两室",
+                "candidates": [{"小区": "新柠长木府", "房号": "3-1002A"}],
+                "shown_count": 1,
+                "total_count": 1,
+            }
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "send_video"],
+                content="第二套视频发我",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "发送上一轮第二套房源的视频",
+                    "context_reference": True,
+                    "selected_indices": [2],
+                    "constraint_proof": {
+                        "selected_indices": [2],
+                        "wants_video": True,
+                    },
+                    "structured_task": {
+                        "original_text": "第二套视频发我",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertEqual(evidence["inventory_rows"], [])
+        self.assertEqual(evidence["video_paths"], [])
+        self.assertEqual(evidence["selection_error"]["requested_indices"], [2])
+        self.assertEqual(evidence["selection_error"]["candidate_count"], 1)
+
+    async def test_empty_new_inventory_query_clears_stale_candidates_before_batch_video(self) -> None:
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return []
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "query": "皋塘一室",
+                "candidates": [{"小区": "皋塘运都", "房号": "9-2-402B"}],
+                "shown_count": 1,
+                "total_count": 1,
+            }
+            context["confirmed_room"] = {
+                "row": {"小区": "皋塘运都", "房号": "9-2-402B"},
+                "label": "皋塘运都9-2-402B",
+            }
+
+            first_evidence = await main._execute_tools(
+                actions=["search_inventory", "generate_reply"],
+                content="东站附近4000左右两室有没有？",
+                context=context,
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "闸弄口 新塘 元宝塘 东站 4000左右 两室",
+                    "rewritten_query": "东站附近4000左右两室在租房源",
+                    "constraint_proof": {
+                        "area": "闸弄口 新塘 元宝塘 东站",
+                        "budget_range": [3500, 4500],
+                        "layout": "两室",
+                    },
+                    "structured_task": {
+                        "original_text": "东站附近4000左右两室有没有？",
+                        "tool_requirements": {"needs_inventory_search": True},
+                    },
+                },
+            )
+
+            second_evidence = await main._execute_tools(
+                actions=["search_inventory", "send_video", "generate_reply"],
+                content="前两套视频发我。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "发送上一轮前两套候选房源的视频",
+                    "rewritten_query": "上一轮候选前两套视频",
+                    "context_reference": True,
+                    "selected_indices": [1, 2],
+                    "constraint_proof": {
+                        "selected_indices": [1, 2],
+                        "wants_video": True,
+                    },
+                    "structured_task": {
+                        "original_text": "前两套视频发我。",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(first_evidence["inventory_rows"], [])
+        self.assertEqual(first_evidence["candidate_context_cleared"]["reason"], "empty_new_scoped_inventory_search")
+        self.assertNotIn("last_candidate_set", context)
+        self.assertNotIn("confirmed_room", context)
+        self.assertEqual(second_evidence["target_rows"], [])
+        self.assertEqual(second_evidence["video_paths"], [])
+        self.assertEqual(second_evidence["selection_error"]["reason"], "missing_current_candidate_set")
+        self.assertEqual(second_evidence["selection_error"]["requested_indices"], [1, 2])
+
+    async def test_single_contextual_inventory_result_replaces_previous_candidate_set(self) -> None:
+        single_row = {
+            "区域": "闸弄口 新塘 元宝塘 东站",
+            "小区": "皋塘运都",
+            "房号": "9-402B",
+            "户型描述": "一室朝南独厨独卫",
+            "户型分类": "一室一厅",
+        }
+
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return [single_row]
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "query": "2600以下一室",
+                "candidates": [{"小区": "棠润府", "房号": "10-1004C"}],
+                "shown_count": 1,
+                "total_count": 1,
+            }
+
+            first_evidence = await main._execute_tools(
+                actions=["search_inventory", "generate_reply"],
+                content="有带独厨卫的吗？",
+                context=context,
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "2600以下一室 带独厨卫",
+                    "rewritten_query": "上一轮2600以下一室里筛选带独厨卫的房源",
+                    "context_reference": True,
+                    "constraint_proof": {},
+                    "structured_task": {
+                        "original_text": "有带独厨卫的吗？",
+                        "tool_requirements": {"needs_inventory_search": True},
+                    },
+                },
+            )
+
+            second_evidence = await main._execute_tools(
+                actions=["search_inventory", "send_video", "generate_reply"],
+                content="第一套视频发我。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "发送上一轮第一套候选房源的视频",
+                    "rewritten_query": "上一轮候选第一套视频",
+                    "context_reference": True,
+                    "selected_indices": [1],
+                    "constraint_proof": {
+                        "selected_indices": [1],
+                        "wants_video": True,
+                    },
+                    "structured_task": {
+                        "original_text": "第一套视频发我。",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual([row["房号"] for row in first_evidence["inventory_rows"]], ["9-402B"])
+        self.assertEqual(context["last_candidate_set"]["candidates"][0]["房号"], "9-402B")
+        self.assertEqual(second_evidence["target_rows"], [single_row])
+
+    async def test_vague_send_media_followup_binds_previous_candidate_set(self) -> None:
+        previous_candidates = [
+            {"小区": "兴业杨家府", "房号": "4-1502", "户型分类": "一室一厅"},
+            {"小区": "兴业杨家府", "房号": "8-1203", "户型分类": "一室一厅"},
+        ]
+        unrelated_rows = [
+            {"小区": "杨家新雅苑", "房号": "49-1102", "户型分类": "一室一厅"},
+            {"小区": "永佳新苑", "房号": "2-703", "户型分类": "一室一厅"},
+        ]
+
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return unrelated_rows
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "query": "兴业杨家府 4000-5000 一室一厅",
+                "candidates": previous_candidates,
+                "shown_count": 2,
+                "total_count": 2,
+            }
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "send_image", "send_video", "generate_reply"],
+                content="如果有的话先发视频和图片给客户看看。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "如果有的话先发视频和图片给客户看看 石桥街道 华丰 石桥 永佳 半山 4000到5000预算 一室一厅",
+                    "rewritten_query": "如果有的话先发视频和图片给客户看看 石桥街道 华丰 石桥 永佳 半山 4000到5000预算 一室一厅",
+                    "context_reference": True,
+                    "constraint_proof": {
+                        "area": "石桥街道 华丰 石桥 永佳 半山",
+                        "budget_range": [4000, 5000],
+                        "layout": "一室一厅",
+                        "wants_video": True,
+                        "wants_image": True,
+                    },
+                    "structured_task": {
+                        "original_text": "如果有的话先发视频和图片给客户看看。",
+                        "tool_requirements": {"needs_video": True, "needs_image": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual([row["房号"] for row in evidence["target_rows"]], ["4-1502", "8-1203"])
+
+    async def test_selected_candidate_field_followup_narrows_inventory_rows(self) -> None:
+        previous_candidates = [
+            {"小区": "兴业杨家府", "房号": "4-1502", "户型分类": "一室一厅", "押一付一": "4500", "押二付一": "4200"},
+            {"小区": "兴业杨家府", "房号": "8-1203", "户型分类": "一室一厅", "押一付一": "4500", "押二付一": "4200"},
+        ]
+        broad_rows = [
+            {"小区": "杨家新雅苑", "房号": "49-1102", "户型分类": "一室一厅", "押一付一": "4500"},
+            *previous_candidates,
+        ]
+
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return broad_rows
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "query": "兴业杨家府 4000-5000 一室一厅",
+                "candidates": previous_candidates,
+                "shown_count": 2,
+                "total_count": 2,
+            }
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "generate_reply"],
+                content="第一套多少钱，押一付一和押二付一分别多少？",
+                context=context,
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "第一套价格 押一付一 押二付一",
+                    "rewritten_query": "第一套价格 押一付一 押二付一",
+                    "context_reference": True,
+                    "selected_indices": [1],
+                    "constraint_proof": {
+                        "selected_indices": [1],
+                        "wants_price": True,
+                    },
+                    "structured_task": {
+                        "original_text": "第一套多少钱，押一付一和押二付一分别多少？",
+                        "tool_requirements": {"needs_inventory_search": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual([row["房号"] for row in evidence["target_rows"]], ["4-1502"])
+        self.assertEqual([row["房号"] for row in evidence["inventory_rows"]], ["4-1502"])
+
+    def test_selection_indices_treat_third_room_as_single_index(self) -> None:
+        self.assertEqual(main._selection_indices_from_text("第三套今天能看吗？"), [3])
+        self.assertEqual(main._selection_indices_from_text("把前三套视频都发我"), [1, 2, 3])
+        self.assertEqual(main._selection_indices_from_text("第1和第3套视频发我。"), [1, 3])
+        self.assertEqual(main._selection_indices_from_text("1和5视频"), [1, 5])
+
+    def test_structured_selected_indices_require_explicit_user_selection_text(self) -> None:
+        self.assertEqual(
+            main._selected_indices_from_understanding(
+                {
+                    "selected_indices": [1, 2, 3, 4],
+                    "constraint_proof": {"selected_indices": [1, 2, 3, 4]},
+                },
+                "有带独厨卫的吗？ 闸弄口 新塘 元宝塘 东站 一室一厅",
+            ),
+            [],
+        )
+        self.assertEqual(
+            main._selected_indices_from_understanding(
+                {"constraint_proof": {"selected_indices": [1]}},
+                "第一套视频发我。",
+            ),
+            [1],
+        )
+
+    async def test_rewrite_timeout_falls_back_to_contextual_image_task(self) -> None:
+        async def timeout_rewrite(**kwargs):
+            raise asyncio.TimeoutError()
+
+        original_rewrite = main.reply_generator.rewrite_kf_message
+        original_rows = main._inventory_rows_for_resolution
+        main.reply_generator.rewrite_kf_message = timeout_rewrite
+        main._inventory_rows_for_resolution = lambda: asyncio.sleep(0, result=[])
+        try:
+            context = kf_context_memory.empty_context()
+            context["confirmed_room"] = {
+                "row": {"小区": "皋塘运都", "房号": "9-402B"},
+                "label": "皋塘运都9-402B",
+            }
+            context["last_candidate_set"] = {
+                "query": "皋塘运都9-402B",
+                "candidates": [{"小区": "皋塘运都", "房号": "9-402B"}],
+                "shown_count": 1,
+                "total_count": 1,
+            }
+            context = kf_context_memory.append_dialog_message(
+                context,
+                role="assistant",
+                content="这是皋塘运都9-402B的视频。",
+            ) or context
+            result = await main._understand_message(
+                content="这个图片也发一下。",
+                context=context,
+                signals=main._deterministic_signals("这个图片也发一下。"),
+            )
+        finally:
+            main.reply_generator.rewrite_kf_message = original_rewrite
+            main._inventory_rows_for_resolution = original_rows
+
+        self.assertEqual(result["intent"], "media")
+        self.assertTrue(result["context_reference"])
+        self.assertTrue(result["constraint_proof"]["wants_image"])
+        self.assertTrue(result["structured_task"]["tool_requirements"]["needs_image"])
+
+    async def test_execute_tools_does_not_recover_viewing_when_candidate_index_out_of_range(self) -> None:
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return [
+                    {"小区": "新柠长木府", "房号": "3-1002A", "看房方式密码": "336699#"},
+                    {"小区": "杨乐府", "房号": "9-604B", "看房方式密码": "提前联系"},
+                ]
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "query": "新天地4000左右两室",
+                "candidates": [
+                    {"小区": "新柠长木府", "房号": "3-1002A", "看房方式密码": "336699#"},
+                    {"小区": "杨乐府", "房号": "9-604B", "看房方式密码": "提前联系"},
+                ],
+                "shown_count": 2,
+                "total_count": 2,
+            }
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "explain_unavailable_viewing"],
+                content="第三套今天能看吗？",
+                context=context,
+                understanding={
+                    "intent": "viewing",
+                    "effective_query": "查询上一轮第三套房源看房方式",
+                    "context_reference": True,
+                    "selected_indices": [3],
+                    "constraint_proof": {
+                        "selected_indices": [3],
+                    },
+                    "structured_task": {
+                        "original_text": "第三套今天能看吗？",
+                        "tool_requirements": {"needs_viewing_policy": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertEqual(evidence["rule_evidence"].get("viewing", {}).get("rooms"), [])
+        self.assertEqual(evidence["selection_error"]["requested_indices"], [3])
+        self.assertEqual(evidence["selection_error"]["candidate_count"], 2)
+
+    async def test_execute_tools_binds_confirmed_room_for_water_and_password_followup(self) -> None:
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return [
+                    {"小区": "东方茂商业中心T", "房号": "3-1540", "备注": "民用水电", "看房方式密码": "提前联系"},
+                    {"小区": "白田畈龙吟府", "房号": "4-902B", "备注": "水30/月，电1元/度", "看房方式密码": "902902#"},
+                ]
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            confirmed = {
+                "小区": "白田畈龙吟府",
+                "房号": "4-902B",
+                "备注": "水30/月，电1元/度",
+                "看房方式密码": "902902#",
+            }
+            context["confirmed_room"] = {"row": confirmed, "label": "白田畈龙吟府4-902B"}
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "explain_unavailable_viewing", "context_tools"],
+                content="水电和密码一起发我。",
+                context=context,
+                understanding={
+                    "intent": "viewing",
+                    "effective_query": "水电和密码一起发我。 东新园 杭氧 新天地 2000到4000预算 一室一厅",
+                    "constraint_proof": {
+                        "area": "东新园\n杭氧\n新天地",
+                        "budget_range": [2000, 4000],
+                        "layout": "一室一厅",
+                        "wants_utilities": True,
+                    },
+                    "structured_task": {
+                        "original_text": "水电和密码一起发我。",
+                        "tool_requirements": {"needs_viewing_policy": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual([main._row_label(row) for row in evidence["target_rows"]], ["白田畈龙吟府4-902B"])
+        reply = main._reply_for_utilities_and_viewing(
+            {
+                "intent": "viewing",
+                "constraint_proof": {"wants_utilities": True},
+                "structured_task": {"tool_requirements": {"needs_viewing_policy": True}},
+            },
+            evidence,
+            content="水电和密码一起发我。",
+        )
+        self.assertIn("白田畈龙吟府4-902B", reply)
+        self.assertIn("水电是水30/月，电1元/度", reply)
+        self.assertIn("看房方式/密码是902902#", reply)
+
+    def test_candidate_selection_error_reply_explains_candidate_count(self) -> None:
+        reply = main._reply_for_candidate_selection_error(
+            {
+                "selection_error": {
+                    "requested_indices": [2],
+                    "candidate_count": 1,
+                    "candidate_labels": ["华丰欣苑14-2-901"],
+                }
+            }
+        )
+
+        self.assertIn("上一轮我只列了1套", reply)
+        self.assertIn("没有第2套", reply)
+        self.assertIn("华丰欣苑14-2-901", reply)
+
+    def test_selection_error_selfcheck_does_not_require_budget_or_layout_terms(self) -> None:
+        reply = "上一轮我只列了1套，没有第2套。上一轮候选是：华丰欣苑14-2-901。你可以直接说第1套，或者换区域/预算我重新筛。"
+
+        result = main._constraint_consistency_selfcheck(
+            content="第二套户型怎么样？",
+            draft_reply=reply,
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道 华丰 石桥 永佳 半山",
+                    "budget_range": [4000, 5000],
+                    "layout": "一室一厅",
+                    "selected_indices": [2],
+                },
+                "structured_task": {
+                    "original_text": "第二套户型怎么样？",
+                    "tool_requirements": {"needs_inventory_search": True},
+                },
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                "selection_error": {
+                    "requested_indices": [2],
+                    "candidate_count": 1,
+                    "candidate_labels": ["华丰欣苑14-2-901"],
+                },
+                "inventory_rows": [],
+                "target_rows": [],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    async def test_execute_tools_preserves_raw_low_price_intent_for_inventory_search(self) -> None:
+        class FakeInventory:
+            def __init__(self) -> None:
+                self.queries: list[str] = []
+
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                self.queries.append(query)
+                if "便宜点" not in query:
                     return [
                         {
-                            "小区": "香柠颜家府",
-                            "房号": "2-2-1401B",
-                            "密码": "88888888#",
+                            "区域": "拱墅万达\n北部软件园\n城北万象城",
+                            "小区": "大华海派风景",
+                            "房号": "2-1-402A",
+                            "户型分类": "一室",
+                            "押一付": "1600",
+                            "押二付": "1500",
                         }
                     ]
                 return [
                     {
-                        "小区": "诸葛龙吟院",
-                        "房号": "13-1101",
-                        "密码": "336699#",
-                    }
-                ]
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            fake_client = FakeKfClient()
-            video_path = Path("room_database/video/房源素材/诸葛龙吟院13-1101/视频.mp4")
-            try:
-                main.wecom_kf = fake_client
-                main.inventory = FakeInventory()
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main._remember_kf_media_context(
-                    "kf_xxx",
-                    "wm_xxx",
-                    video_paths=[video_path],
-                    video_urls=["https://example.com/video.mp4"],
-                )
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "香柠颜家府2-2-1401B怎么看房"},
-                    }
-                )
-
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("香柠颜家府2-2-1401B看房密码是：88888888#", fake_client.texts[0])
-                self.assertNotIn("诸葛龙吟院", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_generic_viewing_followup_after_multiple_videos_lists_all_passwords(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
-                return [
-                    {"小区": "香柠颜家府", "房号": "2-2-1401B", "密码": "218619#"},
-                    {"小区": "香柠颜家府", "房号": "3-1-701A", "密码": "336699#"},
-                ]
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            fake_client = FakeKfClient()
-            try:
-                main.wecom_kf = fake_client
-                main.inventory = FakeInventory()
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-                main._remember_kf_media_context(
-                    "kf_xxx",
-                    "wm_xxx",
-                    video_paths=[
-                        Path("room_database/video/香柠颜家府2-2-1401B/视频.mp4"),
-                        Path("room_database/video/香柠颜家府3-1-701A/视频.mp4"),
-                    ],
-                    video_urls=[
-                        "https://example.com/2-2-1401B.mp4",
-                        "https://example.com/3-1-701A.mp4",
-                    ],
-                )
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "怎么看房的"},
-                    }
-                )
-
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("香柠颜家府2-2-1401B：218619#", fake_client.texts[0])
-                self.assertIn("香柠颜家府3-1-701A：336699#", fake_client.texts[0])
-                self.assertIn("刚发的这几套", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_dynamic_password_viewing_query_sends_contact_numbers(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
-                return [{"小区": "诸葛龙吟院", "房号": "13-1101", "密码": "动态密码"}]
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            try:
-                main.wecom_kf = FakeKfClient()
-                main.inventory = FakeInventory()
-                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "诸葛怎么看房的"},
-                    }
-                )
-
-                self.assertIn("诸葛龙吟院13-1101是动态密码", main.wecom_kf.texts[0])
-                self.assertIn("18758141785", main.wecom_kf.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_not_vacant_password_field_sends_booking_contact(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
-                return [{"小区": "长木府", "房号": "3-1002B", "密码": "6.14空出"}]
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            try:
-                main.wecom_kf = FakeKfClient()
-                main.inventory = FakeInventory()
-                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "长木府3-1002B怎么看房"},
-                    }
-                )
-
-                self.assertIn("长木府3-1002B6.14空出", main.wecom_kf.texts[0])
-                self.assertIn("目前还未空出", main.wecom_kf.texts[0])
-                self.assertIn("预约", main.wecom_kf.texts[0])
-                self.assertIn("19941091943", main.wecom_kf.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_correction_followup_reuses_persisted_video_paths(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, content: str, limit: int = 8) -> list[dict]:
-                return [{"小区": "小洋坝", "房号": "三区12-1003-2"}]
-
-        class FakeMediaStore:
-            def __init__(self, video_path: Path) -> None:
-                self.video_path = video_path
-
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                if "小洋坝" in query and "三区12-1003-2" in query:
-                    return [self.video_path]
-                return []
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            previous_delay = main.settings.wecom_kf_satisfaction_delay_seconds
-            fake_client = FakeKfClient()
-            video_path = Path("room_database/video/小洋坝三区12-1003-2/微信视频.mp4")
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = FakeInventory()
-                main.media_store = FakeMediaStore(video_path)
-                main.settings.wecom_kf_satisfaction_delay_seconds = 999
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_context_store.save(
-                    "kf_xxx:wm_xxx",
-                    {
-                        "video_paths": [video_path],
-                        "updated_at": 9999999999.0,
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "瑷颐湾",
+                        "房号": "13-1-402A",
+                        "户型分类": "一室",
+                        "押一付": "600",
+                        "押二付": "600",
                     },
-                )
-
-                await main.handle_kf_message(
                     {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {
-                            "content": "你这个视频存放的文件夹名字不就是小区和房间号吗，你怎么还问？"
-                        },
-                    }
-                )
-
-                self.assertEqual(fake_client.videos, [video_path])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.settings.wecom_kf_satisfaction_delay_seconds = previous_delay
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-
-class WeComKfSatisfiedFeedbackTests(unittest.IsolatedAsyncioTestCase):
-    async def test_satisfied_feedback_gets_short_ack(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        fake_client = FakeKfClient()
-        try:
-            main.wecom_kf = fake_client
-            await main.handle_kf_message(
-                {
-                    "msgid": "msg-1",
-                    "open_kfid": "kf_xxx",
-                    "external_userid": "wm_xxx",
-                    "origin": 3,
-                    "msgtype": "text",
-                    "text": {"content": "这个视频还可以"},
-                }
-            )
-
-            self.assertEqual(fake_client.texts, ["好的，有需要随时发我。"])
-        finally:
-            main.wecom_kf = previous_client
-            main.wecom_kf_idle_sequences.clear()
-
-
-class WeComKfContractContactTests(unittest.IsolatedAsyncioTestCase):
-    async def test_contract_question_returns_table_contact_numbers(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        previous_schedule = main._schedule_kf_satisfaction_prompt
-        scheduled: list[tuple[str, str, int]] = []
-
-        def fake_schedule(open_kfid: str, external_userid: str, sequence: int) -> None:
-            scheduled.append((open_kfid, external_userid, sequence))
-
-        try:
-            main.wecom_kf = FakeKfClient()
-            main._schedule_kf_satisfaction_prompt = fake_schedule
-            main.wecom_kf_idle_sequences.clear()
-
-            await main.handle_kf_message(
-                {
-                    "msgid": "msg-1",
-                    "open_kfid": "kf_xxx",
-                    "external_userid": "wm_xxx",
-                    "origin": 3,
-                    "msgtype": "text",
-                    "text": {"content": "我联系谁签合同呢？"},
-                }
-            )
-
-            self.assertEqual(len(main.wecom_kf.texts), 1)
-            self.assertIn("18758141785", main.wecom_kf.texts[0])
-            self.assertIn("13282125992", main.wecom_kf.texts[0])
-            self.assertIn("19941091943", main.wecom_kf.texts[0])
-            self.assertNotIn("联系我", main.wecom_kf.texts[0])
-            self.assertEqual(scheduled, [])
-        finally:
-            main.wecom_kf = previous_client
-            main._schedule_kf_satisfaction_prompt = previous_schedule
-            main.wecom_kf_idle_sequences.clear()
-
-    def test_detects_booking_questions(self) -> None:
-        self.assertTrue(main._wants_contract_contact("已经看完房子了。怎么订房"))
-        self.assertTrue(main._wants_contract_contact("我联系谁签合同呢？"))
-
-
-class WeComKfDepositWaiverTests(unittest.IsolatedAsyncioTestCase):
-    async def test_deposit_waiver_question_returns_credit_rules(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        previous_schedule = main._schedule_kf_satisfaction_prompt
-        scheduled: list[tuple[str, str, int]] = []
-
-        def fake_schedule(open_kfid: str, external_userid: str, sequence: int) -> None:
-            scheduled.append((open_kfid, external_userid, sequence))
-
-        try:
-            main.wecom_kf = FakeKfClient()
-            main._schedule_kf_satisfaction_prompt = fake_schedule
-            main.wecom_kf_idle_sequences.clear()
-
-            await main.handle_kf_message(
-                {
-                    "msgid": "msg-1",
-                    "open_kfid": "kf_xxx",
-                    "external_userid": "wm_xxx",
-                    "origin": 3,
-                    "msgtype": "text",
-                    "text": {"content": "免押金的条件"},
-                }
-            )
-
-            self.assertEqual(len(main.wecom_kf.texts), 1)
-            reply = main.wecom_kf.texts[0]
-            self.assertIn("支付宝芝麻信用", reply)
-            self.assertIn("无忧住", reply)
-            self.assertIn("550", reply)
-            self.assertIn("3-12", reply)
-            self.assertIn("电子合同", reply)
-            self.assertIn("5.5%-8%", reply)
-            self.assertIn("建行惠市宝", reply)
-            self.assertIn("仅新签合同支持免押", reply)
-            self.assertNotIn("完全免费免押", reply)
-            self.assertEqual(scheduled, [])
-        finally:
-            main.wecom_kf = previous_client
-            main._schedule_kf_satisfaction_prompt = previous_schedule
-            main.wecom_kf_idle_sequences.clear()
-
-    async def test_can_do_deposit_waiver_returns_short_eligibility_check(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        previous_schedule = main._schedule_kf_satisfaction_prompt
-
-        def fake_schedule(open_kfid: str, external_userid: str, sequence: int) -> None:
-            return None
-
-        try:
-            main.wecom_kf = FakeKfClient()
-            main._schedule_kf_satisfaction_prompt = fake_schedule
-            main.wecom_kf_idle_sequences.clear()
-
-            await main.handle_kf_message(
-                {
-                    "msgid": "msg-1",
-                    "open_kfid": "kf_xxx",
-                    "external_userid": "wm_xxx",
-                    "origin": 3,
-                    "msgtype": "text",
-                    "text": {"content": "能做免押吗"},
-                }
-            )
-
-            reply = main.wecom_kf.texts[0]
-            self.assertIn("芝麻分大于等于 550", reply)
-            self.assertIn("自查方式", reply)
-            self.assertIn("租房板块申请额度", reply)
-            self.assertNotIn("免押服务费：", reply)
-            self.assertNotIn("5.5%-8%", reply)
-        finally:
-            main.wecom_kf = previous_client
-            main._schedule_kf_satisfaction_prompt = previous_schedule
-            main.wecom_kf_idle_sequences.clear()
-
-    async def test_deposit_waiver_fee_question_returns_fee_only(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        previous_schedule = main._schedule_kf_satisfaction_prompt
-
-        def fake_schedule(open_kfid: str, external_userid: str, sequence: int) -> None:
-            return None
-
-        try:
-            main.wecom_kf = FakeKfClient()
-            main._schedule_kf_satisfaction_prompt = fake_schedule
-            main.wecom_kf_idle_sequences.clear()
-
-            await main.handle_kf_message(
-                {
-                    "msgid": "msg-1",
-                    "open_kfid": "kf_xxx",
-                    "external_userid": "wm_xxx",
-                    "origin": 3,
-                    "msgtype": "text",
-                    "text": {"content": "免押服务费多少"},
-                }
-            )
-
-            reply = main.wecom_kf.texts[0]
-            self.assertIn("5.5%", reply)
-            self.assertIn("7%", reply)
-            self.assertIn("8%", reply)
-            self.assertNotIn("自查方式", reply)
-        finally:
-            main.wecom_kf = previous_client
-            main._schedule_kf_satisfaction_prompt = previous_schedule
-            main.wecom_kf_idle_sequences.clear()
-
-    def test_detects_deposit_waiver_questions(self) -> None:
-        self.assertTrue(main._wants_deposit_waiver("免押金怎么办"))
-        self.assertTrue(main._wants_deposit_waiver("无忧住怎么申请"))
-        self.assertTrue(main._wants_deposit_waiver("芝麻信用多少分可以免押"))
-        self.assertFalse(main._wants_deposit_waiver("押一付一多少钱"))
-
-
-class WeComKfRoomDatabaseVideoSendTests(unittest.IsolatedAsyncioTestCase):
-    async def test_generic_send_followup_sends_latest_room_video(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, content: str, limit: int = 8) -> list[dict]:
-                return [{"小区": "小洋坝家园", "房号": "二区6-801-3"}]
-
-            def format_rows(self, rows: list[dict]) -> str:
-                return ""
-
-            async def snapshot(self) -> str:
-                return "暂无"
-
-        class FakeMediaStore:
-            def __init__(self, video_path: Path) -> None:
-                self.video_path = video_path
-                self.queries: list[str] = []
-                self.limits: list[int] = []
-
-            def list_for_rooms(self, rooms: list[dict]) -> list:
-                return []
-
-            def public_urls(self, media: list) -> tuple[list[str], list[str]]:
-                return [], []
-
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                self.queries.append(query)
-                self.limits.append(limit)
-                if "小洋坝家园" in query and "二区6-801-3" in query:
-                    return [self.video_path]
-                return []
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            previous_delay = main.settings.wecom_kf_satisfaction_delay_seconds
-            fake_client = FakeKfClient()
-            video_path = Path("room_database/video/小洋坝家园二区6-801-3/video.mp4")
-            fake_media_store = FakeMediaStore(video_path)
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = FakeInventory()
-                main.media_store = fake_media_store
-                main.settings.wecom_kf_satisfaction_delay_seconds = 999
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_context_store.save(
-                    "kf_xxx:wm_xxx",
-                    {
-                        "recent_messages": [
-                            {
-                                "role": "客服",
-                                "content": (
-                                    "小区：小洋坝家园\n"
-                                    "房号：二区6-801-3\n"
-                                    "户型：一室独立厨卫带阳台\n"
-                                    "我把视频发你哈。"
-                                ),
-                            },
-                        ],
-                        "updated_at": 9999999999.0,
-                    },
-                )
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "发我"},
-                    }
-                )
-
-                self.assertEqual(fake_client.texts, ["这是小洋坝家园二区6-801-3的视频。"])
-                self.assertEqual(fake_client.videos, [video_path])
-                self.assertIn("小洋坝家园", fake_media_store.queries[0])
-                self.assertIn("二区6-801-3", fake_media_store.queries[0])
-                self.assertEqual(fake_media_store.limits[0], 1)
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.settings.wecom_kf_satisfaction_delay_seconds = previous_delay
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_video_correction_uses_latest_room_detail_before_cached_images(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, content: str, limit: int = 8) -> list[dict]:
-                return [{"小区": "华丰人家", "房号": "8-603"}]
-
-        class FakeMediaStore:
-            def __init__(self, video_path: Path) -> None:
-                self.video_path = video_path
-                self.queries: list[str] = []
-
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                self.queries.append(query)
-                if "华丰人家" in query and "8-603" in query:
-                    return [self.video_path]
-                return []
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            fake_client = FakeKfClient()
-            video_path = Path("room_database/video/华丰人家8-603/视频.mp4")
-            fake_media_store = FakeMediaStore(video_path)
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = FakeInventory()
-                main.media_store = fake_media_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_context_store.save(
-                    "kf_xxx:wm_xxx",
-                    {
-                        "image_paths": [str(Path("room_database/inventory_1.png"))],
-                        "recent_messages": [
-                            {
-                                "role": "客服",
-                                "content": (
-                                    "华丰人家 8-603 这套是 65㎡法式中古风一室一厅，"
-                                    "我这边暂时没有这套的视频。"
-                                ),
-                            },
-                        ],
-                        "updated_at": 9999999999.0,
-                    },
-                )
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "你明明有这个视频啊"},
-                    }
-                )
-
-                self.assertEqual(fake_client.texts, ["这是华丰人家8-603的视频。"])
-                self.assertEqual(fake_client.videos, [video_path])
-                self.assertIn("华丰人家", fake_media_store.queries[0])
-                self.assertIn("8-603", fake_media_store.queries[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_video_request_checks_inventory_before_room_database_media(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            def __init__(self) -> None:
-                self.queries: list[str] = []
-                self.limits: list[int] = []
-
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
-                self.queries.append(query)
-                self.limits.append(limit)
-                return [
-                    {"小区": "棠润府", "房号": "1-602B", "价格": "1700"},
-                    {"小区": "棠润府", "房号": "12-2-1202A", "价格": "1700"},
-                ]
-
-        class FakeMediaStore:
-            def __init__(self) -> None:
-                self.queries: list[str] = []
-                self.old = Path("room_database/video/棠润府10-1004C/视频.mp4")
-                self.first = Path("room_database/video/棠润府1-602B/视频.mp4")
-                self.second = Path("room_database/video/棠润府12-2-1202A/视频.mp4")
-
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                self.queries.append(query)
-                if "10-1004C" in query:
-                    return [self.old]
-                if "1-602B" in query:
-                    return [self.first]
-                if "12-2-1202A" in query:
-                    return [self.second]
-                return []
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            fake_client = FakeKfClient()
-            fake_inventory = FakeInventory()
-            fake_media_store = FakeMediaStore()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = fake_inventory
-                main.media_store = fake_media_store
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "棠润府1700的视频发一下啊"},
-                    }
-                )
-
-                self.assertEqual(fake_inventory.limits, [main.KF_VIDEO_SEND_LIMIT])
-                self.assertEqual(fake_client.videos, [fake_media_store.first, fake_media_store.second])
-                self.assertIn("棠润府1-602B", fake_media_store.queries)
-                self.assertIn("棠润府12-2-1202A", fake_media_store.queries)
-                self.assertNotIn(fake_media_store.old, fake_client.videos)
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_community_video_request_checks_five_inventory_rooms(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(self, open_kfid: str, external_userid: str, video_path: Path) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            def __init__(self) -> None:
-                self.limits: list[int] = []
-
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
-                self.limits.append(limit)
-                return [
-                    {"小区": "皋塘运都", "房号": "12-1-1802"},
-                    {"小区": "皋塘运都", "房号": "12-2-401"},
-                    {"小区": "皋塘运都", "房号": "16-1-804"},
-                    {"小区": "皋塘运都", "房号": "16-1-805"},
-                    {"小区": "皋塘运都", "房号": "16-1-1003"},
-                ][:limit]
-
-        class FakeMediaStore:
-            def __init__(self) -> None:
-                self.paths = {
-                    room: Path(f"room_database/video/皋塘运都{room}/视频.mp4")
-                    for room in ("12-1-1802", "16-1-804", "16-1-805", "16-1-1003")
-                }
-
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                for room, path in self.paths.items():
-                    if room in query:
-                        return [path]
-                return []
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            fake_client = FakeKfClient()
-            fake_inventory = FakeInventory()
-            fake_media_store = FakeMediaStore()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
-                main.inventory = fake_inventory
-                main.media_store = fake_media_store
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "皋塘运都视频发一下"},
-                    }
-                )
-
-                self.assertEqual(fake_inventory.limits, [main.KF_VIDEO_SEND_LIMIT])
-                self.assertEqual(
-                    fake_client.videos,
-                    [
-                        fake_media_store.paths["12-1-1802"],
-                        fake_media_store.paths["16-1-804"],
-                    ],
-                )
-                self.assertIn("这些房源表里还在，其中皋塘运都12-2-401视频暂时没有。", fake_client.texts[0])
-                self.assertTrue(any("视频比较多" in text for text in fake_client.texts))
-                self.assertTrue(any("5分钟后" in text for text in fake_client.texts))
-                self.assertNotIn("https://", "\n".join(fake_client.texts))
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_video_request_replies_rented_out_when_inventory_has_no_match(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(self, open_kfid: str, external_userid: str, video_path: Path) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
-                return []
-
-        class FakeMediaStore:
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                return [Path("room_database/video/棠润府10-1004C/视频.mp4")]
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            fake_client = FakeKfClient()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = FakeInventory()
-                main.media_store = FakeMediaStore()
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "棠润府10-1004C视频发一下"},
-                    }
-                )
-
-                self.assertEqual(fake_client.videos, [])
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("已经租掉了", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_yanglefu_video_request_does_not_send_stale_media_when_not_in_inventory(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(self, open_kfid: str, external_userid: str, video_path: Path) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, query: str, limit: int = 8) -> list[dict]:
-                return []
-
-        class FakeMediaStore:
-            def __init__(self) -> None:
-                self.queries: list[str] = []
-                self.stale_video = Path("room_database/video/杨乐府1-101/视频.mp4")
-
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                self.queries.append(query)
-                if "杨乐府" in query:
-                    return [self.stale_video]
-                return []
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            fake_client = FakeKfClient()
-            fake_media_store = FakeMediaStore()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = FakeInventory()
-                main.media_store = fake_media_store
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "杨乐府的视频发一下"},
-                    }
-                )
-
-                self.assertEqual(fake_client.videos, [])
-                self.assertEqual(fake_media_store.queries, [])
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("杨乐府", fake_client.texts[0])
-                self.assertIn("已经租掉了", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_plural_send_followup_sends_two_recent_room_videos(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, content: str, limit: int = 8) -> list[dict]:
-                if "华丰人家" in content:
-                    return [{"小区": "华丰人家", "房号": "8-603"}]
-                return [
-                    {"小区": "永佳新苑", "房号": "2-703"},
-                ]
-
-            def format_rows(self, rows: list[dict]) -> str:
-                return ""
-
-            async def snapshot(self) -> str:
-                return "暂无"
-
-        class FakeMediaStore:
-            def __init__(self) -> None:
-                self.queries: list[str] = []
-                self.limits: list[int] = []
-                self.yongjia = Path("room_database/video/永佳新苑2-703/视频.mp4")
-                self.huafeng = Path("room_database/video/华丰人家8-603/视频.mp4")
-
-            def list_for_rooms(self, rooms: list[dict]) -> list:
-                return []
-
-            def public_urls(self, media: list) -> tuple[list[str], list[str]]:
-                return [], []
-
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                self.queries.append(query)
-                self.limits.append(limit)
-                if "永佳新苑" in query and "2-703" in query:
-                    return [self.yongjia]
-                if "华丰人家" in query and "8-603" in query:
-                    return [self.huafeng]
-                return []
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            fake_client = FakeKfClient()
-            fake_media_store = FakeMediaStore()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = FakeInventory()
-                main.media_store = fake_media_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_context_store.save(
-                    "kf_xxx:wm_xxx",
-                    {
-                        "recent_messages": [
-                            {
-                                "role": "客服",
-                                "content": "小区：永佳新苑\n房号：2-703\n户型：一室一厅",
-                            },
-                            {
-                                "role": "客服",
-                                "content": "小区：华丰人家\n房号：8-603\n户型：整租一室一厅",
-                            },
-                        ],
-                        "updated_at": 9999999999.0,
-                    },
-                )
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "这两套视频发一下"},
-                    }
-                )
-
-                self.assertEqual(
-                    fake_client.texts,
-                    ["这是永佳新苑2-703的视频。", "这是华丰人家8-603的视频。"],
-                )
-                self.assertEqual(fake_client.videos, [fake_media_store.yongjia, fake_media_store.huafeng])
-                self.assertEqual(fake_media_store.limits[:2], [1, 1])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_polite_video_followup_sends_recent_listed_room_videos(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, content: str, limit: int = 8) -> list[dict]:
-                if "杨家府" not in content and "10-1-304" not in content and "1-202" not in content:
-                    return []
-                return [
-                    {"小区": "杨家府（兴业杨家府）", "房号": "10-1-304"},
-                    {"小区": "杨家府（兴业杨家府）", "房号": "1-202"},
-                ][:limit]
-
-            def format_rows(self, rows: list[dict]) -> str:
-                return ""
-
-            async def snapshot(self) -> str:
-                return "暂无"
-
-        class FakeMediaStore:
-            def __init__(self) -> None:
-                self.links = ["https://example.com/old-original.mp4"]
-                self.room_10304 = Path("room_database/video/杨家府10-1-304/视频.mp4")
-                self.room_1202 = Path("room_database/video/杨家府1-202/视频.mp4")
-
-            def list_for_rooms(self, rooms: list[dict]) -> list:
-                return []
-
-            def public_urls(self, media: list) -> tuple[list[str], list[str]]:
-                return [], []
-
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                paths = []
-                if "10-1-304" in query:
-                    paths.append(self.room_10304)
-                if "1-202" in query:
-                    paths.append(self.room_1202)
-                return paths[:limit]
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            fake_client = FakeKfClient()
-            fake_media_store = FakeMediaStore()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = FakeInventory()
-                main.media_store = fake_media_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_context_store.save(
-                    "kf_xxx:wm_xxx",
-                    {
-                        "video_urls": ["https://example.com/old-original.mp4"],
-                        "recent_messages": [
-                            {"role": "客户", "content": "杨家府的还在吗"},
-                            {
-                                "role": "客服",
-                                "content": (
-                                    "杨家府（兴业杨家府）我这边看到还有两套：\n"
-                                    "1. 房号10-1-304，一室一厅，押一付4500/押二付4200，密码88888888#，民用水电。\n"
-                                    "2. 房号1-202，一室一厅，押一付4200/押一付3800，密码336699#，民用水电。\n"
-                                    "这两套都是65㎡整租，一年起租。需要看视频或者具体细节直接说，我发你。"
-                                ),
-                            },
-                        ],
-                        "updated_at": 9999999999.0,
-                    },
-                )
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "视频麻烦发我一下"},
-                    }
-                )
-
-                self.assertEqual(
-                    fake_client.texts,
-                    [
-                        "这是杨家府10-1-304的视频。",
-                        "这是杨家府1-202的视频。",
-                    ],
-                )
-                self.assertEqual(
-                    fake_client.videos,
-                    [fake_media_store.room_10304, fake_media_store.room_1202],
-                )
-                self.assertNotIn("old-original.mp4", "\n".join(fake_client.texts))
-                self.assertNotIn("已经租掉了", "\n".join(fake_client.texts))
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_final_validation_fixes_false_missing_video_reply_and_sends_video(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        class FakeInventory:
-            async def search(self, content: str, limit: int = 8) -> list[dict]:
-                return [
-                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
                         "小区": "大华海派风景",
                         "房号": "2-1-402A",
-                        "户型": "朝南一室一厅燃气独立厨卫",
-                        "视频索引": "素材库唯一索引Z9",
+                        "户型分类": "一室",
+                        "押一付": "1600",
+                        "押二付": "1500",
+                    },
+                ]
+
+        fake_inventory = FakeInventory()
+        original_inventory = main.inventory
+        main.inventory = fake_inventory
+        try:
+            context = kf_context_memory.empty_context()
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "compact_listing"],
+                content="北部软件园附近便宜点的单间还有吗？客户预算1800以内。",
+                context=context,
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "北部软件园附近，预算1800元以内，一室或一室一厅的在租房源有哪些？ 拱墅万达 北部软件园 城北万象城 单间",
+                    "constraint_proof": {
+                        "area": "拱墅万达\n北部软件园\n城北万象城",
+                        "budget_range": [0, 1800],
+                        "layout": "单间",
+                    },
+                    "query_state": {"intent": "inventory"},
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertTrue(fake_inventory.queries)
+        self.assertIn("便宜点", fake_inventory.queries[0])
+        self.assertEqual([row["房号"] for row in evidence["inventory_rows"]], ["13-1-402A", "2-1-402A"])
+
+    async def test_media_request_with_count_targets_current_search_rows(self) -> None:
+        rows = [
+            {"区域": "拱墅万达", "小区": "星桥锦绣嘉苑", "房号": "20-1606A", "户型分类": "一室一厅", "押一付": "1900"},
+            {"区域": "拱墅万达", "小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅", "押一付": "1600"},
+            {"区域": "拱墅万达", "小区": "小洋坝家园二区", "房号": "7-1001E", "户型分类": "一室一厅", "押一付": "1800"},
+        ]
+
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return rows
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                content="先把万达2000以下一室里最合适的两套视频发我。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "拱墅万达 2000以下 一室 前两套视频",
+                    "rewritten_query": "拱墅万达2000以下一室前两套视频",
+                    "constraint_proof": {
+                        "area": "拱墅万达",
+                        "budget_range": [0, 2000],
+                        "layout": "一室",
+                        "wants_video": True,
+                    },
+                    "query_state": {"intent": "media", "area": "拱墅万达", "wants_video": True},
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual([row["房号"] for row in evidence["target_rows"]], ["20-1606A", "15-2-801B"])
+        self.assertEqual(evidence["media_request"]["requested_count"], 2)
+        self.assertEqual(context["last_candidate_set"]["shown_count"], 3)
+
+    def test_candidate_set_reconciles_to_visible_reply_order(self) -> None:
+        raw_rows = [
+            {"区域": "拱墅万达", "小区": "瑷颐湾", "房号": "13-1-402A"},
+            {"区域": "拱墅万达", "小区": "大华海派风景", "房号": "2-1-402A"},
+            {"区域": "拱墅万达", "小区": "棠润府", "房号": "15-2-801B"},
+            {"区域": "拱墅万达", "小区": "小洋坝家园二区", "房号": "7-1001E"},
+            {"区域": "拱墅万达", "小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+        ]
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达2000以下一室",
+            "candidates": raw_rows,
+            "shown_count": len(raw_rows),
+            "total_count": len(raw_rows),
+        }
+        reply = "\n".join(
+            [
+                "有的，万达2000以下一室优先看这几套：",
+                "1. 棠润府15-2-801B，一室一厅，押一付1600",
+                "2. 小洋坝家园二区7-1001E，一室一厅，押一付1800",
+                "3. 星桥锦绣嘉苑20-1606A，一室一厅，押一付1900",
+            ]
+        )
+
+        context = main._reconcile_last_candidate_set_with_visible_reply(
+            context,
+            reply,
+            {"inventory_rows": raw_rows},
+        )
+
+        self.assertEqual(
+            [row["房号"] for row in context["last_candidate_set"]["candidates"]],
+            ["15-2-801B", "7-1001E", "20-1606A"],
+        )
+        self.assertEqual(context["last_candidate_set"]["shown_count"], 3)
+
+        selected_rows = main._target_rows_from_understanding(
+            {
+                "intent": "media",
+                "effective_query": "前两套视频",
+                "selected_indices": [1, 2],
+                "constraint_proof": {"selected_indices": [1, 2], "wants_video": True},
+            },
+            context,
+            raw_rows,
+        )
+        self.assertEqual([row["房号"] for row in selected_rows], ["15-2-801B", "7-1001E"])
+
+    def test_unresolved_community_clarification_requires_real_entity_shape(self) -> None:
+        weak_resolution = {
+            "communities": [],
+            "community_options": [],
+            "areas": [],
+            "raw_mentions": ["是多少", "是民用", "怎么回"],
+        }
+        for content in (
+            "这套密码是多少，今天能自己看吗？",
+            "这套水电是民用吗？",
+            "如果客户问押一付一是多少钱，该怎么回？",
+        ):
+            self.assertEqual(
+                main._unresolved_community_mention_clarification(
+                    content=content,
+                    entity_resolution=weak_resolution,
+                ),
+                "",
+            )
+
+        strong = main._unresolved_community_mention_clarification(
+            content="荣润府1600还有吗？",
+            entity_resolution={
+                "communities": [],
+                "community_options": [],
+                "areas": [],
+                "raw_mentions": ["荣润府"],
+            },
+        )
+        self.assertIn("荣润府", strong)
+        self.assertIn("暂时没查到", strong)
+
+    def test_inventory_search_reply_prefers_community_constraint_over_area(self) -> None:
+        reply = main._reply_for_inventory_search(
+            {
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "闸弄口\n新塘\n元宝塘\n东站",
+                    "communities": ["皋塘运都"],
+                    "budget_range": [0, 4500],
+                    "layout": "两室",
+                },
+                "structured_task": {"tool_requirements": {}},
+            },
+            {"actions": ["search_inventory"], "inventory_rows": []},
+        )
+
+        self.assertIn("皋塘运都", reply)
+        self.assertIn("4500以下", reply)
+        self.assertIn("两室", reply)
+        self.assertNotIn("闸弄口、新塘、元宝塘、东站、4500以下、两室", reply)
+
+    def test_deterministic_selection_overrides_llm_expanded_indices(self) -> None:
+        proof = main._build_constraint_proof(
+            content="这两套图片和视频都发我。",
+            effective_query="万达4000以下两室图片视频",
+            understanding={
+                "intent": "media",
+                "selected_indices": [1, 2, 3, 4, 5],
+                "query_state": {"wants_video": True, "wants_image": True},
+            },
+            entity_resolution={},
+            signals={"wants_video": True, "wants_image": True},
+        )
+
+        self.assertEqual(proof["selected_indices"], [1, 2])
+
+    def test_media_candidate_selection_does_not_overwrite_last_candidate_set(self) -> None:
+        self.assertFalse(
+            main._should_remember_candidate_set(
+                content="前两套视频先发我",
+                understanding={
+                    "intent": "media",
+                    "selected_indices": [1, 2],
+                    "constraint_proof": {"selected_indices": [1, 2], "wants_video": True},
+                },
+                rows=[
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+                    {"小区": "棠润府", "房号": "10-1004C"},
+                ],
+            )
+        )
+
+    def test_context_media_search_rows_do_not_overwrite_last_candidate_set(self) -> None:
+        self.assertFalse(
+            main._should_remember_candidate_set(
+                content="这套图片也发一下",
+                understanding={
+                    "intent": "media",
+                    "context_reference": True,
+                    "constraint_proof": {"wants_image": True},
+                },
+                rows=[
+                    {"小区": "兴业杨家府", "房号": "4-1502"},
+                    {"小区": "石桥铭苑", "房号": "6-1102"},
+                ],
+            )
+        )
+
+    def test_utilities_reply_uses_remark_field_for_bound_room(self) -> None:
+        reply = main._reply_for_deposit_and_utilities(
+            {
+                "constraint_proof": {"wants_utilities": True},
+                "query_state": {"wants_utilities": True},
+            },
+            {
+                "target_rows": [
+                    {
+                        "小区": "棠润府",
+                        "房号": "15-2-801B",
+                        "备注": "水30/月，电1元/度",
                     }
-                ][:limit]
+                ],
+                "rule_evidence": {},
+            },
+            content="这套水电怎么收？",
+        )
 
-            def format_rows(self, rows: list[dict]) -> str:
-                return "大华海派风景2-1-402A，朝南一室一厅燃气独立厨卫"
+        self.assertIn("棠润府15-2-801B", reply)
+        self.assertIn("水30/月，电1元/度", reply)
+        self.assertNotIn("服务费", reply)
 
-            async def snapshot(self) -> str:
-                return "暂无"
+    def test_bound_room_utilities_selfcheck_ignores_inherited_budget_area_layout(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="这套水电怎么收？",
+            draft_reply="棠润府15-2-801B：水30/月，电1元/度。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "拱墅万达 北部软件园 城北万象城",
+                    "budget_range": [0, 2000],
+                    "layout": "一室一厅",
+                    "wants_utilities": True,
+                },
+                "structured_task": {"tool_requirements": {"needs_utilities": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory"],
+                "target_rows": [
+                    {
+                        "小区": "棠润府",
+                        "房号": "15-2-801B",
+                        "户型分类": "一室一厅",
+                        "押一付一": "1600",
+                        "押二付一": "1400",
+                        "备注": "水30/月，电1元/度",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_utilities_field_lookup_normalizes_misclassified_viewing_intent(self) -> None:
+        result = main._normalize_field_lookup_understanding(
+            "第一套水电怎么收？",
+            {
+                "intent": "viewing",
+                "query_state": {"intent": "viewing"},
+                "constraint_proof": {"intent": "viewing"},
+                "structured_task": {
+                    "intent": "viewing",
+                    "query_state": {"intent": "viewing"},
+                    "constraint_proof": {"intent": "viewing"},
+                    "tool_requirements": {
+                        "needs_inventory_search": True,
+                        "needs_viewing_policy": True,
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(result["intent"], "inventory")
+        self.assertTrue(result["query_state"]["wants_utilities"])
+        self.assertTrue(result["constraint_proof"]["wants_utilities"])
+        self.assertFalse(result["structured_task"]["tool_requirements"]["needs_viewing_policy"])
+        self.assertTrue(result["structured_task"]["tool_requirements"]["needs_utilities"])
+
+    def test_utilities_selfcheck_ignores_misclassified_viewing_intent(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="第一套水电怎么收？",
+            draft_reply="长岳王马府4-2002：民用水电。",
+            understanding={
+                "intent": "viewing",
+                "constraint_proof": {"wants_utilities": True},
+                "structured_task": {
+                    "tool_requirements": {
+                        "needs_utilities": True,
+                        "needs_viewing_policy": True,
+                    }
+                },
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "target_rows": [
+                    {
+                        "小区": "长岳王马府",
+                        "房号": "4-2002",
+                        "备注": "民用水电",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_viewing_selfcheck_rejects_reply_without_viewing_field_evidence(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="这套今天能看吗？",
+            draft_reply="还在，这是兴业杨家府4-1502的视频，可以看房了。",
+            understanding={
+                "intent": "viewing",
+                "constraint_proof": {},
+                "structured_task": {
+                    "original_text": "这套今天能看吗？",
+                    "tool_requirements": {"needs_viewing_policy": True},
+                },
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "target_rows": [
+                    {
+                        "小区": "兴业杨家府",
+                        "房号": "4-1502",
+                        "看房方式密码": "看房提前联系",
+                    }
+                ],
+                "rule_evidence": {
+                    "viewing": {
+                        "rooms": [
+                            {
+                                "room": "兴业杨家府4-1502",
+                                "viewing": "看房提前联系",
+                                "needs_contact": True,
+                                "contact_numbers": list(main.CONTACT_NUMBERS),
+                            }
+                        ]
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("看房方式密码字段", result["reason"])
+
+    def test_utility_field_selfcheck_catches_electricity_as_water_swap(self) -> None:
+        failures = main._utility_field_consistency_failures(
+            "棠润府15-2-801B：水电费30元/月，水1元/度。",
+            [
+                {
+                    "小区": "棠润府",
+                    "房号": "15-2-801B",
+                    "备注": "水30/月，电1元/度",
+                }
+            ],
+        )
+
+        self.assertTrue(failures)
+        self.assertIn("电费写成了水费", failures[0])
+
+    def test_utilities_reply_keeps_price_when_user_asks_both(self) -> None:
+        reply = main._reply_for_deposit_and_utilities(
+            {
+                "intent": "inventory",
+                "constraint_proof": {"wants_utilities": True, "wants_price": True},
+                "query_state": {"wants_utilities": True, "wants_price": True},
+                "structured_task": {
+                    "tool_requirements": {
+                        "needs_utilities": True,
+                        "needs_price": True,
+                    }
+                },
+            },
+            {
+                "inventory_rows": [
+                    {
+                        "小区": "长岳王马府",
+                        "房号": "4-2002",
+                        "押一付一": "4300",
+                        "押二付一": "4000",
+                        "备注": "民用水电",
+                    },
+                    {
+                        "小区": "长浜龙吟轩",
+                        "房号": "11-1603",
+                        "押一付一": "4200",
+                        "押二付一": "3900",
+                        "备注": "水30/月，电1元/度",
+                    },
+                ]
+            },
+            content="这两套水电和价格帮我对比一下。",
+        )
+
+        self.assertIn("长岳王马府4-2002", reply)
+        self.assertIn("押一付一4300", reply)
+        self.assertIn("押二付一4000", reply)
+        self.assertIn("民用水电", reply)
+        self.assertIn("长浜龙吟轩11-1603", reply)
+        self.assertIn("押一付一4200", reply)
+        self.assertIn("押二付一3900", reply)
+        self.assertIn("水30/月，电1元/度", reply)
+
+    def test_multi_room_payment_selfcheck_rejects_aggregate_wrong_price(self) -> None:
+        failures = main._payment_field_consistency_failures(
+            (
+                "这是棠润府15-2-801B和小洋坝家园二区7-1001E的视频。"
+                "这两套押一付一600元，押二付一1400元。"
+            ),
+            [
+                {"小区": "棠润府", "房号": "15-2-801B", "押一付一": "1600", "押二付一": "1400"},
+                {"小区": "小洋坝家园二区", "房号": "7-1001E", "押一付一": "1800", "押二付一": "1700"},
+            ],
+        )
+
+        self.assertTrue(failures)
+        self.assertIn("600", failures[0])
+
+    def test_multi_room_utility_selfcheck_rejects_false_aggregate_same_utility(self) -> None:
+        failures = main._utility_field_consistency_failures(
+            (
+                "这是昌运里三区3-1403和棠润府15-2-1901B的视频。"
+                "两套水电均为民用水电。"
+            ),
+            [
+                {"小区": "昌运里三区", "房号": "3-1403", "备注": "民用水电"},
+                {"小区": "棠润府", "房号": "15-2-1901B", "备注": "水30/月，电1元/度"},
+            ],
+        )
+
+        self.assertTrue(failures)
+        self.assertIn("逐套说明", failures[0])
+
+    def test_outbound_selfcheck_requires_per_room_image_and_video_explanations(self) -> None:
+        result = main._outbound_package_selfcheck(
+            draft_reply=(
+                "有的，这是昌运里三区3-1403和棠润府15-2-1901B的视频，"
+                "两套图片也发你了。"
+            ),
+            tool_evidence={
+                "actions": ["send_image", "send_video"],
+                "video_rows": [
+                    {"小区": "昌运里三区", "房号": "3-1403"},
+                    {"小区": "棠润府", "房号": "15-2-1901B"},
+                ],
+                "image_rows": [
+                    {"小区": "昌运里三区", "房号": "3-1403"},
+                    {"小区": "棠润府", "房号": "15-2-1901B"},
+                ],
+            },
+            outbound_package={
+                "video_paths": [__file__, __file__],
+                "image_paths": [__file__, __file__],
+                "video_explanations": [
+                    "这是昌运里三区3-1403的视频。",
+                    "这是棠润府15-2-1901B的视频。",
+                ],
+                "image_explanations": [
+                    "这是昌运里三区3-1403的图片。",
+                    "这是棠润府15-2-1901B的图片。",
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("多套图片动作", result["reason"])
+
+    def test_budget_selfcheck_rejects_listed_room_outside_budget_range(self) -> None:
+        failures = main._budget_payment_scope_failures(
+            reply_text=(
+                "拱墅万达、0-2000、一室一厅我查到这些还在租：\n"
+                "1. 棠润府15-2-801B，一室一厅，押一付一1600，押二付一1400\n"
+                "2. 棠润府10-1004C，一室一厅，押一付一2600，押二付一2300"
+            ),
+            evidence_rows=[
+                {
+                    "小区": "棠润府",
+                    "房号": "15-2-801B",
+                    "押一付一": "1600",
+                    "押二付一": "1400",
+                },
+                {
+                    "小区": "棠润府",
+                    "房号": "10-1004C",
+                    "押一付一": "2600",
+                    "押二付一": "2300",
+                },
+            ],
+            budget_range=[0, 2000],
+        )
+
+        self.assertTrue(failures)
+        self.assertIn("棠润府10-1004C", failures[0])
+
+    def test_constraint_proof_uses_query_state_budget_range(self) -> None:
+        proof = main._build_constraint_proof(
+            content="有没有带厅的，一室一厅也算。",
+            effective_query="拱墅万达 0-2000 一室一厅 在租房源",
+            understanding={
+                "intent": "inventory",
+                "query_state": {
+                    "area": "拱墅万达\n北部软件园\n城北万象城",
+                    "budget_range": [0, 2000],
+                    "budget": "0-2000",
+                    "layout": "一室一厅",
+                },
+            },
+            entity_resolution={},
+            signals={},
+        )
+
+        self.assertEqual(proof["budget_range"], [0, 2000])
+        self.assertTrue(proof["hard_constraints"]["budget_range"])
+
+    def test_constraint_proof_parses_query_state_budget_label(self) -> None:
+        proof = main._build_constraint_proof(
+            content="4000-5000 的呢？",
+            effective_query="新天地 两室 4000-5000 在租房源",
+            understanding={
+                "intent": "inventory",
+                "query_state": {
+                    "area": "东新园\n杭氧\n新天地",
+                    "budget": "4000-5000",
+                    "layout": "两室",
+                },
+            },
+            entity_resolution={},
+            signals={},
+        )
+
+        self.assertEqual(proof["budget_range"], [4000, 5000])
+        self.assertTrue(proof["hard_constraints"]["budget_range"])
+
+    async def test_area_alias_does_not_trigger_community_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "查询石桥附近5000左右两室整租",
+                    "query_state": {"intent": "inventory", "area": "石桥"},
+                    "needs_clarification": False,
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "石桥铭苑", "房号": "6-1102"},
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "华丰欣苑", "房号": "14-2-901"},
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "永佳新苑", "房号": "2-703"},
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="石桥附近5000左右有两室吗？最好整租。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("石桥附近5000左右有两室吗？最好整租。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["status"], "resolved")
+        self.assertEqual(result["entity_resolution"]["community_options"], [])
+        self.assertIn("石桥街道", result["constraint_proof"]["area"])
+
+    async def test_one_room_broad_query_does_not_trigger_living_room_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "拱墅万达2000以下一室房源",
+                    "query_state": {"intent": "inventory", "area": "拱墅万达", "layout": "一室"},
+                    "needs_clarification": True,
+                    "clarification_text": "请问您说的一室是指一室户，还是一室一厅也包含在内？",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"区域": "拱墅万达\n北部软件园\n城北万象城", "小区": "星桥锦绣嘉苑", "房号": "20-1606A", "户型分类": "一室一厅"},
+                    {"区域": "拱墅万达\n北部软件园\n城北万象城", "小区": "大华海派风景", "房号": "2-1-402A", "户型分类": "一室"},
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="万达有什么2000以下的一室",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("万达有什么2000以下的一室"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["clarification_text"], "")
+        self.assertEqual(result["constraint_proof"]["layout"], "一室")
+
+    async def test_resolved_area_alias_overrides_bad_llm_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "万达1500左右有哪些",
+                    "query_state": {"intent": "inventory", "area": "万达"},
+                    "needs_clarification": True,
+                    "clarification_text": "请问是哪个城市的万达广场？",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "合幢悦府",
+                        "房号": "6-1-1204B",
+                        "户型分类": "一室一厅",
+                        "押一付一": "1500",
+                    }
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="万达1500左右有哪些？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("万达1500左右有哪些？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["clarification_text"], "")
+        self.assertEqual(result["entity_resolution"]["status"], "resolved")
+        self.assertIn("拱墅万达", result["constraint_proof"]["area"])
+        self.assertNotIn("哪个城市", result["effective_query"])
+
+    async def test_area_context_overrides_community_guess_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "media",
+                    "rewritten_query": "石桥5000左右两室整租前两套视频",
+                    "query_state": {"intent": "media", "area": "石桥", "wants_video": True},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是石桥铭苑吗？我先确认一下小区名。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "石桥铭苑", "房号": "6-1102"},
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "华丰欣苑", "房号": "14-2-901"},
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="石桥5000左右两室整租的前两套视频也发我。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("石桥5000左右两室整租的前两套视频也发我。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["clarification_text"], "")
+        self.assertEqual(result["entity_resolution"]["status"], "resolved")
+        self.assertEqual(result["entity_resolution"]["community_options"], [])
+        self.assertEqual(result["constraint_proof"]["proof_status"], "complete")
+        self.assertIn("石桥街道", result["constraint_proof"]["area"])
+        self.assertTrue(result["constraint_proof"]["wants_video"])
+
+    async def test_area_context_suppresses_generic_entity_community_guess(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "media",
+                    "rewritten_query": "石桥5000左右两室整租前两套视频",
+                    "query_state": {"intent": "media", "area": "石桥", "wants_video": True},
+                    "needs_clarification": False,
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "石桥铭苑", "房号": "6-1102"},
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "华丰欣苑", "房号": "14-2-901"},
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="石桥5000左右两室整租的前两套视频也发我。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("石桥5000左右两室整租的前两套视频也发我。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["clarification_text"], "")
+        self.assertEqual(result["entity_resolution"]["status"], "resolved")
+        self.assertEqual(result["entity_resolution"]["community_options"], [])
+        self.assertEqual(result["constraint_proof"]["proof_status"], "complete")
+        self.assertIn("石桥街道", result["constraint_proof"]["area"])
+
+    async def test_unclear_area_alias_asks_area_or_community(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "media",
+                    "rewritten_query": "石桥视频",
+                    "query_state": {"intent": "media", "wants_video": True},
+                    "needs_clarification": True,
+                    "clarification_text": "你说的是石桥铭苑吗？我先确认一下小区名。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "石桥铭苑", "房号": "6-1102"},
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "华丰欣苑", "房号": "14-2-901"},
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="石桥视频发我",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("石桥视频发我"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertTrue(result["needs_clarification"])
+        self.assertIn("石桥这个区域", result["clarification_text"])
+        self.assertIn("石桥铭苑这个小区", result["clarification_text"])
+
+    async def test_deposit_and_utilities_keep_policy_and_candidate_rows(self) -> None:
+        candidate_rows = [
+            {"区域": "拱墅万达", "小区": "大华海派风景", "房号": "2-1-402A", "备注": "水30/月，电1元/度"},
+            {"区域": "拱墅万达", "小区": "星桥锦绣嘉苑", "房号": "20-1606A", "备注": "水30/月，电1元/度"},
+        ]
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return [{"小区": "不应使用搜索结果", "房号": "0-000", "备注": "错误"}]
+
+        understanding = {
+            "intent": "deposit",
+            "effective_query": "用户咨询免押和这几套水电",
+            "query_state": {"intent": "deposit", "wants_deposit": True, "wants_utilities": True},
+            "constraint_proof": {"intent": "deposit", "wants_utilities": True},
+            "structured_task": {
+                "tool_requirements": {
+                    "needs_deposit_policy": True,
+                    "needs_utilities": True,
+                }
+            },
+        }
+        planner = main._ensure_required_actions(
+            {"actions": ["generate_reply"], "source": "test"},
+            understanding,
+            main._deterministic_signals("免押金要什么条件？服务费怎么算？顺便说下这几套水电怎么收。"),
+        )
+        self.assertIn("send_deposit_policy", planner["actions"])
+        self.assertIn("search_inventory", planner["actions"])
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "intent": "media",
+                "query": "万达2000以下一室",
+                "candidates": candidate_rows,
+                "shown_count": 2,
+                "total_count": 2,
+            }
+            evidence = await main._execute_tools(
+                actions=planner["actions"],
+                content="免押金要什么条件？服务费怎么算？顺便说下这几套水电怎么收。",
+                context=context,
+                understanding=understanding,
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual([row["房号"] for row in evidence["inventory_rows"]], ["2-1-402A", "20-1606A"])
+        self.assertIn("deposit_policy", evidence["rule_evidence"])
+
+    def test_deposit_and_utilities_reply_uses_candidate_remarks(self) -> None:
+        reply = main._reply_for_deposit_and_utilities(
+            {"constraint_proof": {"wants_utilities": True}},
+            {
+                "rule_evidence": {"deposit_policy": main._deposit_policy_evidence()},
+                "inventory_rows": [
+                    {"小区": "大华海派风景", "房号": "2-1-402A", "备注": "水30/月，电1元/度"},
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "备注": "水30/月，电1元/度"},
+                ],
+            },
+        )
+
+        self.assertIn("大华海派风景2-1-402A", reply)
+        self.assertIn("星桥锦绣嘉苑20-1606A", reply)
+        self.assertIn("水30/月，电1元/度", reply)
+        self.assertIn("免押", reply)
+        self.assertNotIn("稍后", reply)
+        self.assertNotIn("电话", reply)
+
+    def test_deposit_utilities_signal_forces_inventory_search(self) -> None:
+        planner = main._ensure_required_actions(
+            {"actions": ["send_deposit_policy", "generate_reply"], "source": "test"},
+            {
+                "intent": "deposit",
+                "constraint_proof": {},
+                "structured_task": {"tool_requirements": {"needs_deposit_policy": True}},
+            },
+            main._deterministic_signals("免押金要什么条件？顺便说下这几套水电怎么收。"),
+        )
+
+        self.assertIn("send_deposit_policy", planner["actions"])
+        self.assertIn("search_inventory", planner["actions"])
+        self.assertIn("context_tools", planner["actions"])
+        self.assertIn("generate_reply", planner["actions"])
+
+    def test_utilities_selfcheck_rejects_missing_remark_answer(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="免押金要什么条件？顺便说下这几套水电怎么收。",
+            draft_reply="免押走支付宝无忧住，服务费按租期收取。",
+            understanding={
+                "constraint_proof": {"wants_utilities": True},
+                "structured_task": {"tool_requirements": {"needs_utilities": True}},
+            },
+            tool_evidence={
+                "inventory_rows": [
+                    {"小区": "大华海派风景", "房号": "2-1-402A", "备注": "水30/月，电1元/度"},
+                ]
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("水电", result["reason"])
+
+    def test_viewing_selfcheck_rejects_missing_viewing_evidence(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="这几套里面客户今天想看，密码多少？如果打不开门怎么办？",
+            draft_reply="我先帮您确认一下最新房态，稍后给您准确回复。",
+            understanding={
+                "intent": "viewing",
+                "constraint_proof": {},
+                "structured_task": {"tool_requirements": {"needs_viewing_policy": True}},
+            },
+            tool_evidence={
+                "target_rows": [
+                    {"小区": "棠润府", "房号": "15-2-801B", "看房方式密码": "6.19空出 看房提前联系"},
+                ],
+                "rule_evidence": {},
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("看房", result["reason"])
+
+    def test_outbound_selfcheck_rejects_placeholder_room_labels(self) -> None:
+        result = main._outbound_package_selfcheck(
+            draft_reply="先发有视频的：XX小区XX房号视频，其他几套稍后补发你。",
+            tool_evidence={"actions": ["send_video"]},
+            outbound_package={
+                "text": "先发有视频的：XX小区XX房号视频，其他几套稍后补发你。",
+                "video_paths": [],
+                "image_paths": [],
+                "inventory_images": [],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("占位符", result["reason"])
+
+    def test_inventory_selfcheck_requires_concrete_room_when_rows_found(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="北部软件园附近便宜点的单间还有吗？客户预算1800以内。",
+            draft_reply="有的，拱墅万达、北部软件园、城北万象城这边预算1800以内的单间，我查到了几套，发你看看。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "拱墅万达/北部软件园/城北万象城",
+                    "budget_range": [0, 1800],
+                    "layout": "一室",
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"区域": "拱墅万达", "小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅", "押一付一": "1600"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("真实小区+房号", result["reason"])
+
+    def test_inventory_selfcheck_rejects_generic_password_in_multi_room_listing(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="北部软件园附近便宜点的单间还有吗？客户预算1800以内。",
+            draft_reply=(
+                "有的，北部软件园这边1800以内单间有星桥锦绣嘉苑20-1606A和棠润府15-2-801B。"
+                "看房密码一般是960615#，需要看哪个随时联系我。"
+            ),
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "拱墅万达/北部软件园/城北万象城",
+                    "budget_range": [0, 1800],
+                    "layout": "一室",
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "押一付一": "1900", "押二付一": "1800"},
+                    {"小区": "棠润府", "房号": "15-2-801B", "押一付一": "1600", "押二付一": "1400"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("多房源推荐不能泛化看房密码", result["reason"])
+
+    def test_inventory_selfcheck_rejects_found_claim_without_rows(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="石桥附近5000左右有两室吗？最好整租。",
+            draft_reply="石桥附近5000左右的两室整租有的，查到了几套。比如某小区两室一厅，押一付一5000。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道/华丰/石桥/永佳/半山",
+                    "budget_range": [4500, 5500],
+                    "layout": "两室",
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("没有返回匹配房源", result["reason"])
+
+    def test_inventory_selfcheck_rejects_soft_found_claim_without_rows(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="石桥附近5000左右有两室吗？最好整租。",
+            draft_reply="石桥街道附近4500-5500预算的两室一厅整租房源有查到，押一付一价格在5000元左右，看房方式可进一步查看。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道/华丰/石桥/永佳/半山",
+                    "budget_range": [4500, 5500],
+                    "layout": "两室",
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("没有返回匹配房源", result["reason"])
+
+    def test_inventory_selfcheck_rejects_missing_feature_constraint_in_no_match_reply(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="华丰附近有没有带燃气的一室一厅？",
+            draft_reply="我这边暂时没查到石桥街道、华丰、石桥、永佳、半山的一室一厅完全匹配房源。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道/华丰/石桥/永佳/半山",
+                    "layout": "一室一厅",
+                    "features": ["燃气"],
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("回复遗漏特征约束：燃气", result["reason"])
+
+    def test_inventory_no_match_reply_preserves_feature_constraint(self) -> None:
+        reply = main._reply_for_inventory_search(
+            {
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道/华丰/石桥/永佳/半山",
+                    "layout": "一室一厅",
+                    "features": ["燃气"],
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            {
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [],
+            },
+        )
+
+        self.assertIn("燃气", reply)
+        self.assertIn("一室一厅", reply)
+        self.assertIn("石桥街道", reply)
+
+    def test_inventory_final_fallback_preserves_feature_constraint(self) -> None:
+        reply = main._constraint_preserving_inventory_fallback(
+            {
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道/华丰/石桥/永佳/半山",
+                    "layout": "一室一厅",
+                    "features": ["燃气"],
+                },
+            },
+            "我这边为了避免发错，先不乱发。你把小区+房号或更具体条件发我一下，我重新按最新房源表查准。",
+        )
+
+        self.assertIn("燃气", reply)
+        self.assertIn("一室一厅", reply)
+        self.assertNotIn("小区+房号", reply)
+
+    def test_price_comparison_selfcheck_rejects_conclusion_when_one_room_missing(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="兴业杨家府3-601和10-1-304哪个价格低点？",
+            draft_reply="兴业杨家府3-601押一付一4500元，押二付一4200元；10-1-304没查到具体价格信息，所以3-601押二付一价格更低。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "communities": ["兴业杨家府"],
+                    "room_refs": ["3-601", "10-1-304"],
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "兴业杨家府", "房号": "3-601", "押一付一": "4500", "押二付一": "4200"}
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("只查到部分房源", result["reason"])
+
+    def test_price_comparison_selfcheck_allows_missing_room_explanation(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="兴业杨家府3-601和10-1-304哪个价格低点？",
+            draft_reply="有的，兴业杨家府3-601押一付一4500元，押二付一4200元；10-1-304暂时没查到。目前只查到3-601这套，没法对比哪套更便宜，建议先确认房号。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "communities": ["兴业杨家府"],
+                    "room_refs": ["3-601", "10-1-304"],
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "兴业杨家府", "房号": "3-601", "押一付一": "4500", "押二付一": "4200"}
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_price_comparison_selfcheck_does_not_require_inferred_area_for_exact_rooms(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="新柠长木府3-1002A和3-1002B价格一样吗？",
+            draft_reply=(
+                "新柠长木府3-1002A和3-1002B价格不一样。"
+                "3-1002A押一付一4600元，押二付一4300元；"
+                "3-1002B押一付一3300元，押二付一3000元。"
+            ),
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "东新园\n杭氧\n新天地",
+                    "communities": ["新柠长木府"],
+                    "room_refs": ["3-1002A", "3-1002B"],
+                    "layout": "两室一厅",
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "新柠长木府", "房号": "3-1002A", "押一付一": "4600", "押二付一": "4300"},
+                    {"小区": "新柠长木府", "房号": "3-1002B", "押一付一": "3300", "押二付一": "3000"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_viewing_selfcheck_requires_viewing_answer_when_today_viewing_requested(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="诸葛龙吟院10-601A还在吗？客户今天想看。",
+            draft_reply="还在，诸葛龙吟院10-601A是两室一厅，押一付一3700元，押二付一3400元，水30/月，电1元/度。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"communities": ["诸葛龙吟院"], "room_refs": ["10-601A"]},
+                "structured_task": {"tool_requirements": {"needs_viewing_policy": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "target_rows": [
+                    {
+                        "小区": "诸葛龙吟院",
+                        "房号": "10-601A",
+                        "押一付一": "3700",
+                        "押二付一": "3400",
+                        "看房方式密码": "336699#",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("今天看/看房方式", result["reason"])
+
+    def test_viewing_selfcheck_requires_availability_answer_when_asked_still_available(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="诸葛龙吟院10-601A还在吗？客户今天想看。",
+            draft_reply="诸葛龙吟院10-601A：看房方式是 336699#。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"communities": ["诸葛龙吟院"], "room_refs": ["10-601A"]},
+                "structured_task": {"tool_requirements": {"needs_viewing_policy": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "target_rows": [
+                    {
+                        "小区": "诸葛龙吟院",
+                        "房号": "10-601A",
+                        "押一付一": "3700",
+                        "押二付一": "3400",
+                        "看房方式密码": "336699#",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("有没有/有哪些/还在吗", result["reason"])
+
+    def test_inventory_selfcheck_rejects_contradictory_found_then_no_match(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="石桥附近5000左右有两室吗？最好整租。",
+            draft_reply="石桥街道附近4500-5500预算内有两室一厅整租房源，暂时没查到符合条件的房源。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道/华丰/石桥/永佳/半山",
+                    "budget_range": [4500, 5500],
+                    "layout": "两室",
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能先说有房源再说没查到", result["reason"])
+
+    def test_inventory_selfcheck_rejects_two_rooms_claim_with_one_label(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="北部软件园附近便宜点的单间还有吗？客户预算1800以内。",
+            draft_reply="北部软件园附近预算1800元以内的单间查到了：棠润府15-2-801B，押一付一1600。两套都符合您的预算。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "拱墅万达/北部软件园/城北万象城",
+                    "budget_range": [0, 1800],
+                    "layout": "一室",
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "棠润府", "房号": "15-2-801B", "押一付一": "1600", "押二付一": "1400"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("两套房源", result["reason"])
+
+    def test_human_selfcheck_rejects_waiting_reply_when_tool_has_facts(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="星桥锦绣嘉苑20-1606A还在不在？价格多少？",
+            draft_reply="我查一下星桥锦绣嘉苑20-1606A还在不在，价格多少，稍等。",
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "押一付一": "1900", "押二付一": "1800"},
+                ],
+            },
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能只回复稍后确认", result["reason"])
+
+    def test_human_selfcheck_allows_password_when_customer_wants_today_viewing(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="诸葛龙吟院10-601A还在吗？客户今天想看。",
+            draft_reply=(
+                "还在的，诸葛龙吟院10-601A这套可以看。看房密码是336699#，"
+                "如果现场密码不对或门打不开，就联系18758141785 / 13282125992 / 19941091943确认。"
+            ),
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "inventory_rows": [
+                    {
+                        "小区": "诸葛龙吟院",
+                        "房号": "10-601A",
+                        "押一付一": "3700",
+                        "押二付一": "3400",
+                        "看房方式密码": "336699#",
+                    },
+                ],
+                "rule_evidence": {"viewing_contact": True},
+            },
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_human_selfcheck_rejects_unasked_missing_video_comment(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="东新园有没有马上空出来的？客户比较急。",
+            draft_reply=(
+                "有的，东新园这边有几套空出时间已定。"
+                "按当前区域和空出时间暂时没匹配到可直接发视频的具体房源。"
+            ),
+            tool_evidence={"actions": ["search_inventory", "generate_reply"], "inventory_rows": []},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能主动提素材缺失", result["reason"])
+
+    def test_price_selfcheck_rejects_reply_without_payment_prices(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="星桥锦绣嘉苑20-1606A还在不在？价格多少？",
+            draft_reply="查到了，星桥锦绣嘉苑20-1606A还在的，价格我马上发给您。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"communities": ["星桥锦绣嘉苑"], "room_refs": ["20-1606A"]},
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "押一付一": "1900", "押二付一": "1800"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("月租价格", result["reason"])
+
+    def test_price_selfcheck_rejects_wrong_payment_field_value(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="荣润府15-2-801B还在吗？1600那套视频发我。",
+            draft_reply="棠润府15-2-801B这套房还在，押一付一1600，押二付一1600。这是该房源的视频。",
+            understanding={
+                "intent": "media",
+                "constraint_proof": {
+                    "communities": ["棠润府"],
+                    "room_refs": ["15-2-801B"],
+                    "wants_video": True,
+                },
+                "structured_task": {"tool_requirements": {"needs_video": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "棠润府", "房号": "15-2-801B", "押一付一": "1600", "押二付一": "1400"},
+                ],
+                "target_rows": [
+                    {"小区": "棠润府", "房号": "15-2-801B", "押一付一": "1600", "押二付一": "1400"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("押二付一应为1400", result["reason"])
+
+    def test_price_selfcheck_requires_both_payment_prices_for_generic_price_question(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="星桥锦绣嘉苑20-1606A还在不在？价格多少？",
+            draft_reply="还在，星桥锦绣嘉苑20-1606A押一付一月租1900元，一室一厅。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"communities": ["星桥锦绣嘉苑"], "room_refs": ["20-1606A"]},
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "押一付一": "1900", "押二付一": "1800"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("遗漏押二付一月租", result["reason"])
+
+    def test_price_selfcheck_allows_single_payment_method_when_user_asks_yayi_only(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="石桥铭苑6-1102押一付一多少？",
+            draft_reply="石桥铭苑6-1102押一付一月租4800元。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"communities": ["石桥铭苑"], "room_refs": ["6-1102"]},
+                "structured_task": {"tool_requirements": {"needs_inventory": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "石桥铭苑", "房号": "6-1102", "押一付一": "4800", "押二付一": "4300"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_outbound_selfcheck_rejects_phone_me_wording(self) -> None:
+        result = main._outbound_package_selfcheck(
+            draft_reply="看房密码960615#，或者电话我18758141785，这几套看中哪套随时联系。",
+            tool_evidence={"actions": ["search_inventory", "generate_reply"]},
+            outbound_package={
+                "text": "看房密码960615#，或者电话我18758141785，这几套看中哪套随时联系。",
+                "video_paths": [],
+                "image_paths": [],
+                "inventory_images": [],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能声称自己会打电话", result["reason"])
+
+    def test_outbound_selfcheck_rejects_inventory_image_text_contradiction(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".png") as image:
+            result = main._outbound_package_selfcheck(
+                draft_reply="抱歉，目前暂未查到拱墅万达附近的最新房源表。我已为您记录需求，一旦有新房源会第一时间发您。",
+                tool_evidence={"actions": ["send_inventory_sheet"]},
+                outbound_package={
+                    "text": "抱歉，目前暂未查到拱墅万达附近的最新房源表。我已为您记录需求，一旦有新房源会第一时间发您。",
+                    "inventory_images": [image.name],
+                    "inventory_explanation": "房源表发你了，你可以让客户先整体看一下。",
+                    "video_paths": [],
+                    "image_paths": [],
+                },
+            )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("文本说不能发送房源表", result["reason"])
+
+    def test_outbound_selfcheck_rejects_inventory_image_generation_failure_text(self) -> None:
+        with tempfile.NamedTemporaryFile(suffix=".png") as image:
+            result = main._outbound_package_selfcheck(
+                draft_reply="房源表图片这边暂时没生成成功，我先不乱发。",
+                tool_evidence={"actions": ["send_inventory_sheet"]},
+                outbound_package={
+                    "text": "房源表图片这边暂时没生成成功，我先不乱发。",
+                    "inventory_images": [image.name],
+                    "inventory_explanation": "房源表发你了，你可以让客户先整体看一下。",
+                    "video_paths": [],
+                    "image_paths": [],
+                },
+            )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("文本说不能发送房源表", result["reason"])
+
+    def test_human_selfcheck_rejects_waiting_reply_without_tool_facts(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="石桥附近5000左右有两室吗？最好整租。",
+            draft_reply="好的，我查一下石桥及周边区域，预算4500到5500的两室整租房源，稍等告诉你。",
+            tool_evidence={"actions": ["search_inventory", "generate_reply"], "inventory_rows": []},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能只回复稍后确认", result["reason"])
+
+    def test_human_selfcheck_rejects_proactive_notification_promise(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="石桥附近5000左右有两室吗？最好整租。",
+            draft_reply="石桥这边暂时没查到，我帮你留意着，有合适的马上通知你。",
+            tool_evidence={"actions": ["search_inventory", "generate_reply"], "inventory_rows": []},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("主动通知", result["reason"])
+
+    def test_human_selfcheck_rejects_first_notice_promise(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="石桥附近5000左右有两室吗？最好整租。",
+            draft_reply="石桥这边暂时没查到，我们正在持续更新房源信息，有新资源会第一时间通知您。",
+            tool_evidence={"actions": ["search_inventory", "generate_reply"], "inventory_rows": []},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("主动通知", result["reason"])
+
+    def test_human_selfcheck_rejects_push_latest_info_promise(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="石桥附近5000左右有两室吗？最好整租。",
+            draft_reply="在石桥街道附近暂时没查到两室整租。我们正在持续更新房源，稍后会为您推送最新信息。",
+            tool_evidence={"actions": ["search_inventory", "generate_reply"], "inventory_rows": []},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("主动通知", result["reason"])
+
+    def test_human_selfcheck_rejects_later_send_promise(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="华丰欣苑14-2-901视频发我，客户想看看装修。",
+            draft_reply="视频先发你，目前暂无其他视频素材，正在补同步，稍后会发您。",
+            tool_evidence={"actions": ["send_video"], "video_paths": ["room.mp4"]},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("主动通知", result["reason"])
+
+    def test_human_selfcheck_rejects_media_replenish_promise(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="万达附近1500左右还有哪些？先发几套视频我筛一下。",
+            draft_reply="这几套视频发你了，小洋坝家园三区12-1003B暂时没找到视频，后面素材补齐再处理。",
+            tool_evidence={"actions": ["send_video", "explain_missing_media"], "video_paths": ["room.mp4"]},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("主动通知", result["reason"])
+
+    def test_missing_media_fallback_does_not_promise_future_replenish(self) -> None:
+        reply = main._reply_for_missing_media(
+            {"constraint_proof": {"wants_video": True}},
+            {
+                "missing_media": ["小洋坝家园三区12-1003B:视频"],
+                "video_paths": ["room.mp4"],
+                "video_rows": [{"小区": "星桥锦绣嘉苑", "房号": "20-1606A"}],
+            },
+        )
+
+        self.assertIn("小洋坝家园三区12-1003B", reply)
+        self.assertIn("星桥锦绣嘉苑20-1606A", reply)
+        self.assertIn("已找到这些视频", reply)
+        self.assertTrue(reply.startswith("有的，"))
+        self.assertNotIn("后面素材补齐", reply)
+        self.assertNotIn("稍后发", reply)
+
+    def test_missing_media_fallback_without_any_media_does_not_claim_sendable_material(self) -> None:
+        reply = main._reply_for_missing_media(
+            {"constraint_proof": {"wants_video": True}},
+            {"missing_media": ["小洋坝家园三区12-1003B:视频"], "video_paths": []},
+        )
+
+        self.assertIn("小洋坝家园三区12-1003B", reply)
+        self.assertIn("这次没有可发送的视频", reply)
+        self.assertNotIn("已找到的素材", reply)
+
+    def test_budget_selfcheck_requires_partial_payment_scope_note(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="北部软件园附近便宜点的单间还有吗？客户预算1800以内。",
+            draft_reply=(
+                "有的，查到以下几套符合预算1800元以内的在租房源：\n"
+                "1. 星桥锦绣嘉苑20-1606A，一室一厅，押一付一1900元，押二付一1800元。\n"
+                "2. 棠润府15-2-801B，一室一厅，押一付一1600元，押二付一1400元。"
+            ),
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "budget_range": [0, 1800],
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory_search": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory"],
+                "inventory_rows": [
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "押一付一": "1900", "押二付一": "1800"},
+                    {"小区": "棠润府", "房号": "15-2-801B", "押一付一": "1600", "押二付一": "1400"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("只有部分付款方式在预算内", result["reason"])
+
+    def test_budget_selfcheck_allows_partial_payment_scope_note(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="北部软件园附近便宜点的单间还有吗？客户预算1800以内。",
+            draft_reply=(
+                "有的，有些房源是押一付一或押二付一其中一种月租在预算内，我把两种付款方式都列出来：\n"
+                "1. 星桥锦绣嘉苑20-1606A，一室一厅，押一付一1900元，押二付一1800元。\n"
+                "2. 棠润府15-2-801B，一室一厅，押一付一1600元，押二付一1400元。"
+            ),
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "budget_range": [0, 1800],
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory_search": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory"],
+                "inventory_rows": [
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "押一付一": "1900", "押二付一": "1800"},
+                    {"小区": "棠润府", "房号": "15-2-801B", "押一付一": "1600", "押二付一": "1400"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_human_selfcheck_rejects_unsolicited_viewing_password(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="星桥锦绣嘉苑20-1606A还在不在？价格多少？",
+            draft_reply="还在，星桥锦绣嘉苑20-1606A押一付一1900，押二付一1800，看房密码是960615#。",
+            tool_evidence={"actions": ["search_inventory", "generate_reply"], "inventory_rows": [{"小区": "星桥锦绣嘉苑", "房号": "20-1606A"}]},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能主动给看房密码", result["reason"])
+
+    def test_human_selfcheck_rejects_unasked_missing_media_hint(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="星桥锦绣嘉苑20-1606A还在不在？价格多少？",
+            draft_reply="还在，星桥锦绣嘉苑20-1606A押一付一1900，押二付一1800。暂时没找到视频素材，可以先看房源表。",
+            tool_evidence={"actions": ["search_inventory", "generate_reply"], "inventory_rows": [{"小区": "星桥锦绣嘉苑", "房号": "20-1606A"}]},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能主动提素材缺失", result["reason"])
+        self.assertIn("不能主动让客户看房源表", result["reason"])
+
+    def test_human_selfcheck_rejects_unasked_video_image_not_found_variant(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="北部软件园附近便宜点的单间还有吗？客户预算1800以内。",
+            draft_reply="有的，北部软件园附近预算1800元以内查到几套。视频和图片暂未找到，可以先看房源信息。",
+            tool_evidence={"actions": ["search_inventory", "generate_reply"], "inventory_rows": [{"小区": "棠润府", "房号": "15-2-801B"}]},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能主动提素材缺失", result["reason"])
+
+    def test_human_selfcheck_rejects_listing_query_with_still_available_opening(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="万达附近1500左右还有哪些？先发几套视频我筛一下。",
+            draft_reply="在拱墅万达区域，预算1500左右的一室一厅房源还在的，我先发几套视频你筛一下。",
+            tool_evidence={"actions": ["search_inventory", "send_video"], "inventory_rows": [{"小区": "棠润府", "房号": "15-2-801B"}]},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能用还在/在的开头", result["reason"])
+
+    def test_routine_planner_reply_uses_local_final_selfcheck_without_llm(self) -> None:
+        result = main._needs_llm_final_selfcheck(
+            content="星桥锦绣嘉苑20-1606A还在不在？价格多少？",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"communities": ["星桥锦绣嘉苑"], "room_refs": ["20-1606A"]},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "押一付一": "1900", "押二付一": "1800"},
+                ],
+            },
+            draft_reply="星桥锦绣嘉苑20-1606A还在的，一室一厅，押一付一1900，押二付一1800。",
+            rule_selfcheck={"status": "pass"},
+            deterministic_reply_source="planner_reply_text",
+            retry_reason="",
+        )
+
+        self.assertFalse(result)
+
+    def test_high_risk_reply_still_uses_llm_final_selfcheck(self) -> None:
+        result = main._needs_llm_final_selfcheck(
+            content="密码不对，门打不开怎么处理？",
+            understanding={"intent": "viewing", "constraint_proof": {}},
+            tool_evidence={"actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"]},
+            draft_reply="密码不对就联系18758141785确认。",
+            rule_selfcheck={"status": "pass"},
+            deterministic_reply_source="planner_reply_text",
+            retry_reason="",
+        )
+
+        self.assertTrue(result)
+
+    def test_outbound_selfcheck_rejects_sent_video_with_unsynced_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "room.mp4"
+            video_path.write_bytes(b"video")
+            result = main._outbound_package_selfcheck(
+                draft_reply="好的，华丰欣苑14-2-901的视频已经发给你了。如果视频暂时没同步，等补全后我再发你。",
+                tool_evidence={"actions": ["send_video"]},
+                outbound_package={
+                    "text": "好的，华丰欣苑14-2-901的视频已经发给你了。如果视频暂时没同步，等补全后我再发你。",
+                    "video_paths": [str(video_path)],
+                    "video_explanations": ["这是华丰欣苑14-2-901的视频。"],
+                    "image_paths": [],
+                    "inventory_images": [],
+                    "missing_media": [],
+                },
+            )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("未同步", result["reason"])
+
+    def test_outbound_selfcheck_rejects_sent_video_same_room_missing_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "room.mp4"
+            video_path.write_bytes(b"video")
+            result = main._outbound_package_selfcheck(
+                draft_reply="棠润府15-2-801B本地暂时没找到视频，我先发你现有素材。",
+                tool_evidence={
+                    "actions": ["send_video"],
+                    "video_rows": [{"小区": "棠润府", "房号": "15-2-801B"}],
+                },
+                outbound_package={
+                    "text": "棠润府15-2-801B本地暂时没找到视频，我先发你现有素材。",
+                    "video_paths": [str(video_path)],
+                    "video_explanations": ["这是棠润府15-2-801B的视频。"],
+                    "image_paths": [],
+                    "inventory_images": [],
+                    "missing_media": [],
+                },
+            )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("同一房源没有视频", result["reason"])
+
+    def test_outbound_selfcheck_rejects_sent_and_missing_same_video_room(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "room.mp4"
+            video_path.write_bytes(b"video")
+            result = main._outbound_package_selfcheck(
+                draft_reply="这是棠润府15-2-801B的视频。棠润府15-2-801B暂时没找到视频。",
+                tool_evidence={
+                    "actions": ["send_video", "explain_missing_media"],
+                    "video_rows": [{"小区": "棠润府", "房号": "15-2-801B"}],
+                },
+                outbound_package={
+                    "text": "这是棠润府15-2-801B的视频。棠润府15-2-801B暂时没找到视频。",
+                    "video_paths": [str(video_path)],
+                    "video_explanations": ["这是棠润府15-2-801B的视频。"],
+                    "image_paths": [],
+                    "inventory_images": [],
+                    "missing_media": ["棠润府15-2-801B: 视频"],
+                },
+            )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("既准备发送视频", result["reason"])
+
+    def test_outbound_selfcheck_rejects_sent_video_with_extra_pending_promise(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "room.mp4"
+            video_path.write_bytes(b"video")
+            result = main._outbound_package_selfcheck(
+                draft_reply="这是华丰欣苑14-2-901的装修视频，您看看是否满意。目前暂无其他视频素材，正在补同步，稍后会发您。",
+                tool_evidence={"actions": ["send_video"]},
+                outbound_package={
+                    "text": "这是华丰欣苑14-2-901的装修视频，您看看是否满意。目前暂无其他视频素材，正在补同步，稍后会发您。",
+                    "video_paths": [str(video_path)],
+                    "video_explanations": ["这是华丰欣苑14-2-901的视频。"],
+                    "image_paths": [],
+                    "inventory_images": [],
+                    "missing_media": [],
+                },
+            )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("视频已准备发送", result["reason"])
+
+    def test_preserved_sendable_evidence_survives_planner_retry(self) -> None:
+        preserved = {
+            "actions": ["search_inventory", "send_video", "generate_reply"],
+            "video_paths": ["video-a.mp4"],
+            "video_rows": [{"小区": "棠润府", "房号": "15-2-801B"}],
+            "missing_media": ["小洋坝家园三区12-1003B: video missing"],
+            "media_request": {"wants_video": True, "requested_count": 2},
+        }
+        current = {
+            "actions": ["search_inventory", "explain_missing_media", "generate_reply"],
+            "missing_media": ["小洋坝家园三区12-1003B: video missing"],
+        }
+
+        merged = main._merge_preserved_sendable_evidence(current, preserved)
+
+        self.assertEqual(merged["video_paths"], ["video-a.mp4"])
+        self.assertIn("send_video", merged["actions"])
+        self.assertEqual(merged["video_rows"][0]["房号"], "15-2-801B")
+
+    def test_outbound_selfcheck_rejects_front_media_hint_without_actions(self) -> None:
+        result = main._outbound_package_selfcheck(
+            draft_reply="这几套我查到了房源，但本地暂时没找到视频：小洋坝家园三区12-1003B。你可以先看前面已经有的素材。",
+            tool_evidence={"actions": ["explain_missing_media"]},
+            outbound_package={
+                "text": "这几套我查到了房源，但本地暂时没找到视频：小洋坝家园三区12-1003B。你可以先看前面已经有的素材。",
+                "video_paths": [],
+                "image_paths": [],
+                "inventory_images": [],
+                "missing_media": ["小洋坝家园三区12-1003B: video missing"],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("前面素材", result["reason"])
+
+    def test_outbound_selfcheck_requires_missing_media_room_label(self) -> None:
+        result = main._outbound_package_selfcheck(
+            draft_reply="有的，先发你4套视频。有些房源暂时没有视频，正在补同步。",
+            tool_evidence={"actions": ["send_video", "explain_missing_media"]},
+            outbound_package={
+                "text": "有的，先发你4套视频。有些房源暂时没有视频，正在补同步。",
+                "video_paths": [],
+                "image_paths": [],
+                "inventory_images": [],
+                "missing_media": ["小洋坝家园三区12-1003B: 视频"],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("点名缺素材", result["reason"])
+
+    def test_human_selfcheck_rejects_final_answer_that_only_promises_to_list(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="石桥附近5000左右有两室吗？最好整租。",
+            draft_reply="石桥街道、华丰、永佳、半山这边4500到5500的两室整租，我帮你查一下，马上列出来给你。",
+            tool_evidence={"actions": ["search_inventory", "generate_reply"], "inventory_rows": []},
+            deterministic_reply_source="planner_reply_text",
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能只回复稍后确认", result["reason"])
+
+    def test_rewrite_inventory_index_contains_user_field_semantics(self) -> None:
+        index = build_rewrite_inventory_index(
+            [
+                {
+                    "区域": "东新园\n杭氧\n新天地",
+                    "小区": "新柠长木府",
+                    "房号": "3-1002B",
+                    "户型描述": "两室一厅朝南带阳台",
+                    "户型分类": "两室一厅",
+                    "押一付一": "3500",
+                    "押二付一": "3200",
+                    "看房方式密码": "6.22空出 看房提前联系",
+                    "备注": "水30/月，电1元/度",
+                }
+            ]
+        )
+
+        self.assertEqual(index["field_semantics"], FIELD_SEMANTICS)
+        self.assertEqual(index["areas"][0]["price_range"], [3200, 3500])
+        self.assertIn("押一付一", index["field_aliases"])
+        self.assertIn("押二付一", index["field_aliases"])
+        self.assertEqual(index["room_index"][0]["layout_description"], "两室一厅朝南带阳台")
+        self.assertEqual(index["room_index"][0]["utilities"], "水30/月，电1元/度")
+
+    async def test_current_room_query_overrides_stale_inventory_sheet_state(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory_sheet",
+                    "rewritten_query": "继续按上一轮房源表任务处理，生成房源表。",
+                    "effective_query": "继续按上一轮房源表任务处理，生成房源表。",
+                    "query_state": {"intent": "inventory_sheet", "wants_inventory_sheet": True},
+                    "needs_clarification": False,
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"区域": "拱墅万达", "小区": "棠润府", "房号": "15-2-801B", "押一付": "1600"}
+                ]
+
+        context = kf_context_memory.empty_context()
+        context["active_query_state"] = {"intent": "inventory_sheet", "wants_inventory_sheet": True}
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="荣润府有没有押一付一的？预算1600到1800。",
+                context=context,
+                signals=main._deterministic_signals("荣润府有没有押一付一的？预算1600到1800。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertEqual(result["intent"], "inventory")
+        self.assertFalse(result["query_state"].get("wants_inventory_sheet"))
+        self.assertIn("荣润府有没有押一付一的？预算1600到1800。", result["effective_query"])
+        self.assertNotIn("棠润府", result["effective_query"])
+        self.assertTrue(result["needs_clarification"])
+        self.assertIn("你说的是棠润府吗", result["clarification_text"])
+
+    async def test_planner_video_requirement_is_hardened_when_llm_omits_send_video(self) -> None:
+        class FakeReplyGenerator:
+            async def plan_kf_tool_actions(self, **kwargs):
+                return {"actions": ["search_inventory", "generate_reply"], "confidence": 0.9}
+
+        fake = FakeReplyGenerator()
+        original = main.reply_generator
+        main.reply_generator = fake
+        try:
+            result = await main._plan_actions(
+                content="杨家新雅苑49-1102视频有吗？先发我。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "杨家新雅苑49-1102视频",
+                    "query_state": {"intent": "media", "wants_video": True},
+                    "constraint_proof": {"wants_video": True, "room_refs": ["49-1102"]},
+                    "structured_task": {
+                        "intent": "media",
+                        "tool_requirements": {"needs_video": True, "needs_inventory_search": True},
+                    },
+                },
+                signals=main._deterministic_signals("杨家新雅苑49-1102视频有吗？先发我。"),
+            )
+        finally:
+            main.reply_generator = original
+
+        self.assertIn("send_video", result["actions"])
+        self.assertIn("search_inventory", result["actions"])
+        self.assertIn("generate_reply", result["actions"])
+
+    async def test_unbound_context_viewing_reference_asks_for_specific_room(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "viewing",
+                    "rewritten_query": "查询这几套的看房密码",
+                    "query_state": {"intent": "viewing"},
+                    "needs_clarification": False,
+                    "clarification_text": "",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return []
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="这几套里面客户今天想看，密码多少？如果打不开门怎么办？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("这几套里面客户今天想看，密码多少？如果打不开门怎么办？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertTrue(result["needs_clarification"])
+        self.assertIn("小区+房号", result["clarification_text"])
+        self.assertNotIn("7套", result["clarification_text"])
+
+    async def test_bound_context_viewing_reference_uses_candidate_set(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "viewing",
+                    "rewritten_query": "查询这几套的看房密码",
+                    "effective_query": "查询这几套的看房密码",
+                    "query_state": {"intent": "viewing"},
+                    "context_reference": True,
+                    "needs_clarification": True,
+                    "clarification_text": "请问具体哪几套？",
+                    "structured_task": {
+                        "intent": "viewing",
+                        "original_text": "这几套里面客户今天想看，密码多少？如果打不开门怎么办？",
+                        "tool_requirements": {"needs_viewing_policy": True},
+                    },
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return []
+
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达2000以下一室",
+            "candidates": [{"小区": "棠润府", "房号": "15-2-801B"}],
+            "shown_count": 1,
+            "total_count": 1,
+        }
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="这几套里面客户今天想看，密码多少？如果打不开门怎么办？",
+                context=context,
+                signals=main._deterministic_signals("这几套里面客户今天想看，密码多少？如果打不开门怎么办？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertTrue(result["context_reference"])
+
+    async def test_bound_viewing_reference_sets_context_reference_without_llm_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "viewing",
+                    "rewritten_query": "查询这几套的看房密码",
+                    "effective_query": "查询这几套的看房密码",
+                    "query_state": {"intent": "viewing"},
+                    "needs_clarification": False,
+                    "clarification_text": "",
+                    "structured_task": {
+                        "intent": "viewing",
+                        "original_text": "这几套里面客户今天想看，密码多少？",
+                        "tool_requirements": {"needs_viewing_policy": True},
+                    },
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return []
+
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "北部软件园1800以内单间",
+            "candidates": [{"小区": "星桥锦绣嘉苑", "房号": "20-1606A"}],
+            "shown_count": 1,
+            "total_count": 1,
+        }
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="这几套里面客户今天想看，密码多少？",
+                context=context,
+                signals=main._deterministic_signals("这几套里面客户今天想看，密码多少？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertTrue(result["context_reference"])
+
+    def test_viewing_context_reference_targets_candidate_rows(self) -> None:
+        candidates = [
+            {"小区": "棠润府", "房号": "15-2-801B"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+        ]
+        context = {"last_candidate_set": {"candidates": candidates}}
+        rows = main._target_rows_from_understanding(
+            {
+                "intent": "viewing",
+                "context_reference": True,
+                "effective_query": "这几套密码多少",
+                "structured_task": {
+                    "original_text": "这几套里面客户今天想看，密码多少？",
+                    "tool_requirements": {"needs_viewing_policy": True},
+                },
+            },
+            context,
+            [],
+        )
+
+        self.assertEqual(rows, candidates)
+
+    async def test_viewing_execute_tools_uses_candidate_rows_even_when_search_misses(self) -> None:
+        candidates = [
+            {"小区": "棠润府", "房号": "15-2-801B", "看房方式密码": "6.19空出 看房提前联系"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "看房方式密码": "960615#"},
+        ]
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return [{"小区": "不应使用搜索结果", "房号": "0-000", "看房方式密码": "错误"}]
+
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达2000以下一室",
+            "candidates": candidates,
+            "shown_count": 2,
+            "total_count": 2,
+        }
+        understanding = {
+            "intent": "viewing",
+            "effective_query": "查询这几套看房密码",
+            "query_state": {"intent": "viewing"},
+            "context_reference": False,
+            "structured_task": {
+                "intent": "viewing",
+                "original_text": "这几套里面客户今天想看，密码多少？如果打不开门怎么办？",
+                "tool_requirements": {"needs_viewing_policy": True},
+            },
+        }
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "explain_unavailable_viewing", "generate_reply"],
+                content="这几套里面客户今天想看，密码多少？如果打不开门怎么办？",
+                context=context,
+                understanding=understanding,
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual([row["房号"] for row in evidence["inventory_rows"]], ["15-2-801B", "20-1606A"])
+        self.assertEqual([row["房号"] for row in evidence["target_rows"]], ["15-2-801B", "20-1606A"])
+        viewing_rooms = evidence["rule_evidence"]["viewing"]["rooms"]
+        self.assertEqual([room["room"] for room in viewing_rooms], ["棠润府15-2-801B", "星桥锦绣嘉苑20-1606A"])
+
+    async def test_viewing_execute_tools_recovers_candidate_rows_from_memory_query(self) -> None:
+        candidates = [
+            {"小区": "棠润府", "房号": "15-2-801B", "看房方式密码": "6.19空出 看房提前联系"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "看房方式密码": "960615#"},
+        ]
+
+        class FakeInventory:
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                self.last_query = query
+                return candidates
+
+        context = kf_context_memory.empty_context()
+        context["structured_memory"] = {
+            "turn_records": [
+                {
+                    "turn_id": "t1",
+                    "turn_index": 1,
+                    "assistant_sent_summary": {
+                        "candidate_state": {
+                            "candidate_set": {
+                                "query": "万达2000以下一室",
+                                "shown_count": 2,
+                                "total_count": 2,
+                            }
+                        }
+                    },
+                }
+            ]
+        }
+        understanding = {
+            "intent": "viewing",
+            "effective_query": "查询这几套看房密码",
+            "query_state": {"intent": "viewing"},
+            "structured_task": {
+                "intent": "viewing",
+                "original_text": "这几套里面客户今天想看，密码多少？如果打不开门怎么办？",
+                "tool_requirements": {"needs_viewing_policy": True},
+            },
+        }
+        fake_inventory = FakeInventory()
+        original_inventory = main.inventory
+        main.inventory = fake_inventory
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "explain_unavailable_viewing", "generate_reply"],
+                content="这几套里面客户今天想看，密码多少？如果打不开门怎么办？",
+                context=context,
+                understanding=understanding,
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(fake_inventory.last_query, "万达2000以下一室")
+        self.assertEqual([row["房号"] for row in evidence["target_rows"]], ["15-2-801B", "20-1606A"])
+        self.assertEqual([row["房号"] for row in context["last_candidate_set"]["candidates"]], ["15-2-801B", "20-1606A"])
+
+    def test_single_exact_room_does_not_overwrite_candidate_set(self) -> None:
+        self.assertFalse(
+            main._should_remember_candidate_set(
+                content="星桥锦绣嘉苑20-1606A还在不在？价格多少？",
+                understanding={"constraint_proof": {"room_refs": ["20-1606A"]}},
+                rows=[{"小区": "星桥锦绣嘉苑", "房号": "20-1606A"}],
+            )
+        )
+        self.assertTrue(
+            main._should_remember_candidate_set(
+                content="北部软件园附近便宜点的单间还有吗？",
+                understanding={},
+                rows=[
+                    {"小区": "棠润府", "房号": "15-2-801B"},
+                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+                ],
+            )
+        )
+
+    async def test_continue_pending_video_uses_pending_missing_labels(self) -> None:
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                raise AssertionError("继续发剩下的视频时不应重新泛搜房源")
+
+        context = kf_context_memory.remember_pending_video_sends(
+            kf_context_memory.empty_context(),
+            paths=[],
+            labels=["小洋坝家园三区12-1003B", "星桥锦绣嘉苑17-503B"],
+            requested_count=2,
+            sent_count=0,
+        )
+        originals = {"inventory": main.inventory}
+        main.inventory = FakeInventory()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                content="继续发剩下的视频。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "继续发剩下的视频",
+                    "constraint_proof": {"wants_video": True},
+                    "query_state": {"pending_video_action": "continue"},
+                    "structured_task": {"intent": "media", "tool_requirements": {"needs_video": True}},
+                },
+            )
+        finally:
+            main.inventory = originals["inventory"]
+
+        self.assertIn("小洋坝家园三区12-1003B:视频", evidence["missing_media"])
+        self.assertIn("星桥锦绣嘉苑17-503B:视频", evidence["missing_media"])
+        self.assertEqual(evidence["media_status"]["video"]["missing_rooms"], ["小洋坝家园三区12-1003B", "星桥锦绣嘉苑17-503B"])
+
+    def test_pending_video_continue_normalizes_rewrite_task(self) -> None:
+        context = kf_context_memory.remember_pending_video_sends(
+            kf_context_memory.empty_context(),
+            paths=[],
+            labels=["小洋坝家园三区12-1003B", "星桥锦绣嘉苑17-503B"],
+            requested_count=2,
+            sent_count=0,
+        )
+        result = main._force_pending_video_continue_task(
+            "剩下的继续发。",
+            {
+                "intent": "inventory",
+                "rewritten_query": "石桥附近4500-5500一室一厅",
+                "effective_query": "石桥附近4500-5500一室一厅",
+                "query_state": {"intent": "inventory"},
+                "constraint_proof": {
+                    "intent": "inventory",
+                    "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                    "budget_range": [4500, 5500],
+                    "layout": "一室一厅",
+                },
+                "structured_task": {
+                    "intent": "inventory",
+                    "effective_query": "石桥附近4500-5500一室一厅",
+                    "query_state": {"intent": "inventory"},
+                    "constraint_proof": {"intent": "inventory"},
+                    "tool_requirements": {"needs_inventory_search": True},
+                },
+            },
+            context,
+        )
+
+        self.assertEqual(result["intent"], "media")
+        self.assertIn("继续发送上一轮未完成的视频素材", result["effective_query"])
+        self.assertTrue(result["constraint_proof"]["wants_video"])
+        self.assertEqual(result["constraint_proof"]["pending_video_action"], "continue")
+        requirements = result["structured_task"]["tool_requirements"]
+        self.assertTrue(requirements["needs_video"])
+        self.assertFalse(requirements["needs_inventory_search"])
+        self.assertFalse(requirements["needs_viewing_policy"])
+
+    def test_pending_video_send_all_phrase_normalizes_rewrite_task(self) -> None:
+        context = kf_context_memory.remember_pending_video_sends(
+            kf_context_memory.empty_context(),
+            paths=[],
+            labels=["兴业杨家府4-1502", "兴业杨家府8-1203"],
+            requested_count=5,
+            sent_count=3,
+        )
+        result = main._force_pending_video_continue_task(
+            "能发的都发，先不要超过5套。",
+            {
+                "intent": "inventory",
+                "rewritten_query": "石桥附近4500-5500整租",
+                "effective_query": "石桥附近4500-5500整租",
+                "query_state": {"intent": "inventory"},
+                "constraint_proof": {"intent": "inventory"},
+                "structured_task": {
+                    "intent": "inventory",
+                    "tool_requirements": {"needs_inventory_search": True},
+                },
+            },
+            context,
+        )
+
+        self.assertEqual(result["intent"], "media")
+        self.assertEqual(result.get("selected_indices"), [])
+        self.assertEqual(result["query_state"]["pending_video_action"], "continue")
+        self.assertNotIn("selected_indices", result["constraint_proof"])
+        requirements = result["structured_task"]["tool_requirements"]
+        self.assertTrue(requirements["needs_video"])
+        self.assertFalse(requirements["needs_inventory_search"])
+        self.assertEqual(main._selected_indices_from_understanding(result, "能发的都发，先不要超过5套。"), [])
+
+    async def test_new_exact_video_request_ignores_stale_pending_video_action(self) -> None:
+        class FakeInventory:
+            def __init__(self) -> None:
+                self.searched = False
+
+            async def search(self, *args, **kwargs):
+                self.searched = True
+                return [{"小区": "华丰欣苑", "房号": "14-2-901", "户型分类": "一室一厅"}]
 
         class FakeMediaStore:
+            def list_room_database_videos(self, query: str, limit: int = 6):
+                if "华丰欣苑" in query and "14-2-901" in query:
+                    return [Path("room_database/video/华丰欣苑14-2-901/570.mp4")]
+                return []
+
+            def list_room_database_images(self, query: str, limit: int = 6):
+                return []
+
+        context = kf_context_memory.remember_pending_video_sends(
+            kf_context_memory.empty_context(),
+            paths=[],
+            labels=["小洋坝家园三区12-1003B"],
+            requested_count=1,
+            sent_count=0,
+        )
+        fake_inventory = FakeInventory()
+        originals = {"inventory": main.inventory, "media_store": main.media_store}
+        main.inventory = fake_inventory
+        main.media_store = FakeMediaStore()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                content="华丰欣苑14-2-901视频发我，客户想看看装修。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "华丰欣苑14-2-901视频客户想看装修",
+                    "constraint_proof": {
+                        "communities": ["华丰欣苑"],
+                        "room_refs": ["14-2-901"],
+                        "wants_video": True,
+                    },
+                    "query_state": {"pending_video_action": "continue", "wants_video": True},
+                    "structured_task": {"intent": "media", "tool_requirements": {"needs_video": True}},
+                },
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertTrue(fake_inventory.searched)
+        self.assertEqual(evidence["target_rows"][0]["房号"], "14-2-901")
+        self.assertEqual(
+            [path.replace("\\", "/") for path in evidence["video_paths"]],
+            ["room_database/video/华丰欣苑14-2-901/570.mp4"],
+        )
+        self.assertNotIn("小洋坝家园三区12-1003B:视频", evidence["missing_media"])
+
+    async def test_pending_send_all_phrase_uses_pending_without_inventory_search(self) -> None:
+        class FakeInventory:
             def __init__(self) -> None:
-                self.video_path = Path("room_database/video/大华海派风景2-1-402A/视频.mp4")
+                self.searched = False
 
-            def list_for_rooms(self, rooms: list[dict]) -> list:
-                return []
+            async def search(self, *args, **kwargs):
+                self.searched = True
+                return [{"小区": "杨家新雅苑", "房号": "15-603"}]
 
-            def public_urls(self, media: list) -> tuple[list[str], list[str]]:
-                return [], []
+        context = kf_context_memory.remember_pending_video_sends(
+            kf_context_memory.empty_context(),
+            paths=[],
+            labels=["兴业杨家府4-1502", "兴业杨家府8-1203"],
+            requested_count=5,
+            sent_count=3,
+        )
+        fake_inventory = FakeInventory()
+        original_inventory = main.inventory
+        main.inventory = fake_inventory
+        try:
+            understanding = main._force_pending_video_continue_task(
+                "能发的都发，先不要超过5套。",
+                {
+                    "intent": "inventory",
+                    "constraint_proof": {"intent": "inventory", "selected_indices": [1, 2, 3, 4, 5]},
+                    "structured_task": {
+                        "intent": "inventory",
+                        "tool_requirements": {"needs_inventory_search": True},
+                    },
+                },
+                context,
+            )
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "send_video", "explain_missing_media", "generate_reply"],
+                content="能发的都发，先不要超过5套。",
+                context=context,
+                understanding=understanding,
+            )
+        finally:
+            main.inventory = original_inventory
 
-            def list_room_database_videos(self, query: str, limit: int = 6) -> list[Path]:
-                if "素材库唯一索引Z9" in query:
-                    return [self.video_path]
-                return []
+        self.assertFalse(fake_inventory.searched)
+        self.assertEqual(evidence["inventory_rows"], [])
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertIn("兴业杨家府4-1502:视频", evidence["missing_media"])
+        self.assertIn("兴业杨家府8-1203:视频", evidence["missing_media"])
 
+    async def test_inventory_sheet_hard_rule_keeps_prepared_image_action(self) -> None:
         class FakeReplyGenerator:
-            async def generate(
-                self,
-                message,
-                inventory_snapshot: str,
-                media_images: list[str],
-                media_videos: list[str],
-                conversation_context: str = "",
-            ) -> ReplyPlan:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先确认一下房源表。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="房源表也发我一下，客户想自己筛。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory_sheet",
+                    "constraint_proof": {"wants_inventory_sheet": True},
+                    "structured_task": {"tool_requirements": {"needs_inventory_sheet": True}},
+                },
+                tool_evidence={
+                    "actions": ["send_inventory_sheet"],
+                    "inventory_images": ["room_database/inventory_01.png"],
+                },
+                planner_result={
+                    "actions": ["send_inventory_sheet"],
+                    "reply_text": "房源表发你了，你可以让客户先整体看一下。",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("房源表发你了", result["reply"])
+
+    def test_inventory_sheet_reply_normalization_removes_unasked_media_clause(self) -> None:
+        reply = main._normalize_inventory_sheet_reply_before_selfcheck(
+            draft_reply=(
+                "房源表发你了，你可以让客户先整体看一下。"
+                "按当前条件，暂时没匹配到可直接发视频的具体房源。"
+            ),
+            understanding={
+                "intent": "inventory_sheet",
+                "constraint_proof": {"wants_inventory_sheet": True},
+                "structured_task": {"tool_requirements": {"needs_inventory_sheet": True}},
+            },
+            tool_evidence={
+                "actions": ["send_inventory_sheet"],
+                "inventory_images": ["room_database/inventory_01.png"],
+            },
+        )
+
+        self.assertEqual(reply, "房源表发你了，你可以让客户先整体看一下。")
+
+    def test_inventory_sheet_reply_normalization_keeps_media_request_clause(self) -> None:
+        draft = (
+            "房源表发你了，你可以让客户先整体看一下。"
+            "这两套视频暂时没找到，我先把表发你。"
+        )
+        reply = main._normalize_inventory_sheet_reply_before_selfcheck(
+            draft_reply=draft,
+            understanding={
+                "intent": "inventory_sheet",
+                "constraint_proof": {"wants_inventory_sheet": True, "wants_video": True},
+                "structured_task": {"tool_requirements": {"needs_inventory_sheet": True, "needs_video": True}},
+            },
+            tool_evidence={
+                "actions": ["send_inventory_sheet"],
+                "inventory_images": ["room_database/inventory_01.png"],
+            },
+        )
+
+        self.assertEqual(reply, draft)
+
+    def test_unasked_viewing_tail_normalization_removes_appointment_hint(self) -> None:
+        draft = (
+            "有的，元宝塘附近一室房源有视频的优先推荐，查到了两套。\n"
+            "这两套都有视频，已发送给你了。你可以先看视频，选中想了解的再告诉我房号，我来帮你查具体看房方式或预约。"
+        )
+
+        reply = main._normalize_unasked_viewing_tail_before_selfcheck(
+            content="元宝塘附近客户想看便宜点的，有视频的优先。",
+            draft_reply=draft,
+            understanding={"intent": "inventory"},
+        )
+
+        self.assertNotIn("预约", reply)
+        self.assertNotIn("看房方式", reply)
+        self.assertIn("其他细节", reply)
+
+    def test_unasked_viewing_tail_normalization_removes_booking_contact_sentence(self) -> None:
+        draft = (
+            "有的，查到三套符合条件的房源，视频已发。\n"
+            "如果想约看房，可以联系18758141785 / 13282125992 / 19941091943提前预约。"
+        )
+
+        reply = main._normalize_unasked_viewing_tail_before_selfcheck(
+            content="元宝塘附近客户想看便宜点的，有视频的优先。",
+            draft_reply=draft,
+            understanding={"intent": "inventory"},
+        )
+
+        self.assertNotIn("预约", reply)
+        self.assertNotIn("18758141785", reply)
+        self.assertIn("视频已发", reply)
+
+    def test_unasked_viewing_tail_normalization_removes_embedded_booking_phrase(self) -> None:
+        draft = (
+            "这两套都有视频，已经发你了。"
+            "你可以先看，如果想看某一套的具体视频或预约看房，直接说小区+房号。"
+        )
+
+        reply = main._normalize_unasked_viewing_tail_before_selfcheck(
+            content="元宝塘附近客户想看便宜点的，有视频的优先。",
+            draft_reply=draft,
+            understanding={"intent": "inventory"},
+        )
+
+        self.assertNotIn("预约", reply)
+        self.assertIn("具体视频", reply)
+
+    def test_unasked_viewing_tail_normalization_keeps_explicit_viewing_request(self) -> None:
+        draft = "这套可以看，选中后我来帮你查具体看房方式或预约。"
+
+        reply = main._normalize_unasked_viewing_tail_before_selfcheck(
+            content="客户今天想看，怎么预约？",
+            draft_reply=draft,
+            understanding={"intent": "viewing"},
+        )
+
+        self.assertEqual(reply, draft)
+
+    def test_reply_alias_separator_normalization_removes_internal_pipe(self) -> None:
+        reply = main._normalize_reply_alias_separators_before_selfcheck(
+            "有的，3000以下、一室|一室一厅我查到这些还在租。"
+        )
+
+        self.assertEqual(reply, "有的，3000以下、一室、一室一厅我查到这些还在租。")
+
+    def test_customer_visible_reply_normalization_removes_internal_formats(self) -> None:
+        reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+            "有的，东新园\n杭氧\n新天地、{'min': 0, 'max': 5000}、一室|一室一厅里有新柠长木府2-702-B。"
+        )
+
+        self.assertNotIn("{'min'", reply)
+        self.assertNotIn("|", reply)
+        self.assertNotIn("东新园\n杭氧", reply)
+        self.assertIn("东新园、杭氧、新天地", reply)
+        self.assertIn("一室、一室一厅", reply)
+        self.assertIn("新柠长木府2-702B", reply)
+
+    def test_customer_visible_format_selfcheck_rejects_internal_leakage(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="万达、东新园两边都可以，3000以内有什么能住的？",
+            draft_reply="有的，东新园、{'min': 0, 'max': 5000}、一室|一室一厅我查到这些还在租。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"intent": "inventory", "budget_range": [0, 3000]},
+                "structured_task": {"tool_requirements": {"needs_inventory_search": True}},
+            },
+            tool_evidence={"actions": ["search_inventory"], "inventory_rows": []},
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("内部", result["reason"])
+
+    def test_customer_visible_selfcheck_rejects_over_formal_tone(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="石桥附近5000左右有两室吗？最好整租。",
+            draft_reply="暂时没查到完全匹配的在租房源。建议您确认房号或放宽预算范围再试。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "intent": "inventory",
+                    "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                    "budget_range": [4500, 5500],
+                    "layout": "两室",
+                },
+                "structured_task": {"tool_requirements": {"needs_inventory_search": True}},
+            },
+            tool_evidence={"actions": ["search_inventory"], "inventory_rows": []},
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("口吻", result["reason"])
+
+    def test_original_video_signal_and_selfcheck_require_source_evidence(self) -> None:
+        content = "这个视频太糊了，原视频发我，客户要保存转发。"
+        signals = main._deterministic_signals(content)
+        self.assertTrue(signals["wants_video"])
+        self.assertTrue(signals["wants_original_video"])
+
+        result = main._constraint_consistency_selfcheck(
+            content=content,
+            draft_reply="原视频已发你了，这是棠润府15-2-801B的视频。",
+            understanding={
+                "intent": "media",
+                "constraint_proof": {"intent": "media", "wants_video": True, "wants_original_video": True},
+                "structured_task": {"tool_requirements": {"needs_video": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "video_paths": ["room.mp4"],
+                "video_rows": [{"小区": "棠润府", "房号": "15-2-801B"}],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("原视频", result["reason"])
+
+    async def test_inventory_sheet_hard_rule_keeps_area_constraint_in_reply(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先确认一下房源表。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="万达附近的房源表发我一下，我给客户先看整体。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory_sheet",
+                    "constraint_proof": {
+                        "wants_inventory_sheet": True,
+                        "area": "拱墅万达\n北部软件园\n城北万象城",
+                    },
+                    "structured_task": {"tool_requirements": {"needs_inventory_sheet": True}},
+                },
+                tool_evidence={
+                    "actions": ["send_inventory_sheet"],
+                    "inventory_images": ["room_database/inventory_01.png"],
+                },
+                planner_result={
+                    "actions": ["send_inventory_sheet"],
+                    "reply_text": "拱墅万达附近的房源表发你了，你可以让客户先整体看一下。",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("拱墅万达", result["reply"])
+        self.assertIn("房源表发你了", result["reply"])
+
+    def test_constraint_selfcheck_does_not_overrule_prepared_inventory_sheet_action(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="万达附近的房源表发我一下，我给客户先看整体。",
+            draft_reply="房源表发你了，你可以让客户先整体看一下。",
+            understanding={
+                "constraint_proof": {
+                    "wants_inventory_sheet": True,
+                    "area": "拱墅万达\n北部软件园\n城北万象城",
+                }
+            },
+            tool_evidence={
+                "actions": ["send_inventory_sheet"],
+                "inventory_images": ["room_database/inventory_01.png"],
+                "deterministic_reply_source": "inventory_sheet_hard_rule",
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["scope"], "action_fulfilled_hard_rule")
+
+    def test_constraint_selfcheck_allows_bound_field_followup_without_repeating_filters(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="水电和密码一起发我。",
+            draft_reply="白田畈龙吟府4-902B：水电是水30/月，电1元/度；看房方式/密码是902902#。",
+            understanding={
+                "intent": "viewing",
+                "constraint_proof": {
+                    "area": "东新园 杭氧 新天地",
+                    "budget_range": [2000, 4000],
+                    "layout": "一室一厅",
+                    "wants_utilities": True,
+                },
+                "structured_task": {"tool_requirements": {"needs_viewing_policy": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "target_rows": [
+                    {
+                        "区域": "东新园 杭氧 新天地",
+                        "小区": "白田畈龙吟府",
+                        "房号": "4-902B",
+                        "户型分类": "一室一厅",
+                        "押一付一": "2100",
+                        "押二付一": "1800",
+                        "备注": "水30/月，电1元/度",
+                        "看房方式密码": "902902#",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_prepared_media_reply_does_not_leak_internal_any_layout(self) -> None:
+        reply = main._reply_for_prepared_media(
+            {
+                "constraint_proof": {
+                    "area": "拱墅万达\n北部软件园\n城北万象城",
+                    "budget_range": [1000, 2000],
+                    "layout": "any",
+                    "wants_video": True,
+                }
+            },
+            {
+                "video_paths": ["room_database/video/demo.mp4"],
+                "video_rows": [{"小区": "大华海派风景", "房号": "2-1-402A"}],
+            },
+        )
+
+        self.assertIn("拱墅万达", reply)
+        self.assertIn("1000-2000左右", reply)
+        self.assertNotIn("any", reply)
+
+    async def test_planner_reply_uses_tiered_final_selfcheck_for_inventory_sheet(self) -> None:
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.selfcheck_calls = 0
+
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先确认一下房源表。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                self.selfcheck_calls += 1
+                return {"status": "pass", "source": "llm_final_selfcheck"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        fake_reply = FakeReplyGenerator()
+        main.reply_generator = fake_reply
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="房源表发我一下。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory_sheet",
+                    "constraint_proof": {"wants_inventory_sheet": True},
+                    "structured_task": {"tool_requirements": {"needs_inventory_sheet": True}},
+                },
+                tool_evidence={
+                    "actions": ["send_inventory_sheet"],
+                    "inventory_images": ["room_database/inventory_01.png"],
+                },
+                planner_result={
+                    "actions": ["send_inventory_sheet"],
+                    "reply_text": "房源表发你了，你可以让客户先整体看一下。",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("房源表发你了", result["reply"])
+        self.assertEqual(result["selfcheck"]["status"], "pass")
+        self.assertEqual(result["selfcheck"]["llm"]["source"], "llm_selfcheck_skipped_by_tiered_final_selfcheck")
+        self.assertEqual(fake_reply.selfcheck_calls, 0)
+
+    async def test_bad_planner_reply_is_not_replaced_by_tool_reply(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="有的，目前都没视频和图片，我把房源表发你。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="万达有什么2000以下的一室",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "万达2000以下一室",
+                    "constraint_proof": {
+                        "intent": "inventory",
+                        "area": "拱墅万达\n北部软件园\n城北万象城",
+                        "budget_range": [0, 2000],
+                        "layout": "一室",
+                    },
+                    "structured_task": {"intent": "inventory"},
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "inventory_rows": [
+                        {
+                            "区域": "拱墅万达\n北部软件园\n城北万象城",
+                            "小区": "棠润府",
+                            "房号": "15-2-801B",
+                            "户型分类": "一室一厅",
+                            "押一付一": "1600",
+                            "押二付一": "1400",
+                            "备注": "水30/月，电1元/度",
+                        }
+                    ],
+                },
+                planner_result={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "reply_text": "我先按石桥附近5000左右两室整租查，没匹配到会直接说明。",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertTrue(result["needs_planner_retry"])
+        self.assertEqual(result["reply"], "")
+        self.assertIn("我先按石桥附近5000左右两室整租查", result["draft_reply"])
+        self.assertIn("planner_retry_reason", result)
+
+    def test_no_match_reply_with_budget_word_is_not_false_positive(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="杭氧附近有没有带厨房的一室？预算3500左右。",
+            draft_reply="我这边暂时没查到东新园、杭氧、新天地附近带独立厨卫的一室，符合3000-4000预算的在租房源。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "intent": "inventory",
+                    "area": "东新园\n杭氧\n新天地",
+                    "budget_range": [3000, 4000],
+                    "layout": "一室",
+                    "features": ["独立厨卫"],
+                },
+                "structured_task": {"intent": "inventory"},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                "inventory_rows": [],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass", result)
+
+    async def test_new_area_availability_query_drops_unasked_inherited_constraints(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "viewing",
+                    "rewritten_query": "东新园 杭氧 新天地 3500 一室 马上空出来的在租房源",
+                    "effective_query": "东新园 杭氧 新天地 3500 一室 马上空出来的在租房源",
+                    "query_state": {
+                        "intent": "viewing",
+                        "area": "东新园\n杭氧\n新天地",
+                        "budget": "3500",
+                        "layout": "一室",
+                        "features": ["独立厨卫"],
+                    },
+                    "needs_clarification": False,
+                    "clarification_text": "",
+                }
+
+        async def fake_inventory_rows():
+            return [
+                {
+                    "区域": "东新园\n杭氧\n新天地",
+                    "小区": "新柠长木府",
+                    "房号": "3-1002A",
+                    "户型分类": "两室一厅",
+                    "押一付一": "4600",
+                    "看房方式密码": "转租看房提前联系",
+                }
+            ]
+
+        originals = {
+            "reply_generator": main.reply_generator,
+            "_inventory_rows_for_resolution": main._inventory_rows_for_resolution,
+        }
+        main.reply_generator = FakeReplyGenerator()
+        main._inventory_rows_for_resolution = fake_inventory_rows
+        try:
+            result = await main._understand_message(
+                content="东新园有没有马上空出来的？客户比较急。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("东新园有没有马上空出来的？客户比较急。"),
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main._inventory_rows_for_resolution = originals["_inventory_rows_for_resolution"]
+
+        proof = result["constraint_proof"]
+        self.assertTrue(result.get("dropped_inherited_constraints"))
+        self.assertIn("东新园", proof.get("area", ""))
+        self.assertNotIn("budget_range", proof)
+        self.assertNotIn("layout", proof)
+        self.assertNotIn("features", proof)
+        self.assertEqual(result["effective_query"], "东新园有没有马上空出来的？客户比较急。 东新园 杭氧 新天地")
+
+    async def test_explicit_community_query_drops_stale_area_and_layout_context(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "荣润府有没有押一付一的？预算1600到1800。 拱墅万达 北部软件园 城北万象城 棠润府 一室一厅",
+                    "effective_query": "荣润府有没有押一付一的？预算1600到1800。 拱墅万达 北部软件园 城北万象城 棠润府 一室一厅",
+                    "query_state": {
+                        "intent": "inventory",
+                        "area": "拱墅万达\n北部软件园\n城北万象城",
+                        "community": "棠润府",
+                        "budget": 1700,
+                        "layout": "一室一厅",
+                    },
+                    "needs_clarification": False,
+                    "clarification_text": "",
+                }
+
+        async def fake_inventory_rows():
+            return [
+                {
+                    "区域": "拱墅万达\n北部软件园\n城北万象城",
+                    "小区": "棠润府",
+                    "房号": "15-2-801B",
+                    "户型分类": "一室一厅",
+                    "押一付一": "1600",
+                    "押二付一": "1400",
+                }
+            ]
+
+        originals = {
+            "reply_generator": main.reply_generator,
+            "_inventory_rows_for_resolution": main._inventory_rows_for_resolution,
+        }
+        main.reply_generator = FakeReplyGenerator()
+        main._inventory_rows_for_resolution = fake_inventory_rows
+        try:
+            result = await main._understand_message(
+                content="荣润府有没有押一付一的？预算1600到1800。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("荣润府有没有押一付一的？预算1600到1800。"),
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main._inventory_rows_for_resolution = originals["_inventory_rows_for_resolution"]
+
+        proof = result["constraint_proof"]
+        self.assertTrue(result.get("dropped_inherited_constraints"))
+        self.assertNotIn("拱墅万达", result["effective_query"])
+        self.assertNotIn("一室一厅", result["effective_query"])
+        self.assertNotIn("area", proof)
+        self.assertNotIn("layout", proof)
+        self.assertEqual(proof.get("budget_range"), [1600, 1800])
+        self.assertEqual(proof.get("communities"), ["棠润府"])
+
+    async def test_new_area_payment_query_drops_stale_layout_context(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "新塘附近有没有押一付一的低价房？",
+                    "effective_query": "新塘附近有没有押一付一的低价房？",
+                    "query_state": {
+                        "intent": "inventory",
+                        "area": "闸弄口\n新塘\n元宝塘\n东站",
+                        "layout": "一室",
+                    },
+                    "needs_clarification": False,
+                    "clarification_text": "",
+                }
+
+        async def fake_inventory_rows():
+            return []
+
+        originals = {
+            "reply_generator": main.reply_generator,
+            "_inventory_rows_for_resolution": main._inventory_rows_for_resolution,
+        }
+        main.reply_generator = FakeReplyGenerator()
+        main._inventory_rows_for_resolution = fake_inventory_rows
+        try:
+            result = await main._understand_message(
+                content="新塘附近有没有押一付一的低价房？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("新塘附近有没有押一付一的低价房？"),
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main._inventory_rows_for_resolution = originals["_inventory_rows_for_resolution"]
+
+        proof = result["constraint_proof"]
+        self.assertTrue(result.get("dropped_unasked_llm_inferred_constraints"))
+        self.assertIn("新塘", result["effective_query"])
+        self.assertNotIn("一室", result["effective_query"])
+        self.assertIn("area", proof)
+        self.assertNotIn("layout", proof)
+
+    def test_viewing_area_list_requires_viewing_info(self) -> None:
+        rows = [
+            {
+                "区域": "东新园\n杭氧\n新天地",
+                "小区": "长浜龙吟轩",
+                "房号": "9-901",
+                "户型分类": "三室一厅",
+                "押一付一": "5800",
+                "押二付一": "5500",
+                "看房方式密码": "6.24空出 看房提前联系",
+            },
+            {
+                "区域": "东新园\n杭氧\n新天地",
+                "小区": "长岳王马府",
+                "房号": "1-1503",
+                "户型分类": "一室一厅",
+                "押一付一": "4800",
+                "押二付一": "4500",
+                "看房方式密码": "6.27空出 看房提前联系",
+            },
+        ]
+        result = main._constraint_consistency_selfcheck(
+            content="东新园有没有马上空出来的？客户比较急。",
+            draft_reply="有的，东新园这边我查到这些还在租：1. 长浜龙吟轩9-901，押一付一5800；2. 长岳王马府1-1503，押一付一4800。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"intent": "inventory", "area": "东新园\n杭氧\n新天地"},
+                "structured_task": {"intent": "inventory", "tool_requirements": {"needs_viewing_policy": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "inventory_rows": rows,
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("空出", result["reason"])
+
+    def test_viewing_area_list_rejects_generic_viewing_way_prompt_only(self) -> None:
+        rows = [
+            {
+                "区域": "东新园\n杭氧\n新天地",
+                "小区": "长浜龙吟轩",
+                "房号": "9-901",
+                "户型分类": "三室一厅",
+                "押一付一": "5800",
+                "押二付一": "5500",
+                "看房方式密码": "6.24空出 看房提前联系",
+            }
+        ]
+        result = main._constraint_consistency_selfcheck(
+            content="东新园有没有马上空出来的？客户比较急。",
+            draft_reply="有的，东新园这边有房源还在租：1. 长浜龙吟轩9-901。你要看房方式的话直接说房号就行。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"intent": "inventory", "area": "东新园\n杭氧\n新天地"},
+                "structured_task": {"intent": "inventory", "tool_requirements": {"needs_viewing_policy": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "inventory_rows": rows,
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("空出", result["reason"])
+
+    def test_viewing_area_availability_list_can_answer_without_specific_room_binding(self) -> None:
+        rows = [
+            {
+                "区域": "东新园\n杭氧\n新天地",
+                "小区": "长浜龙吟轩",
+                "房号": "9-901",
+                "户型分类": "三室一厅",
+                "押一付一": "5800",
+                "押二付一": "5500",
+                "看房方式密码": "6.24空出 看房提前联系",
+            },
+            {
+                "区域": "东新园\n杭氧\n新天地",
+                "小区": "嘉樘星绣府",
+                "房号": "8-2-802B",
+                "户型分类": "两室一厅",
+                "押一付一": "3300",
+                "押二付一": "3000",
+                "看房方式密码": "6.22空出 看房提前联系",
+            },
+        ]
+        result = main._constraint_consistency_selfcheck(
+            content="东新园有没有马上空出来的？客户比较急。",
+            draft_reply=(
+                "有的，东新园这边有几套还在租：\n"
+                "1. 长浜龙吟轩9-901，三室一厅，押一付一5800元，押二付一5500元，6月24日空出，看房需提前联系。\n"
+                "2. 嘉樘星绣府8-2-802B，两室一厅，押一付一3300元，押二付一3000元，6月22日空出，看房需提前联系。\n"
+                "客户比较急的话，建议先联系18758141785 / 13282125992 / 19941091943确认当天能看的时间。"
+            ),
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"intent": "inventory", "area": "东新园\n杭氧\n新天地"},
+                "structured_task": {"intent": "inventory", "tool_requirements": {"needs_viewing_policy": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "inventory_rows": rows,
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_viewing_selfcheck_rejects_blanket_already_empty_when_rows_have_empty_dates(self) -> None:
+        rows = [
+            {
+                "区域": "东新园\n杭氧\n新天地",
+                "小区": "长浜龙吟轩",
+                "房号": "9-901",
+                "户型分类": "三室一厅",
+                "押一付一": "5800",
+                "押二付一": "5500",
+                "看房方式密码": "6.24空出 看房提前联系",
+            },
+            {
+                "区域": "东新园\n杭氧\n新天地",
+                "小区": "嘉樘星绣府",
+                "房号": "8-2-802B",
+                "户型分类": "两室一厅",
+                "押一付一": "3300",
+                "押二付一": "3000",
+                "看房方式密码": "6.22空出 看房提前联系",
+            },
+        ]
+        result = main._constraint_consistency_selfcheck(
+            content="东新园有没有马上空出来的？客户比较急。",
+            draft_reply=(
+                "有的，东新园这边有几套还在租：\n"
+                "1. 长浜龙吟轩9-901，三室一厅，押一付一5800元，押二付一5500元。\n"
+                "2. 嘉樘星绣府8-2-802B，两室一厅，押一付一3300元，押二付一3000元。\n"
+                "这些房源都已空出，看房需提前联系18758141785 / 13282125992 / 19941091943。"
+            ),
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"intent": "inventory", "area": "东新园\n杭氧\n新天地"},
+                "structured_task": {"intent": "inventory", "tool_requirements": {"needs_viewing_policy": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "inventory_rows": rows,
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能泛称都已空出", result["reason"])
+
+    def test_inventory_sheet_action_can_defer_unbound_viewing_to_outbound_selfcheck(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="东站附近有没有今天能看的？客户预算2500左右，先发房源表和视频。",
+            draft_reply="房源表发你了，可以先给客户看整体。视频暂时没找到，等补全后再发。",
+            understanding={
+                "intent": "inventory_sheet",
+                "constraint_proof": {
+                    "intent": "inventory_sheet",
+                    "area": "闸弄口\n新塘\n元宝塘\n东站",
+                    "budget_range": [2000, 3000],
+                    "wants_inventory_sheet": True,
+                    "wants_video": True,
+                },
+                "structured_task": {
+                    "intent": "inventory_sheet",
+                    "tool_requirements": {
+                        "needs_inventory_sheet": True,
+                        "needs_video": True,
+                        "needs_viewing_policy": True,
+                    },
+                },
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "send_inventory_sheet", "send_video", "explain_unavailable_viewing"],
+                "inventory_rows": [],
+                "inventory_images": ["inventory-1.png"],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_payment_selfcheck_does_not_mix_same_community_rows(self) -> None:
+        rows = [
+            {
+                "小区": "长浜龙吟轩",
+                "房号": "9-901",
+                "押一付一": "5800",
+                "押二付一": "5500",
+            },
+            {
+                "小区": "长浜龙吟轩",
+                "房号": "11-1603",
+                "押一付一": "4200",
+                "押二付一": "3900",
+            },
+        ]
+        reply = (
+            "1. 长浜龙吟轩9-901，押一付一5800元，押二付一5500元。\n"
+            "2. 长浜龙吟轩11-1603，押一付一4200元，押二付一3900元。"
+        )
+
+        self.assertEqual(main._payment_field_consistency_failures(reply, rows), [])
+
+    def test_constraint_proof_budget_and_layout_are_hard_filters(self) -> None:
+        rows = [
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "户型分类": "一室一厅", "押一付一": "1900"},
+            {"小区": "棠润府", "房号": "10-1004C", "户型分类": "一室一厅", "押一付一": "2600"},
+            {"小区": "万融城", "房号": "4-1208", "户型分类": "三室一厅", "押一付一": "5200"},
+        ]
+
+        filtered = main._filter_rows_by_constraint_proof(
+            rows,
+            {"budget_range": [0, 2000], "layout": "一室一厅"},
+            query_text="拱墅万达一室一厅",
+        )
+
+        labels = [f"{row['小区']}{row['房号']}" for row in filtered]
+        self.assertEqual(labels, ["星桥锦绣嘉苑20-1606A"])
+
+    def test_constraint_proof_area_is_hard_filter(self) -> None:
+        rows = [
+            {"区域": "拱墅万达", "小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅", "押一付一": "1600"},
+            {"区域": "东新园 杭氧 新天地", "小区": "新柠长木府", "房号": "3-1002A", "户型分类": "两室一厅", "押一付一": "4600"},
+        ]
+
+        filtered = main._filter_rows_by_constraint_proof(
+            rows,
+            {"area": "石桥街道\n华丰\n石桥\n永佳\n半山"},
+            query_text="石桥附近5000左右两室",
+        )
+
+        self.assertEqual(filtered, [])
+
+    def test_constraint_proof_community_is_hard_filter(self) -> None:
+        rows = [
+            {"区域": "拱墅万达", "小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅", "押一付一": "1600"},
+            {"区域": "东新园 杭氧 新天地", "小区": "新柠长木府", "房号": "3-1002A", "户型分类": "两室一厅", "押一付一": "4600"},
+        ]
+
+        filtered = main._filter_rows_by_constraint_proof(
+            rows,
+            {"communities": ["石桥铭苑"]},
+            query_text="石桥铭苑5000左右两室",
+        )
+
+        self.assertEqual(filtered, [])
+
+    def test_constraint_proof_drops_negated_community(self) -> None:
+        proof = main._build_constraint_proof(
+            content="我说的是石桥区域，不一定是石桥铭苑。",
+            effective_query="石桥区域 4500-5500 两室一厅 石桥铭苑",
+            understanding={
+                "intent": "inventory",
+                "query_state": {"area": "石桥街道\n华丰\n石桥\n永佳\n半山"},
+            },
+            entity_resolution={
+                "status": "resolved",
+                "areas": [{"raw_text": "石桥", "canonical": "石桥街道\n华丰\n石桥\n永佳\n半山"}],
+                "communities": [{"raw_text": "石桥铭苑", "canonical": "石桥铭苑"}],
+            },
+            signals={},
+        )
+
+        self.assertEqual(proof["area"], "石桥街道\n华丰\n石桥\n永佳\n半山")
+        self.assertNotIn("communities", proof)
+
+    def test_utilities_and_viewing_reply_keeps_both_fields(self) -> None:
+        reply = main._reply_for_utilities_and_viewing(
+            {
+                "intent": "viewing",
+                "constraint_proof": {"wants_utilities": True},
+                "structured_task": {"tool_requirements": {"needs_viewing_policy": True}},
+            },
+            {
+                "target_rows": [
+                    {
+                        "小区": "白田畈",
+                        "房号": "16-1-1003",
+                        "备注": "民用水电",
+                        "看房方式密码": "336699#",
+                    }
+                ]
+            },
+            content="水电和密码一起发我",
+        )
+
+        self.assertIn("白田畈16-1-1003", reply)
+        self.assertIn("水电是民用水电", reply)
+        self.assertIn("看房方式/密码是336699#", reply)
+
+    def test_inventory_reply_explains_payment_method_budget_match(self) -> None:
+        reply = main._reply_for_inventory_search(
+            {
+                "intent": "inventory",
+                "effective_query": "北部软件园1800以内单间",
+                "constraint_proof": {
+                    "area": "拱墅万达\n北部软件园\n城北万象城",
+                    "budget_range": [0, 1800],
+                    "layout": "单间",
+                },
+            },
+            {
+                "actions": ["search_inventory", "compact_listing"],
+                "inventory_rows": [
+                    {
+                        "小区": "星桥锦绣嘉苑",
+                        "房号": "20-1606A",
+                        "户型分类": "一室一厅",
+                        "押一付一": "1900",
+                        "押二付一": "1800",
+                        "备注": "水30/月，电1元/度",
+                    }
+                ],
+            },
+        )
+
+        self.assertIn("其中一种月租在预算内", reply)
+        self.assertIn("押一付一1900", reply)
+        self.assertIn("押二付一1800", reply)
+
+    def test_inventory_reply_for_viewing_area_includes_empty_time(self) -> None:
+        reply = main._reply_for_inventory_search(
+            {
+                "intent": "inventory",
+                "effective_query": "东新园有没有马上空出来的？客户比较急。",
+                "constraint_proof": {"area": "东新园\n杭氧\n新天地"},
+                "structured_task": {
+                    "original_text": "东新园有没有马上空出来的？客户比较急。",
+                    "tool_requirements": {"needs_viewing_policy": True},
+                },
+            },
+            {
+                "actions": ["search_inventory", "compact_listing"],
+                "inventory_rows": [
+                    {
+                        "小区": "长浜龙吟轩",
+                        "房号": "9-901",
+                        "户型分类": "三室一厅",
+                        "押一付一": "5800",
+                        "押二付一": "5500",
+                        "看房方式密码": "6.24空出 看房提前联系",
+                        "备注": "民用水电",
+                    },
+                    {
+                        "小区": "嘉樘星绣府",
+                        "房号": "8-2-802B",
+                        "户型分类": "两室一厅",
+                        "押一付一": "3300",
+                        "押二付一": "3000",
+                        "看房方式密码": "6.22空出 看房提前联系",
+                        "备注": "水30/月，电1元/度",
+                    },
+                ],
+            },
+        )
+
+        self.assertIn("6.24空出", reply)
+        self.assertIn("6.22空出", reply)
+        self.assertIn("提前联系", reply)
+        self.assertIn("18758141785", reply)
+
+    def test_viewing_summary_does_not_leave_password_hash_when_password_hidden(self) -> None:
+        summary = main._row_viewing_summary({"看房方式密码": "336699#"})
+
+        self.assertNotIn("#", summary)
+        self.assertIn("密码", summary)
+
+    def test_selfcheck_rejects_unasked_empty_time_in_price_reply(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="东方茂T3-1540是不是一室一厅？价格多少？",
+            draft_reply="东方茂商业中心T3-1540是一室一厅，押一付一3800元，押二付一3500元，6.23空出，看房提前联系。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"room_refs": ["T3-1540"]},
+                "structured_task": {"intent": "inventory", "tool_requirements": {}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory"],
+                "inventory_rows": [
+                    {
+                        "小区": "东方茂商业中心",
+                        "房号": "T3-1540",
+                        "户型分类": "一室一厅",
+                        "押一付一": "3800",
+                        "押二付一": "3500",
+                        "看房方式密码": "6.23空出 看房提前联系",
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("未问看房", result["reason"])
+
+    def test_selfcheck_rejects_unasked_missing_media_wording(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="东新园有没有马上空出来的？客户比较急。",
+            draft_reply="有的，东新园这边有几套空出时间明确。目前暂未匹配到可直接发送视频或图片的具体房源。",
+            tool_evidence={"inventory_rows": [{"小区": "长浜龙吟轩", "房号": "9-901"}]},
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("素材缺失", result["reason"])
+
+    def test_selfcheck_rejects_unasked_missing_media_wording_with_status_before_media(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="新天地这边有没有4000以内的两室？",
+            draft_reply=(
+                "有的，新天地这边4000以内两室查到几套。"
+                "目前暂未查到可直接发送视频的具体房源，建议先选小区+房号。"
+            ),
+            tool_evidence={"inventory_rows": [{"小区": "诸葛龙吟院", "房号": "10-601A"}]},
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("素材缺失", result["reason"])
+
+    def test_viewing_area_list_rejects_password_before_specific_room_selected(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="东新园有没有马上空出来的？客户比较急。",
+            draft_reply="有的，东新园这边有几套。1. 杨乐府9-604B，看房密码为336699#。",
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {"area": "东新园\n杭氧\n新天地"},
+                "structured_task": {"intent": "inventory", "tool_requirements": {"needs_viewing_policy": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory"],
+                "inventory_rows": [
+                    {"小区": "杨乐府", "房号": "9-604B", "看房方式密码": "336699#"},
+                    {"小区": "长浜龙吟轩", "房号": "9-901", "看房方式密码": "6.24空出 看房提前联系"},
+                ],
+            },
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能直接给看房密码", result["reason"])
+
+    def test_human_selfcheck_requires_contact_numbers_for_advance_viewing_contact(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="东新园有没有马上空出来的？客户比较急。",
+            draft_reply=(
+                "有的，东新园这边有几套马上空出的房源。"
+                "1. 长浜龙吟轩9-901，6.24空出，看房需提前联系。"
+                "你告诉我具体房号，我来帮你安排看房。"
+            ),
+            tool_evidence={"inventory_rows": [{"小区": "长浜龙吟轩", "房号": "9-901"}]},
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("三个联系电话", result["reason"])
+
+    def test_human_selfcheck_allows_advance_viewing_contact_with_phone_numbers(self) -> None:
+        result = main._local_human_context_selfcheck(
+            content="东新园有没有马上空出来的？客户比较急。",
+            draft_reply=(
+                "有的，长浜龙吟轩9-901这套6.24空出，看房需提前联系。"
+                "客户比较急的话，先联系18758141785 / 13282125992 / 19941091943确认时间。"
+            ),
+            tool_evidence={"inventory_rows": [{"小区": "长浜龙吟轩", "房号": "9-901"}]},
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    async def test_price_availability_query_is_not_overridden_by_viewing_tool_noise(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
+
+            async def plan_kf_reply_text(self, **kwargs):
+                return {"reply_text": "", "source": "fake_planner_reply_empty"}
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="星桥锦绣嘉苑20-1606A还在不在？价格多少？",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "星桥锦绣嘉苑20-1606A还在不在，价格多少",
+                    "constraint_proof": {"intent": "inventory"},
+                    "structured_task": {"intent": "inventory", "tool_requirements": {"needs_inventory_search": True}},
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                    "inventory_rows": [
+                        {
+                            "小区": "星桥锦绣嘉苑",
+                            "房号": "20-1606A",
+                            "户型分类": "一室一厅",
+                            "押一付一": "1900",
+                            "押二付一": "1800",
+                            "看房方式密码": "960615#",
+                            "备注": "水30/月，电1元/度",
+                        }
+                    ],
+                    "target_rows": [
+                        {
+                            "小区": "星桥锦绣嘉苑",
+                            "房号": "20-1606A",
+                            "户型分类": "一室一厅",
+                            "押一付一": "1900",
+                            "押二付一": "1800",
+                            "看房方式密码": "960615#",
+                            "备注": "水30/月，电1元/度",
+                        }
+                    ],
+                    "rule_evidence": {
+                        "viewing": {
+                            "rooms": [
+                                {
+                                    "room": "星桥锦绣嘉苑20-1606A",
+                                    "viewing": "960615#",
+                                    "has_password": True,
+                                    "needs_contact": False,
+                                }
+                            ]
+                        },
+                    },
+                },
+                planner_result={
+                    "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                    "reply_text": "星桥锦绣嘉苑20-1606A还在，押一付一1900，押二付一1800，水30/月，电1元/度。",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("星桥锦绣嘉苑20-1606A", result["reply"])
+        self.assertIn("押一付一1900", result["reply"])
+        self.assertNotIn("看房方式是", result["reply"])
+
+    async def test_price_and_viewing_question_keeps_both_replies(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        row = {
+            "小区": "合嵣悦府",
+            "房号": "6-1-1204B",
+            "户型分类": "一室一厅",
+            "押一付一": "1500",
+            "押二付一": "1300",
+            "看房方式密码": "6.19空出 看房提前联系",
+            "备注": "水30/月，电1元/度",
+        }
+        try:
+            result = await main._generate_reply_result(
+                content="合嵣悦府6-1-1204B是不是1500？今天能看吗？",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "viewing",
+                    "effective_query": "合嵣悦府6-1-1204B价格和今天看房",
+                    "constraint_proof": {
+                        "intent": "viewing",
+                        "communities": ["合嵣悦府"],
+                        "room_refs": ["6-1-1204B"],
+                    },
+                    "structured_task": {
+                        "intent": "viewing",
+                        "tool_requirements": {
+                            "needs_inventory_search": True,
+                            "needs_viewing_policy": True,
+                        },
+                    },
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                    "inventory_rows": [row],
+                    "target_rows": [row],
+                    "rule_evidence": {
+                        "viewing": {
+                            "rooms": [
+                                {
+                                    "room": "合嵣悦府6-1-1204B",
+                                    "viewing": "6.19空出 看房提前联系",
+                                    "has_password": False,
+                                    "needs_contact": True,
+                                }
+                            ]
+                        },
+                        "viewing_contact": ["18758141785", "13282125992", "19941091943"],
+                    },
+                },
+                planner_result={
+                    "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                    "reply_text": "合嵣悦府6-1-1204B还在，押一付一1500，押二付一1300；6.19空出，看房需要提前联系。密码不对、打不开门或者还没空出，就联系 18758141785 / 13282125992 / 19941091943 确认。",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("还在", result["reply"])
+        self.assertIn("押一付一1500", result["reply"])
+        self.assertIn("提前联系", result["reply"])
+        self.assertIn("18758141785", result["reply"])
+
+    async def test_reply_generation_uses_no_match_evidence_when_llm_waits(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="石桥附近5000左右有两室吗？最好整租。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "石桥5000左右两室整租",
+                    "constraint_proof": {
+                        "intent": "inventory",
+                        "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "budget_range": [4500, 5500],
+                        "layout": "两室",
+                    },
+                    "structured_task": {"intent": "inventory"},
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "inventory_rows": [],
+                },
+                planner_result={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "reply_text": "我这边暂时没查到石桥附近5000左右两室整租完全匹配的在租房源。你可以放宽一点预算、户型或区域，我再帮你筛一轮。",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("暂时没查到", result["reply"])
+        self.assertIn("石桥", result["reply"])
+        self.assertNotIn("稍后给您准确回复", result["reply"])
+
+    async def test_single_inventory_result_does_not_ask_for_sequence_number(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="星桥锦绣嘉苑20-1606A还在不在？价格多少？",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "星桥锦绣嘉苑20-1606A房态和价格",
+                    "constraint_proof": {
+                        "intent": "inventory",
+                        "communities": ["星桥锦绣嘉苑"],
+                        "room_refs": ["20-1606A"],
+                        "budget_range": [0, 1800],
+                        "layout": "一室",
+                    },
+                    "structured_task": {"intent": "inventory"},
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "generate_reply"],
+                    "inventory_rows": [
+                        {
+                            "小区": "星桥锦绣嘉苑",
+                            "房号": "20-1606A",
+                            "户型分类": "一室一厅",
+                            "押一付一": "1900",
+                            "押二付一": "1800",
+                            "备注": "水30/月，电1元/度",
+                        }
+                    ],
+                    "target_rows": [
+                        {
+                            "小区": "星桥锦绣嘉苑",
+                            "房号": "20-1606A",
+                            "户型分类": "一室一厅",
+                            "押一付一": "1900",
+                            "押二付一": "1800",
+                            "备注": "水30/月，电1元/度",
+                        }
+                    ],
+                },
+                planner_result={
+                    "actions": ["search_inventory", "generate_reply"],
+                    "reply_text": "还在，星桥锦绣嘉苑20-1606A，一室一厅，押一付一1900，押二付一1800，水30/月，电1元/度。要视频、图片或者看房方式的话，直接说这套就行。",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("星桥锦绣嘉苑20-1606A", result["reply"])
+        self.assertIn("还在", result["reply"])
+        self.assertNotIn("1800以内", result["reply"])
+        self.assertIn("直接说这套", result["reply"])
+        self.assertNotIn("回序号", result["reply"])
+
+    async def test_inventory_evidence_is_safe_fallback_after_selfcheck_retry(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                if "棠润府15-2-801B" in str(kwargs.get("draft_reply") or ""):
+                    return {"status": "pass"}
+                return {
+                    "status": "fail",
+                    "reason": "LLM selfcheck false negative",
+                    "fallback_reply": "我先帮您确认一下最新房态，稍后给您准确回复。",
+                }
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="北部软件园附近便宜点的单间还有吗？客户预算1800以内。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "北部软件园1800以内单间",
+                    "constraint_proof": {
+                        "intent": "inventory",
+                        "area": "拱墅万达\n北部软件园\n城北万象城",
+                        "budget_range": [0, 1800],
+                        "layout": "未明确",
+                    },
+                    "structured_task": {"intent": "inventory"},
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "inventory_rows": [
+                        {
+                            "小区": "棠润府",
+                            "房号": "15-2-801B",
+                            "户型分类": "一室一厅",
+                            "押一付一": "1600",
+                            "押二付一": "1400",
+                            "备注": "水30/月，电1元/度",
+                        }
+                    ],
+                },
+                planner_result={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "reply_text": "万达2000以下一室我按最新房源表查到了。",
+                },
+                retry_reason="selfcheck_retry",
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("有的", result["reply"])
+        self.assertIn("棠润府15-2-801B", result["reply"])
+        self.assertNotIn("稍后给您准确回复", result["reply"])
+        self.assertNotIn("未明确", result["reply"])
+
+    async def test_reply_generation_uses_prepared_video_evidence_when_llm_waits(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+            main.reply_generator = FakeReplyGenerator()
+            main.agentic_rag = FakeRag()
+            try:
+                result = await main._generate_reply_result(
+                    content="先把万达2000以下一室里最合适的一套视频发我。",
+                    context=kf_context_memory.empty_context(),
+                    understanding={
+                        "intent": "media",
+                        "effective_query": "万达2000以下一室视频",
+                        "constraint_proof": {
+                            "intent": "media",
+                            "area": "拱墅万达\n北部软件园\n城北万象城",
+                            "budget_range": [0, 2000],
+                            "layout": "一室",
+                            "wants_video": True,
+                        },
+                        "structured_task": {"intent": "media"},
+                    },
+                    tool_evidence={
+                        "actions": ["search_inventory", "send_video", "generate_reply"],
+                        "media_request": {"wants_video": True, "requested_count": 1},
+                        "inventory_rows": [
+                            {"小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅"}
+                        ],
+                        "target_rows": [
+                            {"小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅"}
+                        ],
+                        "video_rows": [
+                            {"小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅"}
+                        ],
+                        "video_paths": [video.name],
+                    },
+                    planner_result={
+                        "actions": ["search_inventory", "send_video", "generate_reply"],
+                        "reply_text": "找到了，这是棠润府15-2-801B的视频。",
+                    },
+                )
+            finally:
+                main.reply_generator = originals["reply_generator"]
+                main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("找到了", result["reply"])
+        self.assertIn("棠润府15-2-801B", result["reply"])
+        self.assertNotIn("稍后给您准确回复", result["reply"])
+
+    async def test_missing_video_reply_survives_selfcheck_retry(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                if "暂时没找到视频" in str(kwargs.get("draft_reply") or ""):
+                    return {"status": "pass"}
+                return {
+                    "status": "fail",
+                    "reason": "缺素材说明需要重写",
+                    "fallback_reply": "我先帮您确认一下最新房态，稍后给您准确回复。",
+                }
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="继续发剩下的视频。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "继续发剩下的视频",
+                    "constraint_proof": {"wants_video": True},
+                    "structured_task": {"intent": "media", "tool_requirements": {"needs_video": True}},
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "send_video", "explain_missing_media", "generate_reply"],
+                    "media_request": {"wants_video": True, "requested_count": 1},
+                    "inventory_rows": [{"小区": "小洋坝家园三区", "房号": "12-1003B"}],
+                    "target_rows": [{"小区": "小洋坝家园三区", "房号": "12-1003B"}],
+                    "missing_media": ["小洋坝家园三区12-1003B:视频"],
+                    "media_status": {"video": {"requested_count": 1, "sent_count": 0, "missing_rooms": ["小洋坝家园三区12-1003B"]}},
+                },
+                planner_result={
+                    "actions": ["search_inventory", "send_video", "explain_missing_media", "generate_reply"],
+                    "reply_text": "我先查这套视频，有素材就发你；没有会直接说明暂无视频。",
+                },
+                retry_reason="selfcheck_retry",
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("暂时没找到视频", result["reply"])
+        self.assertIn("小洋坝家园三区12-1003B", result["reply"])
+        self.assertNotIn("找到就发你", result["reply"])
+        self.assertNotIn("有的，", result["reply"])
+
+    async def test_planner_missing_reply_after_retry_cannot_send_media(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            row = {"小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅"}
+            tool_evidence = {
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "media_request": {"wants_video": True, "requested_count": 1},
+                "inventory_rows": [row],
+                "target_rows": [row],
+                "video_rows": [row],
+                "video_paths": [video.name],
+            }
+            originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+            main.reply_generator = FakeReplyGenerator()
+            main.agentic_rag = FakeRag()
+            try:
+                result = await main._generate_reply_result(
+                    content="棠润府15-2-801B视频发我。",
+                    context=kf_context_memory.empty_context(),
+                    understanding={
+                        "intent": "media",
+                        "effective_query": "棠润府15-2-801B视频",
+                        "constraint_proof": {"intent": "media", "wants_video": True},
+                        "structured_task": {"intent": "media"},
+                    },
+                    tool_evidence=tool_evidence,
+                    planner_result={
+                        "actions": ["search_inventory", "send_video", "generate_reply"],
+                        "reply_text": "",
+                    },
+                    retry_reason="selfcheck_retry",
+                )
+            finally:
+                main.reply_generator = originals["reply_generator"]
+                main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertTrue(tool_evidence.get("suppress_actions"))
+        self.assertEqual(tool_evidence["outbound_package"]["video_paths"], [])
+        self.assertEqual(
+            result["selfcheck"]["fallback"]["llm"]["source"],
+            "planner_missing_reply_safe_fallback",
+        )
+
+    async def test_planner_missing_reply_before_retry_does_not_enter_selfcheck(self) -> None:
+        class FakeReplyGenerator:
+            async def plan_kf_reply_text(self, **kwargs):
+                return {"reply_text": "", "source": "fake_planner_reply_empty"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                raise AssertionError("Planner 空 reply_text 不能进入回复检索或最终自检")
+
+            def assess_reply(self, **kwargs):
+                raise AssertionError("Planner 空 reply_text 不能进入最终自检")
+
+        row = {"小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅"}
+        originals = {"agentic_rag": main.agentic_rag, "reply_generator": main.reply_generator}
+        main.agentic_rag = FakeRag()
+        main.reply_generator = FakeReplyGenerator()
+        try:
+            result = await main._generate_reply_result(
+                content="棠润府15-2-801B视频发我。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "棠润府15-2-801B视频",
+                    "constraint_proof": {"intent": "media", "wants_video": True},
+                    "structured_task": {"intent": "media"},
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "send_video", "generate_reply"],
+                    "media_request": {"wants_video": True, "requested_count": 1},
+                    "inventory_rows": [row],
+                    "target_rows": [row],
+                },
+                planner_result={
+                    "actions": ["search_inventory", "send_video", "generate_reply"],
+                    "reply_text": "",
+                },
+                retry_reason="",
+            )
+        finally:
+            main.agentic_rag = originals["agentic_rag"]
+            main.reply_generator = originals["reply_generator"]
+
+        self.assertTrue(result["needs_planner_retry"])
+        self.assertEqual(result["reply"], "")
+        self.assertEqual(result["selfcheck"]["rule"]["source"], "planner_output_gate")
+        self.assertIn("不能进入最终自检", result["selfcheck"]["rule"]["reason"])
+
+    async def test_selfcheck_retry_fallback_preserves_valid_video_actions(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            video_row = {"小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅"}
+            missing_row = {"小区": "小洋坝家园三区", "房号": "12-1003B", "户型分类": "一室一厅"}
+            tool_evidence = {
+                "actions": ["search_inventory", "send_video", "explain_missing_media", "generate_reply"],
+                "media_request": {"wants_video": True, "requested_count": 2},
+                "inventory_rows": [video_row, missing_row],
+                "target_rows": [video_row, missing_row],
+                "video_rows": [video_row],
+                "video_paths": [video.name],
+                "missing_media": ["小洋坝家园三区12-1003B:视频"],
+                "media_status": {
+                    "video": {
+                        "requested_count": 2,
+                        "sent_count": 1,
+                        "missing_rooms": ["小洋坝家园三区12-1003B"],
+                    }
+                },
+            }
+            originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+            main.reply_generator = FakeReplyGenerator()
+            main.agentic_rag = FakeRag()
+            try:
+                result = await main._generate_reply_result(
+                    content="万达附近1500左右先发几套视频我筛一下。",
+                    context=kf_context_memory.empty_context(),
+                    understanding={
+                        "intent": "media",
+                        "effective_query": "万达1500左右视频",
+                        "constraint_proof": {
+                            "intent": "media",
+                            "area": "拱墅万达\n北部软件园\n城北万象城",
+                            "budget_range": [1000, 2000],
+                            "wants_video": True,
+                        },
+                        "structured_task": {"intent": "media"},
+                    },
+                    tool_evidence=tool_evidence,
+                    planner_result={
+                        "actions": ["search_inventory", "send_video", "explain_missing_media", "generate_reply"],
+                        "reply_text": "我先查一下，稍等。",
+                    },
+                    retry_reason="selfcheck_retry",
+                )
+            finally:
+                main.reply_generator = originals["reply_generator"]
+                main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertFalse(bool(tool_evidence.get("suppress_actions")))
+        self.assertEqual(tool_evidence["outbound_package"]["video_paths"], [video.name])
+        self.assertIn("这是棠润府15-2-801B的视频。", tool_evidence["outbound_package"]["video_explanations"])
+        self.assertIn("小洋坝家园三区12-1003B", result["reply"])
+
+    async def test_robotic_tone_fallback_keeps_verified_batch_video_actions(self) -> None:
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(
+                    action="fallback",
+                    status="fallback",
+                    reason="robotic_template_reply",
+                    fallback_text=kwargs.get("reply_text") or "",
+                    fallback_reply=kwargs.get("reply_text") or "",
+                )
+
+        rows = [
+            {"小区": "杨家新雅苑", "房号": "15-603", "户型分类": "三室一厅"},
+            {"小区": "杨家新雅苑", "房号": "49-1102", "户型分类": "一室一厅"},
+            {"小区": "兴业杨家府", "房号": "3-601", "户型分类": "一室一厅"},
+            {"小区": "石桥铭苑", "房号": "6-1102", "户型分类": "一室一厅"},
+        ]
+        videos = [tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) for _ in rows]
+        for video in videos:
+            video.write(b"video")
+            video.close()
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            tool_evidence = {
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "media_request": {"wants_video": True, "requested_count": 4},
+                "inventory_rows": rows,
+                "target_rows": rows,
+                "video_rows": rows,
+                "video_paths": [video.name for video in videos],
+                "missing_media": [],
+                "media_status": {"video": {"requested_count": 4, "sent_count": 4, "missing_rooms": []}},
+            }
+            result = await main._generate_reply_result(
+                content="石桥和华丰附近5000左右整租视频都发我几套。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "石桥和华丰附近5000左右整租视频",
+                    "constraint_proof": {
+                        "intent": "inventory",
+                        "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "budget_range": [4500, 5500],
+                        "wants_video": True,
+                    },
+                    "structured_task": {"intent": "inventory"},
+                },
+                tool_evidence=tool_evidence,
+                planner_result={
+                    "actions": ["search_inventory", "send_video", "generate_reply"],
+                    "reply_text": "如需看房，请提前联系。视频已准备好，具体如下。",
+                },
+                retry_reason="robotic_template_reply",
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+            for video in videos:
+                Path(video.name).unlink(missing_ok=True)
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertNotIn("先不乱发", result["reply"], result)
+        self.assertIn("按你说的条件先发这4套视频", result["reply"])
+        self.assertIn("杨家新雅苑15-603", result["reply"])
+        self.assertIn("石桥铭苑6-1102", result["reply"])
+        self.assertFalse(bool(tool_evidence.get("suppress_actions")))
+        self.assertEqual(len(tool_evidence["outbound_package"]["video_paths"]), 4)
+        self.assertEqual(result["selfcheck"]["fallback"]["rule"]["status"], "pass")
+        self.assertEqual(result["selfcheck"]["fallback"]["human"]["status"], "pass")
+
+    async def test_original_video_request_explains_sendable_video_is_not_original_source(self) -> None:
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        row = {"小区": "嘉樘星绣府", "房号": "9-603", "户型分类": "两室一厅"}
+        video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        video.write(b"video")
+        video.close()
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            tool_evidence = {
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "media_request": {"wants_video": True, "requested_count": 1},
+                "inventory_rows": [row],
+                "target_rows": [row],
+                "video_rows": [row],
+                "video_paths": [video.name],
+                "missing_media": [],
+                "original_video_request": {
+                    "requested": True,
+                    "has_original_source": False,
+                    "has_sendable_video": True,
+                    "sendable_video_count": 1,
+                    "reason": "当前素材库只提供企业微信可发送视频，没有单独的原视频/高清下载链接证据。",
+                },
+            }
+            result = await main._generate_reply_result(
+                content="这套有原视频或者清楚一点的视频吗？",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "嘉樘星绣府9-603原视频高清视频",
+                    "constraint_proof": {
+                        "intent": "media",
+                        "wants_video": True,
+                        "wants_original_video": True,
+                        "room_refs": ["9-603"],
+                    },
+                    "structured_task": {"intent": "media"},
+                },
+                tool_evidence=tool_evidence,
+                planner_result={
+                    "actions": ["search_inventory", "send_video", "generate_reply"],
+                    "reply_text": "有的，这套视频我先发你。",
+                },
+                retry_reason="",
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+            Path(video.name).unlink(missing_ok=True)
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("企业微信可发送视频", result["reply"])
+        self.assertIn("可能会压缩", result["reply"])
+        self.assertIn("原视频/高清下载链接", result["reply"])
+        self.assertIn("original_video_request", tool_evidence["outbound_package"])
+        self.assertEqual(tool_evidence["outbound_package"]["video_paths"], [video.name])
+
+    def test_missing_original_video_reply_mentions_no_high_resolution_source(self) -> None:
+        row = {"小区": "长岳王马府", "房号": "4-2002", "户型分类": "两室一厅"}
+        reply = main._reply_for_missing_media(
+            {
+                "constraint_proof": {
+                    "wants_video": True,
+                    "wants_original_video": True,
+                    "selected_indices": [1, 2],
+                }
+            },
+            {
+                "target_rows": [row],
+                "missing_media": ["长岳王马府4-2002:视频"],
+                "video_paths": [],
+                "image_paths": [],
+            },
+        )
+
+        self.assertIn("长岳王马府4-2002", reply)
+        self.assertIn("原视频/高清下载链接", reply)
+        self.assertIn("没有可发送的视频", reply)
+
+    async def test_pending_missing_video_reply_overrides_planner_send_claim(self) -> None:
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="剩下的继续发。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "继续发送上一轮未完成的视频素材。",
+                    "constraint_proof": {
+                        "intent": "media",
+                        "wants_video": True,
+                        "pending_video_action": "continue",
+                    },
+                    "structured_task": {
+                        "intent": "media",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+                tool_evidence={
+                    "actions": ["send_video", "explain_missing_media", "generate_reply"],
+                    "missing_media": ["兴业杨家府4-1502:视频", "兴业杨家府8-1203:视频"],
+                    "video_paths": [],
+                    "image_paths": [],
+                    "media_status": {
+                        "video": {
+                            "requested_count": 5,
+                            "sent_count": 0,
+                            "missing_rooms": ["兴业杨家府4-1502", "兴业杨家府8-1203"],
+                            "sync_status": {"source": "pending_video_sends"},
+                        }
+                    },
+                },
+                planner_result={
+                    "actions": ["send_video", "explain_missing_media", "generate_reply"],
+                    "reply_text": "好的，剩下的视频继续发你。",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("兴业杨家府4-1502", result["reply"])
+        self.assertIn("兴业杨家府8-1203", result["reply"])
+        self.assertIn("暂时没找到视频", result["reply"])
+        self.assertNotIn("小区+房号", result["reply"])
+
+    async def test_original_video_fallback_keeps_video_action_and_explains_no_source_link(self) -> None:
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(
+                    action="fallback",
+                    status="fallback",
+                    reason="robotic_template_reply",
+                    fallback_text=kwargs.get("reply_text") or "",
+                    fallback_reply=kwargs.get("reply_text") or "",
+                )
+
+        row = {"小区": "新柠长木府", "房号": "3-1002A", "户型分类": "两室一厅"}
+        video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        video.write(b"video")
+        video.close()
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            tool_evidence = {
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "media_request": {"wants_video": True, "requested_count": 1},
+                "inventory_rows": [row],
+                "target_rows": [row],
+                "video_rows": [row],
+                "video_paths": [video.name],
+                "missing_media": [],
+                "original_video_request": {
+                    "requested": True,
+                    "has_original_source": False,
+                    "has_sendable_video": True,
+                    "sendable_video_count": 1,
+                },
+            }
+            result = await main._generate_reply_result(
+                content="有原视频或者高清一点的吗？",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "新柠长木府3-1002A原视频高清视频",
+                    "constraint_proof": {
+                        "intent": "media",
+                        "wants_video": True,
+                        "wants_original_video": True,
+                    },
+                    "structured_task": {"intent": "media"},
+                },
+                tool_evidence=tool_evidence,
+                planner_result={
+                    "actions": ["search_inventory", "send_video", "generate_reply"],
+                    "reply_text": "视频已准备好。",
+                },
+                retry_reason="robotic_template_reply",
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+            Path(video.name).unlink(missing_ok=True)
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertFalse(bool(tool_evidence.get("suppress_actions")))
+        self.assertIn("新柠长木府3-1002A", result["reply"])
+        self.assertIn("可能会压缩", result["reply"])
+        self.assertIn("原视频/高清下载链接", result["reply"])
+        self.assertEqual(tool_evidence["outbound_package"]["video_paths"], [video.name])
+
+    async def test_action_explanation_retry_keeps_verified_batch_media_actions(self) -> None:
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="")
+
+        rows = [
+            {"小区": "昌运里三区", "房号": "3-1403", "户型分类": "两室一厅"},
+            {"小区": "棠润府", "房号": "15-2-1901B", "户型分类": "两室一厅"},
+        ]
+        videos = [tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) for _ in rows]
+        images = [tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) for _ in rows]
+        for file in [*videos, *images]:
+            file.write(b"media")
+            file.close()
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            tool_evidence = {
+                "actions": ["search_inventory", "send_image", "send_video", "generate_reply"],
+                "media_request": {"wants_video": True, "wants_image": True, "requested_count": 2},
+                "inventory_rows": rows,
+                "target_rows": rows,
+                "video_rows": rows,
+                "image_rows": rows,
+                "video_paths": [video.name for video in videos],
+                "image_paths": [image.name for image in images],
+                "missing_media": [],
+            }
+            result = await main._generate_reply_result(
+                content="这两套图片和视频都发我。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "这两套图片和视频",
+                    "constraint_proof": {"wants_video": True, "wants_image": True, "selected_indices": [1, 2]},
+                    "structured_task": {"intent": "media"},
+                },
+                tool_evidence=tool_evidence,
+                planner_result={
+                    "actions": ["search_inventory", "send_image", "send_video", "generate_reply"],
+                    "reply_text": "有的，这是昌运里三区3-1403和棠润府15-2-1901B的图片和视频。",
+                },
+                retry_reason="多套视频动作回复必须逐套说明",
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+            for file in [*videos, *images]:
+                Path(file.name).unlink(missing_ok=True)
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertNotIn("先不乱发", result["reply"], result)
+        self.assertIn("这是昌运里三区3-1403的视频", result["reply"])
+        self.assertIn("这是棠润府15-2-1901B的图片", result["reply"])
+        self.assertFalse(bool(tool_evidence.get("suppress_actions")))
+
+    async def test_contract_reply_does_not_invent_room_details(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
                 return ReplyPlan(
                     text=(
-                        "这套是大华海派风景 2-1-402A，朝南一室一厅带燃气和独立厨卫。\n"
-                        "我这边暂时没找到这套的视频，需要人工再确认一下素材。"
+                        "客户看中了直接联系 18758141785 / 13282125992 / 19941091943 定房。"
+                        "比如星桥锦绣嘉苑20-1606A这套，密码是960615#，可以马上安排。"
                     )
                 )
 
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_inventory = main.inventory
-            previous_media_store = main.media_store
-            previous_generator = main.reply_generator
-            previous_key = main.settings.dashscope_api_key
-            fake_client = FakeKfClient()
-            fake_media_store = FakeMediaStore()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.inventory = FakeInventory()
-                main.media_store = fake_media_store
-                main.reply_generator = FakeReplyGenerator()
-                main.settings.dashscope_api_key = ""
-                main.wecom_kf_conversation_memory.clear()
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
 
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "就是这套"},
-                    }
-                )
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
 
-                self.assertEqual(fake_client.videos, [fake_media_store.video_path])
-                self.assertNotIn("暂时没找到", fake_client.texts[0])
-                self.assertIn("有对应视频", fake_client.texts[0])
-                self.assertEqual(fake_client.texts[1], "这是大华海派风景2-1-402A的视频。")
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.inventory = previous_inventory
-                main.media_store = previous_media_store
-                main.reply_generator = previous_generator
-                main.settings.dashscope_api_key = previous_key
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
 
-    async def test_sends_room_database_videos_as_native_videos(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        fake_client = FakeKfClient()
-        video_path = Path("room_database/video/小洋坝/视频.mp4")
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
         try:
-            main.wecom_kf = fake_client
-            sent = await main._send_kf_room_database_videos(
-                "kf_xxx",
-                "wm_xxx",
-                [video_path],
+            result = await main._generate_reply_result(
+                content="客户看中了怎么定房？定金和合同怎么弄？",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "contract",
+                    "structured_task": {
+                        "intent": "contract",
+                        "tool_requirements": {"needs_contract_contact": True},
+                    },
+                },
+                tool_evidence={"actions": ["send_contract_contact", "generate_reply"]},
+                planner_result={
+                    "actions": ["send_contract_contact", "generate_reply"],
+                    "reply_text": "客户看中了可以联系 18758141785 / 13282125992 / 19941091943 定房和签电子合同。联系时带上小区+房号，方便确认房态和定金。",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("18758141785", result["reply"])
+        self.assertIn("签电子合同", result["reply"])
+        self.assertIn("小区+房号", result["reply"])
+        self.assertNotIn("比如星桥锦绣嘉苑", result["reply"])
+        self.assertNotIn("密码是", result["reply"])
+
+    async def test_deposit_utilities_reply_survives_selfcheck_retry(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="免押走支付宝无忧住芝麻信用评估，服务费按租期5.5%-8%。")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                if "水电要按具体房源备注查" in str(kwargs.get("draft_reply") or ""):
+                    return {"status": "pass"}
+                return {
+                    "status": "fail",
+                    "reason": "遗漏水电追问",
+                    "fallback_reply": "免押走支付宝无忧住芝麻信用评估，服务费按租期5.5%-8%。",
+                }
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="免押金要什么条件？服务费怎么算？顺便说下这几套水电怎么收。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "deposit",
+                    "structured_task": {
+                        "intent": "deposit",
+                        "tool_requirements": {"needs_deposit_policy": True, "needs_utilities": True},
+                    },
+                },
+                tool_evidence={"actions": ["send_deposit_policy", "generate_reply"]},
+                planner_result={
+                    "actions": ["send_deposit_policy", "generate_reply"],
+                    "reply_text": "免押是支付宝无忧住信用免押服务，需要符合芝麻信用风控并支付免押服务费。",
+                },
+                retry_reason="selfcheck_retry",
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("免押走支付宝无忧住", result["reply"])
+        self.assertIn("水电要按具体房源备注查", result["reply"])
+        self.assertIn("小区+房号", result["reply"])
+
+    async def test_contract_question_is_forced_to_contract_intent(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "unclear",
+                    "rewritten_query": "这两套具体是哪两套？",
+                    "query_state": {"intent": "unclear"},
+                    "needs_clarification": True,
+                    "clarification_text": "请问是哪两套？",
+                }
+
+        original = main.reply_generator
+        main.reply_generator = FakeReplyGenerator()
+        try:
+            result = await main._understand_message(
+                content="这两套客户看中了怎么定房？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("这两套客户看中了怎么定房？"),
+            )
+        finally:
+            main.reply_generator = original
+
+        self.assertEqual(result["intent"], "contract")
+        self.assertFalse(result["needs_clarification"])
+        self.assertTrue(result["query_state"]["wants_contract_contact"])
+
+    def test_outbound_package_selfcheck_rejects_payment_field_semantic_error(self) -> None:
+        result = main._outbound_package_selfcheck(
+            draft_reply="这套押一付一押金是3500，押二付一押金是3200。",
+            tool_evidence={
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [
+                    {
+                        "小区": "新柠长木府",
+                        "房号": "3-1002B",
+                        "押一付一": "3500",
+                        "押二付一": "3200",
+                    }
+                ],
+            },
+            outbound_package={"text": "这套押一付一押金是3500，押二付一押金是3200。"},
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("押一付一/押二付一", result["reason"])
+
+    def test_outbound_package_selfcheck_rejects_robot_phone_call_claim(self) -> None:
+        result = main._outbound_package_selfcheck(
+            draft_reply="水电费我这边直接电话跟您核对一下。",
+            tool_evidence={
+                "actions": ["send_deposit_policy", "generate_reply"],
+                "rule_evidence": {"deposit_policy": main._deposit_policy_evidence()},
+            },
+            outbound_package={"text": "水电费我这边直接电话跟您核对一下。"},
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("不能声称自己会打电话", result["reason"])
+
+    def test_outbound_package_selfcheck_rejects_unexplained_missing_video(self) -> None:
+        result = main._outbound_package_selfcheck(
+            draft_reply="我先帮您确认一下最新房态，稍后给您准确回复。",
+            tool_evidence={
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "media_request": {"wants_video": True, "requested_count": 2},
+                "target_rows": [{"小区": "杨乐府", "房号": "9-604B"}],
+            },
+            outbound_package={"text": "我先帮您确认一下最新房态，稍后给您准确回复。"},
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("视频请求", result["reason"])
+
+    def test_outbound_package_selfcheck_rejects_video_claim_without_action(self) -> None:
+        result = main._outbound_package_selfcheck(
+            draft_reply="诸葛龙吟院10-601A的视频已找到，稍后发给您。",
+            tool_evidence={
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "media_request": {"wants_video": True, "requested_count": 1},
+            },
+            outbound_package={"text": "诸葛龙吟院10-601A的视频已找到，稍后发给您。"},
+        )
+
+        self.assertEqual(result["status"], "retry")
+        self.assertIn("待发送包没有视频动作", result["reason"])
+
+    def test_outbound_package_selfcheck_allows_sheet_sent_with_unbound_video_explanation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            inventory_image = Path(directory) / "inventory.png"
+            inventory_image.write_bytes(b"png")
+            result = main._outbound_package_selfcheck(
+                draft_reply=(
+                    "房源表发你了，你可以先整体看一下；按当前区域和预算暂时没匹配到"
+                    "可直接发视频的具体房源，建议你从表里选小区+房号后，我再帮你查视频或看房方式。"
+                ),
+                tool_evidence={
+                    "actions": ["send_inventory_sheet", "send_video", "generate_reply"],
+                    "media_request": {"wants_video": True, "requested_count": 1},
+                },
+                outbound_package={
+                    "text": (
+                        "房源表发你了，你可以先整体看一下；按当前区域和预算暂时没匹配到"
+                        "可直接发视频的具体房源，建议你从表里选小区+房号后，我再帮你查视频或看房方式。"
+                    ),
+                    "inventory_images": [str(inventory_image)],
+                    "inventory_explanation": "房源表发你了，你可以让客户先整体看一下。",
+                },
             )
 
-            self.assertTrue(sent)
-            self.assertEqual(fake_client.videos, [video_path])
-            self.assertEqual(fake_client.texts, ["这是小洋坝的视频。"])
-        finally:
-            main.wecom_kf = previous_client
+        self.assertEqual(result["status"], "pass")
 
-    async def test_batch_room_database_videos_sends_two_native_then_links(self) -> None:
-        class FakeKfClient:
+    def test_safe_deposit_fallback_contains_fee_tiers(self) -> None:
+        fallback = main._safe_fallback_for_intent(
+            {"intent": "deposit"},
+            "免押不是免费，是支付宝芝麻信用无忧住服务。",
+        )
+
+        self.assertIn("芝麻", fallback)
+        self.assertIn("5.5", fallback)
+        self.assertIn("7%", fallback)
+        self.assertIn("8%", fallback)
+        self.assertIn("服务费", fallback)
+
+    def test_safe_contract_fallback_contains_contact_numbers(self) -> None:
+        fallback = main._safe_fallback_for_intent(
+            {"intent": "contract"},
+            "我先帮您确认一下最新房态，稍后给您准确回复。",
+        )
+
+        self.assertIn("18758141785", fallback)
+        self.assertIn("13282125992", fallback)
+        self.assertIn("19941091943", fallback)
+        self.assertIn("电子合同", fallback)
+
+    def test_safe_inventory_sheet_fallback_does_not_claim_send_without_image(self) -> None:
+        fallback = main._safe_fallback_for_intent(
+            {"intent": "inventory_sheet"},
+            "我先帮您确认一下最新房态，稍后给您准确回复。",
+        )
+
+        self.assertIn("房源表图片", fallback)
+        self.assertIn("暂时没生成成功", fallback)
+        self.assertNotIn("发你", fallback)
+
+    def test_clarification_raw_mention_strips_query_tail(self) -> None:
+        self.assertEqual(
+            main._clean_clarification_raw_mention("\u6768\u5bb6\u5e9c\u8fd8\u5b50"),
+            "\u6768\u5bb6\u5e9c",
+        )
+        self.assertEqual(
+            main._clean_clarification_raw_mention("\u6768\u5bb6\u5e9c\u8fd8\u6709\u623f\u5b50\u5417"),
+            "\u6768\u5bb6\u5e9c",
+        )
+
+    async def test_clarification_reply_passes_final_selfcheck_before_send(self) -> None:
+        class FakeStateStore:
             def __init__(self) -> None:
-                self.videos: list[Path] = []
+                self.processed: set[str] = set()
+
+            def mark_processed(self, msgid: str) -> None:
+                self.processed.add(msgid)
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
                 self.texts: list[str] = []
 
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
                 return {"errcode": 0}
 
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_root = main.settings.room_database_path
-            previous_base_url = main.settings.public_base_url
-            fake_client = FakeKfClient()
-            root = Path(directory)
-            video_paths = [
-                root / "video" / f"小区{index}" / "视频.mp4"
-                for index in range(4)
-            ]
-            for path in video_paths:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(b"video")
-            try:
-                main.wecom_kf = fake_client
-                main.settings.room_database_path = root
-                main.settings.public_base_url = "https://example.com"
-
-                sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", video_paths)
-
-                self.assertTrue(sent)
-                self.assertEqual(fake_client.videos, video_paths[:2])
-                self.assertIn("视频比较多", fake_client.texts[0])
-                self.assertIn("5分钟后", fake_client.texts[0])
-                self.assertIn("这是小区0的视频。", fake_client.texts[1])
-                self.assertIn("这是小区1的视频。", fake_client.texts[2])
-                self.assertEqual(len(fake_client.texts), 3)
-                self.assertNotIn("https://", "\n".join(fake_client.texts))
-            finally:
-                main.wecom_kf = previous_client
-                main.settings.room_database_path = previous_root
-                main.settings.public_base_url = previous_base_url
-
-    async def test_send_limit_records_pending_video_without_sent_dialog(self) -> None:
-        class FakeKfClient:
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                raise WeComKfSendLimitError("send msg count limit")
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                return {"errcode": 0}
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            previous_root = main.settings.room_database_path
-            previous_base_url = main.settings.public_base_url
-            root = Path(directory)
-            video_path = root / "video" / "小区1" / "视频.mp4"
-            video_path.parent.mkdir(parents=True, exist_ok=True)
-            video_path.write_bytes(b"video")
-            try:
-                main.wecom_kf = FakeKfClient()
-                main.wecom_kf_context_store = WeComKfContextStore(path=root / "context.json")
-                main.wecom_kf_conversation_memory.clear()
-                main.settings.room_database_path = root
-                main.settings.public_base_url = "https://example.com"
-
-                sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [video_path])
-
-                self.assertFalse(sent)
-                context = main.wecom_kf_context_store.get("kf_xxx:wm_xxx")
-                self.assertIn("send_limited", context)
-                self.assertEqual(context["send_limited"]["video_urls"], [])
-                dialog_text = "\n".join(item["content"] for item in context["recent_messages"])
-                self.assertNotIn("已直接发送相关视频", dialog_text)
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-                main.settings.room_database_path = previous_root
-                main.settings.public_base_url = previous_base_url
-
-    async def test_send_limit_recovery_prompt_sends_pending_video_links_first(self) -> None:
-        class FakeKfClient:
+        class FakeContextStore:
             def __init__(self) -> None:
-                self.texts: list[str] = []
+                self.data: dict[str, dict] = {}
 
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
 
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            fake_client = FakeKfClient()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(path=Path(directory) / "context.json")
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_context_store.save(
-                    "kf_xxx:wm_xxx",
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "\u6768\u5bb6\u5e9c\u6709\u623f\u5b50\u5417",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": True,
+                    "clarification_text": "\u4f60\u8bf4\u7684\u201c\u6768\u5bb6\u5e9c\u201d\u6211\u8fd9\u8fb9\u6709\u51e0\u4e2a\u76f8\u8fd1\u5c0f\u533a\uff1a\u5174\u4e1a\u6768\u5bb6\u5e9c\u3001\u6768\u4e50\u5e9c\u3002\u4f60\u786e\u8ba4\u4e0b\u662f\u54ea\u4e00\u4e2a\uff0c\u6211\u518d\u6309\u6700\u65b0\u623f\u6e90\u8868\u67e5\u3002",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return []
+
+        calls: list[dict] = []
+
+        async def fake_generate_reply_result(**kwargs):
+            calls.append(kwargs)
+            return {
+                "reply": "\u6211\u5148\u786e\u8ba4\u4e00\u4e0b\uff0c\u4f60\u8bf4\u7684\u662f\u5174\u4e1a\u6768\u5bb6\u5e9c\uff0c\u8fd8\u662f\u6768\u4e50\u5e9c\uff1f\u786e\u8ba4\u540e\u6211\u518d\u5e2e\u4f60\u67e5\u8fd8\u6709\u54ea\u4e9b\u5728\u79df\u3002",
+                "draft_reply": str((kwargs.get("planner_result") or {}).get("reply_text") or ""),
+                "context": kwargs["context"],
+                "selfcheck": {"status": "pass"},
+                "needs_planner_retry": False,
+                "planner_retry_reason": "",
+            }
+
+        originals = {
+            "wecom_kf": main.wecom_kf,
+            "wecom_kf_context_store": main.wecom_kf_context_store,
+            "reply_generator": main.reply_generator,
+            "inventory": main.inventory,
+            "_generate_reply_result": main._generate_reply_result,
+            "kf_turn_generations": dict(main.kf_turn_generations),
+        }
+        fake_wecom = FakeWeComKf()
+        main.wecom_kf = fake_wecom
+        main.wecom_kf_context_store = FakeContextStore()
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        main._generate_reply_result = fake_generate_reply_result
+        main.kf_turn_generations["kf:wm"] = 0
+        try:
+            await main._process_text_turn(
+                open_kfid="kf",
+                external_userid="wm",
+                pending_items=[
                     {
-                        "send_limited": {
-                            "triggered_at": 123.0,
-                            "summary": "批量视频触发限流",
-                            "video_urls": ["https://example.com/video-1.mp4"],
+                        "msgid": "msg-clarify",
+                        "content": "\u6768\u5bb6\u5e9c\u8fd8\u6709\u623f\u5b50\u5417\uff1f",
+                    }
+                ],
+                generation=0,
+            )
+        finally:
+            for name, value in originals.items():
+                if name == "kf_turn_generations":
+                    main.kf_turn_generations.clear()
+                    main.kf_turn_generations.update(value)
+                else:
+                    setattr(main, name, value)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tool_evidence"]["actions"], ["clarification"])
+        self.assertEqual(
+            fake_wecom.texts,
+            ["\u6211\u5148\u786e\u8ba4\u4e00\u4e0b\uff0c\u4f60\u8bf4\u7684\u662f\u5174\u4e1a\u6768\u5bb6\u5e9c\uff0c\u8fd8\u662f\u6768\u4e50\u5e9c\uff1f\u786e\u8ba4\u540e\u6211\u518d\u5e2e\u4f60\u67e5\u8fd8\u6709\u54ea\u4e9b\u5728\u79df\u3002"],
+        )
+        self.assertEqual(fake_wecom.state_store.processed, {"msg-clarify"})
+
+    async def test_send_final_actions_suppresses_all_media_when_selfcheck_fallback(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+                self.images: list[str] = []
+                self.videos: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+            def send_image(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+                self.images.append(media_id)
+                return {"errcode": 0}
+
+            def send_video(self, open_kfid: str, external_userid: str, media_id: str, title: str = "") -> dict:
+                self.videos.append(media_id)
+                return {"errcode": 0}
+
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        main.wecom_kf = fake
+        try:
+            result = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context=kf_context_memory.empty_context(),
+                final_reply="这条我需要人工再确认一下，避免发错资料。",
+                tool_evidence={
+                    "suppress_actions": True,
+                    "inventory_images": ["sheet.png"],
+                    "image_paths": ["room.jpg"],
+                    "video_paths": ["room.mp4"],
+                    "outbound_package": {
+                        "inventory_explanation": "房源表发你了。",
+                        "image_explanations": ["这是新柠长木府3-1002B的图片。"],
+                        "video_explanations": ["这是新柠长木府3-1002B的视频。"],
+                    },
+                },
+            )
+        finally:
+            main.wecom_kf = original_wecom
+
+        self.assertEqual(fake.texts, ["这条我需要人工再确认一下，避免发错资料。"])
+        self.assertEqual(fake.images, [])
+        self.assertEqual(fake.videos, [])
+        self.assertEqual(result["sent_actions"], [{"type": "text", "count": 1}])
+
+    async def test_send_final_actions_does_not_duplicate_inventory_explanation(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+                self.images: list[str] = []
+                self.videos: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+            def send_image(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+                self.images.append(str(media_id))
+                return {"errcode": 0}
+
+            def send_video(self, open_kfid: str, external_userid: str, media_id: str, title: str = "") -> dict:
+                self.videos.append(str(media_id))
+                return {"errcode": 0}
+
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        main.wecom_kf = fake
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                sheet_path = str(Path(directory) / "sheet.png")
+                Path(sheet_path).write_bytes(b"png")
+                result = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=kf_context_memory.empty_context(),
+                    final_reply="房源表发你了，可以先给客户看整体。",
+                    tool_evidence={
+                        "inventory_images": [sheet_path],
+                        "outbound_package": {
+                            "inventory_images": [sheet_path],
+                            "inventory_explanation": "房源表发你了，你可以让客户先整体看一下。",
                         },
-                        "updated_at": main.time.time(),
                     },
                 )
+        finally:
+            main.wecom_kf = original_wecom
 
-                await main.handle_kf_message(
+        self.assertEqual(fake.texts, ["房源表发你了，可以先给客户看整体。"])
+        self.assertEqual(fake.images, [sheet_path])
+        self.assertEqual(fake.videos, [])
+        self.assertEqual(
+            result["sent_actions"],
+            [{"type": "text", "count": 1}, {"type": "image", "path": sheet_path, "count": 1}],
+        )
+
+    def test_stale_deposit_selfcheck_is_ignored_for_inventory_sheet(self) -> None:
+        sanitized = main._sanitize_rule_selfcheck_for_intent(
+            {
+                "status": "fallback",
+                "action": "fallback",
+                "reason": "deposit_reply_missing_platform",
+                "fallback_reply": "免押是支付宝无忧住服务。",
+            },
+            content="房源表发我",
+            understanding={"intent": "inventory_sheet"},
+        )
+
+        self.assertEqual(sanitized["status"], "pass")
+        fallback = main._safe_fallback_for_intent(
+            {"intent": "inventory_sheet"},
+            "免押是支付宝无忧住服务。",
+        )
+        self.assertIn("房源表", fallback)
+        self.assertNotIn("免押", fallback)
+
+    async def test_batch_customer_followups_are_merged_before_rewrite(self) -> None:
+        class FakeStateStore:
+            def __init__(self) -> None:
+                self.processed: set[str] = set()
+
+            def is_processed(self, msgid: str) -> bool:
+                return msgid in self.processed
+
+            def mark_processed(self, msgid: str) -> None:
+                self.processed.add(msgid)
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
+                self.texts: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+        class FakeContextStore:
+            def __init__(self) -> None:
+                self.data: dict[str, dict] = {}
+
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
+
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.contents: list[str] = []
+
+            async def rewrite_kf_message(self, **kwargs):
+                self.contents.append(kwargs["content"])
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": kwargs["content"],
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": True,
+                    "clarification_text": "我把你刚才补充的问题一起看了，按你给的预算和视频需求处理。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return []
+
+        fake_wecom = FakeWeComKf()
+        fake_reply = FakeReplyGenerator()
+        originals = {
+            "wecom_kf": main.wecom_kf,
+            "wecom_kf_context_store": main.wecom_kf_context_store,
+            "reply_generator": main.reply_generator,
+            "inventory": main.inventory,
+            "kf_turn_tasks": dict(main.kf_turn_tasks),
+            "kf_turn_generations": dict(main.kf_turn_generations),
+            "kf_turn_pending_messages": dict(main.kf_turn_pending_messages),
+        }
+        main.wecom_kf = fake_wecom
+        main.wecom_kf_context_store = FakeContextStore()
+        main.reply_generator = fake_reply
+        main.inventory = FakeInventory()
+        main.kf_turn_tasks.clear()
+        main.kf_turn_generations.clear()
+        main.kf_turn_pending_messages.clear()
+        try:
+            await main._handle_text_messages_batch(
+                [
                     {
                         "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
                         "msgtype": "text",
-                        "text": {"content": "你好"},
+                        "origin": 3,
+                        "open_kfid": "kf",
+                        "external_userid": "wm",
+                        "text": {"content": "万达1500左右有哪些"},
+                    },
+                    {
+                        "msgid": "msg-2",
+                        "msgtype": "text",
+                        "origin": 3,
+                        "open_kfid": "kf",
+                        "external_userid": "wm",
+                        "text": {"content": "先发几套视频我筛一下"},
+                    },
+                ]
+            )
+        finally:
+            main.wecom_kf = originals["wecom_kf"]
+            main.wecom_kf_context_store = originals["wecom_kf_context_store"]
+            main.reply_generator = originals["reply_generator"]
+            main.inventory = originals["inventory"]
+            main.kf_turn_tasks.clear()
+            main.kf_turn_tasks.update(originals["kf_turn_tasks"])
+            main.kf_turn_generations.clear()
+            main.kf_turn_generations.update(originals["kf_turn_generations"])
+            main.kf_turn_pending_messages.clear()
+            main.kf_turn_pending_messages.update(originals["kf_turn_pending_messages"])
+
+        self.assertEqual(len(fake_reply.contents), 1)
+        self.assertIn("万达1500左右有哪些", fake_reply.contents[0])
+        self.assertIn("先发几套视频我筛一下", fake_reply.contents[0])
+        self.assertEqual(len(fake_wecom.texts), 1)
+        self.assertNotIn("发具体小区或预算", fake_wecom.texts[0])
+        self.assertEqual(fake_wecom.state_store.processed, {"msg-1", "msg-2"})
+
+    async def test_new_followup_cancels_running_turn_and_rewrites_all_questions(self) -> None:
+        class FakeStateStore:
+            def __init__(self) -> None:
+                self.processed: set[str] = set()
+
+            def is_processed(self, msgid: str) -> bool:
+                return msgid in self.processed
+
+            def mark_processed(self, msgid: str) -> None:
+                self.processed.add(msgid)
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
+                self.texts: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+        class FakeContextStore:
+            def __init__(self) -> None:
+                self.data: dict[str, dict] = {}
+
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
+
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.contents: list[str] = []
+                self.first_started = asyncio.Event()
+
+            async def rewrite_kf_message(self, **kwargs):
+                self.contents.append(kwargs["content"])
+                if len(self.contents) == 1:
+                    self.first_started.set()
+                    await asyncio.Event().wait()
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": kwargs["content"],
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": True,
+                    "clarification_text": "我把你连续补充的问题一起看了，按新的完整需求处理。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return []
+
+        fake_wecom = FakeWeComKf()
+        fake_reply = FakeReplyGenerator()
+        originals = {
+            "wecom_kf": main.wecom_kf,
+            "wecom_kf_context_store": main.wecom_kf_context_store,
+            "reply_generator": main.reply_generator,
+            "inventory": main.inventory,
+            "kf_turn_tasks": dict(main.kf_turn_tasks),
+            "kf_turn_generations": dict(main.kf_turn_generations),
+            "kf_turn_pending_messages": dict(main.kf_turn_pending_messages),
+        }
+        main.wecom_kf = fake_wecom
+        main.wecom_kf_context_store = FakeContextStore()
+        main.reply_generator = fake_reply
+        main.inventory = FakeInventory()
+        main.kf_turn_tasks.clear()
+        main.kf_turn_generations.clear()
+        main.kf_turn_pending_messages.clear()
+        try:
+            first = asyncio.create_task(
+                main._handle_text_message(
+                    {
+                        "msgid": "msg-running-1",
+                        "msgtype": "text",
+                        "origin": 3,
+                        "open_kfid": "kf",
+                        "external_userid": "wm",
+                        "text": {"content": "万达1500左右有哪些"},
                     }
                 )
-
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("刚才微信客服发送次数到上限了", fake_client.texts[0])
-                self.assertIn("5分钟后", fake_client.texts[0])
-                self.assertNotIn("https://", fake_client.texts[0])
-                context = main.wecom_kf_context_store.get("kf_xxx:wm_xxx")
-                self.assertNotIn("send_limited", context)
-                self.assertIn("刚才微信客服发送次数到上限了", context["recent_messages"][-1]["content"])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-
-    async def test_transcodes_large_room_database_video_before_sending(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        previous_needs = main.needs_wecom_video_transcode
-        previous_cached = main.cached_wecom_video
-        fake_client = FakeKfClient()
-        original = Path("room_database/video/华丰人家8-603/original.mp4")
-        compressed = Path("room_database/video/华丰人家8-603/.wecom_cache/original.wecom.mp4")
-        try:
-            main.wecom_kf = fake_client
-            main.needs_wecom_video_transcode = lambda path: True
-            main.cached_wecom_video = lambda path: compressed
-
-            sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [original])
-
-            self.assertTrue(sent)
-            self.assertEqual(fake_client.videos, [compressed])
-            self.assertEqual(fake_client.texts, ["这是华丰人家8-603的视频。"])
-        finally:
-            main.wecom_kf = previous_client
-            main.needs_wecom_video_transcode = previous_needs
-            main.cached_wecom_video = previous_cached
-
-    async def test_large_uncached_video_falls_back_to_link_after_transcode_timeout(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_needs = main.needs_wecom_video_transcode
-            previous_cached = main.cached_wecom_video
-            previous_prepare = main.prepare_wecom_video
-            previous_root = main.settings.room_database_path
-            previous_base_url = main.settings.public_base_url
-            fake_client = FakeKfClient()
-            video_path = Path(directory) / "video" / "诸葛龙吟院13-1101" / "视频.mp4"
-            video_path.parent.mkdir(parents=True)
-            video_path.write_bytes(b"video")
-            try:
-                main.wecom_kf = fake_client
-                main.needs_wecom_video_transcode = lambda path: True
-                main.cached_wecom_video = lambda path: None
-                main.prepare_wecom_video = lambda path, force=False, timeout=180: (_ for _ in ()).throw(
-                    TimeoutError(f"timeout={timeout}")
+            )
+            await fake_reply.first_started.wait()
+            second = asyncio.create_task(
+                main._handle_text_message(
+                    {
+                        "msgid": "msg-running-2",
+                        "msgtype": "text",
+                        "origin": 3,
+                        "open_kfid": "kf",
+                        "external_userid": "wm",
+                        "text": {"content": "视频也发我几套"},
+                    }
                 )
-                main.settings.room_database_path = Path(directory)
-                main.settings.public_base_url = "https://example.com"
-
-                sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [video_path])
-
-                self.assertTrue(sent)
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("视频直发失败", fake_client.texts[0])
-                self.assertIn("5分钟后", fake_client.texts[0])
-                self.assertNotIn("https://", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.needs_wecom_video_transcode = previous_needs
-                main.cached_wecom_video = previous_cached
-                main.prepare_wecom_video = previous_prepare
-                main.settings.room_database_path = previous_root
-                main.settings.public_base_url = previous_base_url
-
-    async def test_large_uncached_video_waits_for_quick_transcode_then_sends_native_video(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.videos: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_video(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                video_path: Path,
-            ) -> dict:
-                self.videos.append(video_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        previous_needs = main.needs_wecom_video_transcode
-        previous_cached = main.cached_wecom_video
-        previous_prepare = main.prepare_wecom_video
-        fake_client = FakeKfClient()
-        original = Path("room_database/video/诸葛龙吟院13-1101/original.mp4")
-        compressed = Path("room_database/video/诸葛龙吟院13-1101/.wecom_cache/original.wecom.mp4")
-        seen_timeouts: list[int] = []
-        try:
-            main.wecom_kf = fake_client
-            main.needs_wecom_video_transcode = lambda path: True
-            main.cached_wecom_video = lambda path: None
-
-            def quick_prepare(path: Path, force: bool = False, timeout: int = 180) -> Path:
-                seen_timeouts.append(timeout)
-                return compressed
-
-            main.prepare_wecom_video = quick_prepare
-
-            sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [original])
-
-            self.assertTrue(sent)
-            self.assertEqual(fake_client.videos, [compressed])
-            self.assertEqual(fake_client.texts, ["这是诸葛龙吟院13-1101的视频。"])
-            self.assertEqual(seen_timeouts, [main.KF_VIDEO_TRANSCODE_WAIT_SECONDS])
+            )
+            await asyncio.gather(first, second)
         finally:
-            main.wecom_kf = previous_client
-            main.needs_wecom_video_transcode = previous_needs
-            main.cached_wecom_video = previous_cached
-            main.prepare_wecom_video = previous_prepare
+            main.wecom_kf = originals["wecom_kf"]
+            main.wecom_kf_context_store = originals["wecom_kf_context_store"]
+            main.reply_generator = originals["reply_generator"]
+            main.inventory = originals["inventory"]
+            main.kf_turn_tasks.clear()
+            main.kf_turn_tasks.update(originals["kf_turn_tasks"])
+            main.kf_turn_generations.clear()
+            main.kf_turn_generations.update(originals["kf_turn_generations"])
+            main.kf_turn_pending_messages.clear()
+            main.kf_turn_pending_messages.update(originals["kf_turn_pending_messages"])
 
-    async def test_retries_video_upload_with_transcoded_copy_after_upload_error(self) -> None:
-        class FakeKfClient:
+        self.assertEqual(len(fake_reply.contents), 2)
+        self.assertEqual(fake_reply.contents[0], "万达1500左右有哪些")
+        self.assertIn("万达1500左右有哪些", fake_reply.contents[-1])
+        self.assertIn("视频也发我几套", fake_reply.contents[-1])
+        self.assertEqual(len(fake_wecom.texts), 1)
+        self.assertNotIn("重新查", fake_wecom.texts[0])
+        self.assertEqual(fake_wecom.state_store.processed, {"msg-running-1", "msg-running-2"})
+
+    async def test_enter_session_welcome_is_limited_to_ten_minutes(self) -> None:
+        class FakeStateStore:
             def __init__(self) -> None:
-                self.uploads: list[Path] = []
-                self.media_ids: list[str] = []
-                self.texts: list[str] = []
+                self.sent_at = 0.0
 
-            async def upload_media(
-                self,
-                video_path: Path,
-                media_type: str = "video",
-            ) -> str:
-                self.uploads.append(video_path)
-                if len(self.uploads) == 1:
-                    raise RuntimeError("invalid video size")
-                return "media_xxx"
+            def last_welcome_sent_at(self, key: str) -> float:
+                return self.sent_at
 
-            async def send_video_media(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                media_id: str,
-            ) -> dict:
-                self.media_ids.append(media_id)
+            def mark_welcome_sent(self, key: str, sent_at: float | None = None) -> None:
+                self.sent_at = sent_at or 1.0
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
+                self.sent: list[str] = []
+
+            async def send_welcome_text_on_event(self, welcome_code: str, content: str) -> dict:
+                self.sent.append(content)
                 return {"errcode": 0}
 
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        previous_needs = main.needs_wecom_video_transcode
-        previous_prepare = main.prepare_wecom_video
-        fake_client = FakeKfClient()
-        original = Path("room_database/video/华丰人家8-603/original.mp4")
-        compressed = Path("room_database/video/华丰人家8-603/.wecom_cache/original.wecom.mp4")
+        fake = FakeWeComKf()
+        original = main.wecom_kf
+        original_time = main.time.time
+        original_audit = main._record_kf_welcome_audit
+        main.wecom_kf = fake
+        main.time.time = lambda: 1000.0
+        main._record_kf_welcome_audit = lambda event: None
         try:
-            main.wecom_kf = fake_client
-            main.needs_wecom_video_transcode = lambda path: False
-            main.prepare_wecom_video = lambda path, force=False, timeout=180: compressed
-
-            sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [original])
-
-            self.assertTrue(sent)
-            self.assertEqual(fake_client.uploads, [original, compressed])
-            self.assertEqual(fake_client.media_ids, ["media_xxx"])
-            self.assertEqual(fake_client.texts, ["这是华丰人家8-603的视频。"])
+            message = {
+                "msgtype": "event",
+                "event": {
+                    "welcome_code": "welcome-code",
+                    "open_kfid": "kf",
+                    "external_userid": "wm",
+                },
+            }
+            await main._handle_enter_session(message)
+            await main._handle_enter_session(message)
         finally:
-            main.wecom_kf = previous_client
-            main.needs_wecom_video_transcode = previous_needs
-            main.prepare_wecom_video = previous_prepare
+            main.wecom_kf = original
+            main.time.time = original_time
+            main._record_kf_welcome_audit = original_audit
 
-    async def test_does_not_send_room_label_when_video_upload_fails(self) -> None:
-        class FakeKfClient:
+        self.assertEqual(len(fake.sent), 1)
+        self.assertIn("找房、要视频、看密码、发房源表都可以直接说", fake.sent[0])
+        self.assertIn("万达1500左右还有哪些", fake.sent[0])
+        self.assertIn("小区名、房号记不清也没事", fake.sent[0])
+
+    async def test_enter_session_welcome_falls_back_when_code_expired(self) -> None:
+        class FakeStateStore:
             def __init__(self) -> None:
-                self.texts: list[str] = []
+                self.sent_at = 0.0
+                self.marked: list[tuple[str, float]] = []
 
-            async def upload_media(self, video_path: Path, media_type: str = "video") -> str:
-                raise RuntimeError("upload failed")
+            def last_welcome_sent_at(self, key: str) -> float:
+                return self.sent_at
 
-            async def send_video_media(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                media_id: str,
-            ) -> dict:
-                return {"errcode": 0}
+            def mark_welcome_sent(self, key: str, sent_at: float | None = None) -> None:
+                self.sent_at = sent_at or 1.0
+                self.marked.append((key, self.sent_at))
 
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_root = main.settings.room_database_path
-            previous_base_url = main.settings.public_base_url
-            previous_prepare = main.prepare_wecom_video
-            fake_client = FakeKfClient()
-            try:
-                main.wecom_kf = fake_client
-                main.settings.room_database_path = Path(directory)
-                main.settings.public_base_url = "https://example.com"
-                main.prepare_wecom_video = lambda path, force=False, timeout=180: (_ for _ in ()).throw(
-                    RuntimeError("transcode failed")
-                )
-                video_path = Path(directory) / "video" / "琬秋铭府1-1803" / "视频.mp4"
-                video_path.parent.mkdir(parents=True)
-                video_path.write_bytes(b"not-a-real-video")
-
-                sent = await main._send_kf_room_database_videos("kf_xxx", "wm_xxx", [video_path])
-
-                self.assertTrue(sent)
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("视频直发失败", fake_client.texts[0])
-                self.assertIn("5分钟后", fake_client.texts[0])
-                self.assertNotIn("https://", fake_client.texts[0])
-                self.assertNotIn("这是琬秋铭府1-1803的视频", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.settings.room_database_path = previous_root
-                main.settings.public_base_url = previous_base_url
-                main.prepare_wecom_video = previous_prepare
-
-
-class WeComKfImagePolicyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_room_image_request_does_not_send_room_images(self) -> None:
-        class FakeKfClient:
+        class FakeWeComKf:
             def __init__(self) -> None:
-                self.texts: list[str] = []
-                self.images: list[Path] = []
+                self.state_store = FakeStateStore()
+                self.event_codes: list[str] = []
+                self.texts: list[tuple[str, str, str]] = []
 
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
+            async def send_welcome_text_on_event(self, welcome_code: str, content: str) -> dict:
+                self.event_codes.append(welcome_code)
+                raise RuntimeError("code expired")
+
+            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
+                self.texts.append((open_kfid, external_userid, content))
                 return {"errcode": 0}
 
-            async def send_image(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                image_path: Path,
-            ) -> dict:
-                self.images.append(image_path)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        fake_client = FakeKfClient()
+        fake = FakeWeComKf()
+        audits: list[dict] = []
+        original = main.wecom_kf
+        original_time = main.time.time
+        original_audit = main._record_kf_welcome_audit
+        main.wecom_kf = fake
+        main.time.time = lambda: 2000.0
+        main._record_kf_welcome_audit = audits.append
         try:
-            main.wecom_kf = fake_client
-            main.wecom_kf_conversation_memory.clear()
-
-            await main.handle_kf_message(
+            await main._handle_enter_session(
                 {
-                    "msgid": "msg-1",
-                    "open_kfid": "kf_xxx",
-                    "external_userid": "wm_xxx",
-                    "origin": 3,
-                    "msgtype": "text",
-                    "text": {"content": "华丰人家照片发一下"},
+                    "msgtype": "event",
+                    "event": {
+                        "event_type": "enter_session",
+                        "welcome_code": "expired-code",
+                        "open_kfid": "kf-1",
+                        "external_userid": "wm-1",
+                    },
                 }
             )
-
-            self.assertEqual(fake_client.images, [])
-            self.assertEqual(len(fake_client.texts), 1)
-            self.assertIn("房间图片这边不单独发送", fake_client.texts[0])
-            self.assertIn("只发视频", fake_client.texts[0])
         finally:
-            main.wecom_kf = previous_client
-            main.wecom_kf_conversation_memory.clear()
-            main.wecom_kf_idle_sequences.clear()
+            main.wecom_kf = original
+            main.time.time = original_time
+            main._record_kf_welcome_audit = original_audit
 
-    async def test_inventory_table_image_request_still_sends_inventory_png(self) -> None:
-        class FakeKfClient:
+        self.assertEqual(fake.event_codes, ["expired-code"])
+        self.assertEqual(len(fake.texts), 1)
+        self.assertEqual(fake.texts[0][0:2], ("kf-1", "wm-1"))
+        self.assertEqual(fake.state_store.marked, [("kf-1:wm-1", 2000.0)])
+        self.assertEqual(audits[-1]["status"], "sent")
+        self.assertEqual(audits[-1]["method"], "send_text_fallback")
+
+    async def test_enter_session_welcome_without_code_uses_text_fallback(self) -> None:
+        class FakeStateStore:
             def __init__(self) -> None:
-                self.texts: list[str] = []
-                self.images: list[Path] = []
+                self.sent_at = 0.0
 
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
+            def last_welcome_sent_at(self, key: str) -> float:
+                return self.sent_at
 
-            async def send_image(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                image_path: Path,
-            ) -> dict:
-                self.images.append(image_path)
-                return {"errcode": 0}
+            def mark_welcome_sent(self, key: str, sent_at: float | None = None) -> None:
+                self.sent_at = sent_at or 1.0
 
-        async def noop_refresh() -> bool:
-            return True
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_root = main.settings.room_database_path
-            previous_glob = main.settings.inventory_image_glob
-            previous_refresh = main._refresh_inventory_images_if_needed
-            fake_client = FakeKfClient()
-            image_path = Path(directory) / "inventory_01.png"
-            image_path.write_bytes(b"image")
-            try:
-                main.wecom_kf = fake_client
-                main.settings.room_database_path = Path(directory) / "room_database"
-                main.settings.inventory_image_glob = str(image_path)
-                main._refresh_inventory_images_if_needed = noop_refresh
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "房源表图片发我"},
-                    }
-                )
-
-                self.assertEqual(fake_client.images, [image_path])
-                self.assertEqual(fake_client.texts, [])
-            finally:
-                main.wecom_kf = previous_client
-                main.settings.room_database_path = previous_root
-                main.settings.inventory_image_glob = previous_glob
-                main._refresh_inventory_images_if_needed = previous_refresh
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_inventory_table_image_request_does_not_send_old_png_when_refresh_fails(self) -> None:
-        class FakeKfClient:
+        class FakeWeComKf:
             def __init__(self) -> None:
-                self.texts: list[str] = []
-                self.images: list[Path] = []
+                self.state_store = FakeStateStore()
+                self.texts: list[tuple[str, str, str]] = []
 
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
+            async def send_text(self, open_kfid: str, external_userid: str, content: str) -> dict:
+                self.texts.append((open_kfid, external_userid, content))
                 return {"errcode": 0}
 
-            async def send_image(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                image_path: Path,
-            ) -> dict:
-                self.images.append(image_path)
-                return {"errcode": 0}
-
-        async def failed_refresh() -> bool:
-            return False
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_root = main.settings.room_database_path
-            previous_glob = main.settings.inventory_image_glob
-            previous_refresh = main._refresh_inventory_images_if_needed
-            fake_client = FakeKfClient()
-            image_path = Path(directory) / "inventory_01.png"
-            image_path.write_bytes(b"old-image")
-            try:
-                main.wecom_kf = fake_client
-                main.settings.room_database_path = Path(directory) / "room_database"
-                main.settings.inventory_image_glob = str(image_path)
-                main._refresh_inventory_images_if_needed = failed_refresh
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "房源表发一下"},
-                    }
-                )
-
-                self.assertEqual(fake_client.images, [])
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("先不发旧表", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.settings.room_database_path = previous_root
-                main.settings.inventory_image_glob = previous_glob
-                main._refresh_inventory_images_if_needed = previous_refresh
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-    async def test_original_video_without_context_asks_for_room_reference(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_store = main.wecom_kf_context_store
-            fake_client = FakeKfClient()
-            try:
-                main.wecom_kf = fake_client
-                main.wecom_kf_context_store = WeComKfContextStore(
-                    path=Path(directory) / "context.json"
-                )
-                main.wecom_kf_conversation_memory.clear()
-
-                await main.handle_kf_message(
-                    {
-                        "msgid": "msg-1",
-                        "open_kfid": "kf_xxx",
-                        "external_userid": "wm_xxx",
-                        "origin": 3,
-                        "msgtype": "text",
-                        "text": {"content": "有没有更清楚一点的"},
-                    }
-                )
-
-                self.assertEqual(len(fake_client.texts), 1)
-                self.assertIn("小区和房号", fake_client.texts[0])
-                self.assertNotIn("已经租掉", fake_client.texts[0])
-            finally:
-                main.wecom_kf = previous_client
-                main.wecom_kf_context_store = previous_store
-                main.wecom_kf_conversation_memory.clear()
-                main.wecom_kf_idle_sequences.clear()
-
-
-class WeComKfInventoryImageSendTests(unittest.IsolatedAsyncioTestCase):
-    async def test_sends_inventory_images_as_native_images(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.images: list[Path] = []
-                self.texts: list[str] = []
-
-            async def send_image(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                image_path: Path,
-            ) -> dict:
-                self.images.append(image_path)
-                return {"errcode": 0}
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_root = main.settings.room_database_path
-            previous_glob = main.settings.inventory_image_glob
-            fake_client = FakeKfClient()
-            image_path = Path(directory) / "inventory_1.png"
-            image_path.write_bytes(b"image")
-            try:
-                main.wecom_kf = fake_client
-                main.settings.room_database_path = Path(directory) / "room_database"
-                main.settings.inventory_image_glob = str(image_path)
-
-                sent = await main._send_kf_inventory_images(
-                    "kf_xxx",
-                    "wm_xxx",
-                    [image_path],
-                )
-
-                self.assertTrue(sent)
-                self.assertEqual(fake_client.images, [image_path])
-                self.assertEqual(fake_client.texts, [])
-            finally:
-                main.wecom_kf = previous_client
-                main.settings.room_database_path = previous_root
-                main.settings.inventory_image_glob = previous_glob
-
-    async def test_falls_back_to_links_when_native_image_send_fails(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_image(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                image_path: Path,
-            ) -> dict:
-                raise RuntimeError("upload failed")
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        with tempfile.TemporaryDirectory() as directory:
-            previous_client = main.wecom_kf
-            previous_root = main.settings.room_database_path
-            previous_base_url = main.settings.public_base_url
-            fake_client = FakeKfClient()
-            root = Path(directory)
-            image_path = root / "inventory_1.png"
-            image_path.write_bytes(b"image")
-            try:
-                main.wecom_kf = fake_client
-                main.settings.room_database_path = root
-                main.settings.public_base_url = "https://example.com"
-
-                sent = await main._send_kf_inventory_images(
-                    "kf_xxx",
-                    "wm_xxx",
-                    [image_path],
-                )
-
-                self.assertTrue(sent)
-                self.assertEqual(len(fake_client.texts), 2)
-                self.assertIn("直发失败", fake_client.texts[0])
-                self.assertEqual(
-                    fake_client.texts[1],
-                    "https://example.com/room-database/inventory_1.png",
-                )
-            finally:
-                main.wecom_kf = previous_client
-                main.settings.room_database_path = previous_root
-                main.settings.public_base_url = previous_base_url
-
-    async def test_stops_inventory_image_send_on_send_limit(self) -> None:
-        class FakeKfClient:
-            def __init__(self) -> None:
-                self.texts: list[str] = []
-
-            async def send_image(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                image_path: Path,
-            ) -> dict:
-                raise WeComKfSendLimitError("send msg count limit")
-
-            async def send_text(
-                self,
-                open_kfid: str,
-                external_userid: str,
-                content: str,
-            ) -> dict:
-                self.texts.append(content)
-                return {"errcode": 0}
-
-        previous_client = main.wecom_kf
-        fake_client = FakeKfClient()
+        fake = FakeWeComKf()
+        audits: list[dict] = []
+        original = main.wecom_kf
+        original_audit = main._record_kf_welcome_audit
+        main.wecom_kf = fake
+        main._record_kf_welcome_audit = audits.append
         try:
-            main.wecom_kf = fake_client
-            sent = await main._send_kf_inventory_images(
-                "kf_xxx",
-                "wm_xxx",
-                [Path("inventory_1.png")],
+            await main._handle_enter_session(
+                {
+                    "msgtype": "event",
+                    "open_kfid": "kf-1",
+                    "external_userid": "wm-1",
+                    "event": {"event_type": "enter_session"},
+                }
             )
-
-            self.assertFalse(sent)
-            self.assertEqual(fake_client.texts, [])
         finally:
-            main.wecom_kf = previous_client
+            main.wecom_kf = original
+            main._record_kf_welcome_audit = original_audit
+
+        self.assertEqual(len(fake.texts), 1)
+        self.assertEqual(fake.texts[0][0:2], ("kf-1", "wm-1"))
+        self.assertEqual(audits[-1]["status"], "sent")
+        self.assertEqual(audits[-1]["method"], "send_text_fallback")
+
+    async def test_wecom_kf_status_masks_welcome_state(self) -> None:
+        class FakeStateStore:
+            def load(self) -> dict:
+                return {
+                    "cursor": "cursor-1",
+                    "processed_msgids": ["msg-1", "msg-2"],
+                    "welcome_sent_at": {"kf-open-id:wm-external-id": 2000.0},
+                }
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
+                self.last_next_cursor = "cursor-next"
+
+        original = main.wecom_kf
+        original_recent = main._recent_kf_welcome_audits
+        main.wecom_kf = FakeWeComKf()
+        main._recent_kf_welcome_audits = lambda limit=30: [{"status": "sent"}]
+        try:
+            status = await main.wecom_kf_status()
+        finally:
+            main.wecom_kf = original
+            main._recent_kf_welcome_audits = original_recent
+
+        self.assertTrue(status["ok"])
+        self.assertTrue(status["cursor_present"])
+        self.assertEqual(status["processed_msgid_count"], 2)
+        self.assertEqual(status["welcome_sent_count"], 1)
+        self.assertNotIn("wm-external-id", status["recent_welcome_sent"][0]["key"])
+        self.assertEqual(status["recent_welcome_audits"], [{"status": "sent"}])
+
+    async def test_kf_callback_schedules_message_event_background(self) -> None:
+        class FakeRequest:
+            async def body(self) -> bytes:
+                return b"<xml />"
+
+        class FakeWeComKf:
+            def parse_callback_event(self, body: str, msg_signature: str, timestamp: str, nonce: str) -> dict:
+                return {"Event": "kf_msg_or_event", "Token": "token-1", "OpenKfId": "kf-1"}
+
+        scheduled: list[str] = []
+
+        def fake_schedule(coro, *, label: str):
+            scheduled.append(label)
+            coro.close()
+            return None
+
+        original_wecom = main.wecom_kf
+        original_schedule = main._schedule_background_task
+        main.wecom_kf = FakeWeComKf()
+        main._schedule_background_task = fake_schedule
+        try:
+            result = await main.receive_wecom_kf_callback(
+                FakeRequest(),
+                msg_signature="sig",
+                timestamp="ts",
+                nonce="nonce",
+            )
+        finally:
+            main.wecom_kf = original_wecom
+            main._schedule_background_task = original_schedule
+
+        self.assertEqual(result, "success")
+        self.assertEqual(scheduled, ["KF callback message event"])
+
+    async def test_kf_callback_schedules_direct_enter_session_background(self) -> None:
+        class FakeRequest:
+            async def body(self) -> bytes:
+                return b"<xml />"
+
+        class FakeWeComKf:
+            def parse_callback_event(self, body: str, msg_signature: str, timestamp: str, nonce: str) -> dict:
+                return {
+                    "MsgType": "event",
+                    "Event": "enter_session",
+                    "WelcomeCode": "welcome-code",
+                    "OpenKfId": "kf-1",
+                    "ExternalUserID": "wm-1",
+                }
+
+        scheduled: list[str] = []
+
+        def fake_schedule(coro, *, label: str):
+            scheduled.append(label)
+            coro.close()
+            return None
+
+        original_wecom = main.wecom_kf
+        original_schedule = main._schedule_background_task
+        main.wecom_kf = FakeWeComKf()
+        main._schedule_background_task = fake_schedule
+        try:
+            result = await main.receive_wecom_kf_callback(
+                FakeRequest(),
+                msg_signature="sig",
+                timestamp="ts",
+                nonce="nonce",
+            )
+        finally:
+            main.wecom_kf = original_wecom
+            main._schedule_background_task = original_schedule
+
+        self.assertEqual(result, "success")
+        self.assertEqual(scheduled, ["KF callback enter_session event"])
+
+    async def test_kf_event_awaits_async_sync_messages(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.called = False
+                self.args: tuple[str, str] | None = None
+
+            async def sync_messages(self, open_kfid: str, token: str) -> list[dict]:
+                self.called = True
+                self.args = (open_kfid, token)
+                return []
+
+        fake = FakeWeComKf()
+        original = main.wecom_kf
+        main.wecom_kf = fake
+        try:
+            await main._handle_kf_event({"OpenKfId": "kf-1", "Token": "token-1"})
+        finally:
+            main.wecom_kf = original
+
+        self.assertTrue(fake.called)
+        self.assertEqual(fake.args, ("kf-1", "token-1"))
+
+    async def test_send_text_awaits_async_wecom_client(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.sent: list[tuple[str, str, str]] = []
+
+            async def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.sent.append((open_kfid, external_userid, text))
+                return {"errcode": 0}
+
+        fake = FakeWeComKf()
+        original = main.wecom_kf
+        main.wecom_kf = fake
+        try:
+            await main._send_text("kf", "wm", "  你好  ")
+        finally:
+            main.wecom_kf = original
+
+        self.assertEqual(fake.sent, [("kf", "wm", "你好")])
 
 
 if __name__ == "__main__":

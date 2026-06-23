@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Feishu region inventory sync three times per day
+
+[Timer]
+OnCalendar=*-*-* 08:00:00
+OnCalendar=*-*-* 13:00:00
+OnCalendar=*-*-* 19:00:00
+Persistent=true
+Unit=wecom-room-robot-feishu-region-sync.service
+
+[Install]
+WantedBy=timers.target

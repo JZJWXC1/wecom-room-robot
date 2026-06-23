@@ -1,0 +1,14 @@
+[Unit]
+Description=WeCom room robot Feishu region inventory sync
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/wecom-room-robot
+EnvironmentFile=/opt/wecom-room-robot/.env
+ExecStart=/opt/wecom-room-robot/.venv/bin/python /opt/wecom-room-robot/scripts/sync_feishu_region_inventory.py
+User=root
+Group=root
+Nice=5
+TimeoutStartSec=1800

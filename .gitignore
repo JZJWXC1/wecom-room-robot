@@ -3,14 +3,22 @@ __pycache__/
 *.py[cod]
 .env
 .pytest_cache/
+.codegraph/
 data/
 media/
 data/wecom_kf_state.json
 data/wecom_kf_context.json
 dist/
 room_database/
+qa_artifacts/
+server_snapshots/
+.understand-anything/
+.codex-test-deps/
+.codex-pytest-deps/
 original_captures/
 SERVER_DOWNLOAD_MANIFEST.md
+tmp/
+.local/
 
 # Local browser/debug screenshots generated while configuring WeCom/Feishu.
 *.png

@@ -33,4 +33,13 @@ SERVICE
 
 systemctl daemon-reload
 systemctl enable --now wecom-room-robot
+if [ -f "${PROJECT_DIR}/infra/systemd/wecom-room-robot-feishu-region-sync.service" ]; then
+  cp "${PROJECT_DIR}/infra/systemd/wecom-room-robot-feishu-region-sync.service" /etc/systemd/system/
+  cp "${PROJECT_DIR}/infra/systemd/wecom-room-robot-feishu-region-sync.timer" /etc/systemd/system/
+  cp "${PROJECT_DIR}/infra/systemd/wecom-room-robot-rag-cache-sync.service" /etc/systemd/system/
+  cp "${PROJECT_DIR}/infra/systemd/wecom-room-robot-rag-cache-sync.timer" /etc/systemd/system/
+  systemctl daemon-reload
+  systemctl enable --now wecom-room-robot-feishu-region-sync.timer
+  systemctl enable --now wecom-room-robot-rag-cache-sync.timer
+fi
 systemctl status wecom-room-robot --no-pager

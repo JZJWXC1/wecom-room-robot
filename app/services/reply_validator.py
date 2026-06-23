@@ -55,6 +55,42 @@ SEND_VIDEO_PATTERNS = (
     "直接发你",
     "已直接发送相关视频",
 )
+MISSING_VIDEO_CLAIM_PHRASES = (
+    "我手头暂时没有现成的视频链接",
+    "手头暂时没有现成的视频链接",
+    "我这边暂时没有视频",
+    "视频我这边暂时没有",
+    "这边暂时没有视频",
+    "我这边目前没有视频",
+    "视频我这边目前没有",
+    "目前没有视频",
+    "暂时没有视频",
+    "视频暂时没有",
+    "我这边暂时没视频",
+    "视频我这边暂时没",
+    "这边暂时没视频",
+    "我这边目前没视频",
+    "视频我这边目前没",
+    "目前没视频",
+    "没视频",
+    "没有这套的视频",
+    "视频暂时还没上传",
+    "这几套视频暂时还没上传",
+    "暂时还没上传",
+)
+UNVERIFIED_VIDEO_CLAIM_PATTERNS = (
+    r"视频我发你",
+    r"视频发你",
+    r"我发你视频",
+    r"发你视频",
+    r"给你发视频",
+    r"我这边有[^。！？\n]{0,20}视频",
+    r"有对应视频",
+    r"有视频",
+    r"可以发视频",
+    r"能发视频",
+    r"直接发视频",
+)
 ROOM_IMAGE_PATTERNS = (
     "房间图片",
     "房源图片",
@@ -99,18 +135,41 @@ class ReplyValidationResult:
     extra_image_paths: list[Path] = field(default_factory=list)
 
 
+@dataclass
+class VideoClaimValidationResult:
+    reply_text: str
+    video_paths: list[Path] = field(default_factory=list)
+    should_clear_video_context: bool = False
+
+
 class ReplyValidator:
     def __init__(self) -> None:
+        default_provider = "dashscope"
         self._client = AsyncOpenAI(
-            api_key=settings.dashscope_api_key or "missing-key",
-            base_url=settings.dashscope_base_url,
+            api_key=settings.llm_api_key_for(default_provider) or "missing-key",
+            base_url=settings.llm_base_url_for(default_provider),
         )
+        self._clients: dict[str, AsyncOpenAI] = {default_provider: self._client}
+
+    def _client_for_selfcheck(self) -> AsyncOpenAI:
+        provider = settings.llm_provider_for("selfcheck")
+        if provider == "dashscope":
+            return self._client
+        client = self._clients.get(provider)
+        if client is None:
+            client = AsyncOpenAI(
+                api_key=settings.llm_api_key_for(provider) or "missing-key",
+                base_url=settings.llm_base_url_for(provider),
+            )
+            self._clients[provider] = client
+        return client
 
     async def validate(self, draft: ReplyValidationDraft) -> ReplyValidationResult:
         result = self._hard_validate(draft)
         if not self._should_run_llm_review(draft, result):
             return result
-        if is_missing_or_placeholder(settings.dashscope_api_key):
+        provider = settings.llm_provider_for("selfcheck")
+        if is_missing_or_placeholder(settings.llm_api_key_for(provider)):
             return result
         try:
             return await asyncio.wait_for(
@@ -200,8 +259,8 @@ class ReplyValidator:
         hard_result: ReplyValidationResult,
     ) -> ReplyValidationResult:
         prompt = self._build_review_prompt(draft, hard_result)
-        response = await self._client.chat.completions.create(
-            model=settings.dashscope_model,
+        response = await self._client_for_selfcheck().chat.completions.create(
+            model=settings.llm_model_for("selfcheck"),
             messages=[
                 {
                     "role": "system",
@@ -285,6 +344,167 @@ class ReplyValidator:
 或：
 {{"ok": false, "problems": ["问题"], "fixed_text": "修正后话术"}}
 """
+
+
+def replace_missing_video_claim(reply_text: str) -> str:
+    replaced = reply_text
+    for phrase in MISSING_VIDEO_CLAIM_PHRASES:
+        replaced = replaced.replace(phrase, "我这边有对应视频")
+    return replaced
+
+
+def has_missing_video_claim(reply_text: str) -> bool:
+    return any(phrase in reply_text for phrase in MISSING_VIDEO_CLAIM_PHRASES)
+
+
+def has_unverified_video_claim(reply_text: str) -> bool:
+    if "视频" not in reply_text or has_missing_video_claim(reply_text):
+        return False
+    return any(re.search(pattern, reply_text) for pattern in UNVERIFIED_VIDEO_CLAIM_PATTERNS)
+
+
+def replace_unverified_video_claim(reply_text: str) -> str:
+    if not has_unverified_video_claim(reply_text):
+        return reply_text
+    replacement = "视频我这边还没直接匹配到"
+    replaced = reply_text
+    for pattern in UNVERIFIED_VIDEO_CLAIM_PATTERNS:
+        replaced = re.sub(pattern, replacement, replaced)
+    return replaced
+
+
+def room_number_references(text: str) -> list[str]:
+    references = re.findall(r"\d+(?:[-－—][A-Za-z0-9]+)+", text)
+    for building, room in re.findall(r"(\d+)\s*[幢栋]\s*(\d{2,4}[A-Za-z]?)", text):
+        references.append(f"{building}-{room}")
+    for building, room in re.findall(r"(\d+)\s*号楼\s*(\d{2,4}[A-Za-z]?)", text):
+        references.append(f"{building}-{room}")
+    if not any(marker in text for marker in ("预算", "左右", "以内", "以下", "那套", "哪套", "几号", "推荐", "价格", "押")):
+        for match in re.finditer(r"(?<!\d)(\d{1,2})([2-9]\d{2}[A-Za-z]?)(?!\d)", text):
+            building, room = match.group(1), match.group(2)
+            next_char = text[match.end() : match.end() + 1]
+            if room.endswith("00") or next_char == "的":
+                continue
+            references.append(f"{building}-{room}")
+    return references
+
+
+def room_label_reference_from_text(text: str) -> str:
+    refs = room_number_references(text)
+    if not refs:
+        return ""
+    room_no = refs[0]
+    split_token = room_no
+    compact_room_no = re.sub(r"[-－—\s]+", "", room_no)
+    if split_token not in text and compact_room_no in text:
+        split_token = compact_room_no
+    before = text.split(split_token, 1)[0]
+    community_match = re.search(r"[一-鿿A-Za-z]{2,12}$", before)
+    community = community_match.group(0) if community_match else ""
+    for word in ("客户问", "客户看中", "看中了", "看过了", "你是指", "是指", "这套是", "这套", "那套"):
+        community = community.replace(word, "")
+    return f"{community}{room_no}" if community else room_no
+
+
+def video_claim_search_texts(reply_text: str, rows: list[dict[str, Any]]) -> list[str]:
+    labels = [_row_label(row) for row in rows]
+    label_from_text = room_label_reference_from_text(reply_text)
+    room_refs = room_number_references(reply_text)
+    return _dedupe_strings([*(label for label in labels if label), label_from_text, *room_refs])
+
+
+def rows_matching_video_claim_text(
+    rows: list[dict[str, Any]],
+    search_text: str,
+    *,
+    normalize_text,
+) -> list[dict[str, Any]]:
+    normalized_search = normalize_text(search_text)
+    if not normalized_search:
+        return []
+    matched: list[dict[str, Any]] = []
+    for row in rows:
+        label = _row_label(row)
+        room_no = _first_row_value(row, "房号", "房间号", "room_id", "RoomID", "编号")
+        normalized_label = normalize_text(label)
+        normalized_room_no = normalize_text(room_no)
+        if normalized_label and (
+            normalized_label in normalized_search or normalized_search in normalized_label
+        ):
+            matched.append(row)
+            continue
+        if normalized_room_no and normalized_room_no in normalized_search:
+            matched.append(row)
+    return matched
+
+
+async def validated_room_database_video_paths_for_claim(
+    reply_text: str,
+    rows: list[dict[str, Any]],
+    *,
+    inventory_search,
+    list_video_paths,
+    normalize_text,
+    logger=None,
+    limit: int = 1,
+) -> list[Path]:
+    seen_labels: set[str] = set()
+    for search_text in video_claim_search_texts(reply_text, rows):
+        candidate_rows = rows_matching_video_claim_text(
+            rows,
+            search_text,
+            normalize_text=normalize_text,
+        )
+        if not candidate_rows:
+            try:
+                candidate_rows = await inventory_search(search_text, limit=3)
+            except Exception:
+                if logger is not None:
+                    logger.exception("视频声明发送前房源表校验失败: %s", search_text)
+                candidate_rows = []
+        for row in candidate_rows:
+            label = _row_label(row) or search_text
+            if not label or label in seen_labels:
+                continue
+            seen_labels.add(label)
+            video_paths = list_video_paths(label, limit=limit)
+            if video_paths:
+                return video_paths
+    return []
+
+
+async def validate_reply_video_claims_before_send(
+    reply_text: str,
+    rows: list[dict[str, Any]],
+    *,
+    inventory_search,
+    list_video_paths,
+    normalize_text,
+    logger=None,
+) -> VideoClaimValidationResult:
+    if "视频" not in reply_text:
+        return VideoClaimValidationResult(reply_text=reply_text)
+    needs_video_fact_check = has_missing_video_claim(reply_text) or has_unverified_video_claim(reply_text)
+    if not needs_video_fact_check:
+        return VideoClaimValidationResult(reply_text=reply_text)
+
+    video_paths = await validated_room_database_video_paths_for_claim(
+        reply_text,
+        rows,
+        inventory_search=inventory_search,
+        list_video_paths=list_video_paths,
+        normalize_text=normalize_text,
+        logger=logger,
+    )
+    if video_paths:
+        return VideoClaimValidationResult(
+            reply_text=replace_missing_video_claim(reply_text),
+            video_paths=video_paths,
+        )
+    return VideoClaimValidationResult(
+        reply_text=replace_unverified_video_claim(reply_text),
+        should_clear_video_context=True,
+    )
 
 
 def _mentions_missing_video(text: str) -> bool:
@@ -441,7 +661,7 @@ def _mismatched_video_labels(video_paths: list[Path], rows: list[dict[str, Any]]
         label = path.parent.name or path.stem
         tokens = set(_room_tokens(label))
         path_norm = _normalize_label_text(label)
-        path_has_chinese = bool(re.search(r"[\u4e00-\u9fff]", label))
+        path_has_chinese = bool(re.search(r"[一-鿿]", label))
         matches_row = any(
             tokens.intersection(row_tokens)
             and (not community_tokens or any(token in path_norm for token in community_tokens) or not path_has_chinese)
@@ -477,13 +697,13 @@ def _row_label(row: dict[str, Any]) -> str:
 
 
 def _normalize_label_text(text: str) -> str:
-    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]", "", text).lower()
+    return re.sub(r"[^0-9a-zA-Z一-鿿]", "", text).lower()
 
 
 def _community_match_tokens(text: str) -> set[str]:
     tokens = {
         _normalize_label_text(token)
-        for token in re.findall(r"[\u4e00-\u9fff]{2,}", text)
+        for token in re.findall(r"[一-鿿]{2,}", text)
         if len(_normalize_label_text(token)) >= 2
     }
     normalized = _normalize_label_text(text)
@@ -513,6 +733,17 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
             continue
         seen.add(key)
         deduped.append(path)
+    return deduped
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
     return deduped
 
 

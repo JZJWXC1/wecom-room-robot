@@ -8,11 +8,14 @@ from typing import Any
 import httpx
 
 from app.config import settings
+from app.services import kf_context_memory
+from app.services.fuzzy_match import COMMUNITY_DISPLAY_ALIASES
 from app.services.wx_crypto import WeComCrypto
 
 
 CUSTOMER_ORIGINS = {"3", 3, "customer", "external_user", "external_contact"}
 KF_MESSAGE_EVENT = "kf_msg_or_event"
+KF_ENTER_SESSION_EVENT = "enter_session"
 SEND_MSG_COUNT_LIMIT_ERRCODE = 95001
 
 
@@ -27,14 +30,23 @@ class WeComKfStateStore:
 
     def load(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {"cursor": "", "processed_msgids": []}
+            return {"cursor": "", "processed_msgids": [], "welcome_sent_at": {}}
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"cursor": "", "processed_msgids": []}
+            return {"cursor": "", "processed_msgids": [], "welcome_sent_at": {}}
+        welcome_sent_at: dict[str, float] = {}
+        for key, value in (data.get("welcome_sent_at") or {}).items():
+            if not key:
+                continue
+            try:
+                welcome_sent_at[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
         return {
             "cursor": str(data.get("cursor", "")),
             "processed_msgids": list(data.get("processed_msgids") or []),
+            "welcome_sent_at": welcome_sent_at,
         }
 
     def save_cursor(self, cursor: str) -> None:
@@ -54,6 +66,25 @@ class WeComKfStateStore:
         msgids = [item for item in state.get("processed_msgids", []) if item != msgid]
         msgids.append(msgid)
         state["processed_msgids"] = msgids[-self.max_msgids :]
+        self._write(state)
+
+    def last_welcome_sent_at(self, conversation_key: str) -> float:
+        if not conversation_key:
+            return 0.0
+        return float(self.load().get("welcome_sent_at", {}).get(conversation_key) or 0.0)
+
+    def mark_welcome_sent(self, conversation_key: str, sent_at: float | None = None) -> None:
+        if not conversation_key:
+            return
+        state = self.load()
+        welcome_sent_at = dict(state.get("welcome_sent_at") or {})
+        welcome_sent_at[conversation_key] = float(sent_at or time.time())
+        state["welcome_sent_at"] = dict(
+            sorted(
+                welcome_sent_at.items(),
+                key=lambda item: float(item[1] or 0),
+            )[-self.max_msgids :]
+        )
         self._write(state)
 
     def _write(self, state: dict[str, Any]) -> None:
@@ -128,19 +159,123 @@ class WeComKfContextStore:
             "recent_messages": recent_messages[-10:],
             "updated_at": float(context.get("updated_at") or time.time()),
         }
-        send_limited = context.get("send_limited")
-        if isinstance(send_limited, dict):
-            video_urls = [
-                str(item)
-                for item in send_limited.get("video_urls") or []
-                if item
-            ]
-            normalized["send_limited"] = {
-                "triggered_at": float(send_limited.get("triggered_at") or time.time()),
-                "summary": str(send_limited.get("summary") or "")[:500],
-                "video_urls": video_urls[:20],
-            }
+        last_candidate_set = kf_context_memory.normalize_last_candidate_set(
+            context.get("last_candidate_set")
+        )
+        if last_candidate_set:
+            normalized["last_candidate_set"] = last_candidate_set
+        confirmed = self._normalize_confirmed_room(context.get("confirmed_room"))
+        if confirmed:
+            normalized["confirmed_room"] = confirmed
+        pending_reference = self._normalize_reference_confirmation(
+            context.get("pending_reference_confirmation")
+        )
+        if pending_reference:
+            normalized["pending_reference_confirmation"] = pending_reference
+        last_understanding = self._normalize_last_message_understanding(
+            context.get("last_message_understanding")
+        )
+        if last_understanding:
+            normalized["last_message_understanding"] = last_understanding
+        active_binding = self._normalize_active_context_binding(
+            context.get("active_context_binding")
+        )
+        if active_binding:
+            normalized["active_context_binding"] = active_binding
+        active_query_state = kf_context_memory.normalize_active_query_state(
+            context.get("active_query_state")
+        )
+        if active_query_state:
+            normalized["active_query_state"] = active_query_state
+        pending_video_sends = self._normalize_pending_video_sends(
+            context.get("pending_video_sends")
+        )
+        if pending_video_sends:
+            normalized["pending_video_sends"] = pending_video_sends
+        structured_memory = kf_context_memory.normalize_structured_memory(
+            context.get("structured_memory")
+        )
+        if (
+            structured_memory.get("raw_dialog_context")
+            or structured_memory.get("turn_records")
+            or structured_memory.get("current_turn_id")
+        ):
+            normalized["structured_memory"] = structured_memory
         return normalized
+
+    def _normalize_confirmed_room(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        row = value.get("row")
+        if not isinstance(row, dict):
+            return {}
+        label = str(value.get("label") or "").strip()
+        return {
+            "row": row,
+            "label": label,
+            "intent": str(value.get("intent") or "details"),
+            "created_at": float(value.get("created_at") or time.time()),
+            "inventory_cache_meta": dict(value.get("inventory_cache_meta") or {}),
+        }
+
+    def _normalize_reference_confirmation(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        status = str(value.get("status") or "").strip()
+        kind = str(value.get("kind") or "").strip()
+        raw_text = str(value.get("raw_text") or "").strip()
+        if not status or not kind or not raw_text:
+            return {}
+        return {
+            "status": status,
+            "kind": kind,
+            "raw_text": raw_text,
+            "original_query": str(value.get("original_query") or "").strip(),
+            "suggested_text": str(value.get("suggested_text") or "").strip(),
+            "rewritten_query": str(value.get("rewritten_query") or "").strip(),
+            "options": [str(item).strip() for item in value.get("options") or [] if str(item).strip()][:5],
+            "confidence": str(value.get("confidence") or "medium"),
+            "reason": str(value.get("reason") or ""),
+            "created_at": float(value.get("created_at") or time.time()),
+        }
+
+    def _normalize_last_message_understanding(self, value: Any) -> dict[str, Any]:
+        return kf_context_memory.normalize_last_message_understanding(value)
+
+    def _normalize_active_context_binding(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        content = str(value.get("content") or "").strip()
+        rows = [row for row in value.get("rows") or [] if isinstance(row, dict)]
+        if not content and not rows:
+            return {}
+        return {
+            "content": content,
+            "selected_indices": [
+                int(item)
+                for item in value.get("selected_indices") or []
+                if isinstance(item, int)
+            ][:10],
+            "rows": rows[:10],
+            "created_at": float(value.get("created_at") or time.time()),
+        }
+
+    def _normalize_pending_video_sends(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        paths = [str(item) for item in value.get("paths") or [] if item]
+        labels = [str(item).strip() for item in value.get("labels") or [] if str(item).strip()]
+        if not paths and not labels:
+            return {}
+        return {
+            "paths": paths[:10],
+            "labels": labels[:10],
+            "reason": str(value.get("reason") or "send_pending"),
+            "created_at": float(value.get("created_at") or time.time()),
+            "attempts": int(value.get("attempts") or 0),
+            "requested_count": int(value.get("requested_count") or len(paths) or len(labels)),
+            "sent_count": int(value.get("sent_count") or 0),
+        }
 
     def _write(self, contexts: dict[str, dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -189,6 +324,8 @@ class WeComKfClient:
         if not messages and token:
             messages, next_cursor = await self._sync_message_pages(open_kfid, "", cursor)
         self.last_next_cursor = next_cursor
+        if next_cursor:
+            self.state_store.save_cursor(next_cursor)
 
         return [
             message
@@ -249,6 +386,24 @@ class WeComKfClient:
             if data.get("errcode") == SEND_MSG_COUNT_LIMIT_ERRCODE:
                 raise WeComKfSendLimitError(f"微信客服消息发送次数受限：{data}")
             raise RuntimeError(f"微信客服消息发送失败：{data}")
+        return data
+
+    async def send_welcome_text_on_event(
+        self,
+        welcome_code: str,
+        content: str,
+    ) -> dict[str, Any]:
+        access_token = await self._get_access_token()
+        url = f"https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg_on_event?access_token={access_token}"
+        payload = self.build_event_text_payload(welcome_code, content)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+        if data.get("errcode") != 0:
+            if data.get("errcode") == SEND_MSG_COUNT_LIMIT_ERRCODE:
+                raise WeComKfSendLimitError(f"微信客服欢迎语发送次数受限：{data}")
+            raise RuntimeError(f"微信客服欢迎语发送失败：{data}")
         return data
 
     async def upload_media(self, path: Path, media_type: str = "image") -> str:
@@ -323,12 +478,30 @@ class WeComKfClient:
         external_userid: str,
         content: str,
     ) -> dict[str, Any]:
+        normalized_content = self._normalize_outgoing_text(content)
         return {
             "touser": external_userid,
             "open_kfid": open_kfid,
             "msgtype": "text",
-            "text": {"content": content},
+            "text": {"content": normalized_content},
         }
+
+    def build_event_text_payload(
+        self,
+        welcome_code: str,
+        content: str,
+    ) -> dict[str, Any]:
+        return {
+            "code": welcome_code,
+            "msgtype": "text",
+            "text": {"content": self._normalize_outgoing_text(content)},
+        }
+
+    def _normalize_outgoing_text(self, content: str) -> str:
+        text = str(content or "")
+        for wrong, right in sorted(COMMUNITY_DISPLAY_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
+            text = text.replace(wrong, right)
+        return text
 
     def build_image_payload(
         self,
@@ -375,6 +548,100 @@ class WeComKfClient:
 
 def is_kf_message_event(payload: dict[str, str]) -> bool:
     return payload.get("Event") == KF_MESSAGE_EVENT and bool(payload.get("Token"))
+
+
+def kf_message_event_payload(message: dict[str, Any]) -> dict[str, Any]:
+    event = message.get("event")
+    if isinstance(event, dict):
+        return event
+    if isinstance(event, str):
+        return {"event_type": event}
+    return {}
+
+
+def is_kf_enter_session_event(message: dict[str, Any]) -> bool:
+    if message.get("msgtype") != "event":
+        return False
+    if extract_kf_welcome_code(message):
+        return True
+    event = kf_message_event_payload(message)
+    event_type = str(
+        event.get("event_type")
+        or event.get("event")
+        or message.get("event_type")
+        or message.get("event")
+        or ""
+    )
+    return event_type == KF_ENTER_SESSION_EVENT
+
+
+def extract_kf_welcome_code(message: dict[str, Any]) -> str:
+    event = kf_message_event_payload(message)
+    return str(
+        event.get("welcome_code")
+        or event.get("WelcomeCode")
+        or message.get("welcome_code")
+        or message.get("WelcomeCode")
+        or ""
+    ).strip()
+
+
+def extract_kf_open_kfid(message: dict[str, Any]) -> str:
+    event = kf_message_event_payload(message)
+    return str(
+        message.get("open_kfid")
+        or message.get("OpenKfId")
+        or event.get("open_kfid")
+        or event.get("OpenKfId")
+        or ""
+    ).strip()
+
+
+def extract_kf_external_userid(message: dict[str, Any]) -> str:
+    event = kf_message_event_payload(message)
+    return str(
+        message.get("external_userid")
+        or message.get("ExternalUserID")
+        or message.get("ExternalUserId")
+        or event.get("external_userid")
+        or event.get("ExternalUserID")
+        or event.get("ExternalUserId")
+        or ""
+    ).strip()
+
+
+def kf_callback_payload_event_message(payload: dict[str, Any]) -> dict[str, Any]:
+    event_type = str(
+        payload.get("Event")
+        or payload.get("event")
+        or payload.get("event_type")
+        or payload.get("EventType")
+        or ""
+    ).strip()
+    welcome_code = str(payload.get("WelcomeCode") or payload.get("welcome_code") or "").strip()
+    msgtype = str(payload.get("MsgType") or payload.get("msgtype") or "").strip()
+    if not msgtype and (event_type or welcome_code):
+        msgtype = "event"
+    if msgtype.lower() != "event":
+        return {}
+    open_kfid = str(payload.get("OpenKfId") or payload.get("open_kfid") or "").strip()
+    external_userid = str(
+        payload.get("ExternalUserID")
+        or payload.get("ExternalUserId")
+        or payload.get("external_userid")
+        or ""
+    ).strip()
+    return {
+        "msgtype": "event",
+        "open_kfid": open_kfid,
+        "external_userid": external_userid,
+        "event": {
+            "event_type": event_type,
+            "welcome_code": welcome_code,
+            "open_kfid": open_kfid,
+            "external_userid": external_userid,
+        },
+    }
 
 
 def extract_kf_text(message: dict[str, Any]) -> str:

@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 
 from app.config import settings
+from app.services import reply_validator
 from app.services.reply_validator import ReplyValidationDraft, ReplyValidator
 
 
@@ -222,3 +223,49 @@ class ReplyValidatorTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("棠润府1-602A还在", result.reply_text)
         finally:
             settings.dashscope_api_key = previous_key
+
+    async def test_video_claim_validation_before_send_attaches_existing_video(self) -> None:
+        video_path = Path("room_database/video/棠润府1-602A/视频.mp4")
+
+        async def inventory_search(query: str, *, limit: int = 3) -> list[dict]:
+            raise AssertionError("行内已经匹配时，不应该重新搜索房源表")
+
+        def list_video_paths(label: str, *, limit: int = 1) -> list[Path]:
+            self.assertEqual(label, "棠润府1-602A")
+            return [video_path]
+
+        result = await reply_validator.validate_reply_video_claims_before_send(
+            "这套暂时没有视频，我先发你文字信息。",
+            [{"小区": "棠润府", "房号": "1-602A"}],
+            inventory_search=inventory_search,
+            list_video_paths=list_video_paths,
+            normalize_text=lambda value: value.replace("-", "").lower(),
+        )
+
+        self.assertEqual(result.video_paths, [video_path])
+        self.assertFalse(result.should_clear_video_context)
+        self.assertIn("我这边有对应视频", result.reply_text)
+        self.assertNotIn("暂时没有视频", result.reply_text)
+
+    async def test_video_claim_validation_before_send_clears_unverified_claim(self) -> None:
+        searched: list[str] = []
+
+        async def inventory_search(query: str, *, limit: int = 3) -> list[dict]:
+            searched.append(query)
+            return []
+
+        result = await reply_validator.validate_reply_video_claims_before_send(
+            "这套有视频，我发你。",
+            [{"小区": "棠润府", "房号": "1-602A"}],
+            inventory_search=inventory_search,
+            list_video_paths=lambda label, *, limit=1: [],
+            normalize_text=lambda value: value.replace("-", "").lower(),
+        )
+
+        self.assertEqual(result.video_paths, [])
+        self.assertTrue(result.should_clear_video_context)
+        self.assertIn("视频我这边还没直接匹配到", result.reply_text)
+
+    def test_room_reference_helpers_are_shared_with_kf_flow(self) -> None:
+        self.assertEqual(reply_validator.room_number_references("棠润府1幢602A视频"), ["1-602A"])
+        self.assertEqual(reply_validator.room_label_reference_from_text("客户问棠润府1-602A视频"), "棠润府1-602A")

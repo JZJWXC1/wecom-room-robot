@@ -9,7 +9,6 @@ from app.services.fuzzy_match import fuzzy_contains_score, normalize_search_text
 GENERIC_MEDIA_WORDS = (
     "微信视频",
     "视频",
-    "视屏",
     "图片",
     "照片",
     "房源",
@@ -153,8 +152,17 @@ class MediaStore:
 
         query_room_tokens = set(self._room_tokens(query_text))
         target_room_tokens = set(self._room_tokens(target_text))
-        if query_room_tokens and not query_room_tokens.intersection(target_room_tokens):
-            return 0
+        parent_room_tokens = set(self._room_tokens(path.parent.name))
+        filename_room_tokens = set(self._room_tokens(path.stem))
+        if query_room_tokens:
+            if not query_room_tokens.intersection(target_room_tokens):
+                return 0
+            if (
+                filename_room_tokens
+                and not query_room_tokens.intersection(filename_room_tokens)
+                and not query_room_tokens.intersection(parent_room_tokens)
+            ):
+                return 0
 
         score = 0
         if query_norm in target_norm:
@@ -163,7 +171,7 @@ class MediaStore:
         if query_room_tokens & target_room_tokens:
             score += 90
 
-        for chinese_token in re.findall(r"[\u4e00-\u9fff]{2,}", query_text):
+        for chinese_token in re.findall(r"[一-鿿]{2,}", query_text):
             token_norm = self._normalize_text(chinese_token)
             if len(token_norm) >= 2 and token_norm in target_norm:
                 score += 30 + len(token_norm)
@@ -198,7 +206,7 @@ class MediaStore:
 
     def _query_tokens(self, text: str) -> list[str]:
         tokens = re.findall(
-            r"[\u4e00-\u9fff]*\d+(?:[-－—]\d+)+(?:[-－—]?[a-zA-Z0-9])?|[\u4e00-\u9fff]{2,}|[a-zA-Z0-9]{2,}",
+            r"[一-鿿]*\d+(?:[-－—]\d+)+(?:[-－—]?[a-zA-Z0-9])?|[一-鿿]{2,}|[a-zA-Z0-9]{2,}",
             text,
         )
         return list(dict.fromkeys(tokens))
@@ -212,20 +220,26 @@ class MediaStore:
         return token
 
     def _room_tokens(self, text: str) -> list[str]:
-        tokens = re.findall(r"\d+(?:[-－—]\d+)+(?:[-－—]?[a-zA-Z])?", text)
-        expanded: list[str] = []
+        tokens = re.findall(r"\d+(?:[-－—][a-zA-Z0-9]+)+", text)
+        normalized_tokens: list[str] = []
         for token in tokens:
-            expanded.append(token)
-            expanded.extend(self._room_token_aliases(token))
-        return [self._normalize_text(token) for token in dict.fromkeys(expanded)]
+            normalized_tokens.extend(
+                self._normalize_text(alias)
+                for alias in self._room_token_aliases(token)
+            )
+        return list(dict.fromkeys(normalized_tokens))
 
     def _room_token_aliases(self, token: str) -> list[str]:
-        normalized = re.sub(r"[－—]", "-", token)
-        aliases: list[str] = []
-        if re.search(r"-1$", normalized):
-            aliases.append(re.sub(r"-1$", "A", normalized))
-        if re.search(r"(?i)A$", normalized):
-            aliases.append(f"{normalized[:-1]}-1")
+        token = token.lower().replace("－", "-").replace("—", "-")
+        aliases = [token]
+        dash_suffix = re.fullmatch(r"(.+)-([1-9])", token)
+        if dash_suffix:
+            suffix_index = int(dash_suffix.group(2))
+            aliases.append(f"{dash_suffix.group(1)}{chr(ord('a') + suffix_index - 1)}")
+        letter_suffix = re.fullmatch(r"(.+\d)([a-z])", token)
+        if letter_suffix:
+            suffix_index = ord(letter_suffix.group(2)) - ord("a") + 1
+            aliases.append(f"{letter_suffix.group(1)}-{suffix_index}")
         return aliases
 
     def _char_grams(self, text: str) -> list[str]:
