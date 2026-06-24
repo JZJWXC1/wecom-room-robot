@@ -2116,6 +2116,59 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("东新园", result["effective_query"])
         self.assertEqual(result["structured_task"]["constraint_proof"]["layout"], "两室")
 
+    async def test_exact_community_resolution_overrides_llm_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "兴业杨家府在租房源",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": True,
+                    "clarification_text": "我这边为了避免发错，先不乱发。你把小区+房号或更具体条件发我一下。",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "石桥街道\n华丰 石桥\n永佳 半山",
+                        "小区": "兴业杨家府",
+                        "房号": "4-1502",
+                        "户型分类": "一室一厅",
+                        "押一付一": "4500",
+                        "押二付一": "4200",
+                    },
+                    {
+                        "区域": "石桥街道\n华丰 石桥\n永佳 半山",
+                        "小区": "兴业杨家府",
+                        "房号": "10-1-1205",
+                        "户型分类": "两室一厅",
+                        "押一付一": "3900",
+                        "押二付一": "3700",
+                    },
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="兴业杨家府有什么房",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("兴业杨家府有什么房"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["constraint_proof"]["communities"], ["兴业杨家府"])
+        self.assertEqual(result["query_state"]["community"], "兴业杨家府")
+        self.assertEqual(
+            result["structured_task"]["clarification"]["reason"],
+            "exact_community_resolved",
+        )
+
     async def test_constraint_proof_keeps_broad_one_room_from_user_text(self) -> None:
         class FakeReplyGenerator:
             async def rewrite_kf_message(self, **kwargs):
@@ -2192,6 +2245,50 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["communities"][0]["canonical"], "东方茂商业中心T")
         self.assertEqual(result["room_ref_hits"][0]["room_no"], "3-1540")
+
+    async def test_exact_community_with_particle_resolves_without_clarification(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "兴业杨家府在租房源",
+                    "effective_query": "兴业杨家府在租房源",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": False,
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "石桥街道 华丰 石桥 永佳 半山",
+                        "小区": "兴业杨家府",
+                        "房号": "4-1502",
+                    },
+                    {
+                        "区域": "石桥街道 华丰 石桥 永佳 半山",
+                        "小区": "兴业杨家府",
+                        "房号": "10-1-1205",
+                    },
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="兴业杨家府呢",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("兴业杨家府呢"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["status"], "resolved")
+        self.assertEqual(result["entity_resolution"]["communities"][0]["canonical"], "兴业杨家府")
+        self.assertIn("兴业杨家府", result["constraint_proof"]["communities"])
 
     async def test_ambiguous_community_generates_real_candidate_clarification(self) -> None:
         class FakeReplyGenerator:
@@ -3773,6 +3870,108 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("没有第2套", reply)
         self.assertIn("华丰欣苑14-2-901", reply)
 
+    def test_filter_count_request_is_not_candidate_selection(self) -> None:
+        self.assertEqual(main._selection_indices_from_text("客户想今天先筛两套。"), [])
+        self.assertEqual(main._selection_indices_from_text("先把万达2000以下一室里最合适的两套视频发我。"), [])
+        self.assertEqual(main._requested_room_count_from_text("先把万达2000以下一室里最合适的两套视频发我。"), 2)
+        self.assertEqual(main._selection_indices_from_text("这两套视频发我。"), [1, 2])
+
+    def test_field_target_error_reply_asks_specific_room(self) -> None:
+        reply = main._reply_for_field_target_error(
+            {
+                "field_target_error": {
+                    "field": "水电",
+                    "candidate_count": 2,
+                    "candidate_labels": ["杨乐府9-604B", "新柠长木府3-1002A"],
+                }
+            }
+        )
+
+        self.assertIn("水电要按具体房源查", reply)
+        self.assertIn("杨乐府9-604B", reply)
+        self.assertIn("回序号或小区+房号", reply)
+
+    def test_utilities_reply_does_not_include_deposit_policy_when_not_requested(self) -> None:
+        reply = main._reply_for_deposit_and_utilities(
+            {
+                "intent": "deposit",
+                "constraint_proof": {"wants_utilities": True},
+            },
+            {
+                "rule_evidence": {"deposit_policy": main._deposit_policy_evidence()},
+                "inventory_rows": [],
+                "target_rows": [],
+            },
+            content="水电怎么收？",
+        )
+
+        self.assertIn("水电要按具体房源备注查", reply)
+        self.assertNotIn("免押", reply)
+        self.assertNotIn("芝麻", reply)
+
+    def test_safe_deposit_fallback_does_not_inject_deposit_for_water_only(self) -> None:
+        reply = main._safe_fallback_for_intent(
+            {
+                "intent": "deposit",
+                "effective_query": "水电怎么收？",
+                "rewritten_query": "水电怎么收？",
+                "constraint_proof": {"wants_utilities": True},
+                "structured_task": {"original_text": "水电怎么收？"},
+            },
+            "水电要按具体房源备注查，你把小区+房号发我，我马上按那套核对。",
+        )
+
+        self.assertIn("水电要按具体房源备注查", reply)
+        self.assertNotIn("免押", reply)
+
+    async def test_field_followup_without_target_does_not_use_area_rows(self) -> None:
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return [
+                    {
+                        "区域": "东新园\n杭氧\n新天地",
+                        "小区": "杨乐府",
+                        "房号": "9-604B",
+                        "户型分类": "两室一厅",
+                        "备注": "水30/月，电1元/度",
+                    }
+                ]
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "generate_reply"],
+                content="水电怎么收？",
+                context={},
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "水电怎么收？",
+                    "constraint_proof": {
+                        "intent": "inventory",
+                        "wants_utilities": True,
+                        "hard_constraints": {
+                            "area": False,
+                            "community": False,
+                            "room_refs": False,
+                            "budget_range": False,
+                            "layout": False,
+                            "selected_indices": False,
+                        },
+                    },
+                    "structured_task": {"original_text": "水电怎么收？"},
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(evidence["inventory_rows"], [])
+        self.assertEqual(evidence["field_target_error"]["field"], "水电")
+
     def test_selection_error_selfcheck_does_not_require_budget_or_layout_terms(self) -> None:
         reply = "上一轮我只列了1套，没有第2套。上一轮候选是：华丰欣苑14-2-901。你可以直接说第1套，或者换区域/预算我重新筛。"
 
@@ -3800,6 +3999,41 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     "candidate_labels": ["华丰欣苑14-2-901"],
                 },
                 "inventory_rows": [],
+                "target_rows": [],
+            },
+        )
+
+        self.assertEqual(result["status"], "pass")
+
+    def test_exact_community_inventory_reply_does_not_need_area_repeated(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="兴业杨家府",
+            draft_reply=(
+                "有的，兴业杨家府我查到这些还在租：\n"
+                "1. 兴业杨家府4-1502，一室一厅，押一付一4500，押二付一4200，民用水电"
+            ),
+            understanding={
+                "intent": "inventory",
+                "constraint_proof": {
+                    "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                    "communities": ["兴业杨家府"],
+                    "hard_constraints": {"area": True, "community": True},
+                },
+                "structured_task": {"original_text": "兴业杨家府"},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                "inventory_rows": [
+                    {
+                        "区域": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "小区": "兴业杨家府",
+                        "房号": "4-1502",
+                        "户型分类": "一室一厅",
+                        "押一付一": "4500",
+                        "押二付一": "4200",
+                        "备注": "民用水电",
+                    }
+                ],
                 "target_rows": [],
             },
         )
@@ -5668,6 +5902,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     "押二付一": "3200",
                     "看房方式密码": "6.22空出 看房提前联系",
                     "备注": "水30/月，电1元/度",
+                    "视频数量": "1",
                 }
             ]
         )
@@ -5678,6 +5913,27 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("押二付一", index["field_aliases"])
         self.assertEqual(index["room_index"][0]["layout_description"], "两室一厅朝南带阳台")
         self.assertEqual(index["room_index"][0]["utilities"], "水30/月，电1元/度")
+        self.assertEqual(index["media_summary"]["rooms_with_videos"], ["新柠长木府3-1002B"])
+        self.assertEqual(index["media_summary"]["unknown_image_status_count"], 1)
+        self.assertEqual(index["viewing_summary"]["needs_contact"], 1)
+        self.assertEqual(index["availability_summary"]["has_empty_out_hint"], 1)
+        self.assertTrue(index["room_index"][0]["viewing_summary"]["has_empty_out_hint"])
+
+    def test_rewrite_inventory_index_contains_similar_community_groups(self) -> None:
+        index = build_rewrite_inventory_index(
+            [
+                {"区域": "石桥街道", "小区": "兴业杨家府", "房号": "4-1502"},
+                {"区域": "石桥街道", "小区": "杨家新雅苑", "房号": "15-603"},
+                {"区域": "石桥街道", "小区": "杨乐府", "房号": "9-604B"},
+            ]
+        )
+
+        names = {item["name"] for item in index["similar_communities"]}
+        self.assertTrue({"兴业杨家府", "杨家新雅苑"} & names)
+        sliced = main.slice_rewrite_inventory_index(index, query="杨家府还有吗")
+        self.assertIn("similar_communities", sliced)
+        self.assertIn("viewing_summary", sliced)
+        self.assertIn("availability_summary", sliced)
 
     async def test_current_room_query_overrides_stale_inventory_sheet_state(self) -> None:
         class FakeReplyGenerator:
@@ -6014,6 +6270,278 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
         )
+
+    def test_current_search_community_selection_overrides_stale_confirmed_room(self) -> None:
+        context = kf_context_memory.empty_context()
+        context["confirmed_room"] = {
+            "label": "兴业杨家府4-1502",
+            "row": {"小区": "兴业杨家府", "房号": "4-1502"},
+        }
+        context["last_candidate_set"] = {
+            "candidates": [
+                {"小区": "兴业杨家府", "房号": "4-1502"},
+                {"小区": "兴业杨家府", "房号": "8-1203"},
+            ]
+        }
+        understanding = {
+            "intent": "media",
+            "effective_query": "杨家新雅苑三室一厅 第一套视频",
+            "rewritten_query": "杨家新雅苑三室一厅 第一套视频",
+            "selected_indices": [1],
+            "constraint_proof": {
+                "communities": ["杨家新雅苑"],
+                "selected_indices": [1],
+                "wants_video": True,
+            },
+            "structured_task": {
+                "original_text": "杨家新雅苑那套也发视频，最好清楚一点。",
+                "tool_requirements": {"needs_video": True},
+            },
+        }
+        search_rows = [
+            {"小区": "杨家新雅苑", "房号": "15-603"},
+            {"小区": "杨家新雅苑", "房号": "36-1102"},
+        ]
+
+        rows = main._target_rows_from_understanding(understanding, context, search_rows)
+
+        self.assertEqual([row["小区"] for row in rows], ["杨家新雅苑"])
+        self.assertEqual([row["房号"] for row in rows], ["15-603"])
+
+    def test_explicit_media_community_overrides_stale_candidates_without_selection(self) -> None:
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "candidates": [
+                {"小区": "兴业杨家府", "房号": "4-1502"},
+                {"小区": "兴业杨家府", "房号": "8-1203"},
+            ]
+        }
+        understanding = {
+            "intent": "media",
+            "effective_query": "杨家新雅苑三室视频",
+            "rewritten_query": "杨家新雅苑三室视频",
+            "context_reference": True,
+            "constraint_proof": {
+                "communities": ["杨家新雅苑"],
+                "wants_video": True,
+            },
+            "structured_task": {
+                "original_text": "杨家新雅苑那套也发视频，最好清楚一点。",
+                "tool_requirements": {"needs_video": True},
+            },
+        }
+        search_rows = [
+            {"小区": "杨家新雅苑", "房号": "15-603"},
+            {"小区": "杨家新雅苑", "房号": "36-1102"},
+        ]
+
+        rows = main._target_rows_from_understanding(understanding, context, search_rows)
+
+        self.assertEqual([row["小区"] for row in rows], ["杨家新雅苑", "杨家新雅苑"])
+        self.assertEqual([row["房号"] for row in rows], ["15-603", "36-1102"])
+
+    def test_original_video_followup_binds_recent_missing_media_rows(self) -> None:
+        context = kf_context_memory.empty_context()
+        context["structured_memory"] = {
+            "turn_records": [
+                {
+                    "turn_id": "t1",
+                    "assistant_sent_summary": {
+                        "final_reply": (
+                            "这几套房源我查到了，但本地暂时没找到视频："
+                            "长岳王马府4-2002、长浜龙吟轩11-1603。这次没有可发送的视频。"
+                        )
+                    },
+                }
+            ],
+            "raw_dialog_context": [],
+        }
+        understanding = {
+            "intent": "media",
+            "effective_query": "有原视频或者清楚一点的吗",
+            "rewritten_query": "有原视频或者清楚一点的吗",
+            "context_reference": True,
+            "constraint_proof": {
+                "wants_video": True,
+                "wants_original_video": True,
+            },
+            "structured_task": {
+                "original_text": "有原视频或者清楚一点的吗？客户嫌转发后有点糊。",
+                "tool_requirements": {"needs_video": True},
+            },
+        }
+        search_rows = [
+            {"小区": "长岳王马府", "房号": "4-2002"},
+            {"小区": "长浜龙吟轩", "房号": "11-1603"},
+            {"小区": "嘉樘星绣府", "房号": "9-603"},
+            {"小区": "新柠长木府", "房号": "3-1002A"},
+        ]
+
+        rows = main._target_rows_from_understanding(understanding, context, search_rows)
+
+        self.assertEqual([main._row_label(row) for row in rows], ["长岳王马府4-2002", "长浜龙吟轩11-1603"])
+
+    def test_original_video_only_flag_is_treated_as_media_request(self) -> None:
+        context = kf_context_memory.empty_context()
+        context["structured_memory"] = {
+            "turn_records": [
+                {
+                    "turn_id": "t1",
+                    "assistant_sent_summary": {
+                        "final_reply": (
+                            "这几套房源我查到了，但本地暂时没找到视频："
+                            "长岳王马府4-2002、长浜龙吟轩11-1603。这次没有可发送的视频。"
+                        )
+                    },
+                }
+            ],
+            "raw_dialog_context": [],
+        }
+        understanding = {
+            "intent": "media",
+            "effective_query": "有原视频或者清楚一点的吗",
+            "rewritten_query": "有原视频或者清楚一点的吗",
+            "context_reference": True,
+            "constraint_proof": {
+                "wants_original_video": True,
+            },
+            "structured_task": {
+                "original_text": "有原视频或者清楚一点的吗？客户嫌转发后有点糊。",
+                "tool_requirements": {},
+            },
+        }
+        search_rows = [
+            {"小区": "长岳王马府", "房号": "4-2002"},
+            {"小区": "长浜龙吟轩", "房号": "11-1603"},
+            {"小区": "嘉樘星绣府", "房号": "9-603"},
+        ]
+
+        rows = main._target_rows_from_understanding(understanding, context, search_rows)
+
+        self.assertEqual([main._row_label(row) for row in rows], ["长岳王马府4-2002", "长浜龙吟轩11-1603"])
+
+    async def test_pending_missing_video_labels_restore_rows_for_original_followup(self) -> None:
+        class FakeInventory:
+            async def all_rows(self, limit=1000):
+                return [
+                    {"小区": "长岳王马府", "房号": "4-2002"},
+                    {"小区": "长浜龙吟轩", "房号": "11-1603"},
+                    {"小区": "嘉樘星绣府", "房号": "9-603"},
+                ]
+
+        context = kf_context_memory.remember_pending_video_sends(
+            kf_context_memory.empty_context(),
+            paths=[],
+            labels=["长岳王马府4-2002", "长浜龙吟轩11-1603", "长岳王马府4-2002"],
+            reason="missing_or_pending_video",
+            requested_count=2,
+            sent_count=0,
+        )
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            rows = await main._pending_video_label_rows(context)
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual([main._row_label(row) for row in rows], ["长岳王马府4-2002", "长浜龙吟轩11-1603"])
+
+    async def test_selected_indices_without_candidates_do_not_fallback_to_inventory_search(self) -> None:
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return [
+                    {"小区": "棠润府", "房号": "10-1004C"},
+                    {"小区": "棠润府", "房号": "15-2-801B"},
+                ]
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "send_image", "context_tools", "explain_missing_media"],
+                content="第1和第3套图片发我。",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "第1和第3套图片发我。",
+                    "rewritten_query": "第1和第3套图片发我。",
+                    "constraint_proof": {
+                        "selected_indices": [1, 3],
+                        "wants_image": True,
+                    },
+                    "structured_task": {
+                        "original_text": "第1和第3套图片发我。",
+                        "tool_requirements": {"needs_image": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(evidence["inventory_rows"], [])
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertEqual(evidence["selection_error"]["reason"], "missing_current_candidate_set")
+
+    def test_target_rows_must_match_rewrite_community_constraint(self) -> None:
+        target_rows = [{"小区": "兴业杨家府", "房号": "4-1502"}]
+        inventory_rows = [{"小区": "杨家新雅苑", "房号": "15-603"}]
+        proof = {"communities": ["杨家新雅苑"]}
+
+        rows = main._enforce_target_rows_community_constraints(target_rows, inventory_rows, proof)
+
+        self.assertEqual([main._row_label(row) for row in rows], ["杨家新雅苑15-603"])
+
+    def test_wrong_target_rows_are_cleared_when_no_matching_inventory_rows(self) -> None:
+        target_rows = [{"小区": "兴业杨家府", "房号": "4-1502"}]
+        proof = {"communities": ["杨家新雅苑"]}
+
+        rows = main._enforce_target_rows_community_constraints(target_rows, [], proof)
+
+        self.assertEqual(rows, [])
+
+    def test_blurry_video_followup_prefers_recent_sent_video_room(self) -> None:
+        context = kf_context_memory.empty_context()
+        context["structured_memory"] = {
+            "turn_records": [
+                {
+                    "turn_id": "t1",
+                    "assistant_sent_summary": {
+                        "final_reply": "这是棠润府15-2-801B的视频。",
+                        "sent_actions": [{"type": "video", "room": "棠润府15-2-801B", "count": 1}],
+                    },
+                },
+                {
+                    "turn_id": "t2",
+                    "assistant_sent_summary": {
+                        "final_reply": "这几套房源我查到了，但本地暂时没找到图片：瑷颐湾13-1-402A。"
+                    },
+                },
+            ],
+            "raw_dialog_context": [],
+        }
+        understanding = {
+            "intent": "media",
+            "effective_query": "视频糊 有没有原视频链接",
+            "rewritten_query": "视频糊 有没有原视频链接",
+            "context_reference": True,
+            "constraint_proof": {
+                "wants_video": True,
+                "wants_original_video": True,
+            },
+            "structured_task": {
+                "original_text": "如果客户说视频糊，有没有原视频链接？",
+                "tool_requirements": {"needs_video": True},
+            },
+        }
+        search_rows = [
+            {"小区": "瑷颐湾", "房号": "13-1-402A"},
+            {"小区": "棠润府", "房号": "15-2-801B"},
+            {"小区": "小洋坝家园二区", "房号": "7-1001E"},
+        ]
+
+        rows = main._target_rows_from_understanding(understanding, context, search_rows)
+
+        self.assertEqual([main._row_label(row) for row in rows], ["棠润府15-2-801B"])
 
     async def test_continue_pending_video_uses_pending_missing_labels(self) -> None:
         class FakeInventory:
@@ -6386,6 +6914,14 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("东新园、杭氧、新天地", reply)
         self.assertIn("一室、一室一厅", reply)
         self.assertIn("新柠长木府2-702B", reply)
+
+    def test_customer_visible_reply_normalization_preserves_inventory_list_newline(self) -> None:
+        reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+            "1. 兴业杨家府4-1502，一室一厅，民用水电\n你要视频、图片或者看房方式的话，直接回序号就行。"
+        )
+
+        self.assertIn("民用水电\n你要视频", reply)
+        self.assertNotIn("民用水电、你要视频", reply)
 
     def test_customer_visible_format_selfcheck_rejects_internal_leakage(self) -> None:
         result = main._constraint_consistency_selfcheck(
@@ -7897,6 +8433,174 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["selfcheck"]["rule"]["source"], "planner_output_gate")
         self.assertIn("不能进入最终自检", result["selfcheck"]["rule"]["reason"])
 
+    async def test_inventory_rows_after_planner_retry_use_tool_grounded_reply(self) -> None:
+        class FakeReplyGenerator:
+            async def plan_kf_reply_text(self, **kwargs):
+                return {"reply_text": "", "source": "fake_planner_reply_empty_after_retry"}
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        rows = [
+            {"区域": "石桥街道 华丰 石桥 永佳 半山", "小区": "兴业杨家府", "房号": "4-1502", "户型分类": "一室一厅", "押一付一": "4500", "押二付一": "4200", "备注": "民用水电"},
+            {"区域": "石桥街道 华丰 石桥 永佳 半山", "小区": "兴业杨家府", "房号": "10-1-1205", "户型分类": "两室一厅", "押一付一": "3900", "押二付一": "3700", "备注": "民用水电"},
+        ]
+        originals = {"agentic_rag": main.agentic_rag, "reply_generator": main.reply_generator}
+        main.agentic_rag = FakeRag()
+        main.reply_generator = FakeReplyGenerator()
+        try:
+            result = await main._generate_reply_result(
+                content="兴业杨家府有什么房",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "兴业杨家府有哪些在租房源",
+                    "constraint_proof": {"intent": "inventory", "communities": ["兴业杨家府"]},
+                    "structured_task": {"intent": "inventory"},
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "inventory_rows": rows,
+                    "target_rows": rows,
+                },
+                planner_result={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "reply_text": "",
+                },
+                retry_reason="planner_retry_after_empty_reply",
+            )
+        finally:
+            main.agentic_rag = originals["agentic_rag"]
+            main.reply_generator = originals["reply_generator"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("兴业杨家府4-1502", result["reply"])
+        self.assertIn("兴业杨家府10-1-1205", result["reply"])
+        self.assertNotIn("先不乱发", result["reply"])
+        self.assertEqual(result["planner_reply_result"]["source"], "tool_grounded_inventory_reply_after_planner_retry")
+
+    async def test_inventory_rows_replace_invalid_planner_clarification_reply(self) -> None:
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        rows = [
+            {"区域": "石桥街道 华丰 石桥 永佳 半山", "小区": "兴业杨家府", "房号": "4-1502", "户型分类": "一室一厅", "押一付一": "4500", "押二付一": "4200", "备注": "民用水电"},
+            {"区域": "石桥街道 华丰 石桥 永佳 半山", "小区": "兴业杨家府", "房号": "10-1-1205", "户型分类": "两室一厅", "押一付一": "3900", "押二付一": "3700", "备注": "民用水电"},
+        ]
+        originals = {"agentic_rag": main.agentic_rag, "reply_generator": main.reply_generator}
+        main.agentic_rag = FakeRag()
+        main.reply_generator = FakeReplyGenerator()
+        try:
+            result = await main._generate_reply_result(
+                content="兴业杨家府有什么房",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "兴业杨家府有哪些在租房源",
+                    "constraint_proof": {"intent": "inventory", "communities": ["兴业杨家府"]},
+                    "structured_task": {"intent": "inventory"},
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "inventory_rows": rows,
+                    "target_rows": rows,
+                },
+                planner_result={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "reply_text": "我这边为了避免发错，先不乱发。你把小区+房号或更具体条件发我一下，我重新按最新房源表查准。",
+                },
+                retry_reason="",
+            )
+        finally:
+            main.agentic_rag = originals["agentic_rag"]
+            main.reply_generator = originals["reply_generator"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("兴业杨家府4-1502", result["reply"])
+        self.assertIn("兴业杨家府10-1-1205", result["reply"])
+        self.assertNotIn("先不乱发", result["reply"])
+        self.assertEqual(result["planner_reply_result"]["source"], "tool_grounded_inventory_reply_replaced_invalid_planner_reply")
+
+    async def test_inventory_rows_final_retry_never_falls_back_to_repeat_room_request(self) -> None:
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        rows = [
+            {"区域": "石桥街道 华丰 石桥 永佳 半山", "小区": "兴业杨家府", "房号": "4-1502", "户型分类": "一室一厅", "押一付一": "4500", "押二付一": "4200", "备注": "民用水电"},
+            {"区域": "石桥街道 华丰 石桥 永佳 半山", "小区": "兴业杨家府", "房号": "10-1-1205", "户型分类": "两室一厅", "押一付一": "3900", "押二付一": "3700", "备注": "民用水电"},
+        ]
+        originals = {
+            "agentic_rag": main.agentic_rag,
+            "reply_generator": main.reply_generator,
+            "_outbound_package_selfcheck": main._outbound_package_selfcheck,
+        }
+        main.agentic_rag = FakeRag()
+        main.reply_generator = FakeReplyGenerator()
+        main._outbound_package_selfcheck = lambda **kwargs: {
+            "status": "retry",
+            "action": "retry",
+            "reason": "forced_package_retry",
+            "source": "test_forced_package_retry",
+        }
+        try:
+            result = await main._generate_reply_result(
+                content="兴业杨家府有什么房",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "兴业杨家府有哪些在租房源",
+                    "constraint_proof": {"intent": "inventory", "communities": ["兴业杨家府"]},
+                    "structured_task": {"intent": "inventory"},
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "inventory_rows": rows,
+                    "target_rows": rows,
+                },
+                planner_result={
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "reply_text": "我这边为了避免发错，先不乱发。你把小区+房号或更具体条件发我一下，我重新按最新房源表查准。",
+                },
+                retry_reason="forced_retry_after_first_selfcheck",
+            )
+        finally:
+            main.agentic_rag = originals["agentic_rag"]
+            main.reply_generator = originals["reply_generator"]
+            main._outbound_package_selfcheck = originals["_outbound_package_selfcheck"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("兴业杨家府4-1502", result["reply"])
+        self.assertIn("兴业杨家府10-1-1205", result["reply"])
+        self.assertNotIn("先不乱发", result["reply"])
+        self.assertNotIn("小区+房号或更具体条件", result["reply"])
+        self.assertEqual(
+            result["selfcheck"]["fallback"]["rule"]["source"],
+            "tool_grounded_inventory_final_fallback",
+        )
+
     async def test_selfcheck_retry_fallback_preserves_valid_video_actions(self) -> None:
         class FakeReplyGenerator:
             async def generate(self, *args, **kwargs):
@@ -8113,6 +8817,74 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("原视频/高清下载链接", result["reply"])
         self.assertIn("original_video_request", tool_evidence["outbound_package"])
         self.assertEqual(tool_evidence["outbound_package"]["video_paths"], [video.name])
+
+    async def test_original_video_request_includes_verified_source_link(self) -> None:
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        row = {"小区": "嘉樘星绣府", "房号": "9-603", "户型分类": "两室一厅"}
+        video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        video.write(b"video")
+        video.close()
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            tool_evidence = {
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "media_request": {"wants_video": True, "requested_count": 1},
+                "inventory_rows": [row],
+                "target_rows": [row],
+                "video_rows": [row],
+                "video_paths": [video.name],
+                "missing_media": [],
+                "original_video_urls": ["https://ccn9urs7d60k.feishu.cn/file/source-video"],
+                "material_page_urls": ["https://ccn9urs7d60k.feishu.cn/docx/source-doc"],
+                "original_video_request": {
+                    "requested": True,
+                    "has_original_source": True,
+                    "has_sendable_video": True,
+                    "sendable_video_count": 1,
+                },
+            }
+            result = await main._generate_reply_result(
+                content="这个视频太糊了，有没有原视频链接？",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "嘉樘星绣府9-603原视频链接",
+                    "constraint_proof": {
+                        "intent": "media",
+                        "wants_video": True,
+                        "wants_original_video": True,
+                        "room_refs": ["9-603"],
+                    },
+                    "structured_task": {"intent": "media"},
+                },
+                tool_evidence=tool_evidence,
+                planner_result={
+                    "actions": ["search_inventory", "send_video", "generate_reply"],
+                    "reply_text": "这套视频我先发你，原视频链接也给你。",
+                },
+                retry_reason="",
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+            Path(video.name).unlink(missing_ok=True)
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("https://ccn9urs7d60k.feishu.cn/file/source-video", result["reply"])
+        self.assertIn("https://ccn9urs7d60k.feishu.cn/docx/source-doc", result["reply"])
+        self.assertEqual(tool_evidence["outbound_package"]["original_video_urls"], ["https://ccn9urs7d60k.feishu.cn/file/source-video"])
 
     def test_missing_original_video_reply_mentions_no_high_resolution_source(self) -> None:
         row = {"小区": "长岳王马府", "房号": "4-2002", "户型分类": "两室一厅"}

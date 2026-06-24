@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import re
 
@@ -103,6 +104,31 @@ class MediaStore:
     def describe_paths(self, paths: list[Path]) -> list[str]:
         return [f"{path.parent.name}/{path.name}" for path in paths]
 
+    def original_video_sources_for_paths(self, paths: list[Path]) -> dict[str, list]:
+        manifest = self._load_media_source_manifest()
+        if not manifest or not paths:
+            return {
+                "original_video_paths": [],
+                "original_video_urls": [],
+                "material_page_urls": [],
+                "source_records": [],
+            }
+        by_key = self._media_source_records_by_key(manifest)
+        source_records: list[dict] = []
+        for path in paths:
+            for key in self._source_lookup_keys(path):
+                record = by_key.get(key)
+                if record:
+                    source_records.append(record)
+                    break
+        source_records = self._dedupe_source_records(source_records)
+        return {
+            "original_video_paths": self._source_record_values(source_records, ("original_path", "source_path")),
+            "original_video_urls": self._source_record_urls(source_records, ("original_url", "source_url", "download_url")),
+            "material_page_urls": self._source_record_urls(source_records, ("material_page_url", "feishu_url", "doc_url")),
+            "source_records": source_records,
+        }
+
     def public_urls(self, media: list[RoomMedia]) -> tuple[list[str], list[str]]:
         images: list[str] = []
         videos: list[str] = []
@@ -111,6 +137,99 @@ class MediaStore:
             images.extend(f"{base}/{self._to_public_path(path)}" for path in item.images)
             videos.extend(f"{base}/{self._to_public_path(path)}" for path in item.videos)
         return images, videos
+
+    def _load_media_source_manifest(self) -> dict:
+        path = settings.room_database_path / "media_sources.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _media_source_records_by_key(self, manifest: dict) -> dict[str, dict]:
+        records: list[dict] = []
+        raw_records = manifest.get("sources") or manifest.get("records") or []
+        if isinstance(raw_records, list):
+            records.extend(record for record in raw_records if isinstance(record, dict))
+        by_path = manifest.get("by_path") or {}
+        if isinstance(by_path, dict):
+            for key, record in by_path.items():
+                if isinstance(record, dict):
+                    records.append({"path": key, **record})
+        result: dict[str, dict] = {}
+        for record in records:
+            for key in self._record_lookup_keys(record):
+                result.setdefault(key, record)
+        return result
+
+    def _record_lookup_keys(self, record: dict) -> list[str]:
+        keys: list[str] = []
+        for field in ("path", "local_path", "file_path", "relative_path"):
+            value = str(record.get(field) or "").strip()
+            if value:
+                keys.append(self._normalize_source_path_key(value))
+                keys.append(self._normalize_text(value))
+        room = str(record.get("room") or record.get("room_key") or record.get("label") or "").strip()
+        filename = str(record.get("file_name") or record.get("name") or "").strip()
+        if room and filename:
+            keys.append(self._normalize_source_path_key(f"video/{room}/{filename}"))
+            keys.append(self._normalize_text(f"{room}/{filename}"))
+        return list(dict.fromkeys(key for key in keys if key))
+
+    def _source_lookup_keys(self, path: Path) -> list[str]:
+        keys = [
+            self._normalize_source_path_key(str(path)),
+            self._normalize_text(str(path)),
+            self._normalize_text(path.name),
+            self._normalize_text(f"{path.parent.name}/{path.name}"),
+            self._normalize_source_path_key(f"video/{path.parent.name}/{path.name}"),
+        ]
+        try:
+            relative = path.resolve().relative_to(settings.room_database_path.resolve())
+            keys.extend(
+                [
+                    self._normalize_source_path_key(str(relative)),
+                    self._normalize_text(str(relative)),
+                ]
+            )
+        except (OSError, ValueError):
+            pass
+        return list(dict.fromkeys(key for key in keys if key))
+
+    def _normalize_source_path_key(self, value: str) -> str:
+        return value.replace("\\", "/").strip().lstrip("./").lower()
+
+    def _source_record_values(self, records: list[dict], fields: tuple[str, ...]) -> list[str]:
+        values: list[str] = []
+        for record in records:
+            for field in fields:
+                value = str(record.get(field) or "").strip()
+                if value:
+                    values.append(value)
+                    break
+        return list(dict.fromkeys(values))
+
+    def _source_record_urls(self, records: list[dict], fields: tuple[str, ...]) -> list[str]:
+        values: list[str] = []
+        for value in self._source_record_values(records, fields):
+            if value.startswith(("http://", "https://")):
+                values.append(value)
+        return list(dict.fromkeys(values))
+
+    def _dedupe_source_records(self, records: list[dict]) -> list[dict]:
+        result: list[dict] = []
+        seen: set[str] = set()
+        for record in records:
+            marker = "|".join(
+                str(record.get(field) or "")
+                for field in ("path", "local_path", "file_path", "original_url", "material_page_url", "source_url")
+            )
+            marker = marker or json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            result.append(record)
+        return result
 
     def _extract_room_ids(self, rooms: list[dict]) -> list[str]:
         ids: list[str] = []

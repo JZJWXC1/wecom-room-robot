@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,26 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "看房方式密码": ("看房方式密码", "密码", "看房方式", "看房密码"),
     "备注": ("备注", "水电", "水电费", "说明"),
 }
+
+IMAGE_FIELD_ALIASES: tuple[str, ...] = (
+    "图片",
+    "房源图片",
+    "图片数量",
+    "image",
+    "images",
+    "image_count",
+    "has_image",
+)
+
+VIDEO_FIELD_ALIASES: tuple[str, ...] = (
+    "视频",
+    "房源视频",
+    "视频数量",
+    "video",
+    "videos",
+    "video_count",
+    "has_video",
+)
 
 DEFAULT_AREA_ALIASES: dict[str, str] = {
     "万达": "拱墅万达 北部软件园 城北万象城",
@@ -83,12 +104,23 @@ def build_rewrite_inventory_index(
 ) -> dict[str, Any]:
     aliases = dict(DEFAULT_AREA_ALIASES)
     aliases.update(area_aliases or {})
-    canonical_rows = [canonicalize_row(row) for row in rows]
-    canonical_rows = [row for row in canonical_rows if row.get("小区") or row.get("房号")]
+    row_pairs = [
+        (row, canonicalize_row(row))
+        for row in rows
+    ]
+    row_pairs = [
+        (raw, canonical)
+        for raw, canonical in row_pairs
+        if canonical.get("小区") or canonical.get("房号")
+    ]
+    raw_rows = [raw for raw, _ in row_pairs]
+    canonical_rows = [canonical for _, canonical in row_pairs]
+    media_summary = _media_summary(raw_rows, canonical_rows)
     payload_for_signature = {
         "rows": canonical_rows,
         "aliases": aliases,
         "field_semantics": FIELD_SEMANTICS,
+        "media_summary": media_summary,
         "cache_meta": cache_meta or {},
     }
     signature = hashlib.sha256(
@@ -110,6 +142,10 @@ def build_rewrite_inventory_index(
         "areas": _area_stats(canonical_rows),
         "communities": _community_stats(canonical_rows),
         "room_index": _room_index(canonical_rows),
+        "similar_communities": _similar_communities(canonical_rows),
+        "media_summary": media_summary,
+        "viewing_summary": _viewing_summary(canonical_rows),
+        "availability_summary": _availability_summary(canonical_rows),
         "rules": {
             "payment_fields": "押一付一/押二付一是对应付款方式下的月租价格，不是押金金额。",
             "utility_field": "备注字段是水电费收取方式。",
@@ -177,6 +213,10 @@ def slice_rewrite_inventory_index(
         "rules": index.get("rules") or {},
         "area_aliases": index.get("area_aliases") or [],
         "areas": _limit_list(index.get("areas") or [], limit=24),
+        "similar_communities": _limit_list(index.get("similar_communities") or [], limit=limit),
+        "media_summary": index.get("media_summary") or {},
+        "viewing_summary": index.get("viewing_summary") or {},
+        "availability_summary": index.get("availability_summary") or {},
         "exact_area_hits": area_hits,
         "exact_community_hits": _limit_list(communities, limit=limit),
         "room_ref_hits": _limit_list(room_hits, limit=limit),
@@ -224,6 +264,8 @@ def _community_stats(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
                 "rooms": [row.get("房号") or "" for row in community_rows if row.get("房号")][:80],
                 "layouts": _layout_distribution(community_rows),
                 "price_range": [min(prices), max(prices)] if prices else [],
+                "viewing_summary": _viewing_summary(community_rows),
+                "availability_summary": _availability_summary(community_rows),
             }
         )
     return result
@@ -246,9 +288,156 @@ def _room_index(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
                 "price_yayi": row.get("押一付一") or "",
                 "price_yaer": row.get("押二付一") or "",
                 "viewing": row.get("看房方式密码") or "",
+                "viewing_summary": _viewing_room_summary(row),
+                "availability": _availability_status(row.get("看房方式密码") or ""),
                 "utilities": row.get("备注") or "",
             }
         )
+    return result
+
+
+def _media_summary(raw_rows: list[dict[str, Any]], canonical_rows: list[dict[str, str]]) -> dict[str, Any]:
+    image_rooms: list[str] = []
+    video_rooms: list[str] = []
+    known_image_count = 0
+    known_video_count = 0
+    for raw, canonical in zip(raw_rows, canonical_rows):
+        label = canonical_room_key(canonical)
+        image_value = _media_value(raw, IMAGE_FIELD_ALIASES)
+        video_value = _media_value(raw, VIDEO_FIELD_ALIASES)
+        if image_value is not None:
+            known_image_count += 1
+            if image_value and label:
+                image_rooms.append(label)
+        if video_value is not None:
+            known_video_count += 1
+            if video_value and label:
+                video_rooms.append(label)
+    return {
+        "source": "inventory_row_media_fields_if_present",
+        "note": "只有源数据含图片/视频字段时才标记；没有字段时状态为 unknown，不推测。",
+        "room_count": len(canonical_rows),
+        "known_image_status_count": known_image_count,
+        "known_video_status_count": known_video_count,
+        "unknown_image_status_count": max(len(canonical_rows) - known_image_count, 0),
+        "unknown_video_status_count": max(len(canonical_rows) - known_video_count, 0),
+        "rooms_with_images": image_rooms[:200],
+        "rooms_with_videos": video_rooms[:200],
+    }
+
+
+def _media_value(row: dict[str, Any], aliases: tuple[str, ...]) -> bool | None:
+    for alias in aliases:
+        if alias not in row:
+            continue
+        value = row.get(alias)
+        if value is None:
+            return False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0
+        if isinstance(value, (list, tuple, set, dict)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if not text:
+            return False
+        if text in {"0", "false", "no", "none", "无", "没有", "暂无"}:
+            return False
+        return True
+    return None
+
+
+def _viewing_summary(rows: list[dict[str, str]]) -> dict[str, int]:
+    result = {
+        "has_viewing_text": 0,
+        "has_password": 0,
+        "needs_contact": 0,
+        "has_empty_out_hint": 0,
+        "unknown": 0,
+    }
+    for row in rows:
+        summary = _viewing_room_summary(row)
+        if not summary["has_viewing_text"]:
+            result["unknown"] += 1
+        if summary["has_viewing_text"]:
+            result["has_viewing_text"] += 1
+        if summary["has_password"]:
+            result["has_password"] += 1
+        if summary["needs_contact"]:
+            result["needs_contact"] += 1
+        if summary["has_empty_out_hint"]:
+            result["has_empty_out_hint"] += 1
+    return result
+
+
+def _viewing_room_summary(row: dict[str, str]) -> dict[str, bool]:
+    viewing = row.get("看房方式密码") or ""
+    return {
+        "has_viewing_text": bool(viewing.strip()),
+        "has_password": bool(re.search(r"\d{3,8}#?", viewing)),
+        "needs_contact": any(word in viewing for word in ("提前联系", "联系", "预约", "看房提前", "密码不对")),
+        "has_empty_out_hint": any(word in viewing for word in ("空出", "未空", "还没空", "转租", "待空")),
+    }
+
+
+def _availability_summary(rows: list[dict[str, str]]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for row in rows:
+        status = _availability_status(row.get("看房方式密码") or "")
+        result[status] = result.get(status, 0) + 1
+    return result
+
+
+def _availability_status(viewing: str) -> str:
+    text = viewing.strip()
+    if not text:
+        return "unknown"
+    if any(word in text for word in ("未空", "还没空", "待空")):
+        return "not_yet_vacant"
+    if "空出" in text or "转租" in text:
+        return "has_empty_out_hint"
+    if any(word in text for word in ("提前联系", "联系", "预约")):
+        return "needs_contact"
+    if re.search(r"\d{3,8}#?", text):
+        return "password_available"
+    return "viewing_text_only"
+
+
+def _similar_communities(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    communities = sorted({row.get("小区") or "" for row in rows if row.get("小区")})
+    normalized = {name: normalize_search_text(name) for name in communities}
+    result: list[dict[str, Any]] = []
+    for name in communities:
+        options: list[dict[str, Any]] = []
+        name_norm = normalized[name]
+        name_chars = {char for char in name_norm if "\u4e00" <= char <= "\u9fff"}
+        for other in communities:
+            if other == name:
+                continue
+            other_norm = normalized[other]
+            if not name_norm or not other_norm:
+                continue
+            score = SequenceMatcher(None, name_norm, other_norm).ratio()
+            shared_chars = name_chars & {char for char in other_norm if "\u4e00" <= char <= "\u9fff"}
+            contains_relation = name_norm in other_norm or other_norm in name_norm
+            if contains_relation or (score >= 0.35 and len(shared_chars) >= 2):
+                options.append(
+                    {
+                        "name": other,
+                        "normalized": other_norm,
+                        "score": round(score, 3),
+                    }
+                )
+        if options:
+            options.sort(key=lambda item: (-float(item["score"]), item["name"]))
+            result.append(
+                {
+                    "name": name,
+                    "normalized": name_norm,
+                    "options": options[:8],
+                }
+            )
     return result
 
 

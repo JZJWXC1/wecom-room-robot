@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -199,6 +200,38 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
                 )
 
                 self.assertEqual(matches, [image])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
+    def test_reads_original_video_source_manifest_for_matched_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                video_dir = settings.room_database_path / "video" / "棠润府15-2-801B"
+                video_dir.mkdir(parents=True)
+                video = video_dir / "棠润府15-2-801B.mp4"
+                video.write_bytes(b"video")
+                (settings.room_database_path / "media_sources.json").write_text(
+                    json.dumps(
+                        {
+                            "sources": [
+                                {
+                                    "path": "video/棠润府15-2-801B/棠润府15-2-801B.mp4",
+                                    "original_url": "https://ccn9urs7d60k.feishu.cn/file/source-video",
+                                    "material_page_url": "https://ccn9urs7d60k.feishu.cn/docx/source-doc",
+                                }
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+                sources = MediaStore().original_video_sources_for_paths([video])
+
+                self.assertEqual(sources["original_video_urls"], ["https://ccn9urs7d60k.feishu.cn/file/source-video"])
+                self.assertEqual(sources["material_page_urls"], ["https://ccn9urs7d60k.feishu.cn/docx/source-doc"])
             finally:
                 settings.room_database_path = previous_room_database_path
 
