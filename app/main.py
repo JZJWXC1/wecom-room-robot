@@ -3505,15 +3505,6 @@ def _target_rows_from_understanding(
         or proof.get("wants_image")
         or proof.get("wants_original_video")
     )
-    if wants_media and search_rows and proof_communities:
-        current_search_rows = [
-            row
-            for row in search_rows
-            if normalize_search_text(_row_value(row, ("小区", "小区名"))) in proof_communities
-        ]
-        if current_search_rows:
-            return current_search_rows[:KF_VIDEO_SEND_LIMIT]
-
     if wants_media:
         recent_media_rows = _recent_assistant_mentioned_rows(
             context,
@@ -3575,6 +3566,72 @@ def _target_rows_from_understanding(
     if len(search_rows) == 1:
         return search_rows
     return []
+
+
+def _media_target_error_for_unclear_room(
+    *,
+    content: str,
+    understanding: dict[str, Any],
+    search_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    proof = dict(understanding.get("constraint_proof") or {})
+    wants_media = bool(
+        proof.get("wants_video")
+        or proof.get("wants_image")
+        or proof.get("wants_original_video")
+    )
+    if not wants_media or not search_rows:
+        return {}
+
+    task = dict(understanding.get("structured_task") or {})
+    query_text = " ".join(
+        str(part).strip()
+        for part in (
+            content,
+            task.get("original_text"),
+            understanding.get("effective_query"),
+            understanding.get("rewritten_query"),
+            proof.get("budget_label"),
+        )
+        if str(part or "").strip()
+    )
+    if proof.get("room_refs") or _room_refs_from_text(query_text):
+        return {}
+    if _selected_indices_from_understanding(understanding, query_text):
+        return {}
+    if _has_explicit_candidate_selection(query_text):
+        return {}
+    if _has_single_room_context_pronoun(query_text):
+        return {}
+    if _media_request_targets_previous_candidates(str(task.get("original_text") or query_text)):
+        return {}
+    requested_count = _requested_room_count_from_text(query_text)
+    if requested_count or any(word in query_text for word in ("最合适", "推荐", "几套", "几间", "都发", "全部", "都要", "全发")):
+        return {}
+
+    proof_communities = {
+        normalize_search_text(str(item))
+        for item in proof.get("communities") or []
+        if normalize_search_text(str(item))
+    }
+    if not proof_communities:
+        return {}
+
+    matched_rows = [
+        row
+        for row in search_rows
+        if normalize_search_text(_row_value(row, ("小区", "小区名", "社区", "楼盘"))) in proof_communities
+    ]
+    if len(matched_rows) <= 1:
+        return {}
+
+    field = "视频" if proof.get("wants_video") or proof.get("wants_original_video") else "图片"
+    return {
+        "field": field,
+        "reason": "community_media_request_missing_room_ref",
+        "candidate_count": len(matched_rows),
+        "candidate_labels": [_row_label(row) for row in matched_rows[:10]],
+    }
 
 
 def _normalize_room_ref(value: str) -> str:
@@ -4938,9 +4995,18 @@ async def _execute_tools(
         rows = []
 
     field_followup_requires_specific_room = _field_followup_needs_specific_room(content, understanding)
+    media_target_error = (
+        {}
+        if pending_video_handled
+        else _media_target_error_for_unclear_room(
+            content=content,
+            understanding=understanding,
+            search_rows=rows,
+        )
+    )
     target_rows = (
         []
-        if pending_video_handled or field_followup_requires_specific_room
+        if pending_video_handled or field_followup_requires_specific_room or media_target_error
         else _target_rows_from_understanding(understanding, context, rows)
     )
     target_rows = _enforce_target_rows_community_constraints(target_rows, rows, proof)
@@ -5024,6 +5090,14 @@ async def _execute_tools(
         evidence["inventory_rows"] = []
     if (
         not target_rows
+        and not evidence.get("selection_error")
+        and media_target_error
+    ):
+        evidence["field_target_error"] = media_target_error
+        rows = []
+        evidence["inventory_rows"] = []
+    if (
+        not target_rows
         and "explain_unavailable_viewing" in actions
         and wants_bound_viewing_context
         and not invalid_candidate_selection
@@ -5051,6 +5125,7 @@ async def _execute_tools(
         and rows
         and not explicit_room_refs
         and not invalid_candidate_selection
+        and not media_target_error
         and any(action in actions for action in ("send_image", "send_video"))
     ):
         target_rows = rows[:KF_VIDEO_SEND_LIMIT]
@@ -6618,6 +6693,8 @@ def _reply_for_field_target_error(tool_evidence: dict[str, Any]) -> str:
         prefix = f"{field}要按具体房源查。"
     if candidate_labels:
         labels_text = "、".join(f"{index}. {label}" for index, label in enumerate(candidate_labels[:5], 1))
+        if error.get("reason") == "community_media_request_missing_room_ref":
+            return f"{prefix}这个小区有多套在租：{labels_text}。你回序号或小区+房号，我按那套给你查准。"
         return f"{prefix}刚才候选是：{labels_text}。你回序号或小区+房号，我按那套给你查准。"
     return f"{prefix}你把小区+房号发我，我马上按最新房源表查准。"
 

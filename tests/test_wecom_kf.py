@@ -3891,6 +3891,78 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("杨乐府9-604B", reply)
         self.assertIn("回序号或小区+房号", reply)
 
+    async def test_community_only_video_request_requires_room_selection(self) -> None:
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return [
+                    {"小区": "兴业杨家府", "房号": "10-1-1205", "户型分类": "两室一厅"},
+                    {"小区": "兴业杨家府", "房号": "3-601", "户型分类": "一室一厅"},
+                    {"小区": "兴业杨家府", "房号": "49-1102", "户型分类": "一室一厅"},
+                ]
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "send_video", "generate_reply"],
+                content="兴业杨家府有视频吗",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "查询兴业杨家府房源视频",
+                    "rewritten_query": "查询兴业杨家府房源视频",
+                    "constraint_proof": {
+                        "communities": ["兴业杨家府"],
+                        "wants_video": True,
+                    },
+                    "structured_task": {
+                        "original_text": "兴业杨家府有视频吗",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertEqual(evidence["video_paths"], [])
+        self.assertEqual(evidence["inventory_rows"], [])
+        self.assertEqual(
+            evidence["field_target_error"]["reason"],
+            "community_media_request_missing_room_ref",
+        )
+        self.assertEqual(evidence["field_target_error"]["field"], "视频")
+        self.assertIn("兴业杨家府10-1-1205", evidence["field_target_error"]["candidate_labels"])
+        self.assertIn("last_candidate_set", context)
+
+    def test_community_media_target_error_reply_asks_room_selection(self) -> None:
+        reply = main._reply_for_field_target_error(
+            {
+                "field_target_error": {
+                    "field": "视频",
+                    "reason": "community_media_request_missing_room_ref",
+                    "candidate_count": 3,
+                    "candidate_labels": [
+                        "兴业杨家府10-1-1205",
+                        "兴业杨家府3-601",
+                        "兴业杨家府49-1102",
+                    ],
+                }
+            }
+        )
+
+        self.assertIn("视频要按具体房源查", reply)
+        self.assertIn("这个小区有多套在租", reply)
+        self.assertIn("兴业杨家府10-1-1205", reply)
+        self.assertIn("回序号或小区+房号", reply)
+        self.assertNotIn("这是", reply)
+        self.assertNotIn("的视频", reply)
+
     def test_utilities_reply_does_not_include_deposit_policy_when_not_requested(self) -> None:
         reply = main._reply_for_deposit_and_utilities(
             {
@@ -6308,7 +6380,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["小区"] for row in rows], ["杨家新雅苑"])
         self.assertEqual([row["房号"] for row in rows], ["15-603"])
 
-    def test_explicit_media_community_overrides_stale_candidates_without_selection(self) -> None:
+    def test_explicit_media_community_without_room_ref_does_not_bind_multiple_rows(self) -> None:
         context = kf_context_memory.empty_context()
         context["last_candidate_set"] = {
             "candidates": [
@@ -6337,8 +6409,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         rows = main._target_rows_from_understanding(understanding, context, search_rows)
 
-        self.assertEqual([row["小区"] for row in rows], ["杨家新雅苑", "杨家新雅苑"])
-        self.assertEqual([row["房号"] for row in rows], ["15-603", "36-1102"])
+        self.assertEqual(rows, [])
 
     def test_original_video_followup_binds_recent_missing_media_rows(self) -> None:
         context = kf_context_memory.empty_context()
