@@ -201,7 +201,6 @@ def slice_rewrite_inventory_index(
         if str(item.get("canonical") or "").strip()
     }
     related_communities = _communities_for_areas(index, related_area_names)
-    communities = community_hits or related_communities
     return {
         "source": index.get("source"),
         "generated_at": index.get("generated_at"),
@@ -218,7 +217,8 @@ def slice_rewrite_inventory_index(
         "viewing_summary": index.get("viewing_summary") or {},
         "availability_summary": index.get("availability_summary") or {},
         "exact_area_hits": area_hits,
-        "exact_community_hits": _limit_list(communities, limit=limit),
+        "exact_community_hits": _limit_list(community_hits, limit=limit),
+        "area_related_communities": _limit_list(related_communities, limit=limit),
         "room_ref_hits": _limit_list(room_hits, limit=limit),
         "community_examples": _limit_list(index.get("communities") or [], limit=limit),
     }

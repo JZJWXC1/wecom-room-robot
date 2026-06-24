@@ -23,6 +23,32 @@ from app.services.wecom_kf import (
 )
 
 
+def test_constraint_selfcheck_does_not_force_search_terms_for_contract_followup() -> None:
+    result = main._constraint_consistency_selfcheck(
+        content="客户看中了怎么定房，合同怎么弄？",
+        draft_reply=(
+            "客户看中了就让他联系 18758141785 / 13282125992 / 19941091943 定房，"
+            "定金、签电子合同和具体入住时间都让这几个号码确认。"
+        ),
+        understanding={
+            "intent": "contract",
+            "constraint_proof": {
+                "area": "东新园\n杭氧\n新天地",
+                "budget_range": [4000, 5000],
+                "layout": "两室一厅",
+            },
+            "structured_task": {"tool_requirements": {"needs_contract_contact": True}},
+        },
+        tool_evidence={
+            "actions": ["search_inventory", "compact_listing", "send_contract_contact", "generate_reply"],
+            "rule_evidence": {"contract_contact": ["18758141785", "13282125992", "19941091943"]},
+            "inventory_rows": [{"小区": "长浜龙吟轩", "房号": "11-1603", "户型": "两室一厅"}],
+        },
+    )
+
+    assert result["status"] == "pass"
+
+
 class MainUnderstandingGuardTests(unittest.IsolatedAsyncioTestCase):
     async def test_deposit_question_does_not_need_room_clarification(self) -> None:
         class FakeReplyGenerator:
@@ -727,6 +753,25 @@ class WeComKfContextStoreTests(unittest.TestCase):
 
 
 class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
+    def _prepared_inventory_image(self) -> str:
+        image = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        try:
+            image.write(b"\x89PNG\r\n\x1a\n")
+            return image.name
+        finally:
+            image.close()
+            self.addCleanup(lambda: Path(image.name).unlink(missing_ok=True))
+
+    def test_prepared_inventory_image_fixture_is_real_png_temp_file(self) -> None:
+        image_path = Path(self._prepared_inventory_image())
+
+        assert image_path.exists()
+        assert image_path.stat().st_size > 0
+        assert image_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        assert Path.cwd().resolve() not in image_path.resolve().parents
+        image_path.unlink(missing_ok=True)
+        assert not image_path.exists()
+
     def test_first_stage_planner_reply_is_audit_only_until_tools_finish(self) -> None:
         planner = {
             "actions": ["search_inventory", "generate_reply"],
@@ -1959,7 +2004,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         class FakeReplyGenerator:
             def __init__(self) -> None:
                 self.rewrite_calls: list[dict] = []
-                self.plan_calls = 0
 
             async def rewrite_kf_message(self, **kwargs):
                 self.rewrite_calls.append(kwargs)
@@ -1972,6 +2016,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                         "context_reference": True,
                         "selected_indices": [],
                         "needs_clarification": False,
+                        "tool_plan": {"actions": ["generate_reply"], "confidence": 0.9},
                     }
                 return {
                     "intent": "media",
@@ -1981,17 +2026,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     "context_reference": True,
                     "selected_indices": [],
                     "needs_clarification": False,
-                }
-
-            async def plan_kf_tool_actions(self, **kwargs):
-                self.plan_calls += 1
-                if self.plan_calls == 1:
-                    return {
+                    "tool_plan": {
                         "actions": [],
                         "need_rewrite_clarification": True,
                         "missing_evidence": "缺少上下文绑定证据",
-                    }
-                return {"actions": ["generate_reply"], "confidence": 0.9}
+                    },
+                }
 
             async def generate(
                 self,
@@ -2060,7 +2100,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             for name, value in originals.items():
                 setattr(main, name, value)
 
-        self.assertEqual(fake_reply_generator.plan_calls, 2)
+        self.assertFalse(hasattr(fake_reply_generator, "plan_kf_tool_actions"))
         self.assertEqual(len(fake_reply_generator.rewrite_calls), 2)
         self.assertEqual(
             fake_reply_generator.rewrite_calls[1]["planner_feedback"]["missing_evidence"],
@@ -2867,14 +2907,10 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["constraint_proof"]["communities"], ["合嵣悦府"])
         self.assertIn("6-1-1204b", [str(item).lower() for item in result["constraint_proof"]["room_refs"]])
 
-    async def test_planner_receives_structured_task_contract_not_full_context(self) -> None:
+    async def test_orchestrator_tool_plan_drives_actions_without_old_planner_context(self) -> None:
         class FakeReplyGenerator:
             def __init__(self) -> None:
                 self.kwargs: dict = {}
-
-            async def plan_kf_tool_actions(self, **kwargs):
-                self.kwargs = kwargs
-                return {"actions": ["search_inventory", "generate_reply"], "confidence": 0.9}
 
         fake = FakeReplyGenerator()
         original = main.reply_generator
@@ -2887,21 +2923,24 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     "intent": "inventory",
                     "effective_query": "新天地4000左右两室",
                     "query_state": {"intent": "inventory"},
-                    "structured_task": {"intent": "inventory", "effective_query": "新天地4000左右两室"},
+                    "structured_task": {
+                        "intent": "inventory",
+                        "effective_query": "新天地4000左右两室",
+                    },
                     "entity_resolution": {"status": "resolved"},
                     "constraint_proof": {"area": "东新园\n杭氧\n新天地", "budget_range": [3500, 4500], "layout": "两室"},
+                    "tool_plan": {
+                        "actions": ["search_inventory", "generate_reply"],
+                        "confidence": 0.9,
+                        "reason": "按区域预算户型查房源",
+                    },
                 },
                 signals=main._deterministic_signals("新天地4000左右两室"),
             )
         finally:
             main.reply_generator = original
 
-        self.assertIn("structured_task", fake.kwargs)
-        self.assertIn("constraint_proof", fake.kwargs)
-        self.assertNotIn("planner_memory", fake.kwargs)
-        self.assertNotIn("candidate_set", fake.kwargs)
-        self.assertNotIn("recent_context", fake.kwargs)
-        self.assertNotIn("conversation_context", fake.kwargs)
+        self.assertEqual(fake.kwargs, {})
         self.assertFalse(result.get("need_rewrite_clarification"))
         self.assertEqual(result.get("reply_text"), "")
         self.assertIn("search_inventory", result.get("actions", []))
@@ -2910,13 +2949,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_planner_clarification_keeps_reply_text_empty(self) -> None:
         class FakeReplyGenerator:
-            async def plan_kf_tool_actions(self, **kwargs):
-                return {
-                    "actions": [],
-                    "need_rewrite_clarification": True,
-                    "missing_evidence": "小区名可能指杨家新雅苑或兴业杨家府，需要意图层追问。",
-                    "reply_text": "请问你说的是哪个杨家府？",
-                }
+            pass
 
         original = main.reply_generator
         main.reply_generator = FakeReplyGenerator()
@@ -2931,6 +2964,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     "structured_task": {"intent": "inventory", "effective_query": "杨家府还有房子吗"},
                     "entity_resolution": {"status": "ambiguous"},
                     "constraint_proof": {"communities": ["杨家府"]},
+                    "tool_plan": {
+                        "actions": [],
+                        "need_rewrite_clarification": True,
+                        "missing_evidence": "小区名可能指杨家新雅苑或兴业杨家府，需要意图层追问。",
+                        "reply_text": "请问你说的是哪个杨家府？",
+                    },
                 },
                 signals=main._deterministic_signals("杨家府还有房子吗"),
             )
@@ -3050,38 +3089,37 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeReplyGenerator:
             def __init__(self) -> None:
-                self.plan_calls: list[dict] = []
+                self.rewrite_calls: list[dict] = []
                 self.reply_calls: list[dict] = []
                 self.generate_calls = 0
                 self.selfcheck_calls = 0
 
             async def rewrite_kf_message(self, **kwargs):
+                self.rewrite_calls.append(kwargs)
+                if kwargs.get("planner_feedback"):
+                    return {
+                        "intent": "inventory",
+                        "rewritten_query": "拱墅万达1500左右在租房源",
+                        "effective_query": "拱墅万达1500左右在租房源",
+                        "query_state": {"intent": "inventory", "area": "拱墅万达", "budget": "1500左右"},
+                        "needs_clarification": False,
+                        "tool_plan": {
+                            "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                            "confidence": 0.95,
+                            "reason": "根据自检证据重做房源列表取证",
+                        },
+                    }
                 return {
                     "intent": "inventory",
                     "rewritten_query": "拱墅万达1500左右在租房源",
                     "effective_query": "拱墅万达1500左右在租房源",
                     "query_state": {"intent": "inventory", "area": "拱墅万达", "budget": "1500左右"},
                     "needs_clarification": False,
-                }
-
-            async def plan_kf_tool_actions(self, **kwargs):
-                self.plan_calls.append(kwargs)
-                if len(self.plan_calls) == 1:
-                    return {
+                    "tool_plan": {
                         "actions": ["generate_reply"],
                         "confidence": 0.9,
-                        "reason": "模拟 Planner 首次只规划回复动作",
-                    }
-                retry_reason = kwargs.get("planner_retry_reason") or ""
-                assert "original_content" in retry_reason
-                assert "effective_query" in retry_reason
-                assert "tool_evidence" in retry_reason
-                assert "draft_reply" in retry_reason
-                assert "llm_selfcheck" in retry_reason
-                return {
-                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
-                    "confidence": 0.95,
-                    "reason": "根据自检证据重规划房源列表回复",
+                        "reason": "模拟 Orchestrator 首次工具计划不完整",
+                    },
                 }
 
             async def plan_kf_reply_text(self, **kwargs):
@@ -3091,11 +3129,17 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                         "reply_text": "免押是支付宝无忧住，服务费5.5%-8%。",
                         "need_rewrite_clarification": False,
                         "reason": "模拟工具后 Planner 首次生成了答非所问的草稿",
+                        "selfcheck": {
+                            "status": "retry",
+                            "reason": "客户要查房源，草稿却回答免押，答非所问",
+                            "planner_retry_reason": "重新按拱墅万达1500左右查房源并生成列表回复",
+                        },
                     }
                 return {
                     "reply_text": "有的，拱墅万达1500左右目前查到合幢悦府6-1-1204B还在，押一付一1500。",
                     "need_rewrite_clarification": False,
                     "reason": "根据工具结果重新生成房源列表回复",
+                    "selfcheck": {"status": "pass", "reason": ""},
                 }
 
             async def assess_kf_final_reply(self, **kwargs):
@@ -3177,7 +3221,9 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             for name, value in originals.items():
                 setattr(main, name, value)
 
-        self.assertEqual(len(fake_reply_generator.plan_calls), 2)
+        self.assertFalse(hasattr(fake_reply_generator, "plan_kf_tool_actions"))
+        self.assertEqual(len(fake_reply_generator.rewrite_calls), 2)
+        self.assertIn("planner_retry_reason", fake_reply_generator.rewrite_calls[1]["planner_feedback"])
         self.assertEqual(len(fake_reply_generator.reply_calls), 2)
         self.assertEqual(fake_reply_generator.selfcheck_calls, 0)
         self.assertIn("合幢悦府6-1-1204B", fake_wecom.texts[-1])
@@ -6007,6 +6053,87 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("viewing_summary", sliced)
         self.assertIn("availability_summary", sliced)
 
+    def test_area_alias_slice_does_not_claim_exact_community_hit(self) -> None:
+        index = build_rewrite_inventory_index(
+            [
+                {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "石桥铭苑", "房号": "6-1102"},
+                {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "兴业杨家府", "房号": "3-601"},
+            ],
+            area_aliases=main.AREA_ALIASES,
+        )
+
+        sliced = main.slice_rewrite_inventory_index(index, query="石桥附近5000左右有两室吗")
+
+        self.assertTrue(sliced["exact_area_hits"])
+        self.assertEqual(sliced["exact_community_hits"], [])
+        related_names = {item["name"] for item in sliced["area_related_communities"]}
+        self.assertIn("石桥铭苑", related_names)
+
+    def test_inventory_rewrite_index_filters_area_alias_from_similar_community_candidates(self) -> None:
+        index = main._build_inventory_rewrite_index(
+            content="石桥街道附近3000-4000有两室吗？客户想今天先筛两套。",
+            rows=[
+                {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "石桥铭苑", "房号": "6-1102"},
+                {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "兴业杨家府", "房号": "3-601"},
+            ],
+            signals={},
+        )
+
+        self.assertTrue(index["exact_area_hits"])
+        self.assertEqual(index["exact_community_hits"], [])
+        self.assertFalse(
+            any(item["raw_text"] in {"石桥", "石桥街道"} for item in index["similar_community_candidates"])
+        )
+
+    async def test_understand_message_strips_area_alias_inferred_community(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "石桥铭苑 3000-4000 两室 在租房源",
+                    "effective_query": "石桥铭苑 3000-4000 两室 在租房源",
+                    "query_state": {
+                        "intent": "inventory",
+                        "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "community": "石桥铭苑",
+                        "budget": "3000-4000",
+                        "layout": "两室",
+                    },
+                    "needs_clarification": False,
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "石桥铭苑", "房号": "6-1102"},
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "兴业杨家府", "房号": "3-601"},
+                ]
+
+            def cache_meta(self):
+                return {"source_detail": "test"}
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="石桥街道附近3000-4000有两室吗？客户想今天先筛两套。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("石桥街道附近3000-4000有两室吗？客户想今天先筛两套。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertNotIn("石桥铭苑", str(result.get("effective_query") or ""))
+        self.assertNotIn("community", result.get("query_state") or {})
+        self.assertEqual(result["constraint_proof"].get("communities"), None)
+        self.assertEqual(result["constraint_proof"].get("area"), "石桥街道\n华丰\n石桥\n永佳\n半山")
+        self.assertEqual(
+            result.get("area_alias_community_stripped", {}).get("removed_communities"),
+            ["石桥铭苑"],
+        )
+
     async def test_current_room_query_overrides_stale_inventory_sheet_state(self) -> None:
         class FakeReplyGenerator:
             async def rewrite_kf_message(self, **kwargs):
@@ -6047,31 +6174,23 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("你说的是棠润府吗", result["clarification_text"])
 
     async def test_planner_video_requirement_is_hardened_when_llm_omits_send_video(self) -> None:
-        class FakeReplyGenerator:
-            async def plan_kf_tool_actions(self, **kwargs):
-                return {"actions": ["search_inventory", "generate_reply"], "confidence": 0.9}
-
-        fake = FakeReplyGenerator()
-        original = main.reply_generator
-        main.reply_generator = fake
-        try:
-            result = await main._plan_actions(
-                content="杨家新雅苑49-1102视频有吗？先发我。",
-                context=kf_context_memory.empty_context(),
-                understanding={
+        result = await main._plan_actions(
+            content="杨家新雅苑49-1102视频有吗？先发我。",
+            context=kf_context_memory.empty_context(),
+            understanding={
+                "intent": "media",
+                "effective_query": "杨家新雅苑49-1102视频",
+                "query_state": {"intent": "media", "wants_video": True},
+                "constraint_proof": {"wants_video": True, "room_refs": ["49-1102"]},
+                "structured_task": {
                     "intent": "media",
-                    "effective_query": "杨家新雅苑49-1102视频",
-                    "query_state": {"intent": "media", "wants_video": True},
-                    "constraint_proof": {"wants_video": True, "room_refs": ["49-1102"]},
-                    "structured_task": {
-                        "intent": "media",
-                        "tool_requirements": {"needs_video": True, "needs_inventory_search": True},
-                    },
+                    "tool_requirements": {"needs_video": True, "needs_inventory_search": True},
+                    "tool_plan": {"actions": ["search_inventory", "generate_reply"], "confidence": 0.9},
                 },
-                signals=main._deterministic_signals("杨家新雅苑49-1102视频有吗？先发我。"),
-            )
-        finally:
-            main.reply_generator = original
+                "tool_plan": {"actions": ["search_inventory", "generate_reply"], "confidence": 0.9},
+            },
+            signals=main._deterministic_signals("杨家新雅苑49-1102视频有吗？先发我。"),
+        )
 
         self.assertIn("send_video", result["actions"])
         self.assertIn("search_inventory", result["actions"])
@@ -6843,6 +6962,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
 
         originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        inventory_image = self._prepared_inventory_image()
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
         try:
@@ -6856,7 +6976,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
                 tool_evidence={
                     "actions": ["send_inventory_sheet"],
-                    "inventory_images": ["room_database/inventory_01.png"],
+                    "inventory_images": [inventory_image],
                 },
                 planner_result={
                     "actions": ["send_inventory_sheet"],
@@ -6869,6 +6989,51 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["needs_planner_retry"])
         self.assertIn("房源表发你了", result["reply"])
+
+    async def test_inventory_sheet_missing_image_action_still_requires_retry(self) -> None:
+        class FakeReplyGenerator:
+            async def generate(self, *args, **kwargs):
+                return ReplyPlan(text="checking inventory sheet")
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        missing_image = str(Path(tempfile.gettempdir()) / "missing_inventory_sheet_m05b.png")
+        Path(missing_image).unlink(missing_ok=True)
+        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="send inventory sheet",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory_sheet",
+                    "constraint_proof": {"wants_inventory_sheet": True},
+                    "structured_task": {"tool_requirements": {"needs_inventory_sheet": True}},
+                },
+                tool_evidence={
+                    "actions": ["send_inventory_sheet"],
+                    "inventory_images": [missing_image],
+                },
+                planner_result={
+                    "actions": ["send_inventory_sheet"],
+                    "reply_text": "inventory sheet sent",
+                },
+            )
+        finally:
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertTrue(result["needs_planner_retry"])
+        self.assertEqual(result["selfcheck"]["rule"]["source"], "outbound_package_selfcheck")
 
     def test_inventory_sheet_reply_normalization_removes_unasked_media_clause(self) -> None:
         reply = main._normalize_inventory_sheet_reply_before_selfcheck(
@@ -7069,6 +7234,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
 
         originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        inventory_image = self._prepared_inventory_image()
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
         try:
@@ -7085,7 +7251,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
                 tool_evidence={
                     "actions": ["send_inventory_sheet"],
-                    "inventory_images": ["room_database/inventory_01.png"],
+                    "inventory_images": [inventory_image],
                 },
                 planner_result={
                     "actions": ["send_inventory_sheet"],
@@ -7194,6 +7360,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
         fake_reply = FakeReplyGenerator()
+        inventory_image = self._prepared_inventory_image()
         main.reply_generator = fake_reply
         main.agentic_rag = FakeRag()
         try:
@@ -7207,7 +7374,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
                 tool_evidence={
                     "actions": ["send_inventory_sheet"],
-                    "inventory_images": ["room_database/inventory_01.png"],
+                    "inventory_images": [inventory_image],
                 },
                 planner_result={
                     "actions": ["send_inventory_sheet"],

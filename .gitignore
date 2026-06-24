@@ -10,7 +10,11 @@ data/wecom_kf_state.json
 data/wecom_kf_context.json
 dist/
 room_database/
-qa_artifacts/
+qa_artifacts/m0_baseline/
+qa_artifacts/m05a_baseline/
+qa_artifacts/rag_*.json
+qa_artifacts/redacted_*.json
+qa_artifacts/*.log
 server_snapshots/
 .understand-anything/
 .codex-test-deps/

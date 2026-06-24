@@ -78,6 +78,81 @@ def test_agentic_rag_assessment_allows_inventory_bound_ambiguous_community_clari
     assert assessment.status == "pass"
 
 
+def test_agentic_rag_allows_sequence_guidance_with_concrete_inventory_list(tmp_path: Path) -> None:
+    service = KfAgenticRagService(knowledge_dir=tmp_path)
+
+    result = asyncio.run(
+        service.retrieve_for_reply(
+            content="新天地这边有没有4000左右的两室一厅？",
+            conversation_context="",
+            rooms=[
+                {"小区": "长浜龙吟轩", "房号": "11-1603", "户型": "两室一厅", "押一付一": "4200", "押二付一": "3900"},
+                {"小区": "嘉樘星绣府", "房号": "9-603", "户型": "两室一厅", "押一付一": "4200", "押二付一": "3900"},
+            ],
+            inventory_snapshot="长浜龙吟轩11-1603 两室一厅 押一付一4200 押二付一3900",
+        )
+    )
+    assessment = service.assess_reply(
+        content="新天地这边有没有4000左右的两室一厅？",
+        reply_text=(
+            "有的，新天地附近4000左右两室一厅目前查到这两套：\n"
+            "1. 长浜龙吟轩11-1603，两室一厅，押一付一4200，押二付一3900，民用水电\n"
+            "2. 嘉樘星绣府9-603，两室一厅，押一付一4200，押二付一3900，民用水电\n"
+            "如需视频、图片或者看房方式，你直接回序号就行。"
+        ),
+        rag_result=result,
+        retry_attempted=False,
+    )
+
+    assert assessment.status == "pass"
+
+
+def test_agentic_rag_still_rejects_empty_robotic_template_reply(tmp_path: Path) -> None:
+    service = KfAgenticRagService(knowledge_dir=tmp_path)
+
+    result = asyncio.run(
+        service.retrieve_for_reply(
+            content="租房咨询",
+            conversation_context="",
+            rooms=[],
+            inventory_snapshot="",
+        )
+    )
+    assessment = service.assess_reply(
+        content="租房咨询",
+        reply_text="感谢您的咨询，如需了解更多房源，请提供小区名和房号。",
+        rag_result=result,
+        retry_attempted=False,
+    )
+
+    assert assessment.status == "retry"
+    assert assessment.reason == "robotic_template_reply"
+
+
+def test_agentic_rag_does_not_require_budget_repeat_for_media_followup(tmp_path: Path) -> None:
+    service = KfAgenticRagService(knowledge_dir=tmp_path)
+
+    result = asyncio.run(
+        service.retrieve_for_reply(
+            content="前两套视频先发我，拱墅万达1500左右的一室",
+            conversation_context="",
+            rooms=[
+                {"小区": "合嵣悦府", "房号": "6-1-1204B", "户型": "一室一厅", "押一付一": "1500"},
+                {"小区": "荣润府", "房号": "15-2-801B", "户型": "一室一厅", "押一付一": "1600"},
+            ],
+            inventory_snapshot="合嵣悦府6-1-1204B 一室一厅 押一付一1500",
+        )
+    )
+    assessment = service.assess_reply(
+        content="前两套视频先发我，拱墅万达1500左右的一室",
+        reply_text="这两套房源我查到了，但本地暂时没找到视频：合嵣悦府6-1-1204B、荣润府15-2-801B。这次没有可发送的视频。",
+        rag_result=result,
+        retry_attempted=False,
+    )
+
+    assert assessment.status == "pass"
+
+
 def test_agentic_rag_topics_use_original_content_not_hallucinated_rewrite(tmp_path: Path) -> None:
     service = KfAgenticRagService(knowledge_dir=tmp_path)
 

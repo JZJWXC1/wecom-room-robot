@@ -112,12 +112,12 @@ def test_builtin_rule_cards_cover_budget_payment_scope() -> None:
     assert any(card.id == "planner_budget_payment_scope" for card in cards)
 
 
-def test_planner_prompt_includes_stage_rule_cards_without_full_context(monkeypatch, tmp_path) -> None:
+def test_rewrite_prompt_includes_stage_rule_cards_without_full_context(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(settings, "dashscope_api_key", "test-key")
-    monkeypatch.setattr(settings, "dashscope_planner_model", "planner-model")
+    monkeypatch.setattr(settings, "dashscope_rewrite_model", "rewrite-model")
     _write_card(
-        tmp_path / "planner_batch_video.md",
-        stage="planner",
+        tmp_path / "rewrite_batch_video.md",
+        stage="rewrite",
         intents="media",
         triggers="1和5 视频",
         content="1和5视频必须绑定候选编号，不能重新解释用户意图。",
@@ -130,7 +130,13 @@ def test_planner_prompt_includes_stage_rule_cards_without_full_context(monkeypat
             return SimpleNamespace(
                 choices=[
                     SimpleNamespace(
-                        message=SimpleNamespace(content='{"actions":["send_video"],"confidence":0.9}')
+                        message=SimpleNamespace(
+                            content=(
+                                '{"rewritten_query":"发送第1和第5套视频",'
+                                '"intent":"media",'
+                                '"tool_plan":{"actions":["search_inventory","context_tools","send_video","generate_reply"],"confidence":0.9}}'
+                            )
+                        )
                     )
                 ]
             )
@@ -139,18 +145,20 @@ def test_planner_prompt_includes_stage_rule_cards_without_full_context(monkeypat
     generator._client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
 
     result = asyncio.run(
-        generator.plan_kf_tool_actions(
+        generator.rewrite_kf_message(
             content="1和5视频",
-            structured_task={"intent": "media", "query_state": {"selected_indices": [1, 5]}},
-            entity_resolution={"status": "resolved"},
-            constraint_proof={"wants_video": True, "selected_indices": [1, 5]},
-            tool_catalog=["search_inventory", "send_video", "generate_reply"],
+            structured_memory={
+                "last_turn_record": {
+                    "query_state": {"intent": "media", "selected_indices": [1, 5]}
+                }
+            },
+            inventory_index={"communities": ["棠润府"], "room_keys": ["棠润府15-2-801B"]},
         )
     )
 
     prompt = captured["messages"][1]["content"]
-    assert result["actions"] == ["send_video"]
-    assert "Planner 相关规则卡片" in prompt
+    assert "send_video" in result["tool_plan"]["actions"]
+    assert "问题重写相关规则卡片" in prompt
     assert "1和5视频必须绑定候选编号" in prompt
     assert "raw_dialog_context" not in prompt
 

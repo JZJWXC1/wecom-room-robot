@@ -16,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.models import IncomingMessage
-from app.services import kf_agentic_rag, kf_context_memory, kf_turn_flow
+from app.services import kf_agentic_rag, kf_context_memory, kf_orchestrator_flow, kf_turn_flow
 from app.services.config_check import get_config_status
 from app.services.feishu import FeishuClient
 from app.services.fuzzy_match import (
@@ -603,6 +603,10 @@ def _safe_action_list(planner_result: dict[str, Any]) -> list[str]:
     if planner_result.get("allow_all") and not actions:
         return ["search_inventory", "generate_reply"]
     return actions
+
+
+def _orchestrator_tool_plan_from_understanding(understanding: dict[str, Any]) -> dict[str, Any]:
+    return kf_orchestrator_flow.tool_plan_from_understanding(understanding)
 
 
 def _wants_continue_pending_video(content: str, understanding: dict[str, Any]) -> bool:
@@ -1390,6 +1394,84 @@ def _possible_community_mentions(text: str) -> list[str]:
     return list(dict.fromkeys(mentions))
 
 
+def _looks_like_area_alias_mention(mention: str, area_hits: list[dict[str, Any]]) -> bool:
+    normalized = normalize_search_text(mention)
+    if not normalized:
+        return False
+    for hit in area_hits:
+        raw = normalize_search_text(str(hit.get("raw_text") or ""))
+        canonical = normalize_search_text(str(hit.get("canonical") or ""))
+        if normalized == raw:
+            return True
+        if canonical and normalized in canonical:
+            return True
+    return False
+
+
+def _query_state_communities(query_state: dict[str, Any]) -> list[str]:
+    values: list[str] = []
+    for key in ("community", "communities", "小区"):
+        value = query_state.get(key)
+        if isinstance(value, list):
+            values.extend(str(item).strip() for item in value if str(item).strip())
+        elif isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    return list(dict.fromkeys(values))
+
+
+def _strip_llm_inferred_community_for_area_alias(
+    *,
+    content: str,
+    result: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not _area_alias_hits(content):
+        return result
+    query_state = dict(result.get("query_state") or {})
+    communities = _query_state_communities(query_state)
+    if not communities:
+        return result
+    known_communities = set(_community_names(rows))
+    normalized_content = normalize_search_text(content)
+    inferred = [
+        community
+        for community in communities
+        if community in known_communities
+        and normalize_search_text(community) not in normalized_content
+    ]
+    if not inferred:
+        return result
+
+    updated = dict(result)
+    updated_query_state = dict(query_state)
+    for key in ("community", "communities", "小区"):
+        value = updated_query_state.get(key)
+        if isinstance(value, list):
+            kept = [item for item in value if str(item).strip() not in inferred]
+            if kept:
+                updated_query_state[key] = kept
+            else:
+                updated_query_state.pop(key, None)
+        elif str(value or "").strip() in inferred:
+            updated_query_state.pop(key, None)
+    updated["query_state"] = updated_query_state
+
+    for key in ("rewritten_query", "effective_query"):
+        text = str(updated.get(key) or "")
+        if not text:
+            continue
+        cleaned = text
+        for community in inferred:
+            cleaned = cleaned.replace(community, "")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ，,、")
+        updated[key] = cleaned or content
+    updated["area_alias_community_stripped"] = {
+        "reason": "area_alias_query_not_specific_community",
+        "removed_communities": inferred,
+    }
+    return updated
+
+
 def _looks_like_possible_community_mention(value: str) -> bool:
     text = str(value or "").strip()
     if not 2 <= len(text) <= 8:
@@ -1729,7 +1811,12 @@ def _build_inventory_rewrite_index(
     sliced_index = slice_rewrite_inventory_index(persisted_index, query=rewrite_index_query)
     communities = _community_names(rows)
     community_items, communities_truncated = _community_counts(rows)
-    possible_mentions = _possible_community_mentions(content)
+    area_hits = _area_alias_hits(rewrite_index_query)
+    possible_mentions = [
+        mention
+        for mention in _possible_community_mentions(content)
+        if not _looks_like_area_alias_mention(mention, area_hits)
+    ]
     similar_candidates = [
         {
             "raw_text": mention,
@@ -1753,7 +1840,7 @@ def _build_inventory_rewrite_index(
         "areas": _area_counts(rows),
         "communities": community_items,
         "communities_truncated": communities_truncated,
-        "exact_area_hits": _area_alias_hits(rewrite_index_query),
+        "exact_area_hits": area_hits,
         "exact_community_hits": _community_alias_hits(rewrite_index_query, communities),
         "similar_community_candidates": similar_candidates[:8],
         "room_ref_hits": _room_ref_hits(rewrite_index_query, rows),
@@ -1810,7 +1897,11 @@ def _build_entity_resolution(text: str, rows: list[dict[str, Any]]) -> dict[str,
     community_status = "resolved" if community_hits else "none"
     community_options: list[dict[str, Any]] = []
     room_ref_hits = _room_ref_hits(text, rows)
-    possible_mentions = _possible_community_mentions(text)
+    possible_mentions = [
+        mention
+        for mention in _possible_community_mentions(text)
+        if not _looks_like_area_alias_mention(mention, area_hits)
+    ]
     community_corrections: list[dict[str, str]] = []
     unique_room_communities = list(
         dict.fromkeys(
@@ -4411,6 +4502,11 @@ async def _understand_message(
         dict(result.get("query_state") or {}),
     ):
         result = _drop_unasked_llm_inferred_layout_features(result, content=content)
+    result = _strip_llm_inferred_community_for_area_alias(
+        content=content,
+        result=result,
+        rows=resolution_rows,
+    )
     entity_resolution = _build_entity_resolution(content, resolution_rows)
     entity_resolution = _contextual_community_resolution(
         content=content,
@@ -4457,6 +4553,10 @@ async def _understand_message(
         entity_resolution=entity_resolution,
         constraint_proof=constraint_proof,
     )
+    orchestrator_tool_plan = _orchestrator_tool_plan_from_understanding(result)
+    if orchestrator_tool_plan:
+        result["tool_plan"] = orchestrator_tool_plan
+        result["structured_task"]["tool_plan"] = orchestrator_tool_plan
     result = _normalize_field_lookup_understanding(content, result)
     result = _force_pending_video_continue_task(content, result, context)
     constraint_proof = dict(result.get("constraint_proof") or constraint_proof)
@@ -4696,24 +4796,19 @@ async def _plan_actions(
     signals: dict[str, Any],
     retry_reason: str = "",
 ) -> dict[str, Any]:
-    effective_query = str(understanding.get("effective_query") or content)
-    try:
-        result = await reply_generator.plan_kf_tool_actions(
-            content=effective_query,
-            structured_task=understanding.get("structured_task") or {},
-            entity_resolution=understanding.get("entity_resolution") or {},
-            constraint_proof=understanding.get("constraint_proof") or {},
-            tool_catalog=list(TOOL_CATALOG),
-            planner_retry_reason=retry_reason,
-        )
-    except Exception as exc:
-        logger.exception("KF planner failed: %s", exc)
-        result = {}
-    if not isinstance(result, dict) or not result:
-        if signals.get("wants_inventory_sheet"):
-            result = {"actions": ["send_inventory_sheet"], "confidence": 0.8, "source": "fallback"}
-        else:
-            result = {"actions": ["search_inventory", "generate_reply"], "confidence": 0.5, "source": "fallback"}
+    result = _orchestrator_tool_plan_from_understanding(understanding)
+    if result:
+        result["source"] = f"{result.get('source') or 'orchestrator_pre_tool_plan'}+from_rewrite"
+    else:
+        result = {
+            "actions": _fallback_actions_from_structured_task(understanding, signals),
+            "confidence": 0.55,
+            "source": "structured_task_deterministic_plan",
+            "reason": "Orchestrator 工具前阶段未返回 tool_plan，按结构化任务和确定性信号补齐工具计划。",
+        }
+    if retry_reason:
+        result["planner_retry_reason"] = retry_reason
+        result["source"] = f"{result.get('source') or 'orchestrator_pre_tool_plan'}+retry_packet"
     if not _safe_action_list(result) and not result.get("need_rewrite_clarification"):
         result["actions"] = _fallback_actions_from_structured_task(understanding, signals)
         result["source"] = f"{result.get('source') or 'planner'}+structured_task_fallback"
@@ -5680,6 +5775,8 @@ def _constraint_consistency_selfcheck(
     )
     asks_inventory_existence = any(word in original for word in ("有没有", "还有吗", "有吗", "有哪些", "还在吗", "还在不在", "在不在", "在租吗"))
     inventory_actions = any(action in actions for action in ("search_inventory", "compact_listing"))
+    normalized_intent = _normalize_intent(understanding.get("intent"))
+    contract_contact_request = _understanding_wants_contract_contact(understanding, content=original)
     action_fulfills_primary_need = bool(
         ("send_inventory_sheet" in actions and tool_evidence.get("inventory_images"))
         or ((proof.get("wants_video") or proof.get("wants_image")) and (tool_evidence.get("video_paths") or tool_evidence.get("image_paths")))
@@ -5750,7 +5847,15 @@ def _constraint_consistency_selfcheck(
         if evidence_rows:
             room_labels = [_row_label(row) for row in evidence_rows[:8] if _row_label(row)]
             mentions_room = _reply_mentions_any(draft_reply, room_labels)
-            if (asks_inventory_existence or proof or _normalize_intent(understanding.get("intent")) == "inventory") and not mentions_room:
+            primary_inventory_reply_requires_room_mention = bool(
+                (asks_inventory_existence or normalized_intent == "inventory")
+                and normalized_intent not in {"contract", "deposit", "media", "viewing"}
+                and not contract_contact_request
+                and not wants_utilities
+                and not wants_price
+                and not wants_viewing
+            )
+            if primary_inventory_reply_requires_room_mention and not mentions_room:
                 fail_reasons.append("查到房源后回复必须列出至少一个真实小区+房号，不能只说查到几套")
             mentioned_count = sum(1 for label in room_labels if _reply_mentions_any(draft_reply, [label]))
             if re.search(r"(?:两|2)\s*套(?:都|均|全部)?(?:符合|满足|可以|还在|在租)", draft_reply) and mentioned_count < 2:
@@ -5864,10 +5969,22 @@ def _constraint_consistency_selfcheck(
     area = str(proof.get("area") or "").strip()
     communities = [str(item) for item in proof.get("communities") or [] if str(item).strip()]
     exact_room_bound = bool(proof.get("room_refs"))
-    if (
-        area
+    constraint_scope_requires_search_terms = bool(
+        inventory_actions
         and not pending_media_continue
         and not action_fulfills_primary_need
+        and not bound_single_room_field_followup
+        and not wants_utilities
+        and not wants_viewing
+        and not contract_contact_request
+        and normalized_intent not in {"media", "viewing", "deposit", "contract"}
+        and not proof.get("wants_video")
+        and not proof.get("wants_original_video")
+        and not proof.get("wants_image")
+    )
+    if (
+        area
+        and constraint_scope_requires_search_terms
         and not exact_room_bound
         and not communities
         and not bound_single_room_field_followup
@@ -5876,7 +5993,7 @@ def _constraint_consistency_selfcheck(
         if not _reply_mentions_any(draft_reply, area_tokens) and len(evidence_rows) != 1:
             fail_reasons.append(f"回复遗漏区域约束：{area.replace(chr(10), '/')}")
     budget_range = proof.get("budget_range") or []
-    if budget_range and not pending_media_continue and not action_fulfills_primary_need and not bound_single_room_field_followup:
+    if budget_range and constraint_scope_requires_search_terms:
         price_tokens = [str(value) for value in budget_range]
         price_tokens.extend(re.findall(r"\d{3,5}", original))
         row_price_tokens: list[str] = []
@@ -5897,17 +6014,15 @@ def _constraint_consistency_selfcheck(
     original_requests_layout = any(word in original for word in ("一室", "两室", "二室", "三室", "四室", "单间", "开间", "一厅", "两厅"))
     if (
         layout
-        and not pending_media_continue
-        and not action_fulfills_primary_need
-        and not bound_single_room_field_followup
+        and constraint_scope_requires_search_terms
         and (not exact_room_bound or original_requests_layout)
         and not _reply_mentions_any(draft_reply, [layout, layout.replace("两", "二"), layout.replace("二", "两")])
     ):
         fail_reasons.append(f"回复遗漏户型约束：{layout}")
     features = [str(item).strip() for item in proof.get("features") or [] if str(item).strip()]
-    if features and not action_fulfills_primary_need and not _reply_mentions_any(draft_reply, features):
+    if features and constraint_scope_requires_search_terms and not _reply_mentions_any(draft_reply, features):
         fail_reasons.append(f"回复遗漏特征约束：{'、'.join(features[:3])}")
-    if communities and not action_fulfills_primary_need and not _reply_mentions_any(draft_reply, communities):
+    if communities and constraint_scope_requires_search_terms and not _reply_mentions_any(draft_reply, communities):
         fail_reasons.append(f"回复遗漏已归一小区：{'、'.join(communities[:3])}")
     if wants_utilities:
         utility_values = [
@@ -7553,6 +7668,14 @@ def _needs_llm_final_selfcheck(
     rule_status = str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower()
     if rule_status != "pass":
         return False
+    planner_stage_selfcheck = kf_orchestrator_flow.planner_reply_selfcheck(
+        tool_evidence.get("planner_reply_result") or {}
+    )
+    if (
+        deterministic_reply_source == "planner_reply_text"
+        and str(planner_stage_selfcheck.get("status") or "").lower() == "pass"
+    ):
+        return False
     if retry_reason:
         return False
     proof = dict(understanding.get("constraint_proof") or {})
@@ -7962,6 +8085,47 @@ async def _generate_reply_result(
             "needs_planner_retry": False,
             "planner_retry_reason": retry_payload,
         }
+    planner_stage_selfcheck = kf_orchestrator_flow.planner_reply_selfcheck(planner_reply_result)
+    planner_stage_status = kf_orchestrator_flow.planner_reply_selfcheck_status(planner_reply_result)
+    if planner_stage_status in {"retry", "fallback"} and not retry_reason:
+        stage_reason = str(
+            planner_stage_selfcheck.get("planner_retry_reason")
+            or planner_stage_selfcheck.get("reason")
+            or "Planner 工具后阶段自检未通过。"
+        )
+        retry_payload = _planner_retry_reason_payload(
+            content=content,
+            understanding=understanding,
+            planner_result=planner_result or {},
+            tool_evidence=tool_evidence,
+            draft_reply=planner_reply,
+            rule_selfcheck={
+                "status": planner_stage_status,
+                "source": "planner_reply_text_selfcheck",
+                "reason": stage_reason,
+            },
+            llm_selfcheck=planner_stage_selfcheck,
+            reason=stage_reason,
+        )
+        return {
+            "reply": "",
+            "draft_reply": planner_reply,
+            "planner_reply_result": planner_reply_result,
+            "context": context,
+            "selfcheck": {
+                "status": planner_stage_status,
+                "rule": {
+                    "status": planner_stage_status,
+                    "source": "planner_reply_text_selfcheck",
+                    "reason": stage_reason,
+                },
+                "llm": planner_stage_selfcheck,
+            },
+            "needs_planner_retry": True,
+            "planner_retry_reason": retry_payload,
+        }
+    if planner_stage_selfcheck:
+        tool_evidence["planner_reply_stage_selfcheck"] = planner_stage_selfcheck
     actions = [str(action) for action in tool_evidence.get("actions") or []]
     clarification_only = bool(actions) and all(action == "clarification" for action in actions)
     inventory_text = inventory.format_rows(rows, limit=10) if rows else ""
@@ -8752,7 +8916,45 @@ async def _process_text_turn(
             if reply_result.get("needs_planner_retry") and attempt == 0:
                 final_draft_reply = str(reply_result.get("draft_reply") or "")
                 retry_reason = str(reply_result.get("planner_retry_reason") or "final_selfcheck_retry")
+                planner_feedback = {
+                    "planner_retry_reason": retry_reason,
+                    "selfcheck_result": reply_result.get("selfcheck") or {},
+                    "planner_result": planner_result,
+                    "tool_evidence_summary": _tool_evidence_summary(tool_evidence),
+                }
+                with timer.stage("rewrite_intent"):
+                    understanding = await _understand_message(
+                        content=content,
+                        context=context,
+                        signals=signals,
+                        planner_feedback=planner_feedback,
+                    )
+                _raise_if_stale_kf_turn(conversation_key, generation)
+                context["active_query_state"] = dict(understanding.get("query_state") or {})
+                context = kf_context_memory.update_structured_state(
+                    context,
+                    state=_state_from_understanding(understanding),
+                    rewrite_result=understanding,
+                ) or context
                 _save_context(open_kfid, external_userid, context)
+                if understanding.get("needs_clarification"):
+                    reply = str(understanding.get("clarification_text") or "").strip()
+                    if not reply:
+                        reply = "你把具体小区、房号或预算发我一下，我按最新房源表帮你查准。"
+                    clarification_result = await _finalize_clarification_reply(
+                        content=content,
+                        context=context,
+                        understanding=understanding,
+                        reply=reply,
+                        timer=timer,
+                    )
+                    final_reply = _normalize_customer_visible_reply_text_before_selfcheck(
+                        str(clarification_result.get("reply") or reply)
+                    )
+                    final_draft_reply = str(clarification_result.get("draft_reply") or final_reply)
+                    context = clarification_result.get("context") or context
+                    tool_evidence = {"actions": ["clarification"]}
+                    break
                 continue
             final_reply = str(reply_result.get("reply") or settings.default_fallback_reply)
             final_draft_reply = str(reply_result.get("draft_reply") or final_reply)

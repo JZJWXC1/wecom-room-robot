@@ -1129,9 +1129,35 @@ class KfAgenticRagService:
                 "有的，我按拱墅万达/北部软件园/城北万象城这片给你查，不用再确认城市。",
             )
 
+        action_followup = any(
+            word in content
+            for word in (
+                "视频",
+                "图片",
+                "照片",
+                "原视频",
+                "高清",
+                "水电",
+                "水费",
+                "电费",
+                "密码",
+                "看房",
+                "今天看",
+                "定房",
+                "订房",
+                "合同",
+                "免押",
+                "服务费",
+                "第",
+                "前两套",
+                "这套",
+                "这几套",
+            )
+        )
         budget = self._budget_constraint(content)
         if (
             budget
+            and not action_followup
             and not self._looks_like_disambiguation_reply(text)
             and self._looks_like_inventory_list_reply(text)
             and not self._reply_mentions_budget(text, budget)
@@ -1453,14 +1479,19 @@ class KfAgenticRagService:
         return text.strip()
 
     def _looks_like_robotic_template(self, reply_text: str) -> bool:
+        has_concrete_inventory_list = bool(
+            re.search(r"(?m)^\s*\d+[\.、]\s*\S{2,30}\d", reply_text)
+            and any(
+                marker in reply_text
+                for marker in ("押一付一", "押二付一", "民用水电", "水30/月", "电1元/度")
+            )
+        )
+        broad_guidance_phrases = () if has_concrete_inventory_list else ("请回复", "如需", "若需要", "您可以")
         robotic_phrases = (
             "请提供",
-            "请回复",
-            "如需",
-            "若需要",
-            "您可以",
             "感谢您的咨询",
             "希望能帮到你",
+            *broad_guidance_phrases,
         )
         return any(phrase in reply_text for phrase in robotic_phrases)
 

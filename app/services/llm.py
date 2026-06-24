@@ -63,11 +63,13 @@ class ReplyGenerator:
             tool_result_summary=inventory_index or {},
         )
         system_prompt = (
-            "你是租房客服 Agentic RAG 的问题重写器，只做理解和规划，不生成客服回复。"
+            "你是租房客服 Agentic RAG Orchestrator 的工具前阶段。你要合并完成问题重写、意图分析、目标是否明确、结构化任务包和工具计划。"
+            "本阶段不生成客户可见回复，只输出追问、结构化任务和工具计划。"
             "业务域固定为杭州当前房源表，不处理全国城市查询。"
             "已知区域别名必须直接归一：万达=拱墅万达/北部软件园/城北万象城，不得追问“哪个城市的万达”或“哪个万达广场”。"
             "你只能读取当前原始消息、黑匣子最小记忆、最新房源表事实索引和 Planner 回流证据。"
             "你还必须读取最新房源表事实索引；小区、区域、房号、可查询字段、是否需要追问，只能基于这个索引和上下文判断。"
+            "事实索引里的 exact_community_hits 只代表客户明确命中的小区；area_related_communities 只是区域下的小区示例，不能当成客户已经指定的小区。"
             "房源字段语义固定：押一付一/押二付一是不同付款方式下的月租价格；备注是水电费；户型描述是详细户型介绍和特点；看房方式密码是密码、空出时间、提前联系等看房方式。"
             "用户问“价格多少/多少钱/租金多少”但没有限定押一或押二时，必须理解为同时查询押一付一和押二付一两种月租价格，不能只写押一付一。"
             "用户原话里的房号必须逐字保留，不得删减楼栋、单元或连字符，例如 15-1-603 不能改成 15-603。"
@@ -119,10 +121,25 @@ Planner 回传的内部缺失证据：
   "candidate_action": "remainder|select|none",
   "selected_indices": [候选编号，1 开始],
   "needs_clarification": true 或 false,
-  "clarification_text": "需要澄清时给用户的一句话"
+  "clarification_text": "需要澄清时给用户的一句话",
+  "tool_plan": {{
+    "actions": ["按执行顺序排列的工具动作"],
+    "confidence": 0.0 到 1.0,
+    "need_rewrite_clarification": false,
+    "missing_evidence": "",
+    "reason": "为什么这样取证/执行"
+  }}
 }}
 
 规则：
+- tool_plan 是给确定性工具执行层的唯一工具前计划；目标明确时必须给出 actions，目标不明确时 tool_plan.need_rewrite_clarification=true 且 actions=[]。
+- tool_plan 不能包含客户可见 reply_text；最终话术只能在工具执行后生成。
+- 可用工具动作包括 search_inventory、compact_listing、context_tools、send_video、send_image、send_inventory_sheet、send_deposit_policy、send_contract_contact、explain_missing_media、explain_unavailable_viewing、generate_reply。
+- 需要查房源、价格、房态、预算、户型时，tool_plan 必须包含 search_inventory 和 generate_reply；多套列表加 compact_listing。
+- 需要视频/图片时，tool_plan 必须包含 search_inventory、context_tools、send_video/send_image、explain_missing_media、generate_reply。
+- 需要房源表时，tool_plan 只需要 send_inventory_sheet；如果同时还有视频/看房等明确需求，再补对应动作。
+- 需要看房/密码/今天能看时，tool_plan 必须包含 search_inventory、context_tools、explain_unavailable_viewing、generate_reply。
+- 需要免押时，tool_plan 必须包含 send_deposit_policy 和 generate_reply；需要定房/合同/交定金时，必须包含 send_contract_contact 和 generate_reply。
 - “还有哪4套”这类话，candidate_action 必须是 remainder，selected_indices 填未展示候选编号。
 - “万达1500左右有哪些”必须重写为拱墅万达/北部软件园/城北万象城区域 + 1500左右 + 在租房源查询。
 - “一室”默认宽匹配一室和一室一厅；不得追问“一室户还是一室一厅”。“一室带厅/有没有带厅/一室一厅”才精确匹配一室一厅。
@@ -152,105 +169,6 @@ Planner 回传的内部缺失证据：
         text = response.choices[0].message.content or "{}"
         return self._parse_json_object(text)
 
-    async def plan_kf_tool_actions(
-        self,
-        *,
-        content: str,
-        structured_task: dict[str, Any] | None = None,
-        entity_resolution: dict[str, Any] | None = None,
-        constraint_proof: dict[str, Any] | None = None,
-        tool_catalog: list[str] | None = None,
-        planner_retry_reason: str = "",
-    ) -> dict[str, Any]:
-        use_retry_model = bool(planner_retry_reason.strip())
-        if self._stage_api_key_missing("planner", retry=use_retry_model):
-            return {"allow_all": True, "source": "missing_llm_key"}
-        task = structured_task or {}
-        query_state = task.get("query_state") if isinstance(task.get("query_state"), dict) else {}
-        intent = str(task.get("intent") or query_state.get("intent") or "")
-        rule_cards = self.rule_knowledge.retrieve_text(
-            stage="planner",
-            intent=intent,
-            query_text=content,
-            query_state=query_state,
-            constraint_proof=constraint_proof or {},
-            retry_packet=planner_retry_reason,
-            tool_result_summary={"tool_catalog": tool_catalog or []},
-        )
-        system_prompt = (
-            "你是租房客服 Agentic RAG 的 Planner 第一阶段，只负责工具动作规划。"
-            "正确顺序固定为：读取结构化任务包 -> 规划工具调用 -> 工具执行返回证据 -> Planner 第二阶段再根据工具结果生成 reply_text。"
-            "你只能依据上游给出的结构化任务包、实体归一结果、约束证明和工具目录规划。"
-            "不得读取或推断原始对话，不得重新解释客户意图，不得改写 intent。"
-            "如果目标或证据不足，返回 need_rewrite_clarification=true 和 missing_evidence，交回问题重写层。"
-            "自检失败回流时，按 planner_retry_reason 纠正工具动作或补充必要证据。"
-            "工具结果不完整时，要规划解释动作，例如 explain_missing_media、explain_unavailable_viewing、send_contract_contact、send_deposit_policy。"
-            "本阶段严禁生成客户可见 reply_text；即使你输出了非空 reply_text，主流程也会丢弃，直到工具执行后进入 Planner 第二阶段。"
-            "字段语义固定：押一付一/押二付一是两种付款方式下的月租价格；备注是水电费收取方式；户型描述是详细户型介绍和特点；看房方式密码才是密码、空出、提前联系。"
-            "不要说“笔记”，客户说笔记时统一理解为房间详细信息或视频资料。"
-            "只返回 JSON，不要 Markdown。"
-        )
-        user_prompt = f"""
-当前可执行任务包 StructuredTask：
-{json.dumps(structured_task or {}, ensure_ascii=False, default=str)}
-
-实体归一结果 EntityResolutionResult：
-{json.dumps(entity_resolution or {}, ensure_ascii=False, default=str)}
-
-约束证明 ConstraintProof：
-{json.dumps(constraint_proof or {}, ensure_ascii=False, default=str)}
-
-工具目录 ToolCatalog：
-{json.dumps(tool_catalog or [], ensure_ascii=False, default=str)}
-
-自检失败回流证据 RetryPacket：
-{planner_retry_reason or "无"}
-
-Planner 相关规则卡片：
-{rule_cards or "无"}
-
-返回 JSON：
-{{
-  "actions": ["按执行顺序排列的 action，可用 explain_missing_media/explain_unavailable_viewing/send_deposit_policy"],
-  "reply_text": "",
-  "confidence": 0.0 到 1.0,
-  "need_rewrite_clarification": true 或 false,
-  "missing_evidence": "无法规划时缺少的真实证据，只给内部链路使用",
-  "reason": "一句话说明为什么这样规划"
-}}
-
-        规划规则：
-- need_rewrite_clarification=false 时必须输出可执行 actions；reply_text 必须为空，因为客户可见回复必须等工具执行后由 Planner 第二阶段生成。
-- 第一阶段的输出只代表“怎么取证据/怎么执行动作”，不能代表最终回复；最终回复必须由第二阶段读取 ToolEvidence 后生成。
-- need_rewrite_clarification=true 时 reply_text 只能为空，missing_evidence 要写清楚交给问题重写层补证据或生成追问。
-- intent=inventory_sheet 或 tool_requirements.needs_inventory_sheet=true，只选 send_inventory_sheet，可加 generate_reply，不得追问小区或价位。
-- intent=deposit 或 tool_requirements.needs_deposit_policy=true，必须包含 send_deposit_policy 和 generate_reply；如果 tool_requirements.needs_utilities=true，还必须包含 search_inventory/context_tools，用候选房源备注回答水电，不能只答免押。
-- intent=contract 或 tool_requirements.needs_contract_contact=true，必须包含 send_contract_contact 和 generate_reply。
-- intent=viewing 或 tool_requirements.needs_viewing_policy=true，必须包含 search_inventory、explain_unavailable_viewing、generate_reply。
-- 需要房源、价格、还在不在、预算筛选，必须包含 search_inventory；多套结果包含 compact_listing 和 generate_reply。
-- 需要视频/图片，必须包含 search_inventory 和对应 send_video/send_image；如果 target_binding 是候选编号或上下文追问，加 context_tools。
-- ConstraintProof.wants_video=true 或 tool_requirements.needs_video=true 时，actions 必须包含 send_video；wants_image=true 或 needs_image=true 时，actions 必须包含 send_image。
-- 有 send_video/send_image 时，如果素材可能缺失，必须允许 explain_missing_media 参与 Planner 第二阶段基于工具证据生成回复。
-- ConstraintProof 里的 area/budget_range/layout/room_refs/selected_indices 是硬约束，工具动作不能绕开。
-- EntityResolutionResult 未 resolved 时，不要猜，返回 need_rewrite_clarification=true。
-- 不得输出客户可见追问。
-"""
-        response = await self._client_for_stage(
-            "planner",
-            retry=use_retry_model,
-        ).chat.completions.create(
-            model=self._stage_model("planner", retry=use_retry_model),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,
-        )
-        text = response.choices[0].message.content or "{}"
-        data = self._parse_json_object(text)
-        data["source"] = "llm_tool_planner_structured"
-        return data
-
     async def plan_kf_reply_text(
         self,
         *,
@@ -279,7 +197,7 @@ Planner 相关规则卡片：
             tool_result_summary=evidence,
         )
         system_prompt = (
-            "你是租房客服 Agentic RAG 的 Planner 第二阶段，负责在工具执行后生成客户可见 reply_text。"
+            "你是租房客服 Agentic RAG Orchestrator 的工具后阶段，负责在工具执行后生成客户可见 reply_text，并同时完成最终 LLM 自检。"
             "你只能依据结构化任务包、实体归一结果、约束证明、第一阶段工具计划和工具结果证据写回复。"
             "不得重新解释客户意图，不得改写 intent，不得编造工具证据里没有的房源、价格、密码、视频或图片。"
             "如果工具结果不足以回答，reply_text 也必须自然说明缺什么、下一步怎么处理；不能空回复。"
@@ -311,6 +229,7 @@ Planner 相关规则卡片：
             "客户问今天能不能看、今天想看、怎么约看、自己看、密码时，reply_text 必须包含看房方式、空出时间、提前联系要求或预约联系方式，不能只回答价格水电。"
             "如果看房方式字段写的是“6.xx空出/看房提前联系”，必须按具体房源说空出时间或提前联系，不能泛称“这些房源都已空出/全部已空出”。"
             "话术要像真人中介客服，短一点、直接一点；不要写“系统显示”“根据您提供的信息”“作为机器人”等模板话。"
+            "返回 JSON 必须同时包含 reply_text 和 selfcheck；selfcheck 只检查你本次生成的回复是否事实一致、需求贴合、上下文连贯、口吻自然。"
             "只返回 JSON，不要 Markdown。"
         )
         user_prompt = f"""
@@ -343,7 +262,15 @@ Planner 相关规则卡片：
   "reply_text": "基于工具结果生成的客户可见回复，不能为空，必须自然且事实可证明",
   "need_rewrite_clarification": true 或 false,
   "missing_evidence": "无法生成时缺少的真实证据，只给内部链路使用",
-  "reason": "一句话说明为什么这样回复"
+  "reason": "一句话说明为什么这样回复",
+  "selfcheck": {{
+    "status": "pass|retry|fallback",
+    "reason": "不通过原因；通过则为空",
+    "planner_retry_reason": "给 Orchestrator 重试的证据包摘要",
+    "human_score": 0 到 100,
+    "fact_score": 0 到 100,
+    "demand_fit_score": 0 到 100
+  }}
 }}
 
 规则：
@@ -371,6 +298,7 @@ Planner 相关规则卡片：
 - 客户没有问视频/图片/房源表时，不要主动输出“没找到视频素材/可以先看房源表”。
 - 如果工具结果里有 suppress_actions=true，不要声称已经发送图片/视频/房源表。
 - 如果无法唯一绑定目标，need_rewrite_clarification=true，reply_text 为空。
+- selfcheck.status=pass 才代表工具后阶段认为回复可发送；如果发现事实不一致、动作说明缺失、上下文不连贯、口吻太模板、遗漏客户真实需求，必须 selfcheck.status=retry，并写清 planner_retry_reason。
 """
         response = await self._client_for_stage(
             "planner",
@@ -385,6 +313,20 @@ Planner 相关规则卡片：
         )
         text = response.choices[0].message.content or "{}"
         data = self._parse_json_object(text)
+        selfcheck = data.get("selfcheck")
+        if not isinstance(selfcheck, dict):
+            data["selfcheck"] = {
+                "status": "pass",
+                "source": "planner_reply_text_default_selfcheck",
+                "reason": "Planner 工具后阶段未显式返回 selfcheck，按兼容模式通过；主流程仍会执行本地硬规则自检。",
+            }
+        else:
+            status = str(selfcheck.get("status") or "pass").strip().lower()
+            if status not in {"pass", "retry", "fallback"}:
+                status = "retry"
+            selfcheck["status"] = status
+            selfcheck["source"] = "planner_reply_text_selfcheck"
+            data["selfcheck"] = selfcheck
         data["source"] = "llm_planner_reply_from_tools"
         return data
 

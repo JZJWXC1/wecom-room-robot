@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import ast
+import json
+from datetime import datetime
 from pathlib import Path
 
 from qa_artifacts import (
@@ -12,6 +15,15 @@ from qa_artifacts import (
 
 
 BAD_MOJIBAKE_PHRASES = ("涓囪揪", "鑽ｆ", "鐭虫", "鎴挎", "鍏嶆娂", "瑙嗛")
+
+
+def _windows_constant_from_source() -> list[dict[str, object]]:
+    source_path = Path(__file__).resolve().parents[1] / "qa_artifacts" / "run_rag_10windows_10turns_utf8.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", "") == "WINDOWS":
+            return ast.literal_eval(node.value)
+    raise AssertionError("WINDOWS constant not found")
 
 
 def test_all_qa_scripts_are_utf8_clean() -> None:
@@ -46,7 +58,7 @@ def test_full_test_text_window_inputs_pass_chinese_integrity() -> None:
 
     assert report["full"]["passed"], report
     assert report["window"]["passed"], report
-    assert report["window"]["first_user_raw"] == "万达附近1500左右还有哪些？先发几套视频我筛一下。"
+    assert report["window"]["first_user_raw"] == run_rag_10windows_10turns_utf8.WINDOWS[0]["turns"][0]
 
 
 def test_required_single_window_inputs_pass_chinese_integrity() -> None:
@@ -61,7 +73,21 @@ def test_required_single_window_inputs_pass_chinese_integrity() -> None:
 
     assert report["full"]["passed"], report
     assert report["window"]["passed"], report
-    assert report["window"]["first_user_raw"] == "万达附近1500左右还有哪些？先发几套视频我筛一下。"
+    assert report["window"]["first_user_raw"] == run_rag_10windows_10turns_utf8.WINDOWS[0]["turns"][0]
+
+
+def test_fixture_questions_match_windows_constant_without_importing_source_script() -> None:
+    windows = _windows_constant_from_source()
+    full_fixture = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "qa" / "test_text_full_utf8.json").read_text(encoding="utf-8")
+    )
+    single_fixture = json.loads(
+        (Path(__file__).resolve().parent / "fixtures" / "qa" / "single_window_required_utf8.json").read_text(encoding="utf-8")
+    )
+    flattened = [turn for window in windows for turn in window["turns"]]
+
+    assert single_fixture["questions"] == windows[0]["turns"]
+    assert full_fixture["questions"] == flattened
 
 
 def test_partial_10window_qa_cannot_be_marked_full_suite_completed() -> None:
@@ -105,7 +131,151 @@ def test_random_guard_qa_generation_is_utf8_clean_and_covers_required_categories
     assert integrity["passed"], integrity
     assert coverage["passed"], coverage
     assert windows[0]["turns"][0]
+
+
+def test_qa_artifact_filename_is_ascii_and_not_based_on_user_text() -> None:
+    path = run_rag_10windows_10turns_utf8.artifact_path_for(
+        '客户问:新天地? "4000/5000" \\ 换行\n',
+        now=datetime(2026, 6, 24, 20, 30, 5),
+    )
+
+    assert path.name == "qa_artifact_20260624_203005.json" or path.name.endswith("_20260624_203005.json")
+    assert all(ord(char) < 128 for char in path.name)
+    assert not any(char in path.name for char in '<>:"/\\|?*\r\n')
+    assert "客户" not in path.name
+    assert "新天地" not in path.name
+
+
+def test_qa_artifact_atomic_write_supports_chinese_space_path_and_bad_user_text(tmp_path) -> None:
+    target = tmp_path / "中文 目录" / "window_004_turn_035.json"
+    payload = {
+        "created_at": "2026-06-24T20:30:05",
+        "completed": True,
+        "quality_status": {"passed": True, "exit_code": 0},
+        "windows": [
+            {
+                "turns": [
+                    {
+                        "user": '冒号: 问号? 斜杠/反斜杠\\ "引号"\n换行',
+                        "bot": {"texts": ["正常写入"]},
+                        "problem": {"severity": "info"},
+                    }
+                ]
+            }
+        ],
+    }
+
+    run_rag_10windows_10turns_utf8._write_json_atomic(target, payload)
+
+    loaded = json.loads(target.read_text(encoding="utf-8"))
+    assert loaded["windows"][0]["turns"][0]["user"] == payload["windows"][0]["turns"][0]["user"]
+    assert target.name == "window_004_turn_035.json"
+
+
+def test_qa_artifact_failure_payload_is_infrastructure_error_not_completed() -> None:
+    payload = {
+        "completed": True,
+        "full_suite_completed": True,
+        "quality_status": {"passed": True, "exit_code": 0, "infrastructure_errors": []},
+        "windows": [],
+    }
+    failure = run_rag_10windows_10turns_utf8._artifact_write_failure_payload(
+        payload,
+        OSError(22, "Invalid argument"),
+        Path("bad:name.json"),
+    )
+
+    assert failure["completed"] is False
+    assert failure["full_suite_completed"] is False
+    assert failure["quality_status"]["passed"] is False
+    assert failure["quality_status"]["infrastructure_error"] is True
+    assert failure["quality_status"]["exit_code"] == 2
+    assert failure["quality_status"]["infrastructure_errors"][0]["target_path"] == "bad:name.json"
+
+
+def test_qa_canonical_hash_ignores_dynamic_fields_but_keeps_result_content() -> None:
+    first = {
+        "created_at": "2026-06-24T20:30:05",
+        "completed": False,
+        "quality_status": {"exit_code": 3, "high_count": 6, "medium_count": 2},
+        "windows": [{"turns": [{"elapsed_sec": 1.23, "bot": {"texts": ["回复A"]}, "problem": {"severity": "high"}}]}],
+    }
+    second = {
+        **first,
+        "created_at": "2026-06-24T20:31:05",
+        "windows": [{"turns": [{"elapsed_sec": 9.99, "bot": {"texts": ["回复A"]}, "problem": {"severity": "high"}}]}],
+    }
+    changed_reply = {
+        **first,
+        "windows": [{"turns": [{"elapsed_sec": 1.23, "bot": {"texts": ["回复B"]}, "problem": {"severity": "high"}}]}],
+    }
+
+    assert run_rag_10windows_10turns_utf8.canonical_result_hash(first) == run_rag_10windows_10turns_utf8.canonical_result_hash(second)
+    assert run_rag_10windows_10turns_utf8.canonical_result_hash(first) != run_rag_10windows_10turns_utf8.canonical_result_hash(changed_reply)
+
+
+def test_chinese_integrity_report_uses_repo_relative_posix_script_path() -> None:
+    windows = [{"id": "sample", "turns": ["万达 视频 图片 房源表 免押 水电 密码 定房 原视频"] * 10}]
+    report = run_rag_10windows_10turns_utf8.chinese_integrity_report(windows, required_tokens=())
+
+    assert report["script_path"] == "qa_artifacts/run_rag_10windows_10turns_utf8.py"
+    assert "\\" not in report["script_path"]
     assert all(len(window["turns"]) == 10 for window in windows)
+
+
+def test_fact_based_random_guard_uses_rewrite_inventory_index_rows() -> None:
+    sample_index = {
+        "signature": "sig-test",
+        "generated_at": "2026-06-24T15:00:00+08:00",
+        "area_aliases": [
+            {"alias": "新天地", "canonical": "东新园 杭氧 新天地"},
+            {"alias": "万达", "canonical": "拱墅万达 北部软件园 城北万象城"},
+        ],
+        "similar_communities": [
+            {"name": "棠润府", "options": [{"name": "荣润府"}]},
+        ],
+        "room_index": [
+            {
+                "area": "东新园 杭氧 新天地",
+                "community": "棠润府",
+                "room_no": "15-2-801B",
+                "layout": "一室一厅",
+                "price_yayi": "1600",
+                "price_yaer": "1400",
+            },
+            {
+                "area": "拱墅万达 北部软件园 城北万象城",
+                "community": "兴业杨家府",
+                "room_no": "10-1-1205",
+                "layout": "两室一厅",
+                "price_yayi": "3900",
+                "price_yaer": "3700",
+            },
+            {
+                "area": "拱墅万达 北部软件园 城北万象城",
+                "community": "荣润府",
+                "room_no": "1-602A",
+                "layout": "一室一厅",
+                "price_yayi": "1900",
+                "price_yaer": "1700",
+            },
+        ],
+    }
+
+    windows = run_rag_random_guard_utf8.generate_fact_based_guard_windows(
+        sample_index,
+        seed=20260624,
+        count=10,
+    )
+    coverage = run_rag_random_guard_utf8.coverage_report(windows)
+
+    assert len(windows) == 10
+    assert coverage["passed"], coverage
+    assert all(window["generation_source"] == "rewrite_inventory_index" for window in windows)
+    joined = "\n".join(turn for window in windows for turn in window["turns"])
+    assert "棠润府" in joined or "兴业杨家府" in joined
+    assert "15-2-801B" in joined or "10-1-1205" in joined
+    assert "有视频吗？" in joined
 
 
 def test_qa_problem_detects_target_rows_violating_rewrite_community() -> None:
@@ -121,6 +291,28 @@ def test_qa_problem_detects_target_rows_violating_rewrite_community() -> None:
 
     assert problem["severity"] == "high"
     assert problem["likely_link"] == "Planner/工具目标绑定"
+
+
+def test_qa_problem_detects_area_query_narrowed_to_specific_community() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "石桥街道附近3000-4000有两室吗？客户想今天先筛两套。",
+            "bot": {"texts": ["暂时没查到石桥铭苑符合条件的房源。"], "video_count": 0},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {
+                "constraint_proof": {
+                    "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                    "communities": ["石桥铭苑"],
+                    "budget_range": [3000, 4000],
+                    "layout": "两室",
+                }
+            },
+            "tool": {"target_rows": [], "inventory_rows": []},
+        }
+    )
+
+    assert problem["severity"] == "high"
+    assert problem["likely_link"] == "问题重写/实体归一"
 
 
 def test_qa_problem_detects_unrequested_original_video_batch() -> None:

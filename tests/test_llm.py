@@ -7,9 +7,9 @@ from app.config import settings
 from app.services.llm import ReplyGenerator
 
 
-def test_plan_kf_tool_actions_uses_only_structured_contract(monkeypatch) -> None:
+def test_rewrite_kf_message_returns_orchestrator_tool_plan_contract(monkeypatch) -> None:
     monkeypatch.setattr(settings, "dashscope_api_key", "test-key")
-    monkeypatch.setattr(settings, "dashscope_planner_model", "planner-model")
+    monkeypatch.setattr(settings, "dashscope_rewrite_model", "rewrite-model")
 
     captured: dict[str, object] = {}
 
@@ -20,7 +20,11 @@ def test_plan_kf_tool_actions_uses_only_structured_contract(monkeypatch) -> None
                 choices=[
                     SimpleNamespace(
                         message=SimpleNamespace(
-                            content='{"actions":["send_video"],"confidence":0.9,"reason":"ok"}'
+                            content=(
+                                '{"rewritten_query":"万达1500左右一室",'
+                                '"intent":"inventory",'
+                                '"tool_plan":{"actions":["search_inventory","generate_reply"],"confidence":0.9}}'
+                            )
                         )
                     )
                 ]
@@ -31,27 +35,14 @@ def test_plan_kf_tool_actions_uses_only_structured_contract(monkeypatch) -> None
         chat=SimpleNamespace(completions=FakeCompletions())
     )
 
-    result = asyncio.run(
-        generator.plan_kf_tool_actions(
-            content="视频发我",
-            structured_task={
-                "intent": "media",
-                "effective_query": "发送棠润府1-101视频",
-                "tool_requirements": {"needs_video": True},
-            },
-            entity_resolution={"status": "resolved"},
-            constraint_proof={"wants_video": True, "room_refs": ["1-101"]},
-            tool_catalog=["search_inventory", "send_video", "generate_reply"],
-        )
-    )
+    result = asyncio.run(generator.rewrite_kf_message(content="万达1500左右有哪些"))
 
-    assert result["actions"] == ["send_video"]
-    assert result["source"] == "llm_tool_planner_structured"
-    assert captured["model"] == "planner-model"
+    assert result["tool_plan"]["actions"] == ["search_inventory", "generate_reply"]
     prompt = captured["messages"][1]["content"]
-    assert "客户：棠润府视频" not in prompt
-    assert "room_database" not in prompt
-    assert "StructuredTask" in prompt
+    system_prompt = captured["messages"][0]["content"]
+    assert "tool_plan" in prompt
+    assert "工具前阶段" in system_prompt
+    assert "最终话术只能在工具执行后生成" in prompt
 
 
 def test_plan_kf_reply_text_uses_tool_evidence_after_tools(monkeypatch) -> None:
@@ -94,9 +85,11 @@ def test_plan_kf_reply_text_uses_tool_evidence_after_tools(monkeypatch) -> None:
     )
 
     assert result["source"] == "llm_planner_reply_from_tools"
+    assert result["selfcheck"]["status"] == "pass"
     assert "棠润府15-2-801B" in result["reply_text"]
     prompt = captured["messages"][1]["content"]
     assert "工具结果证据 ToolEvidence" in prompt
+    assert "selfcheck" in prompt
     assert "棠润府" in prompt
     assert "pre_tool_reply_text" in prompt
     system_prompt = captured["messages"][0]["content"]
@@ -169,11 +162,11 @@ def test_reply_generator_routes_each_rag_stage_to_configured_model(monkeypatch) 
             model = kwargs["model"]
             captured_models.append(model)
             if model in {"planner-model", "retry-model"}:
-                content = '{"actions":["generate_reply"],"reply_text":"有的，我这边查到了。","confidence":0.9,"reason":"ok"}'
+                content = '{"reply_text":"有的，我这边查到了。","selfcheck":{"status":"pass","reason":"ok"},"reason":"ok"}'
             elif model == "selfcheck-model":
                 content = '{"status":"pass","reason":""}'
             else:
-                content = '{"rewritten_query":"万达2000以下一室","intent":"inventory"}'
+                content = '{"rewritten_query":"万达2000以下一室","intent":"inventory","tool_plan":{"actions":["search_inventory","generate_reply"],"confidence":0.9}}'
             return SimpleNamespace(
                 choices=[
                     SimpleNamespace(
@@ -189,21 +182,23 @@ def test_reply_generator_routes_each_rag_stage_to_configured_model(monkeypatch) 
 
     asyncio.run(generator.rewrite_kf_message(content="万达一室"))
     asyncio.run(
-        generator.plan_kf_tool_actions(
+        generator.plan_kf_reply_text(
             content="万达一室",
             structured_task={"intent": "inventory"},
             entity_resolution={"status": "resolved"},
             constraint_proof={"layout": "一室"},
-            tool_catalog=["search_inventory", "generate_reply"],
+            planner_result={"actions": ["search_inventory", "generate_reply"]},
+            tool_evidence={"target_rows": [{"小区": "万融城", "房号": "1-101"}]},
         )
     )
     asyncio.run(
-        generator.plan_kf_tool_actions(
+        generator.plan_kf_reply_text(
             content="万达一室",
             structured_task={"intent": "inventory"},
             entity_resolution={"status": "resolved"},
             constraint_proof={"layout": "一室"},
-            tool_catalog=["search_inventory", "generate_reply"],
+            planner_result={"actions": ["search_inventory", "generate_reply"]},
+            tool_evidence={"target_rows": [{"小区": "万融城", "房号": "1-101"}]},
             planner_retry_reason="自检失败，重新规划",
         )
     )
