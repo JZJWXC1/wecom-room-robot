@@ -48,6 +48,8 @@ data/inventory_snapshots/
 
 ## 快照标识
 
+`snapshot_id` 是一次构建/发布身份，不是内容寻址身份。相同规范内容在不同时间重新构建，可以得到不同 `snapshot_id`；确定性的内容身份由 `source_hash` 承担。
+
 `snapshot_id` 生成规则：
 
 ```text
@@ -57,11 +59,15 @@ YYYYMMDDTHHMMSSZ_<source_hash_12>
 - 时间使用 UTC，保证跨 Windows 和 Linux 一致排序。
 - `source_hash_12` 取 `source_hash` 前 12 位，用于人工排查。
 - 若同秒同源重复生成，内容 hash 相同则不切换；内容不同则追加 `_<attempt>`，并在 `sync_report.json` 记录原因。
+- `attempt` 只能使用短的路径安全标识；`snapshot_id` 不允许包含 `..`、路径分隔符、驱动器前缀或绝对路径片段。
 
 ## source_hash 与 schema_version
 
 - `schema_version` 固定从 `inventory_snapshot.v1` 开始；任何字段语义、目录布局或敏感字段策略变化都要升级。
 - `source_hash` 基于规范化后的源 payload 计算 SHA-256。payload 包含：源类型、飞书 sheet metadata、revision/range、原始 values、合并单元格信息、导出 xlsx 文件 hash、同步代码版本、字段映射版本。
+- `source_hash` 是确定性内容身份：相同规范 payload 得到相同 hash；普通字段、价格、房态、看房密码、schema_version、generator_version、字段映射版本变化都必须改变 hash。
+- BOM 和 EOL 差异在 hash 前归一，不应改变 hash。
+- 电子表格行顺序属于源 payload 的一部分；行顺序变化会改变 `source_hash`。如果未来要忽略排序，必须升级 schema/normalization 版本。
 - 不把 token、App Secret、真实密码以外的凭证写入 source payload；源 token 只写 `source_kind` 和脱敏标识。
 - `manifest.json` 同时保存 `source_hash`、`schema_version`、`snapshot_id`、`created_at`、`row_count`、`file_hashes`。
 
@@ -145,6 +151,7 @@ listing_id = "lst_" + sha256(normalize_community + "\0" + normalize_room_no)[:16
 
 - 机器主读产物，包含 `schema_version`、`snapshot_id`、`source_hash`、`generated_at`、`listings`。
 - 每条 listing 包含标准字段、检索字段、非敏感状态和指向 sensitive 的同快照引用。
+- `viewing_secret_ref` 可以指向同快照 private 文件中的 `listing_id`，但不得包含真实密码、完整看房原文、手机号或 token。
 
 `inventory.csv`：
 
@@ -195,6 +202,34 @@ listing_id = "lst_" + sha256(normalize_community + "\0" + normalize_room_no)[:16
 6. Reader 每次先读取 pointer，再读取 pointer 指向目录；如果任何文件缺失，退回上一成功 pointer 并记录健康警告。
 
 Windows 与 Linux 均使用 `pathlib` 和同一文件系统内 `Path.replace`。不依赖 symlink，因为 Windows 权限和 Linux systemd 环境对 symlink 行为可能不同。
+
+M1B Store 的安全边界：
+
+- `tmp/`、`snapshots/`、`current_snapshot.json`、`locks/` 均位于同一 snapshot root 下，避免跨文件系统 rename。
+- 发布前通过 `locks/sync.lock` 独占创建做进程级冲突检测；拿不到锁时返回明确冲突错误，不覆盖 pointer。
+- JSON、CSV、private manifest 和 pointer 都先写同目录临时文件，再 `replace` 到目标文件。
+- `snapshots/<snapshot_id>` 已存在时不覆盖；相同内容可由上层选择复用，M1B Store 只返回明确已存在错误。
+- Reader 和 Validator 不允许 `snapshot_id`、pointer path 或 manifest artifact path 包含路径穿越、反斜杠、驱动器前缀、绝对路径或空片段。
+
+## Public / Private Artifact 边界
+
+公共 artifact：
+
+- `manifest.json`
+- `inventory.json`
+- `inventory.csv`
+- `rewrite_inventory_index.json`
+- `sync_report.json`
+- `png/`
+
+公共 artifact 不得包含真实看房密码、完整 viewing 原文、手机号、token、App Secret 或 canary 测试密文。公共 `manifest.json` 只声明公共 artifact，不声明 `private/viewing_secrets.json` 的 hash 或大小，避免低熵密码被公共 hash 扩大泄露面。
+
+私有 artifact：
+
+- `private/viewing_secrets.json`：明文保存同快照 viewing 文本，只允许后续 viewing tool 以 `snapshot_id + listing_id` 读取。
+- `private/manifest.json`：只在 private 目录中记录 `viewing_secrets.json` 的 hash 和大小，用于 Reader/Validator 完整性校验。
+
+`private/` 不是加密目录。POSIX 环境尽量设置目录 `0700`、文件 `0600`；Windows 环境依赖 NTFS ACL 和运行账号隔离，M1B 不声称提供等价 chmod 或加密。
 
 ## 失败回退与健康状态
 

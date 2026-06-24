@@ -35,6 +35,26 @@ python -m pytest -q -p no:cacheprovider tests/test_inventory.py tests/test_inven
 - `test_snapshot_reader_rejects_corrupt_manifest`
 - `test_windows_and_posix_relative_paths_round_trip`
 
+## M1B-GATE 加固覆盖
+
+M1B-GATE 后，Snapshot 专项测试扩展到 49 个通过、1 个 Windows 权限语义跳过。新增覆盖不是按数量凑数，而是对应以下行为契约：
+
+- `source_hash` 是确定性内容身份，`snapshot_id` 是构建/发布身份；同内容不同构建时间可有不同 `snapshot_id`。
+- 普通字段、密码、行顺序、generator version 变化会改变 `source_hash`；BOM/EOL 不改变 hash。
+- `snapshot_id`、pointer path、manifest artifact path 拒绝路径穿越。
+- `listing_id` collision 和重复 key 被 Validator 阻断。
+- 公共 artifact 递归扫描不含 `TEST_SECRET_001234#`、真实手机号或 viewing 原文；`inventory.csv` 单独覆盖。
+- 默认 `repr`、异常、validation report 不含 secret canary。
+- `private/viewing_secrets.json` 不进入公共 manifest；private 目录使用 `private/manifest.json` 做完整性校验。
+- POSIX private 目录/文件权限检查为 `0700/0600`；Windows 明确跳过并说明 ACL 语义。
+- staging 写入失败、manifest 写入失败、private secret 写入失败、pointer replace 失败均保持旧 pointer。
+- 已存在 snapshot 不覆盖；发布锁冲突返回明确错误。
+- 缺失 manifest 文件、artifact hash mismatch、private hash mismatch 均导致 Reader 拒绝读取或 health corrupt。
+- UTF-8 中文和字母房号 roundtrip；公共/私有 artifact 不写入硬编码绝对开发机路径。
+- 空价格、待定价格、`3900.0` 和负价格分别按设计处理。
+- 合并 community 不跨空白行或区域标题继承；宣传文本带房号时不被误过滤。
+- rewrite index 不依赖 LLM，也不含完整 viewing 原文。
+
 ## 现有测试扩展
 
 `tests/test_inventory.py`：

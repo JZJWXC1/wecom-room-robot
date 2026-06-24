@@ -13,6 +13,9 @@ from app.services.inventory_snapshot_models import (
     InventorySnapshotManifest,
     SnapshotValidationResult,
     generate_listing_id,
+    is_safe_listing_id,
+    is_safe_relative_artifact_path,
+    is_safe_snapshot_id,
 )
 
 
@@ -23,7 +26,15 @@ REQUIRED_MANIFEST_FILES = {
     "rewrite_inventory_index": "rewrite_inventory_index.json",
     "sync_report": "sync_report.json",
 }
-PASSWORD_TEXT_PATTERN = re.compile(r"(?<!\d)\d{3,8}#(?!\d)")
+PUBLIC_SECRET_TEXT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("public_payload_contains_password", re.compile(r"(?<!\d)\d{3,8}#(?!\d)")),
+    ("public_payload_contains_secret_canary", re.compile(r"TEST_SECRET_[A-Za-z0-9_#-]+")),
+    ("public_payload_contains_phone", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")),
+    (
+        "public_payload_contains_password_context",
+        re.compile(r"(?:看房方式|看房|门锁|门禁|钥匙|密码)[^0-9A-Za-z#]{0,12}[A-Za-z0-9][A-Za-z0-9_#-]{2,31}"),
+    ),
+)
 PUBLIC_FORBIDDEN_KEYS = {
     "viewing",
     "viewing_text",
@@ -48,10 +59,28 @@ PUBLIC_ALLOWED_KEYS = {
     "availability_summary",
     "availability_status",
 }
+MACHINE_TEXT_PATH_SUFFIXES = (
+    ".schema_version",
+    ".snapshot_id",
+    ".source_hash",
+    ".listing_id",
+    ".listing_key",
+    ".normalized_community",
+    ".normalized_room_no",
+    ".viewing_secret_ref",
+    ".sha256",
+    ".path",
+    ".source_record_id",
+    ".source_record_ids",
+    ".generator_version",
+)
 
 
 class SnapshotValidator:
+    """Validate snapshot artifacts before publish and before read."""
+
     def validate_snapshot(self, snapshot: InventorySnapshot) -> SnapshotValidationResult:
+        """Validate an in-memory snapshot model and public payload boundary."""
         result = SnapshotValidationResult()
         self._validate_snapshot_headers(snapshot, result)
         self._validate_manifest(snapshot, result)
@@ -63,6 +92,7 @@ class SnapshotValidator:
         return result
 
     def validate_directory(self, snapshot_dir: Path) -> SnapshotValidationResult:
+        """Validate a snapshot directory, including public and private integrity."""
         result = SnapshotValidationResult()
         manifest_path = snapshot_dir / "manifest.json"
         inventory_path = snapshot_dir / "inventory.json"
@@ -78,6 +108,7 @@ class SnapshotValidator:
             return result
 
         self._validate_manifest_files(snapshot_dir, manifest, result)
+        self._validate_private_manifest_files(snapshot_dir, result)
         if not inventory_path.exists() or not rewrite_path.exists():
             return result
         try:
@@ -102,6 +133,7 @@ class SnapshotValidator:
         return result
 
     def validate_pointer(self, pointer_data: dict[str, Any], root: Path) -> SnapshotValidationResult:
+        """Validate current_snapshot.json without guessing a latest directory."""
         result = SnapshotValidationResult()
         if pointer_data.get("schema_version") != CURRENT_POINTER_SCHEMA_VERSION:
             result.add("error", "invalid_pointer_schema", "current_snapshot.json schema_version 不正确。", path="current_snapshot.json")
@@ -109,8 +141,17 @@ class SnapshotValidator:
         snapshot_path = str(pointer_data.get("snapshot_path") or "")
         if not snapshot_id:
             result.add("error", "missing_pointer_snapshot_id", "current pointer 缺少 snapshot_id。", path="current_snapshot.json")
+        elif not is_safe_snapshot_id(snapshot_id):
+            result.add("error", "invalid_pointer_snapshot_id", "current pointer snapshot_id 含非法字符。", path="current_snapshot.json")
         if not snapshot_path:
             result.add("error", "missing_pointer_snapshot_path", "current pointer 缺少 snapshot_path。", path="current_snapshot.json")
+            return result
+        if not is_safe_relative_artifact_path(snapshot_path):
+            result.add("error", "pointer_path_unsafe", "current pointer snapshot_path 不是安全相对路径。", path="current_snapshot.json")
+            return result
+        expected_path = f"snapshots/{snapshot_id}" if snapshot_id else ""
+        if expected_path and snapshot_path != expected_path:
+            result.add("error", "pointer_path_snapshot_id_mismatch", "current pointer snapshot_path 与 snapshot_id 不一致。", path="current_snapshot.json")
             return result
         target = (root / Path(snapshot_path)).resolve()
         root_resolved = root.resolve()
@@ -130,6 +171,8 @@ class SnapshotValidator:
             result.add("error", "invalid_schema_version", "snapshot schema_version 不正确。", path="inventory.schema_version")
         if not snapshot.snapshot_id:
             result.add("error", "missing_snapshot_id", "snapshot_id 不能为空。", path="inventory.snapshot_id")
+        elif not is_safe_snapshot_id(snapshot.snapshot_id):
+            result.add("error", "invalid_snapshot_id", "snapshot_id 含非法字符或不符合 v1 格式。", path="inventory.snapshot_id")
         if not snapshot.source_hash or not re.fullmatch(r"[0-9a-f]{64}", snapshot.source_hash):
             result.add("error", "invalid_source_hash", "source_hash 必须是 SHA-256 hex。", path="inventory.source_hash")
         if snapshot.source_hash and snapshot.snapshot_id and snapshot.source_hash[:12] not in snapshot.snapshot_id:
@@ -150,6 +193,10 @@ class SnapshotValidator:
         for logical_name in REQUIRED_MANIFEST_FILES:
             if logical_name not in manifest.files:
                 result.add("error", "manifest_file_missing", "manifest 缺少必要文件声明。", path=f"manifest.files.{logical_name}")
+        for logical_name, entry in manifest.files.items():
+            relative_path = str(entry.get("path") or "") if isinstance(entry, dict) else ""
+            if logical_name.startswith("private") or relative_path.startswith("private/"):
+                result.add("error", "public_manifest_private_file", "公共 manifest 不应声明 private 文件。", path=f"manifest.files.{logical_name}")
 
     def _validate_listings(self, snapshot: InventorySnapshot, result: SnapshotValidationResult) -> None:
         seen_listing_ids: set[str] = set()
@@ -158,6 +205,8 @@ class SnapshotValidator:
             path = f"listings[{index}]"
             if not listing.listing_id:
                 result.add("error", "missing_listing_id", "房源缺少 listing_id。", path=path)
+            elif not is_safe_listing_id(listing.listing_id):
+                result.add("error", "invalid_listing_id", "listing_id 含非法字符或不符合 v1 格式。", path=f"{path}.listing_id")
             if listing.listing_id in seen_listing_ids:
                 result.add("error", "duplicate_listing_id", "listing_id 不唯一。", path=f"{path}.listing_id", context={"listing_id": listing.listing_id})
             seen_listing_ids.add(listing.listing_id)
@@ -182,6 +231,8 @@ class SnapshotValidator:
                     context={"first_listing_id": seen_keys[key], "listing_id": listing.listing_id},
                 )
             seen_keys[key] = listing.listing_id
+            if listing.viewing_secret_ref and listing.viewing_secret_ref != f"private/viewing_secrets.json#{listing.listing_id}":
+                result.add("error", "invalid_viewing_secret_ref", "viewing_secret_ref 必须指向同快照 private 文件中的当前 listing_id。", path=f"{path}.viewing_secret_ref")
             self._validate_public_payload(listing.raw_fields, f"{path}.raw_fields", result)
 
     def _validate_rent(self, value: Any, path: str, result: SnapshotValidationResult) -> None:
@@ -218,8 +269,10 @@ class SnapshotValidator:
             for index, item in enumerate(value):
                 self._validate_public_payload(item, f"{path}[{index}]", result)
             return
-        if isinstance(value, str) and PASSWORD_TEXT_PATTERN.search(value):
-            result.add("error", "public_payload_contains_password", "公共快照产物包含疑似真实密码。", path=path)
+        if isinstance(value, str) and not _is_machine_text_path(path):
+            for code, pattern in PUBLIC_SECRET_TEXT_PATTERNS:
+                if pattern.search(value):
+                    result.add("error", code, "公共快照产物包含疑似敏感文本。", path=path)
 
     def _validate_utf8_serializable(self, value: Any, path: str, result: SnapshotValidationResult) -> None:
         try:
@@ -249,6 +302,10 @@ class SnapshotValidator:
             if not relative_path:
                 result.add("error", "manifest_file_path_missing", "manifest 文件声明缺少 path。", path=f"manifest.files.{logical_name}.path")
                 continue
+            allow_directory = relative_path.endswith("/") or entry.get("status") == "reserved"
+            if not is_safe_relative_artifact_path(relative_path, allow_directory=allow_directory):
+                result.add("error", "manifest_file_path_unsafe", "manifest 文件路径不是安全相对路径。", path=f"manifest.files.{logical_name}.path")
+                continue
             if relative_path.endswith("/") or entry.get("status") == "reserved":
                 continue
             target = snapshot_dir / relative_path
@@ -258,6 +315,55 @@ class SnapshotValidator:
             declared_hash = str(entry.get("sha256") or "")
             if declared_hash and declared_hash != _file_sha256(target):
                 result.add("error", "snapshot_file_hash_mismatch", "manifest 文件 hash 与实际内容不一致。", path=relative_path)
+            if "bytes" in entry:
+                try:
+                    declared_bytes = int(entry.get("bytes"))
+                except (TypeError, ValueError):
+                    result.add("error", "snapshot_file_size_invalid", "manifest 文件大小声明不是整数。", path=relative_path)
+                    continue
+                if declared_bytes != target.stat().st_size:
+                    result.add("error", "snapshot_file_size_mismatch", "manifest 文件大小与实际内容不一致。", path=relative_path)
+
+    def _validate_private_manifest_files(self, snapshot_dir: Path, result: SnapshotValidationResult) -> None:
+        private_dir = snapshot_dir / "private"
+        private_manifest_path = private_dir / "manifest.json"
+        private_secrets_path = private_dir / "viewing_secrets.json"
+        if not private_dir.exists() and not private_manifest_path.exists() and not private_secrets_path.exists():
+            return
+        if not private_manifest_path.exists():
+            result.add("error", "private_manifest_missing", "private 目录缺少 manifest.json。", path="private/manifest.json")
+            return
+        try:
+            private_manifest = _read_json(private_manifest_path)
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            result.add("error", "invalid_private_manifest_json", "private manifest 不是有效 JSON。", path="private/manifest.json", context={"error": str(exc)})
+            return
+        files = private_manifest.get("files")
+        if not isinstance(files, dict):
+            result.add("error", "private_manifest_files_invalid", "private manifest files 必须是对象。", path="private/manifest.json")
+            return
+        entry = files.get("viewing_secrets")
+        if not isinstance(entry, dict):
+            result.add("error", "private_manifest_viewing_secrets_missing", "private manifest 缺少 viewing_secrets 声明。", path="private/manifest.json")
+            return
+        relative_path = str(entry.get("path") or "")
+        if relative_path != "viewing_secrets.json":
+            result.add("error", "private_manifest_file_path_mismatch", "private manifest 文件路径声明不符合约定。", path="private/manifest.json")
+            return
+        target = private_dir / relative_path
+        if not target.exists():
+            result.add("error", "private_snapshot_file_missing", "private manifest 声明的文件不存在。", path="private/viewing_secrets.json")
+            return
+        declared_hash = str(entry.get("sha256") or "")
+        if not declared_hash or declared_hash != _file_sha256(target):
+            result.add("error", "private_snapshot_file_hash_mismatch", "private 文件 hash 与实际内容不一致。", path="private/viewing_secrets.json")
+        try:
+            declared_bytes = int(entry.get("bytes"))
+        except (TypeError, ValueError):
+            result.add("error", "private_snapshot_file_size_invalid", "private 文件大小声明不是整数。", path="private/viewing_secrets.json")
+            return
+        if declared_bytes != target.stat().st_size:
+            result.add("error", "private_snapshot_file_size_mismatch", "private 文件大小与实际内容不一致。", path="private/viewing_secrets.json")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -265,6 +371,10 @@ def _read_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise TypeError(f"{path} is not a JSON object")
     return data
+
+
+def _is_machine_text_path(path: str) -> bool:
+    return any(path.endswith(suffix) for suffix in MACHINE_TEXT_PATH_SUFFIXES)
 
 
 def _file_sha256(path: Path) -> str:

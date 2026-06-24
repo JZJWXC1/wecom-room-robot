@@ -48,6 +48,14 @@
 - 失败时不更新 pointer。
 - 单元测试覆盖重复房源阻断、字段保真、schema_version、source_hash。
 
+M1B-GATE 当前状态：
+
+- 已实现纯本地 Snapshot Models、Builder、Validator、Store、Reader 和专项测试。
+- 未接入飞书生产同步，未切换 `InventoryService`、`RegionInventorySyncService` 或 `app/main.py` 读取路径。
+- 公共 manifest 只声明公共 artifact；`private/viewing_secrets.json` 的完整性由 private 目录内 manifest 校验。
+- `snapshot_id` 为构建/发布身份，`source_hash` 为确定性内容身份。
+- Store 已具备本地原子写、发布锁、路径安全校验和失败回退测试；生产 stale lock 接管、磁盘空间预估和 PNG 渲染接入留待 M1C/M1D 结合定时器实现。
+
 ### M1C：运行时只读 Snapshot
 
 目标：`app/main.py` 一轮 RAG 锁定 snapshot，并让 `search/all_rows/snapshot/current_inventory_images` 走同一快照。

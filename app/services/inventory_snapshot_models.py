@@ -17,7 +17,14 @@ FIELD_MAPPING_VERSION = "inventory_snapshot_fields.v1"
 REDACTED_VALUE = "[REDACTED]"
 
 
-_PASSWORD_PATTERN = re.compile(r"(?<!\d)\d{3,8}#(?!\d)")
+_HASHED_PASSWORD_PATTERN = re.compile(r"(?<!\d)\d{3,8}#(?!\d)")
+_PASSWORD_CONTEXT_PATTERN = re.compile(
+    r"((?:看房方式|看房|门锁|门禁|钥匙|密码)[^0-9A-Za-z#]{0,12})([A-Za-z0-9][A-Za-z0-9_#-]{2,31})"
+)
+_PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_SECRET_CANARY_PATTERN = re.compile(r"TEST_SECRET_[A-Za-z0-9_#-]+")
+SNAPSHOT_ID_PATTERN = re.compile(r"^\d{8}T\d{6}Z_[0-9a-f]{12}(?:_[A-Za-z0-9][A-Za-z0-9_-]{0,31})?$")
+LISTING_ID_PATTERN = re.compile(r"^lst_[0-9a-f]{16}$")
 _SENSITIVE_KEY_TOKENS = (
     "password",
     "secret",
@@ -42,10 +49,12 @@ _SAFE_SENSITIVE_SUMMARY_KEYS = {
 
 
 def now_utc_iso() -> str:
+    """Return the current UTC time in snapshot artifact format."""
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def parse_iso_datetime(value: str) -> datetime | None:
+    """Parse an ISO datetime, treating naive values as UTC."""
     text = str(value or "").strip()
     if not text:
         return None
@@ -59,12 +68,14 @@ def parse_iso_datetime(value: str) -> datetime | None:
 
 
 def normalize_hash_text(value: str) -> str:
+    """Normalize text before hashing without changing business-visible content."""
     text = str(value or "").replace("\ufeff", "")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return unicodedata.normalize("NFC", text)
 
 
 def normalize_for_hash(value: Any) -> Any:
+    """Recursively normalize values into a stable JSON-hashable shape."""
     if isinstance(value, dict):
         return {
             str(key): normalize_for_hash(value[key])
@@ -83,6 +94,7 @@ def normalize_for_hash(value: Any) -> Any:
 
 
 def canonical_json(value: Any) -> str:
+    """Serialize a value into canonical JSON for content hashing."""
     return json.dumps(
         normalize_for_hash(value),
         ensure_ascii=False,
@@ -93,6 +105,7 @@ def canonical_json(value: Any) -> str:
 
 
 def generate_source_hash(payload: Any) -> str:
+    """Generate the deterministic source content identity for a normalized payload."""
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
@@ -102,6 +115,9 @@ def generate_snapshot_id(
     generated_at: datetime | str | None = None,
     attempt: int | str | None = None,
 ) -> str:
+    """Generate a build identity: UTC timestamp plus the source hash prefix."""
+    if not re.fullmatch(r"[0-9a-f]{64}", str(source_hash or "")):
+        raise ValueError("source_hash must be a 64-character SHA-256 hex digest")
     if isinstance(generated_at, datetime):
         timestamp = generated_at.astimezone(UTC)
     elif isinstance(generated_at, str) and generated_at.strip():
@@ -111,11 +127,15 @@ def generate_snapshot_id(
         timestamp = datetime.now(UTC)
     value = f"{timestamp.strftime('%Y%m%dT%H%M%SZ')}_{source_hash[:12]}"
     if attempt not in (None, "", 0):
+        attempt_text = str(attempt)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", attempt_text):
+            raise ValueError("attempt must be a short path-safe identifier")
         value = f"{value}_{attempt}"
     return value
 
 
 def normalize_listing_identity(value: Any) -> str:
+    """Normalize community and room identifiers for stable listing_id generation."""
     text = normalize_hash_text(str(value or "")).strip()
     text = unicodedata.normalize("NFKC", text)
     text = text.replace("－", "-").replace("—", "-").replace("–", "-")
@@ -124,11 +144,36 @@ def normalize_listing_identity(value: Any) -> str:
 
 
 def generate_listing_id(community: Any, room_no: Any) -> str:
+    """Generate a stable listing_id from normalized community and room number."""
     payload = f"{normalize_listing_identity(community)}\0{normalize_listing_identity(room_no)}"
     return "lst_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def is_safe_snapshot_id(value: Any) -> bool:
+    """Return whether a snapshot_id is safe to use as one path segment."""
+    return bool(SNAPSHOT_ID_PATTERN.fullmatch(str(value or "")))
+
+
+def is_safe_listing_id(value: Any) -> bool:
+    """Return whether a listing_id follows the v1 collision-resistant shape."""
+    return bool(LISTING_ID_PATTERN.fullmatch(str(value or "")))
+
+
+def is_safe_relative_artifact_path(value: Any, *, allow_directory: bool = False) -> bool:
+    """Return whether an artifact path is relative POSIX text without traversal."""
+    text = str(value or "")
+    if not text or "\\" in text or ":" in text or text.startswith(("/", "~")):
+        return False
+    if text.endswith("/") and not allow_directory:
+        return False
+    path = PurePosixPath(text)
+    if path.is_absolute():
+        return False
+    return all(part not in {"", ".", ".."} for part in path.parts)
+
+
 def looks_sensitive_key(key: str) -> bool:
+    """Return whether a mapping key should be redacted before logging."""
     lowered = str(key or "").strip().lower()
     if lowered in _SAFE_SENSITIVE_SUMMARY_KEYS:
         return False
@@ -136,11 +181,22 @@ def looks_sensitive_key(key: str) -> bool:
 
 
 def redact_sensitive_text(value: Any) -> str:
+    """Redact passwords, phone numbers, and test canaries from free text."""
     text = str(value or "")
-    return _PASSWORD_PATTERN.sub(REDACTED_VALUE, text)
+    if (
+        SNAPSHOT_ID_PATTERN.fullmatch(text)
+        or LISTING_ID_PATTERN.fullmatch(text)
+        or re.fullmatch(r"[0-9a-f]{12,64}", text)
+    ):
+        return text
+    text = _SECRET_CANARY_PATTERN.sub(REDACTED_VALUE, text)
+    text = _PHONE_PATTERN.sub(REDACTED_VALUE, text)
+    text = _HASHED_PASSWORD_PATTERN.sub(REDACTED_VALUE, text)
+    return _PASSWORD_CONTEXT_PATTERN.sub(lambda match: f"{match.group(1)}{REDACTED_VALUE}", text)
 
 
 def sanitize_for_log(value: Any) -> Any:
+    """Recursively redact sensitive content before logging or public serialization."""
     if is_dataclass(value):
         return {
             item.name: sanitize_for_log(getattr(value, item.name))
@@ -183,6 +239,9 @@ class SnapshotValidationIssue:
                 "context": self.context,
             }
         )
+
+    def __repr__(self) -> str:
+        return f"SnapshotValidationIssue({self.to_dict()!r})"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SnapshotValidationIssue":
@@ -246,6 +305,9 @@ class SnapshotValidationResult:
             "issues": [issue.to_dict() for issue in self.issues],
         }
 
+    def __repr__(self) -> str:
+        return f"SnapshotValidationResult({self.to_dict()!r})"
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SnapshotValidationResult":
         return cls(
@@ -286,6 +348,7 @@ class InventorySourceMetadata:
         return sanitize_for_log(payload) if redact_sensitive else payload
 
     def to_hash_payload(self) -> dict[str, Any]:
+        """Return source metadata fields that participate in source_hash."""
         payload = self.to_dict(redact_sensitive=True)
         payload["generator_version"] = self.generator_version
         payload["field_mapping_version"] = self.field_mapping_version
@@ -382,6 +445,9 @@ class InventoryListing:
     def to_log_dict(self) -> dict[str, Any]:
         return self.to_dict(redact_sensitive=True)
 
+    def __repr__(self) -> str:
+        return f"InventoryListing({self.to_log_dict()!r})"
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "InventoryListing":
         return cls(
@@ -451,6 +517,9 @@ class InventorySnapshotManifest:
         }
         return sanitize_for_log(payload) if redact_sensitive else payload
 
+    def __repr__(self) -> str:
+        return f"InventorySnapshotManifest({self.to_dict()!r})"
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "InventorySnapshotManifest":
         return cls(
@@ -479,7 +548,7 @@ class InventorySnapshot:
     manifest: InventorySnapshotManifest
     listings: list[InventoryListing] = field(default_factory=list)
     rewrite_index: dict[str, Any] = field(default_factory=dict)
-    private_viewing_secrets: dict[str, Any] = field(default_factory=dict)
+    private_viewing_secrets: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def inventory_payload(self, *, redact_sensitive: bool = True) -> dict[str, Any]:
         payload = {
@@ -508,6 +577,9 @@ class InventorySnapshot:
 
     def to_log_dict(self) -> dict[str, Any]:
         return self.to_dict(redact_sensitive=True)
+
+    def __repr__(self) -> str:
+        return f"InventorySnapshot({self.to_log_dict()!r})"
 
     @classmethod
     def from_inventory_payload(
@@ -556,6 +628,9 @@ class InventorySnapshotHealth:
                 "issues": [issue.to_dict() for issue in self.issues],
             }
         )
+
+    def __repr__(self) -> str:
+        return f"InventorySnapshotHealth({self.to_dict()!r})"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "InventorySnapshotHealth":
@@ -617,6 +692,9 @@ class InventorySyncReport:
             "notes": self.notes,
         }
         return sanitize_for_log(payload) if redact_sensitive else payload
+
+    def __repr__(self) -> str:
+        return f"InventorySyncReport({self.to_dict()!r})"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "InventorySyncReport":
@@ -698,3 +776,6 @@ class SnapshotReadResult:
                 "value": value,
             }
         )
+
+    def __repr__(self) -> str:
+        return f"SnapshotReadResult({self.to_dict()!r})"

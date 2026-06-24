@@ -12,6 +12,8 @@ from app.services.inventory_snapshot_models import (
     InventorySnapshotManifest,
     SnapshotReadResult,
     SnapshotValidationIssue,
+    is_safe_listing_id,
+    is_safe_snapshot_id,
     parse_iso_datetime,
 )
 from app.services.inventory_snapshot_store import DEFAULT_SNAPSHOT_ROOT
@@ -19,6 +21,8 @@ from app.services.inventory_snapshot_validator import SnapshotValidator
 
 
 class SnapshotReader:
+    """Read only the pointer-selected immutable inventory snapshot."""
+
     def __init__(
         self,
         root: Path | str = DEFAULT_SNAPSHOT_ROOT,
@@ -35,6 +39,7 @@ class SnapshotReader:
         return self.root / "current_snapshot.json"
 
     def get_current_pointer(self) -> SnapshotReadResult:
+        """Read and validate current_snapshot.json without directory guessing."""
         path = self.current_pointer_path
         if not path.exists():
             return _error_result(
@@ -63,6 +68,7 @@ class SnapshotReader:
             )
 
     def get_current_snapshot(self) -> SnapshotReadResult:
+        """Return the active snapshot or a structured read error."""
         pointer_result = self.get_current_pointer()
         if not pointer_result.ok:
             return pointer_result
@@ -70,8 +76,11 @@ class SnapshotReader:
         return self.get_snapshot(pointer.snapshot_id)
 
     def get_snapshot(self, snapshot_id: str) -> SnapshotReadResult:
+        """Return a named snapshot after validating directory integrity."""
         if not snapshot_id:
             return _error_result("missing_snapshot_id", "snapshot_id 不能为空。", status="invalid")
+        if not is_safe_snapshot_id(snapshot_id):
+            return _error_result("invalid_snapshot_id", "snapshot_id 含非法字符或不符合 v1 格式。", status="invalid")
         snapshot_dir = self.root / "snapshots" / snapshot_id
         if not snapshot_dir.exists():
             return _error_result(
@@ -109,6 +118,9 @@ class SnapshotReader:
         return SnapshotReadResult(ok=True, value=snapshot, status="ok")
 
     def get_listing(self, listing_id: str) -> SnapshotReadResult:
+        """Return one listing from the current snapshot by stable listing_id."""
+        if not is_safe_listing_id(listing_id):
+            return _error_result("invalid_listing_id", "listing_id 含非法字符或不符合 v1 格式。", status="invalid")
         snapshot_result = self.get_current_snapshot()
         if not snapshot_result.ok:
             return snapshot_result
@@ -122,12 +134,14 @@ class SnapshotReader:
         )
 
     def get_rewrite_index(self) -> SnapshotReadResult:
+        """Return the safe rewrite index from the current snapshot."""
         snapshot_result = self.get_current_snapshot()
         if not snapshot_result.ok:
             return snapshot_result
         return SnapshotReadResult(ok=True, value=snapshot_result.value.rewrite_index, status="ok")
 
     def health(self) -> InventorySnapshotHealth:
+        """Summarize pointer and snapshot readability for health checks."""
         pointer_result = self.get_current_pointer()
         if not pointer_result.ok:
             return InventorySnapshotHealth(

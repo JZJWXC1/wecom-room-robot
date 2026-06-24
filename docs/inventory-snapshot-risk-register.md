@@ -23,7 +23,15 @@
 ## 未决策项
 
 - Snapshot root 是否沿用 `data/inventory_snapshots`，还是放在 `room_database/inventory_snapshots` 以便素材一起打包。
-- `private/viewing_secrets.json` 是否单独 chmod 或依赖项目目录权限。
+- `private/viewing_secrets.json` 是否单独 chmod 或依赖项目目录权限。M1B-GATE 当前实现：POSIX 尽量设置 private 目录 `0700`、文件 `0600`；Windows 明确依赖 NTFS ACL，不声称 chmod 等价或加密。
 - 旧 `local_image` OCR 是否在 M1D 删除，还是保留为人工灾备工具。
 - listing_id alias 迁移是否需要人工维护文件，或由飞书 record_id 辅助迁移。
 - health 对 stale 的默认阈值应与当前 300 秒 cache max age 一致，还是按定时器 3 次/日放宽。
+
+## M1B-GATE 已缓解风险
+
+- R2：M1B Snapshot rewrite index 不保存 `viewing` 原文，并有 canary 扫描测试；旧生产 index 的替换仍在 M1C。
+- R6：Snapshot JSON、CSV、private manifest 和 pointer 使用同目录临时文件 + replace；旧生产活动文件仍待 M1C/M1D 迁移。
+- R7：M1B Builder/Validator 对 duplicate conflict 阻断，listing_id collision 有专项测试。
+- R9：合并字段不跨空白行或区域标题继承。
+- R13：M1B Store 使用 `locks/sync.lock` 独占创建做发布冲突检测；stale lock 接管策略留待生产同步接入时细化。

@@ -80,6 +80,26 @@ M1B 已新增 InventorySnapshot 纯本地核心模型、构建器、校验器、
 
 本轮新增代码均有本地单元测试覆盖；未新增第二套可直接被生产调用的同步入口，未新增直接生成客户回复的规则。
 
+## M1B-GATE Legacy Removal Report
+
+本轮仍未接管生产路径，因此不删除旧 `InventoryService`、旧 rewrite index、旧 PNG 和 `app/main.py` 读取入口。M1B-GATE 只删除或迁移新 Snapshot 核心内部的风险点：
+
+- 公共 `manifest.json` 不再声明 `private/viewing_secrets.json`；private 完整性改由 `private/manifest.json` 负责。
+- Snapshot Store 不新增 legacy wrapper，不新增生产 feature flag，不调用旧 `InventoryService` 或 `RegionInventorySyncService`。
+- Snapshot Reader 不猜测旧活动 CSV、旧 PNG 或目录 mtime；没有 current pointer 时返回结构化 missing。
+- M1B 新代码内部统一使用 v1 `snapshot_id`、`listing_id` 和 artifact 相对路径校验，避免后续 M1C 接入时继承路径穿越风险。
+- 合并字段、价格解析、secret 脱敏、atomic write、发布锁和 private 权限均在 Snapshot 专项测试中覆盖；这些属于 M1B 新核心，不改变客户回复。
+
+后续 removal_milestone 保持：
+
+| 待移除/迁移旧入口 | removal_milestone | M1C/M1D 前置门槛 |
+| --- | --- | --- |
+| 旧 `data/rewrite_inventory_index.json` 生产读取 | M1C | 同轮锁定 snapshot rewrite index，未问密码不进 Prompt/记忆 |
+| 旧 `room_database/inventory_*.png` 发送入口 | M1C | 房源表发送从同快照 `png/` 读取并通过发送阶段回归 |
+| `InventoryService` 活动 CSV 读写和 cache meta | M1D | Snapshot Reader 搜索/all_rows/snapshot 行为回归，旧 fallback 删除前全量测试通过 |
+| OCR/local image 库存 fallback | M1D 或手工灾备 | 明确不在生产默认 RAG 路径，灾备调用需单独权限和测试 |
+| Region/Feishu 同步后直接刷新 cache/index | M1C | 同步成功只构建候选快照，校验通过后切 pointer |
+
 ## 删除前总门槛
 
 - `pytest -q` 通过。

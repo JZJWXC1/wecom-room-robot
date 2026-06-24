@@ -19,6 +19,7 @@ from app.services.inventory_snapshot_models import (
     generate_source_hash,
     normalize_listing_identity,
     now_utc_iso,
+    redact_sensitive_text,
     sanitize_for_log,
 )
 
@@ -80,6 +81,8 @@ RENT_MAX = 100000
 
 
 class SnapshotBuilder:
+    """Build an immutable local inventory snapshot from tabular source rows."""
+
     def __init__(
         self,
         *,
@@ -99,6 +102,7 @@ class SnapshotBuilder:
         source_payload: Any | None = None,
         attempt: int | str | None = None,
     ) -> tuple[InventorySnapshot, InventorySyncReport]:
+        """Build snapshot models and a safe sync report without writing files."""
         started_at = time.monotonic()
         generated_at_iso = _generated_at_iso(generated_at)
         normalized_rows_for_hash = _rows_for_hash(rows)
@@ -130,6 +134,8 @@ class SnapshotBuilder:
             safe_raw_fields = _safe_raw_fields(raw_row)
             canonical = _canonicalize_row(raw_row)
             if _is_empty_row(canonical):
+                current_area = ""
+                current_community = ""
                 filtered_rows.append(_row_report(source_row_number, "empty_row", raw_row))
                 continue
             if _is_header_row(canonical):
@@ -140,14 +146,17 @@ class SnapshotBuilder:
             raw_community = canonical["community"]
             raw_room_no = canonical["room_no"]
 
+            if _is_area_title_row(canonical):
+                current_area = raw_area
+                current_community = ""
+                filtered_rows.append(_row_report(source_row_number, "area_title_row", raw_row))
+                continue
             if raw_area:
+                if raw_area != current_area:
+                    current_community = ""
                 current_area = raw_area
             if raw_community:
                 current_community = raw_community
-
-            if _is_area_title_row(canonical):
-                filtered_rows.append(_row_report(source_row_number, "area_title_row", raw_row))
-                continue
             if _is_promotional_row(canonical):
                 filtered_rows.append(_row_report(source_row_number, "promotional_row", raw_row))
                 continue
@@ -281,7 +290,6 @@ class SnapshotBuilder:
                 "inventory_csv": {"path": "inventory.csv"},
                 "rewrite_inventory_index": {"path": "rewrite_inventory_index.json"},
                 "sync_report": {"path": "sync_report.json"},
-                "private_viewing_secrets": {"path": "private/viewing_secrets.json"},
                 "png": {"path": "png/", "status": "reserved"},
             },
             generator_version=self.generator_version,
@@ -327,6 +335,7 @@ def build_inventory_snapshot(
     generated_at: datetime | str | None = None,
     source_payload: Any | None = None,
 ) -> tuple[InventorySnapshot, InventorySyncReport]:
+    """Convenience wrapper for building a snapshot with the default builder."""
     return SnapshotBuilder().build(
         rows,
         source_metadata,
@@ -340,6 +349,7 @@ def build_safe_rewrite_inventory_index(
     *,
     area_aliases: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """Create the safe rewrite index without LLM calls or secret fields."""
     aliases = dict(DEFAULT_AREA_ALIASES)
     aliases.update(area_aliases or {})
     room_index = [_rewrite_room_item(listing) for listing in snapshot.listings]
@@ -378,9 +388,12 @@ def build_safe_rewrite_inventory_index(
 
 
 def parse_monthly_rent(value: Any) -> tuple[int | None, str]:
+    """Parse monthly rent while preserving empty or pending prices as null."""
     text = _stringify_cell(value)
     if not text or text in {"无", "暂无", "待定", "面议", "-", "—", "/"}:
         return None, ""
+    if re.search(r"(^|[^\d])-+\s*\d", text):
+        return None, "negative_or_signed_value"
     matches = re.findall(r"\d+(?:\.\d+)?", text)
     if not matches:
         return None, "non_numeric"
@@ -401,6 +414,7 @@ def parse_monthly_rent(value: Any) -> tuple[int | None, str]:
 
 
 def build_viewing_summary(viewing_text: Any) -> dict[str, Any]:
+    """Build a structured viewing summary without copying the raw text."""
     text = _stringify_cell(viewing_text)
     has_password = bool(re.search(r"(?<!\d)\d{3,8}#?(?!\d)", text))
     needs_contact = any(marker in text for marker in ("提前联系", "联系", "预约", "看房提前", "密码不对"))
@@ -423,6 +437,7 @@ def build_viewing_summary(viewing_text: Any) -> dict[str, Any]:
 
 
 def build_availability_summary(viewing_text: Any, explicit_status: Any = "") -> dict[str, Any]:
+    """Build a structured availability status from viewing/status fields."""
     text = f"{_stringify_cell(viewing_text)} {_stringify_cell(explicit_status)}".strip()
     if not text:
         status = "unknown"
@@ -442,14 +457,16 @@ def build_availability_summary(viewing_text: Any, explicit_status: Any = "") -> 
 
 
 def build_utility_summary(remark: Any) -> dict[str, Any]:
+    """Build a safe utility summary from the remark field."""
     text = _stringify_cell(remark)
     return {
         "has_utility_text": bool(text),
-        "summary": text,
+        "summary": redact_sensitive_text(text),
     }
 
 
 def parse_media_bool(row: dict[str, Any], aliases: tuple[str, ...]) -> bool:
+    """Parse media presence from known image/video source columns."""
     for alias in aliases:
         if alias not in row:
             continue
