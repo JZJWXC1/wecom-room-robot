@@ -63,6 +63,23 @@ Snapshot 后这些入口应统一为“构建候选快照 -> 校验 -> 切 curre
 
 M1A 全仓搜索未确认任何库存相关纯死代码可安全删除；本轮不删除代码。
 
+## M1B 旁路实现记录
+
+M1B 已新增 InventorySnapshot 纯本地核心模型、构建器、校验器、Store 和 Reader，但未接入飞书同步、未切换生产读取路径、未修改客户可见回复。旧路径仍保留在当前生产调用链中，后续由 M1C/M1D 分阶段接管或删除。
+
+| 旧路径 | 当前唯一生产入口 | M1B 状态 | removal_milestone |
+| --- | --- | --- | --- |
+| `InventoryService._save_cache/_read_cache/_reload_cache_if_file_changed` | `InventoryService.refresh/all_rows/search/snapshot` | 保留；新增 SnapshotReader 不被生产调用 | M1D |
+| `InventoryService._read_public_document` | `InventoryService.refresh` 的 public document 分支 | 保留；M1B 不新增线上读取 fallback | M1D |
+| `InventoryService._read_image_inventory_text/_parse_image_rows` | `InventoryService.refresh/all_rows/search/snapshot` 的 local_image 分支 | 保留；M1B 不接管 OCR 图片 fallback | M1D 或保留为手工灾备 |
+| `scripts/refresh_rag_inventory_cache.py` 直接写 CSV/index | systemd `wecom-room-robot-rag-cache-sync.timer` | 保留；M1B 只提供可测试的本地 Store，不新增生产同步入口 | M1C |
+| `InventoryImageSyncer._replace_inventory_images` | `InventoryImageSyncer.refresh_if_changed` | 保留；M1B 仅在 manifest 预留 PNG 路径，不生成生产 PNG | M1C |
+| `write_rewrite_inventory_index` 直接写 `data/rewrite_inventory_index.json` | `app/main.py`、两个脚本 | 保留；M1B 新增安全 `rewrite_inventory_index` 产物，但未替换旧生产 index | M1B 安全产物已覆盖；生产替换在 M1C |
+| `app/main.py::_current_inventory_images` | 客户请求房源表后的发送阶段 | 保留；M1B 未修改发送阶段 | M1C |
+| `app/main.py::_inventory_rows_for_resolution/_execute_tools/_generate_reply_result` | Agentic RAG 工具执行和回复生成 | 保留；M1B 未切换 RAG 库存读取入口 | M1C |
+
+本轮新增代码均有本地单元测试覆盖；未新增第二套可直接被生产调用的同步入口，未新增直接生成客户回复的规则。
+
 ## 删除前总门槛
 
 - `pytest -q` 通过。
