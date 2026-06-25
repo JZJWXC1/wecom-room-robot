@@ -266,6 +266,26 @@ M1D2A 约束：
 - `shadow` 聊天路径不得调用 `SnapshotReader`。
 - 未获得 `APPROVE_DEPLOY`，本轮只做本地代码、文档和离线测试。
 
+## M1D2B1 Viewing And Sheet Legacy Removal Gate
+
+M1D2B1 只删除或替代本轮同位置重复读取，不删除仍承担生产职责的 legacy reader、旧 CSV/index/PNG、素材库、发送路径或 Planner/selfcheck 规则。
+
+| Legacy 路径 | M1D2B1 状态 | removal_milestone | 保留原因 |
+| --- | --- | --- | --- |
+| `_execute_tools` 中房源表刷新和 PNG 列举 | 改为 `sheet_artifacts_for_context` 调用；legacy provider 内部继续复用旧 `_refresh_inventory_images` 和 `_current_inventory_images` | M1D/M1E | 客户可见发送路径和旧 PNG 产物必须保持等价 |
+| `_execute_tools` 中 viewing rule evidence 直接构造 | 改为 `viewing_evidence_for_rows` 调用；legacy provider 内部继续复用旧 `_viewing_text` 字段读取 | M1D/M1E | 客户显式问看房/密码时，旧回复文本必须保持逐字等价 |
+| `_viewing_evidence` | 保留给 `_viewing_needs_contact`、`_reply_for_utilities_and_viewing` 等旧回复/selfcheck 兼容点 | M1D/M1E | 本轮禁止重写客户回复和自检语义 |
+| `_current_inventory_images` | 保留为 legacy sheet provider 的唯一旧 PNG 列举函数 | M1D/M1E | Snapshot PNG 尚未接管生产发送 |
+| `InventoryService.search/all_rows/snapshot` | 保留；已迁移的 RAG 房源事实通过 `inventory_read_turn.py` 适配访问 | M1D/M1E | disabled/shadow 客户结果仍需 legacy 等价 |
+| 图片、视频、原视频、企业微信发送 | 未迁移、未修改 | 后续里程碑 | 本轮边界禁止接入素材和发送路径 |
+
+本轮收敛：
+
+- `app/main.py` 不新增第二个 Router、source selection、fallback 业务规则、候选编号解析或 alias 归一。
+- viewing 密码只在受控 legacy rule dict 中供既有客户显式看房回复使用。
+- 普通 tool summary、日志、RAG knowledge context 和 artifact evidence 不输出真实密码。
+- Snapshot sheet/viewing 只在本地测试中证明 Context 锁定，不启用生产 primary。
+
 ## 删除前总门槛
 
 - `pytest -q` 通过。

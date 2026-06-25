@@ -18,6 +18,7 @@ from app.config import settings
 from app.models import IncomingMessage
 from app.services import (
     inventory_read_turn,
+    inventory_sensitive_access,
     kf_agentic_rag,
     kf_context_memory,
     kf_orchestrator_flow,
@@ -1272,6 +1273,10 @@ def _current_inventory_images() -> list[Path]:
     if not paths:
         paths = sorted(Path("room_database").glob("inventory_*_original.png"))
     return [path for path in paths if path.exists()]
+
+
+async def _refresh_current_inventory_images_for_sheet() -> Any:
+    return await _refresh_inventory_images(force=False)
 
 
 def _row_value(row: dict[str, Any], names: tuple[str, ...]) -> str:
@@ -5133,11 +5138,21 @@ async def _execute_tools(
 
     if "send_inventory_sheet" in actions:
         try:
-            await _refresh_inventory_images(force=False)
-        except Exception as exc:
-            logger.exception("inventory image refresh failed: %s", exc)
-            evidence["inventory_image_error"] = str(exc)
-        evidence["inventory_images"] = [str(path) for path in _current_inventory_images()]
+            sheet_result = await inventory_sensitive_access.sheet_artifacts_for_context(
+                context=inventory_read_context,
+                refresh_func=_refresh_current_inventory_images_for_sheet,
+                list_paths_func=_current_inventory_images,
+            )
+            evidence["inventory_images"] = [str(path) for path in sheet_result.paths]
+            evidence["inventory_sheet_artifact_evidence"] = [
+                item.to_dict() for item in sheet_result.evidence
+            ]
+            if sheet_result.error:
+                evidence["inventory_image_error"] = str(sheet_result.error.get("message") or sheet_result.error)
+        except InventoryReadError as exc:
+            logger.warning("inventory sheet artifact blocked by read context: %s", exc.to_dict())
+            evidence["inventory_sheet_artifact_error"] = exc.to_dict()
+            evidence["inventory_images"] = []
 
     proof = dict(understanding.get("constraint_proof") or {})
     if proof.get("wants_original_video"):
@@ -5564,7 +5579,23 @@ async def _execute_tools(
     if "send_deposit_policy" in actions:
         evidence["rule_evidence"]["deposit_policy"] = _deposit_policy_evidence()
     if "explain_unavailable_viewing" in actions:
-        evidence["rule_evidence"]["viewing"] = _viewing_evidence(target_rows)
+        try:
+            viewing_evidence, viewing_rule = await inventory_sensitive_access.viewing_evidence_for_rows(
+                context=inventory_read_context,
+                rows=target_rows,
+                content=content,
+                row_labeler=_row_label,
+                viewing_text_getter=_viewing_text,
+                contact_numbers=CONTACT_NUMBERS,
+            )
+            evidence["rule_evidence"]["viewing"] = viewing_rule
+            evidence["viewing_instruction_evidence"] = [
+                item.to_log_dict() for item in viewing_evidence
+            ]
+        except InventoryReadError as exc:
+            logger.warning("viewing access blocked by read context: %s", exc.to_dict())
+            evidence["viewing_instruction_error"] = exc.to_dict()
+            evidence["rule_evidence"]["viewing"] = {"rooms": [], "contact_numbers": list(CONTACT_NUMBERS)}
         if _viewing_needs_contact(target_rows):
             evidence["rule_evidence"]["viewing_contact"] = list(CONTACT_NUMBERS)
 
@@ -5592,7 +5623,8 @@ def _row_brief(row: dict[str, Any]) -> dict[str, str]:
         "layout": _row_value(row, ("户型分类", "房型")),
         "rent_yayi": _row_value(row, ("押一付一", "押一付", "押一付一月租金")),
         "rent_yaer": _row_value(row, ("押二付一", "押二付", "押二付一月租金")),
-        "viewing": _row_value(row, ("看房方式密码", "看房方式", "密码")),
+        "has_viewing": str(bool(_row_value(row, ("看房方式密码", "看房方式", "密码")))),
+        "viewing_summary": _row_viewing_summary(row),
         "utilities": _row_value(row, ("备注", "水电", "说明")),
     }
 
@@ -5616,14 +5648,20 @@ def _tool_evidence_summary(tool_evidence: dict[str, Any]) -> dict[str, Any]:
         "original_video_url_count": len(tool_evidence.get("original_video_urls") or []),
         "material_page_url_count": len(tool_evidence.get("material_page_urls") or []),
         "inventory_image_error": tool_evidence.get("inventory_image_error") or "",
-        "rule_evidence": tool_evidence.get("rule_evidence") or {},
+        "rule_evidence": inventory_sensitive_access.safe_rule_evidence_for_summary(
+            tool_evidence.get("rule_evidence") or {}
+        ),
         "media_sync": tool_evidence.get("media_sync") or {},
         "planner_reply_result": tool_evidence.get("planner_reply_result") or {},
         "outbound_package": tool_evidence.get("outbound_package") or {},
         "inventory_read_context": tool_evidence.get("inventory_read_context") or {},
         "inventory_source_metadata": tool_evidence.get("inventory_source_metadata") or {},
         "inventory_listing_evidence_count": len(tool_evidence.get("inventory_listing_evidence") or []),
+        "viewing_instruction_evidence_count": len(tool_evidence.get("viewing_instruction_evidence") or []),
+        "inventory_sheet_artifact_evidence_count": len(tool_evidence.get("inventory_sheet_artifact_evidence") or []),
         "inventory_read_error": tool_evidence.get("inventory_read_error") or {},
+        "viewing_instruction_error": tool_evidence.get("viewing_instruction_error") or {},
+        "inventory_sheet_artifact_error": tool_evidence.get("inventory_sheet_artifact_error") or {},
         "selection_error": tool_evidence.get("selection_error") or {},
         "field_target_error": tool_evidence.get("field_target_error") or {},
         "field_semantics": FIELD_SEMANTICS,
@@ -8402,7 +8440,11 @@ async def _generate_reply_result(
     )
     knowledge_context = rag_result.context_text
     if tool_evidence.get("rule_evidence"):
-        knowledge_context += "\n\n确定性规则证据：\n" + str(tool_evidence["rule_evidence"])
+        knowledge_context += "\n\n确定性规则证据：\n" + str(
+            inventory_sensitive_access.safe_rule_evidence_for_summary(
+                tool_evidence["rule_evidence"]
+            )
+        )
     if tool_evidence.get("inventory_images"):
         knowledge_context += "\n\n动作摘要：\n" + json.dumps(
             {"will_send_inventory_sheet": True, "image_count": len(tool_evidence.get("inventory_images") or [])},

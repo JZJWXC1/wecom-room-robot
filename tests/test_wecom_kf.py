@@ -3769,6 +3769,140 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(evidence["inventory_rows"]), 1)
         self.assertEqual(context["last_candidate_set"]["inventory_cache_meta"]["source"], "test_property")
 
+    def test_tool_evidence_summary_redacts_viewing_secret(self) -> None:
+        canary = "M1D2B1_SUMMARY_SECRET#"
+        row = {
+            "community": "HeDe",
+            "room_no": "6-1-1204B",
+            "\u5c0f\u533a": "HeDe",
+            "\u623f\u53f7": "6-1-1204B",
+            "\u770b\u623f\u65b9\u5f0f\u5bc6\u7801": canary,
+        }
+
+        summary = main._tool_evidence_summary(
+            {
+                "actions": ["search_inventory", "explain_unavailable_viewing"],
+                "inventory_rows": [row],
+                "target_rows": [row],
+                "rule_evidence": {
+                    "viewing": {
+                        "rooms": [
+                            {
+                                "room": "HeDe6-1-1204B",
+                                "viewing": canary,
+                                "has_password": True,
+                            }
+                        ]
+                    }
+                },
+            }
+        )
+
+        dumped = json.dumps(summary, ensure_ascii=False)
+        self.assertNotIn(canary, dumped)
+        self.assertEqual(summary["inventory_rows"][0]["has_viewing"], "True")
+        self.assertNotIn(canary, summary["inventory_rows"][0]["viewing_summary"])
+
+    async def test_video_action_does_not_create_viewing_instruction_evidence(self) -> None:
+        canary = "M1D2B1_VIDEO_SECRET#"
+        row = {
+            "community": "HeDe",
+            "room_no": "6-1-1204B",
+            "\u5c0f\u533a": "HeDe",
+            "\u623f\u53f7": "6-1-1204B",
+            "\u770b\u623f\u65b9\u5f0f\u5bc6\u7801": canary,
+        }
+
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "video_no_viewing"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return [row]
+
+        async def fake_collect_room_media(rows: list[dict], *, media_kind: str, limit: int):
+            return [], [], [main._row_label(item) for item in rows], None
+
+        originals = {
+            "inventory": main.inventory,
+            "_collect_room_media": main._collect_room_media,
+        }
+        main.inventory = FakeInventory()
+        main._collect_room_media = fake_collect_room_media
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "send_video"],
+                content="HeDe 6-1-1204B video",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "HeDe 6-1-1204B video",
+                    "query_state": {"intent": "media"},
+                    "constraint_proof": {
+                        "communities": ["HeDe"],
+                        "room_refs": ["6-1-1204B"],
+                        "wants_video": True,
+                    },
+                    "structured_task": {"tool_requirements": {"needs_video": True}},
+                },
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertEqual(len(evidence["target_rows"]), 1)
+        self.assertNotIn("viewing_instruction_evidence", evidence)
+        self.assertNotIn("viewing", evidence["rule_evidence"])
+        summary_dumped = json.dumps(main._tool_evidence_summary(evidence), ensure_ascii=False)
+        self.assertNotIn(canary, summary_dumped)
+
+    async def test_send_inventory_sheet_uses_artifact_evidence(self) -> None:
+        calls = {"refresh": 0, "list": 0}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            png = Path(tmpdir) / "inventory_01.png"
+            png.write_bytes(b"png")
+
+            async def fake_refresh():
+                calls["refresh"] += 1
+                return {"ok": True}
+
+            def fake_current_images():
+                calls["list"] += 1
+                return [png]
+
+            originals = {
+                "_refresh_current_inventory_images_for_sheet": main._refresh_current_inventory_images_for_sheet,
+                "_current_inventory_images": main._current_inventory_images,
+            }
+            main._refresh_current_inventory_images_for_sheet = fake_refresh
+            main._current_inventory_images = fake_current_images
+            try:
+                evidence = await main._execute_tools(
+                    actions=["send_inventory_sheet"],
+                    content="inventory sheet",
+                    context=kf_context_memory.empty_context(),
+                    understanding={
+                        "intent": "inventory_sheet",
+                        "effective_query": "inventory sheet",
+                        "query_state": {"intent": "inventory_sheet"},
+                        "constraint_proof": {"wants_inventory_sheet": True},
+                        "structured_task": {
+                            "tool_requirements": {"needs_inventory_sheet": True}
+                        },
+                    },
+                )
+            finally:
+                for name, value in originals.items():
+                    setattr(main, name, value)
+
+        self.assertEqual(calls, {"refresh": 1, "list": 1})
+        self.assertEqual(evidence["inventory_images"], [str(png)])
+        artifact = evidence["inventory_sheet_artifact_evidence"][0]
+        self.assertEqual(artifact["decision_id"], evidence["inventory_read_context"]["decision_id"])
+        self.assertEqual(artifact["source_kind"], evidence["inventory_read_context"]["source_kind"])
+        self.assertEqual(artifact["safe_filename"], "inventory_01.png")
+
     async def test_execute_tools_does_not_fallback_search_when_candidate_index_out_of_range(self) -> None:
         class FakeInventory:
             @property

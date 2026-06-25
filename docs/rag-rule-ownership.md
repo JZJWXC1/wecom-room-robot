@@ -121,6 +121,31 @@ M1D2A 将 `InventoryReadRouter` 接入客服 RAG turn 起点，但不接 primary
 - `tests/test_inventory_read_router.py::test_production_customer_path_uses_read_router_without_snapshot_reader`
 - `tests/test_inventory_read_router.py::test_shadow_chat_mode_can_skip_snapshot_health_probe`
 
+## M1D2B1 Sensitive Tool Ownership
+
+M1D2B1 仍属于 RAG 工具执行层和发送准备层的读取契约收口，不属于 Planner、LLM Prompt、自检规则或发送语义变更。
+
+归属变更：
+
+- Viewing Tool：`app/services/inventory_sensitive_access.py` 成为真实 viewing 文本的唯一受控读取边界。必须有同一 turn 的 `InventoryReadContext`、绑定 `listing_id`、显式 viewing/password 目的和一致的 `decision_id`。
+- Sheet Artifact Tool：房源表 PNG 读取从 `_execute_tools` 中的直接刷新/列举，收口为 `sheet_artifacts_for_context`。Legacy provider 继续调用旧刷新和旧 PNG 列表，Snapshot provider 只读 Context snapshot manifest。
+- Tool Evidence：看房证据和房源表 artifact evidence 都带 `decision_id/source_kind/source_hash/schema_version`。普通摘要、日志和 RAG knowledge context 只能保存脱敏版本。
+
+保持不变：
+
+- Planner action 判断不变。
+- LLM Prompt 文本不变。
+- 客户回复、欢迎语、澄清话术、安全兜底不变。
+- 图片、视频、原视频、PNG 实际发送路径不变。
+- 水电、价格字段解释和候选排序不变。
+
+新增测试证明：
+
+- `tests/test_inventory_sensitive_access.py`
+- `tests/test_wecom_kf.py::MainAgenticRagFlowTests::test_tool_evidence_summary_redacts_viewing_secret`
+- `tests/test_wecom_kf.py::MainAgenticRagFlowTests::test_video_action_does_not_create_viewing_instruction_evidence`
+- `tests/test_wecom_kf.py::MainAgenticRagFlowTests::test_send_inventory_sheet_uses_artifact_evidence`
+
 ## M1B 修改归属声明模板
 
 后续提交说明需标明：
