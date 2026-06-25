@@ -100,6 +100,26 @@ M1B 已新增 InventorySnapshot 纯本地核心模型、构建器、校验器、
 | OCR/local image 库存 fallback | M1D 或手工灾备 | 明确不在生产默认 RAG 路径，灾备调用需单独权限和测试 |
 | Region/Feishu 同步后直接刷新 cache/index | M1C | 同步成功只构建候选快照，校验通过后切 pointer |
 
+## M1C1 Shadow 集成记录
+
+本轮新增 `INVENTORY_SNAPSHOT_MODE` 临时模式开关，取值仅允许 `disabled` 和 `shadow`，默认 `disabled`。该开关不切换生产读取入口；`shadow` 只在旧同步已经生成活动 cache/rewrite index 后，复用同一批结构化 rows 构建 `data/inventory_snapshots_shadow/` 下的 Shadow Snapshot、差异报告和 `shadow_current_snapshot.json`。不得写入 `data/inventory_snapshots/current_snapshot.json`。
+
+`INVENTORY_SNAPSHOT_MODE` 是 M1C1 到 M1D 的迁移开关，removal_milestone=M1D；到 M1D 时必须决定删除、或转为正式 Snapshot 读取配置，不允许继续与生产 reader feature flag 重叠。
+
+`LegacyInventoryToSnapshotAdapter` 是 M1C1 唯一旧字段到 Snapshot 输入字段的适配边界，唯一调用方为 `InventorySnapshotShadowCoordinator`。它只做字段映射，不请求飞书、不生成客户回复、不复制旧 normalizer、不实现第二套业务归一规则。该 adapter removal_milestone=M1D。
+
+M1C1 保留的旧入口与原因：
+
+| 入口 | M1C1 状态 | removal_milestone | 覆盖 |
+| --- | --- | --- | --- |
+| `scripts/refresh_rag_inventory_cache.py` | 旧 cache/index 成功后非阻断触发 Shadow | M1C/M1D | M1C1 Shadow 专项测试、全量 pytest |
+| `scripts/sync_feishu_region_inventory.py::refresh_rewrite_inventory_index` | 旧 region 同步成功后沿原流程刷新 cache/index，再非阻断触发 Shadow | M1C/M1D | M1C1 Shadow 专项测试 |
+| `app/main.py::_refresh_inventory` | 仅 admin refresh helper 追加非阻断 Shadow 结果，不改客服回复 | M1C/M1D | 全量 pytest |
+| 旧 `data/rewrite_inventory_index.json` | 仍是生产 rewrite 入口；Shadow 只读取本次生成文件做对比 | M1C | viewing 脱敏报告测试 |
+| 旧活动 CSV 和旧 PNG | 继续作为唯一生产事实源和客户发送来源 | M1D/M1C | 全量 pytest |
+
+Shadow 失败、超时、报告写失败、reconciliation blocking 和并发冲突都不得改变旧同步返回值，不得删除旧产物，不得更新生产 pointer。Shadow 报告只允许记录 `has_password` 和 `password_match` 布尔，不写真实密码、完整 viewing 原文、token、手机号或开发机绝对路径。
+
 ## 删除前总门槛
 
 - `pytest -q` 通过。

@@ -29,6 +29,14 @@
 - 不允许让 rewrite 层根据旧 index 声称房源不存在；未验证的 not found 必须路由到工具。
 - 不允许把旧固定规则升级为主要事实源；固定规则只能做安全阀。
 
+## M1C1 Shadow 归属
+
+M1C1 属于“房源/素材同步”阶段，只在旧同步完成结构化 rows 和旧 rewrite index 生成后运行 `InventorySnapshotShadowCoordinator`。Shadow 产物写入独立 `data/inventory_snapshots_shadow/` 根目录，聊天链路、RAG、Planner、工具执行、自检回流和发送阶段均不得读取该目录。
+
+本轮没有切换 `InventoryService`、`load_rewrite_inventory_index`、房源表 PNG 发送入口或 viewing tool。`app/main.py` 只在 admin refresh helper 返回 Shadow 状态；不新增客服规则、不新增客户可见回复分支。
+
+`LegacyInventoryToSnapshotAdapter` 的规则归属是“房源/素材同步”的临时字段映射，removal_milestone=M1D。它不是事实 reader，也不是 Planner/RAG 工具。
+
 ## M1B 修改归属声明模板
 
 后续提交说明需标明：

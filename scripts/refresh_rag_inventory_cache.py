@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.config import settings
 from app.services.inventory import InventoryService
+from app.services.inventory_snapshot_shadow import run_inventory_snapshot_shadow
 from app.services.rewrite_inventory_index import (
     DEFAULT_AREA_ALIASES,
     write_rewrite_inventory_index,
@@ -92,6 +93,14 @@ async def refresh_cache() -> dict[str, Any]:
         area_aliases=DEFAULT_AREA_ALIASES,
         cache_meta=service.cache_meta,
     )
+    shadow = run_inventory_snapshot_shadow(
+        legacy_rows=rows,
+        source_kind="rag_inventory_cache_sync",
+        source_version=str(index.get("signature") or service.cache_meta.get("hash") or ""),
+        cache_meta=service.cache_meta,
+        legacy_rewrite_index_path=settings.rewrite_inventory_index_path,
+        legacy_rewrite_index=index,
+    )
     return {
         "ok": True,
         "inventory_source": settings.inventory_source,
@@ -105,6 +114,7 @@ async def refresh_cache() -> dict[str, Any]:
             "row_count": index.get("row_count", 0),
             "signature": index.get("signature", ""),
         },
+        "inventory_snapshot_shadow": shadow,
     }
 
 

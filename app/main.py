@@ -27,6 +27,7 @@ from app.services.fuzzy_match import (
 )
 from app.services.inventory import InventoryService
 from app.services.inventory_image_sync import InventoryImageSyncer
+from app.services.inventory_snapshot_shadow import run_inventory_snapshot_shadow
 from app.services.inventory_query import (
     parse_inventory_query,
     row_matches_hard_constraints,
@@ -1163,7 +1164,27 @@ async def _refresh_inventory() -> dict[str, Any]:
         frame = await inventory.refresh()
     rows = frame.fillna("").to_dict(orient="records") if hasattr(frame, "fillna") else []
     index_result = _write_rewrite_inventory_index(rows)
-    return {"ok": True, "rows": int(len(frame)), "rewrite_index": index_result}
+    if index_result.get("ok"):
+        shadow_result = run_inventory_snapshot_shadow(
+            legacy_rows=rows,
+            source_kind="admin_inventory_refresh",
+            source_version=str(index_result.get("signature") or inventory.cache_meta.get("hash") or ""),
+            cache_meta=inventory.cache_meta,
+            legacy_rewrite_index_path=settings.rewrite_inventory_index_path,
+        )
+    else:
+        shadow_result = {
+            "ok": False,
+            "mode": settings.inventory_snapshot_mode,
+            "status": "skipped",
+            "error_code": "legacy_rewrite_index_failed",
+        }
+    return {
+        "ok": True,
+        "rows": int(len(frame)),
+        "rewrite_index": index_result,
+        "inventory_snapshot_shadow": shadow_result,
+    }
 
 
 def _write_rewrite_inventory_index(rows: list[dict[str, Any]]) -> dict[str, Any]:

@@ -251,6 +251,14 @@ class Settings(BaseSettings):
         default=Path("data/rewrite_inventory_index.json"),
         alias="REWRITE_INVENTORY_INDEX_PATH",
     )
+    inventory_snapshot_mode: str = Field(
+        default="disabled",
+        alias="INVENTORY_SNAPSHOT_MODE",
+    )
+    inventory_snapshot_shadow_root: Path = Field(
+        default=Path("data/inventory_snapshots_shadow"),
+        alias="INVENTORY_SNAPSHOT_SHADOW_ROOT",
+    )
     room_database_path: Path = Path("room_database")
     inventory_image_path: Path = Path("room_database/inventory.png")
     inventory_image_glob: str = "room_database/inventory_*.png"
