@@ -69,6 +69,31 @@ M1C3-FIX1 只修复 Shadow reconciliation 对旧 rewrite index 与 Snapshot safe
 - 当 Shadow 调用方已经传入本轮 in-memory legacy index 时，reconciliation 优先使用该 index，避免 path 指向历史文件时混入当前批次。
 - 本修复不新增客户消息调用点，不接入 Snapshot Reader，不切换生产读取入口。
 
+## M1D1 Inventory Read Router 归属
+
+M1D1 新增 `InventoryReadRouter`、`LegacyInventoryReadProvider`、`SnapshotInventoryReadProvider`、`InventoryReadContext` 和 `InventoryListingEvidence`，归属为“房源读取契约/测试覆盖”的本地底座，不接入当前客服生产链路。
+
+职责边界：
+
+- Router 唯一负责 source selection。
+- Provider 唯一负责读取与 Evidence 转换。
+- LLM1 不得选择数据源。
+- LLM2 不得选择数据源。
+- 工具层不得自行更换数据源。
+- selfcheck 不得修改 Context。
+- `app/main.py` 不得再次实现 source selection。
+
+M1D1 仍保持：
+
+- 问题重写/意图分析继续使用旧 `InventoryService` 和旧 rewrite index。
+- Planner 只声明工具需求，不调用新 Router。
+- 工具执行继续使用旧 `inventory.search/all_rows`。
+- 结构化会话记忆未切换 snapshot_id。
+- 自检回流未读取新 Evidence。
+- 发送阶段继续使用旧 PNG。
+
+生产隔离证明由 `tests/test_inventory_read_router.py::test_production_customer_path_is_not_switched_to_inventory_read_router` 覆盖。
+
 ## M1B 修改归属声明模板
 
 后续提交说明需标明：
