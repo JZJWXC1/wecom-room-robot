@@ -139,6 +139,26 @@ M1C2 保留的旧入口与原因：
 
 M1C2 后，若要进入正式切换评估，至少需要 Shadow 模式、最近一次 reconciliation 无 blocking、公开产物扫描通过、状态未过期、连续不同 `source_hash` 通过次数达到门槛、且最近一次无 error。该状态仅表示“可进入人工/后续门禁评估”，不是自动切生产。
 
+## M1C3 Shadow 发布预检 Legacy Removal Gate
+
+M1C3 只准备 Shadow 生产观察的部署清单、配置、观察工具、preflight 和回滚方案；仍禁止删除旧生产路径，因为旧路径继续承担客户事实读取。
+
+| Legacy 路径 | M1C3 状态 | M1D 候选处理 |
+| --- | --- | --- |
+| 旧 `data/inventory_cache.csv` | 保留，仍由 `InventoryService` 和旧同步使用 | M1D 候选删除；前提是 Snapshot Reader 已成为唯一生产库存读取源且回归通过。 |
+| 旧 `data/rewrite_inventory_index.json` | 保留，RAG rewrite/实体解析仍读取旧 index | M1D 候选删除；前提是同轮锁定 snapshot rewrite index 已上线并覆盖测试。 |
+| 旧 `room_database/inventory_*.png` 生成/发送 | 保留，客户要房源表仍依赖旧 PNG 发送入口 | 是否删除取决于客户发房源表需求；若 Snapshot PNG 接管发送阶段，旧 PNG 才能降级或删除。 |
+| 旧 `InventoryService` 读取 | 保留，客户查询、工具执行和 health 仍依赖 | M1D 候选删除或降级为灾备；前提是 `search/all_rows/snapshot` 全部切 Snapshot Reader。 |
+| Shadow mode 临时兼容代码 | 保留，用于 M1C3 观察和门禁 | M1D 决策：删除、改为正式 Snapshot 发布路径、或保留为只读审计工具。 |
+| `LegacyInventoryToSnapshotAdapter` | 保留，Shadow 唯一旧字段适配边界 | M1D 删除；前提是同步源直接输出 Snapshot 标准字段。 |
+
+M1C3 内部收束：
+
+- Shadow mode 解析继续集中在 `parse_inventory_snapshot_mode`，禁止在 CLI 或脚本中自行解析 `primary`。
+- Shadow health 读取集中由 `get_inventory_snapshot_shadow_health` 和 `inventory_snapshot_shadow_observer` 复用。
+- CLI 人类输出和 JSON 输出复用同一套安全观察 payload，避免重复格式化逻辑。
+- Preflight 只做只读检查，不构建真实 Snapshot，不写 production pointer，不启动同步，不连接飞书或企业微信。
+
 ## 删除前总门槛
 
 - `pytest -q` 通过。

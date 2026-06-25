@@ -73,6 +73,13 @@ M1C1/M1C2 当前状态：
 - M1C2 新增 health/readiness、`sync_run_id` 去重和离线全链路验证，门禁只表示“可进入切换评估”，不自动切换生产 pointer。
 - 客服消息回调、Planner、工具执行、自检回流、发送房源表 PNG 仍未读取 Shadow 目录；正式只读 Snapshot 切换仍需后续 M1C 步骤完成。
 
+M1C3 当前状态：
+
+- 新增 Shadow 只读观察 CLI、发布前 preflight、部署清单、runbook 和三次观察模板。
+- 新增 Shadow timeout、report retention 集中配置；默认 mode 仍为 `disabled`。
+- M1C3 允许生产观察期配置 `INVENTORY_SNAPSHOT_MODE=shadow`，但仍禁止 `primary`、自动切换和客户读取入口切换。
+- 正式只读 Snapshot 运行时切换仍未完成，继续留给后续 M1C/M1D。
+
 ### M1D：清理旧活动文件直读
 
 目标：确认生产路径不再依赖 `data/inventory_cache.csv`、`data/rewrite_inventory_index.json`、`room_database/inventory_*.png` 活动文件后，删除或降级旧 fallback。

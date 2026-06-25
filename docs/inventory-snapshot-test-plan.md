@@ -80,6 +80,19 @@ Skipped test 审计：当前唯一 skip 为 `tests/test_inventory_snapshot.py::t
 - AST 测试确认 `app/main.py` 中 Shadow 调用仅存在于 `_refresh_inventory` admin helper，不在客服消息/RAG 链路。
 - Region 同步脚本测试确认旧流程只 refresh 一次，并传入唯一 `sync_run_id` 给 Shadow。
 
+## M1C3 发布预检覆盖
+
+新增 `tests/test_inventory_snapshot_m1c3.py`：
+
+- Shadow 观察 CLI 覆盖 healthy、never_run、disabled、stale、blocking、corrupt status。
+- `--json` 输出不含 secret canary、手机号、token 或开发机绝对路径。
+- CLI 只读：读取前后 Shadow 状态、pointer、report 文件字节不变。
+- UTF-8 中文输出可正常打印。
+- Preflight 覆盖：不访问网络、不写 production pointer、非法 mode、Shadow/production path 重叠。
+- Preflight 覆盖旧生产文件存在、旧生产读取路径未切 Snapshot Reader。
+- 路径输出使用安全 label，避免公开绝对敏感路径；覆盖 Windows 绝对路径和相对部署路径。
+- 客服消息路径仍无 Snapshot Reader 调用。
+
 ## 现有测试扩展
 
 `tests/test_inventory.py`：

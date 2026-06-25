@@ -267,6 +267,14 @@ class Settings(BaseSettings):
         default=3,
         alias="INVENTORY_SNAPSHOT_SHADOW_REQUIRED_PASSES",
     )
+    inventory_snapshot_shadow_timeout_seconds: float = Field(
+        default=10.0,
+        alias="INVENTORY_SNAPSHOT_SHADOW_TIMEOUT_SECONDS",
+    )
+    inventory_snapshot_shadow_report_retention: int = Field(
+        default=30,
+        alias="INVENTORY_SNAPSHOT_SHADOW_REPORT_RETENTION",
+    )
     room_database_path: Path = Path("room_database")
     inventory_image_path: Path = Path("room_database/inventory.png")
     inventory_image_glob: str = "room_database/inventory_*.png"

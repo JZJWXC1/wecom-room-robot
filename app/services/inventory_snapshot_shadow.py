@@ -148,7 +148,7 @@ class InventorySnapshotShadowCoordinator:
         *,
         mode: str | None = None,
         root: Path | None = None,
-        timeout_seconds: float = DEFAULT_SHADOW_TIMEOUT_SECONDS,
+        timeout_seconds: float | None = None,
         adapter: LegacyInventoryToSnapshotAdapter | None = None,
         builder_factory: Callable[[], SnapshotBuilder] | None = None,
         validator: SnapshotValidator | None = None,
@@ -156,7 +156,11 @@ class InventorySnapshotShadowCoordinator:
     ) -> None:
         self.mode_value = mode
         self.root = Path(root) if root is not None else Path(settings.inventory_snapshot_shadow_root)
-        self.timeout_seconds = float(timeout_seconds)
+        self.timeout_seconds = float(
+            settings.inventory_snapshot_shadow_timeout_seconds
+            if timeout_seconds is None
+            else timeout_seconds
+        )
         self.adapter = adapter or LegacyInventoryToSnapshotAdapter()
         self.builder_factory = builder_factory or SnapshotBuilder
         self.validator = validator or SnapshotValidator()
@@ -338,6 +342,7 @@ class InventorySnapshotShadowCoordinator:
         reports_dir.mkdir(parents=True, exist_ok=True)
         report_path = reports_dir / f"{snapshot.snapshot_id}_reconciliation.json"
         _atomic_write_json(report_path, reconciliation.to_dict())
+        _prune_reconciliation_reports(reports_dir, keep_count=settings.inventory_snapshot_shadow_report_retention)
         return report_path
 
     def _write_shadow_pointer(
@@ -483,7 +488,7 @@ def run_inventory_snapshot_shadow(
     legacy_rewrite_index: dict[str, Any] | None = None,
     source_payload: Any | None = None,
     root: Path | None = None,
-    timeout_seconds: float = DEFAULT_SHADOW_TIMEOUT_SECONDS,
+    timeout_seconds: float | None = None,
     sync_run_id: str | None = None,
     mode: str | None = None,
 ) -> dict[str, Any]:
@@ -733,6 +738,27 @@ def _contains_sensitive_artifact_text(text: str) -> bool:
     if re.search(r"[A-Za-z]:\\Users\\", text):
         return True
     return False
+
+
+def _prune_reconciliation_reports(reports_dir: Path, *, keep_count: int) -> None:
+    keep = max(int(keep_count or 0), 1)
+    reports = sorted(
+        reports_dir.glob("*_reconciliation.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in reports[keep:]:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            logger.warning(
+                "inventory_snapshot_shadow_report_prune_failed report=%s error_code=%s message=%s",
+                path.name,
+                _error_code(exc),
+                _safe_error_message(exc),
+            )
 
 
 def _safe_error_message(exc: BaseException) -> str:
