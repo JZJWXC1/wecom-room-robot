@@ -716,23 +716,58 @@ def _public_artifact_secret_scan(root: Path, snapshot_id: str) -> tuple[bool, st
     snapshot_dir = root / "snapshots" / snapshot_id
     if not snapshot_dir.exists():
         return False, "snapshot_dir_missing"
-    for path in snapshot_dir.rglob("*"):
+    scan = scan_public_artifacts_for_sensitive_text(root, snapshot_id=snapshot_id)
+    if not scan["passed"]:
+        return False, "public_artifact_secret_scan_failed"
+    return True, ""
+
+
+def scan_public_artifacts_for_sensitive_text(root: Path, *, snapshot_id: str = "") -> dict[str, Any]:
+    root_path = Path(root)
+    scan_root = root_path / "snapshots" / snapshot_id if snapshot_id else root_path
+    findings: list[dict[str, Any]] = []
+    files_scanned = 0
+    if not scan_root.exists():
+        return {
+            "passed": False,
+            "files_scanned": 0,
+            "findings": [
+                {
+                    "code": "scan_root_missing",
+                    "path": _relative_to_root(scan_root, root_path),
+                    "public": True,
+                    "byte_size": 0,
+                    "sha256_prefix": "",
+                }
+            ],
+        }
+    for path in scan_root.rglob("*"):
         if not path.is_file():
             continue
-        try:
-            path.relative_to(snapshot_dir / "private")
+        if _is_private_artifact_path(path, scan_root):
             continue
-        except ValueError:
-            pass
         if path.suffix.lower() not in {".json", ".csv", ".txt", ".md"}:
             continue
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             text = path.read_text(encoding="utf-8-sig")
+        files_scanned += 1
         if contains_sensitive_artifact_text(text):
-            return False, "public_artifact_secret_scan_failed"
-    return True, ""
+            findings.append(
+                {
+                    "code": "sensitive_artifact_text",
+                    "path": _relative_to_root(path, root_path),
+                    "public": True,
+                    "byte_size": path.stat().st_size,
+                    "sha256_prefix": _safe_file_hash_prefix(path),
+                }
+            )
+    return {
+        "passed": not findings,
+        "files_scanned": files_scanned,
+        "findings": findings,
+    }
 
 
 def contains_sensitive_artifact_text(text: str) -> bool:
@@ -794,6 +829,25 @@ def _is_artifact_hashlike_text(value: str) -> bool:
         _ARTIFACT_HASHLIKE_PATTERN.fullmatch(text)
         or _ARTIFACT_SNAPSHOT_ID_PATTERN.fullmatch(text)
     )
+
+
+def _is_private_artifact_path(path: Path, scan_root: Path) -> bool:
+    try:
+        relative = path.relative_to(scan_root)
+    except ValueError:
+        return False
+    return "private" in relative.parts
+
+
+def _safe_file_hash_prefix(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as file:
+            for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    return digest.hexdigest()[:12]
 
 
 def _prune_reconciliation_reports(reports_dir: Path, *, keep_count: int) -> None:

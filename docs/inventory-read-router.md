@@ -170,3 +170,38 @@ M1D2B1 将看房信息和房源表 PNG 产物接入同一个 `InventoryReadConte
 - 视频动作不会触发 viewing provider。
 - shadow 聊天中的 legacy 房源表读取不会访问 Snapshot provider。
 - Snapshot sheet artifact 只读取 Context 指定 snapshot，不读取最新 pointer。
+
+## M1D2B2 Local Primary Rehearsal
+
+M1D2B2 新增 `app/services/inventory_snapshot_cutover.py`，只用于本地 primary cutover 演练和测试覆盖，不接入客服生产配置，不修改 `app/main.py` 客户回复链路。
+
+本地演练覆盖：
+
+- 完全虚构的 Snapshot 构建和 primary replay。
+- Legacy/Snapshot query golden parity。
+- 两版 Snapshot 的 turn 级 `snapshot_id/source_hash/decision_id` 锁定。
+- `strict` 与 `legacy_whole_request` 整体 fallback。
+- 禁止业务读取开始后的半轮 fallback。
+- pointer、manifest、private viewing secret、PNG hash/size 故障注入。
+- public artifact、cutover report、PreparedOutboundPackage 和 send action metadata 的敏感 canary 扫描。
+- 并发 case/root 隔离。
+- 本地 current pointer rollback rehearsal。
+- Cutover readiness evaluator 和性能摘要。
+
+M1D2B2 不改变：
+
+- 客服路径仍只允许 disabled/shadow 使用 Legacy。
+- 服务器不启用 primary。
+- Planner、Prompt、自检、发送语义不变。
+- 图片、视频、原视频素材不接入 Snapshot。
+- 旧 CSV/index/PNG 不删除。
+
+Secret scan 继续复用 `inventory_snapshot_shadow.scan_public_artifacts_for_sensitive_text`：结构化 `sha256/source_hash/snapshot_id/decision_id/evidence_id` 中的手机号形态数字不会误报；普通业务文本、嵌套 list/dict、manifest 业务字段中的手机号、canary、开发机绝对路径仍会阻断。
+
+M1D2B2 Legacy Removal Report：
+
+| 保留项 | 保留原因 | removal_milestone |
+| --- | --- | --- |
+| `InventoryService` | 生产客户读取仍未获批切 primary | approved primary cutover 通过并观察稳定后 |
+| 旧 CSV/rewrite index/PNG | legacy_whole_request 回退和生产安全 | primary 稳定性复审后 |
+| `LegacyInventoryReadProvider` | golden parity 和整体 fallback 契约 | primary 成为唯一批准读取源后 |

@@ -23,6 +23,8 @@ _PASSWORD_CONTEXT_PATTERN = re.compile(
 )
 _PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _SECRET_CANARY_PATTERN = re.compile(r"TEST_SECRET_[A-Za-z0-9_#-]+")
+_CANARY_PATTERN = re.compile(r"\b[\w-]*canary[\w#-]*", re.IGNORECASE)
+_TOKEN_CONTEXT_PATTERN = re.compile(r"\b(token|access_token|secret)\s*[:= ]+\S+", re.IGNORECASE)
 SNAPSHOT_ID_PATTERN = re.compile(r"^\d{8}T\d{6}Z_[0-9a-f]{12}(?:_[A-Za-z0-9][A-Za-z0-9_-]{0,31})?$")
 LISTING_ID_PATTERN = re.compile(r"^lst_[0-9a-f]{16}$")
 INTERNAL_SAFE_ID_PATTERN = re.compile(r"^(?:ird|evd)_[0-9a-f]{16}$")
@@ -192,7 +194,9 @@ def redact_sensitive_text(value: Any) -> str:
         or re.fullmatch(r"[0-9a-f]{12,64}", text)
     ):
         return text
+    text = _CANARY_PATTERN.sub(REDACTED_VALUE, text)
     text = _SECRET_CANARY_PATTERN.sub(REDACTED_VALUE, text)
+    text = _TOKEN_CONTEXT_PATTERN.sub(lambda match: f"{match.group(1)} {REDACTED_VALUE}", text)
     text = _PHONE_PATTERN.sub(REDACTED_VALUE, text)
     text = _HASHED_PASSWORD_PATTERN.sub(REDACTED_VALUE, text)
     return _PASSWORD_CONTEXT_PATTERN.sub(lambda match: f"{match.group(1)}{REDACTED_VALUE}", text)

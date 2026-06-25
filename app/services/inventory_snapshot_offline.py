@@ -10,9 +10,9 @@ from typing import Any
 from app.services.inventory_legacy_parser import spreadsheet_values_to_inventory_rows
 from app.services.inventory_snapshot_models import sanitize_for_log
 from app.services.inventory_snapshot_shadow import (
-    contains_sensitive_artifact_text,
     get_inventory_snapshot_shadow_health,
     run_inventory_snapshot_shadow,
+    scan_public_artifacts_for_sensitive_text,
 )
 from app.services.rewrite_inventory_index import build_rewrite_inventory_index
 
@@ -123,20 +123,9 @@ class InventorySnapshotOfflineComparisonRunner:
 
 
 def scan_safe_artifacts_for_canaries(root: Path) -> tuple[bool, list[str]]:
-    issues: list[str] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in {".json", ".csv", ".txt", ".md"}:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            text = path.read_text(encoding="utf-8-sig")
-        if contains_sensitive_artifact_text(text):
-            issues.append(path.relative_to(root).as_posix())
-    unique_issues = sorted(set(issues))
-    return not unique_issues, unique_issues
+    scan = scan_public_artifacts_for_sensitive_text(root)
+    issues = sorted({str(item.get("path") or "") for item in scan.get("findings") or [] if item.get("path")})
+    return bool(scan.get("passed")), issues
 
 
 def _source_version(fixture_name: str, values: list[list[Any]]) -> str:
