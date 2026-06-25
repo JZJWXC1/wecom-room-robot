@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_SHADOW_TIMEOUT_SECONDS = 10.0
 SHADOW_HEALTH_SCHEMA_VERSION = "inventory_snapshot_shadow_health.v1"
 SHADOW_STATUS_SCHEMA_VERSION = "inventory_snapshot_shadow_status.v2"
+_ARTIFACT_PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+_ARTIFACT_HASHLIKE_PATTERN = re.compile(r"[0-9a-fA-F]{12,128}")
+_ARTIFACT_SNAPSHOT_ID_PATTERN = re.compile(
+    r"\d{8}T\d{6}Z_[0-9a-fA-F]{12}(?:_[A-Za-z0-9][A-Za-z0-9_-]{0,31})?"
+)
 
 
 class InventorySnapshotMode(str, Enum):
@@ -725,19 +730,70 @@ def _public_artifact_secret_scan(root: Path, snapshot_id: str) -> tuple[bool, st
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             text = path.read_text(encoding="utf-8-sig")
-        if _contains_sensitive_artifact_text(text):
+        if contains_sensitive_artifact_text(text):
             return False, "public_artifact_secret_scan_failed"
     return True, ""
 
 
-def _contains_sensitive_artifact_text(text: str) -> bool:
+def contains_sensitive_artifact_text(text: str) -> bool:
     if re.search(r"canary", text, flags=re.IGNORECASE):
         return True
-    if re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", text):
+    if _artifact_text_contains_phone(text):
         return True
     if re.search(r"[A-Za-z]:\\Users\\", text):
         return True
     return False
+
+
+def _artifact_text_contains_phone(text: str) -> bool:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return _free_text_contains_phone(text)
+    return _artifact_json_contains_phone(parsed)
+
+
+def _artifact_json_contains_phone(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(
+            _free_text_contains_phone(str(key))
+            or _artifact_json_contains_phone(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_artifact_json_contains_phone(item) for item in value)
+    if isinstance(value, str):
+        if _is_artifact_hashlike_text(value):
+            return False
+        return _free_text_contains_phone(value)
+    return False
+
+
+def _free_text_contains_phone(text: str) -> bool:
+    for match in _ARTIFACT_PHONE_PATTERN.finditer(text):
+        token = _alnum_token_around(text, match.start(), match.end())
+        if _is_artifact_hashlike_text(token):
+            continue
+        return True
+    return False
+
+
+def _alnum_token_around(text: str, start: int, end: int) -> str:
+    left = start
+    while left > 0 and text[left - 1].isalnum():
+        left -= 1
+    right = end
+    while right < len(text) and text[right].isalnum():
+        right += 1
+    return text[left:right]
+
+
+def _is_artifact_hashlike_text(value: str) -> bool:
+    text = str(value or "").strip()
+    return bool(
+        _ARTIFACT_HASHLIKE_PATTERN.fullmatch(text)
+        or _ARTIFACT_SNAPSHOT_ID_PATTERN.fullmatch(text)
+    )
 
 
 def _prune_reconciliation_reports(reports_dir: Path, *, keep_count: int) -> None:

@@ -24,7 +24,7 @@ from app.services.inventory_sensitive_access import (
     viewing_evidence_for_rows,
 )
 from app.services.inventory_snapshot_builder import SnapshotBuilder
-from app.services.inventory_snapshot_models import InventorySourceMetadata
+from app.services.inventory_snapshot_models import InventorySourceMetadata, sanitize_for_log
 from app.services.inventory_snapshot_reader import SnapshotReader
 from app.services.inventory_snapshot_store import SnapshotStore
 
@@ -74,6 +74,21 @@ def test_secret_value_does_not_render_raw_value() -> None:
     assert SECRET_CANARY not in str(secret)
     assert SECRET_CANARY not in json.dumps(secret.to_log_dict(), ensure_ascii=False)
     assert secret.reveal_for_authorized_render() == SECRET_CANARY
+
+
+def test_safe_inventory_ids_are_not_phone_redacted() -> None:
+    phone = "199" + "0000" + "9999"
+    payload = sanitize_for_log(
+        {
+            "decision_id": "ird_17435665458f662a",
+            "evidence_id": "evd_17435665458f662a",
+            "note": f"联系 {phone}",
+        }
+    )
+
+    assert payload["decision_id"] == "ird_17435665458f662a"
+    assert payload["evidence_id"] == "evd_17435665458f662a"
+    assert phone not in payload["note"]
 
 
 def test_legacy_viewing_access_binds_context_and_listing_id_without_log_secret() -> None:

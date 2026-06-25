@@ -10,8 +10,11 @@ from typing import Any
 from app.services.inventory_legacy_parser import spreadsheet_values_to_inventory_rows
 from app.services.inventory_snapshot_builder import SnapshotBuilder
 from app.services.inventory_snapshot_legacy_adapter import LegacyInventoryToSnapshotAdapter
-from app.services.inventory_snapshot_models import InventorySourceMetadata
-from app.services.inventory_snapshot_offline import InventorySnapshotOfflineComparisonRunner
+from app.services.inventory_snapshot_models import InventorySourceMetadata, now_utc_iso
+from app.services.inventory_snapshot_offline import (
+    InventorySnapshotOfflineComparisonRunner,
+    scan_safe_artifacts_for_canaries,
+)
 from app.services.inventory_snapshot_reconciliation import reconcile_inventory_snapshot
 from app.services.inventory_snapshot_shadow import (
     InventorySnapshotShadowCoordinator,
@@ -303,6 +306,101 @@ def test_shadow_health_requires_distinct_successes_and_resets_after_blocking(tmp
     assert health_after_recovery["consecutive_passes"] == 1
     assert health_after_recovery["consecutive_failures"] == 0
     assert health_after_recovery["ready_for_cutover_evaluation"] is True
+
+
+def test_shadow_health_secret_scan_ignores_phone_like_sha256_digest(tmp_path: Path) -> None:
+    root = tmp_path / "shadow"
+    snapshot_id = "20260625T000000Z_abcdef123456"
+    snapshot_dir = root / "snapshots" / snapshot_id
+    snapshot_dir.mkdir(parents=True)
+    phone_like_digest = "a19900009999b" + ("0" * 51)
+    (snapshot_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "inventory_snapshot.v1",
+                "snapshot_id": snapshot_id,
+                "files": {
+                    "inventory_json": {
+                        "path": "inventory.json",
+                        "sha256": phone_like_digest,
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    current_time = now_utc_iso()
+    (root / "shadow_status.json").write_text(
+        json.dumps(
+            {
+                "last_snapshot_id": snapshot_id,
+                "last_attempt_at": current_time,
+                "last_success_at": current_time,
+                "last_reconciliation_passed": True,
+                "last_blocking_count": 0,
+                "last_warning_count": 0,
+                "consecutive_passes": 1,
+                "consecutive_failures": 0,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    health = get_inventory_snapshot_shadow_health(
+        root=root,
+        mode="shadow",
+        required_consecutive_passes=1,
+    ).to_dict()
+    scan_passed, issues = scan_safe_artifacts_for_canaries(root)
+
+    assert health["public_artifact_secret_scan_passed"] is True
+    assert health["ready_for_cutover_evaluation"] is True
+    assert scan_passed is True
+    assert issues == []
+
+
+def test_shadow_health_secret_scan_still_blocks_public_phone_text(tmp_path: Path) -> None:
+    root = tmp_path / "shadow"
+    snapshot_id = "20260625T000000Z_abcdef654321"
+    snapshot_dir = root / "snapshots" / snapshot_id
+    snapshot_dir.mkdir(parents=True)
+    phone = "199" + "0000" + "9999"
+    (snapshot_dir / "inventory.json").write_text(
+        json.dumps({"remark": f"联系 {phone}"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    current_time = now_utc_iso()
+    (root / "shadow_status.json").write_text(
+        json.dumps(
+            {
+                "last_snapshot_id": snapshot_id,
+                "last_attempt_at": current_time,
+                "last_success_at": current_time,
+                "last_reconciliation_passed": True,
+                "last_blocking_count": 0,
+                "last_warning_count": 0,
+                "consecutive_passes": 1,
+                "consecutive_failures": 0,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    health = get_inventory_snapshot_shadow_health(
+        root=root,
+        mode="shadow",
+        required_consecutive_passes=1,
+    ).to_dict()
+    scan_passed, issues = scan_safe_artifacts_for_canaries(root)
+
+    assert health["ready_for_cutover_evaluation"] is False
+    assert health["public_artifact_secret_scan_passed"] is False
+    assert "public_artifact_secret_scan_failed" in health["not_ready_reasons"]
+    assert scan_passed is False
+    assert issues == ["snapshots/20260625T000000Z_abcdef654321/inventory.json"]
 
 
 def test_health_handles_disabled_never_run_stale_corrupt_and_safe_output(tmp_path: Path) -> None:

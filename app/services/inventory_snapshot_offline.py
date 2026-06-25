@@ -4,13 +4,13 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
-import re
 import time
 from typing import Any
 
 from app.services.inventory_legacy_parser import spreadsheet_values_to_inventory_rows
 from app.services.inventory_snapshot_models import sanitize_for_log
 from app.services.inventory_snapshot_shadow import (
+    contains_sensitive_artifact_text,
     get_inventory_snapshot_shadow_health,
     run_inventory_snapshot_shadow,
 )
@@ -133,12 +133,7 @@ def scan_safe_artifacts_for_canaries(root: Path) -> tuple[bool, list[str]]:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             text = path.read_text(encoding="utf-8-sig")
-        lowered = text.lower()
-        if "canary" in lowered or "phone_canary" in lowered:
-            issues.append(path.relative_to(root).as_posix())
-        if re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", text):
-            issues.append(path.relative_to(root).as_posix())
-        if "c:\\users\\" in lowered:
+        if contains_sensitive_artifact_text(text):
             issues.append(path.relative_to(root).as_posix())
     unique_issues = sorted(set(issues))
     return not unique_issues, unique_issues

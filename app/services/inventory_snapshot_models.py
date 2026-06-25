@@ -25,6 +25,7 @@ _PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _SECRET_CANARY_PATTERN = re.compile(r"TEST_SECRET_[A-Za-z0-9_#-]+")
 SNAPSHOT_ID_PATTERN = re.compile(r"^\d{8}T\d{6}Z_[0-9a-f]{12}(?:_[A-Za-z0-9][A-Za-z0-9_-]{0,31})?$")
 LISTING_ID_PATTERN = re.compile(r"^lst_[0-9a-f]{16}$")
+INTERNAL_SAFE_ID_PATTERN = re.compile(r"^(?:ird|evd)_[0-9a-f]{16}$")
 _SENSITIVE_KEY_TOKENS = (
     "password",
     "secret",
@@ -187,6 +188,7 @@ def redact_sensitive_text(value: Any) -> str:
     if (
         SNAPSHOT_ID_PATTERN.fullmatch(text)
         or LISTING_ID_PATTERN.fullmatch(text)
+        or INTERNAL_SAFE_ID_PATTERN.fullmatch(text)
         or re.fullmatch(r"[0-9a-f]{12,64}", text)
     ):
         return text
