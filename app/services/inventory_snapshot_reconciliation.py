@@ -212,13 +212,15 @@ def reconcile_inventory_snapshot(
 
 
 def load_legacy_rewrite_index(path: Path | None, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    if fallback is not None:
+        return dict(fallback)
     if path is None:
-        return dict(fallback or {})
+        return {}
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return dict(fallback or {})
-    return value if isinstance(value, dict) else dict(fallback or {})
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def compare_rewrite_inventory_index(
@@ -254,32 +256,41 @@ def compare_rewrite_inventory_index(
         _named_set(snapshot_index.get("areas") or []),
         "blocking",
     )
-    legacy_communities = _community_map(legacy_index.get("communities") or [])
-    snapshot_communities = _community_map(snapshot_index.get("communities") or [])
+    legacy_communities, legacy_duplicate_communities = _community_map(
+        legacy_index.get("communities") or [],
+        side="legacy",
+    )
+    snapshot_communities, snapshot_duplicate_communities = _community_map(
+        snapshot_index.get("communities") or [],
+        side="snapshot",
+    )
+    mismatches.extend(legacy_duplicate_communities)
+    mismatches.extend(snapshot_duplicate_communities)
     snapshot_layouts_by_community = _layouts_by_community(snapshot_index.get("room_index") or [])
     _compare_set(mismatches, "communities", set(legacy_communities), set(snapshot_communities), "blocking")
-    for name in sorted(set(legacy_communities) & set(snapshot_communities)):
-        legacy = legacy_communities[name]
-        current = snapshot_communities[name]
+    for community_key in sorted(set(legacy_communities) & set(snapshot_communities)):
+        legacy = legacy_communities[community_key]
+        current = snapshot_communities[community_key]
+        display_name = _community_display_name(legacy, current, community_key)
         _compare_set(
             mismatches,
-            f"communities[{name}].rooms",
+            f"communities[{display_name}].rooms",
             set(str(item) for item in legacy.get("rooms") or []),
             set(str(item) for item in current.get("rooms") or []),
             "blocking",
         )
         _compare_value(
             mismatches,
-            f"communities[{name}].price_range",
+            f"communities[{display_name}].price_range",
             legacy.get("price_range") or [],
             current.get("price_range") or [],
             "blocking",
         )
         _compare_value(
             mismatches,
-            f"communities[{name}].layouts",
+            f"communities[{display_name}].layouts",
             legacy.get("layouts") or {},
-            current.get("layouts") or snapshot_layouts_by_community.get(name, {}),
+            current.get("layouts") or snapshot_layouts_by_community.get(community_key, {}),
             "warning",
         )
     _compare_media_summary(mismatches, legacy_index.get("media_summary") or {}, snapshot_index.get("media_summary") or {})
@@ -517,12 +528,99 @@ def _named_set(items: list[Any]) -> set[str]:
     return {str(item.get("name") or "").strip() for item in items if isinstance(item, dict) and str(item.get("name") or "").strip()}
 
 
-def _community_map(items: list[Any]) -> dict[str, dict[str, Any]]:
-    return {
-        str(item.get("name") or "").strip(): item
-        for item in items
-        if isinstance(item, dict) and str(item.get("name") or "").strip()
-    }
+def _community_map(items: list[Any], *, side: str) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = _community_identity_key(item)
+        if not key:
+            continue
+        buckets.setdefault(key, []).append(item)
+
+    result: dict[str, dict[str, Any]] = {}
+    duplicates: list[dict[str, Any]] = []
+    for key, bucket_items in buckets.items():
+        result[key] = _merge_community_items(bucket_items)
+        if len(bucket_items) > 1:
+            duplicates.append(
+                sanitize_for_log(
+                    {
+                        "severity": "warning",
+                        "code": "rewrite_index_duplicate_community",
+                        "field": f"{side}.communities",
+                        "side": side,
+                        "normalized_key": key,
+                        "names": sorted(
+                            {
+                                str(item.get("name") or "").strip()
+                                for item in bucket_items
+                                if str(item.get("name") or "").strip()
+                            }
+                        )[:20],
+                        "count": len(bucket_items),
+                        "message": "rewrite index 中存在标准化后重复的小区项；集合对比会按同一小区合并，但重复项需要后续清理。",
+                    }
+                )
+            )
+    return result, duplicates
+
+
+def _community_identity_key(item: dict[str, Any]) -> str:
+    normalized = str(item.get("normalized") or "").strip()
+    name = str(item.get("name") or "").strip()
+    return normalize_listing_identity(normalized or name)
+
+
+def _merge_community_items(items: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(items) == 1:
+        return dict(items[0])
+    merged = dict(items[0])
+    rooms: list[str] = []
+    layouts: dict[str, int] = {}
+    prices: list[int] = []
+    total_count = 0
+    for item in items:
+        try:
+            total_count += int(item.get("count") or 0)
+        except (TypeError, ValueError):
+            pass
+        for room in item.get("rooms") or []:
+            room_text = str(room).strip()
+            if room_text:
+                rooms.append(room_text)
+        for layout, count in dict(item.get("layouts") or {}).items():
+            layout_text = str(layout).strip()
+            if not layout_text:
+                continue
+            try:
+                count_int = int(count)
+            except (TypeError, ValueError):
+                count_int = 1
+            layouts[layout_text] = layouts.get(layout_text, 0) + count_int
+        for price in item.get("price_range") or []:
+            if isinstance(price, int):
+                prices.append(price)
+    merged["rooms"] = list(dict.fromkeys(rooms))
+    if layouts:
+        merged["layouts"] = layouts
+    if prices:
+        merged["price_range"] = [min(prices), max(prices)]
+    if total_count:
+        merged["count"] = total_count
+    return merged
+
+
+def _community_display_name(
+    legacy: dict[str, Any],
+    snapshot: dict[str, Any],
+    fallback: str,
+) -> str:
+    for item in (legacy, snapshot):
+        name = str(item.get("name") or "").strip()
+        if name:
+            return name
+    return fallback
 
 
 def _layouts_by_community(items: list[Any]) -> dict[str, dict[str, int]]:
@@ -530,11 +628,11 @@ def _layouts_by_community(items: list[Any]) -> dict[str, dict[str, int]]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        community = str(item.get("community") or "").strip()
+        community = str(item.get("normalized_community") or item.get("community") or "").strip()
         layout = str(item.get("layout_type") or item.get("layout") or "").strip()
         if not community or not layout:
             continue
-        bucket = result.setdefault(community, {})
+        bucket = result.setdefault(normalize_listing_identity(community), {})
         bucket[layout] = bucket.get(layout, 0) + 1
     return result
 

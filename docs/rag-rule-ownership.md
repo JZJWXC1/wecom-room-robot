@@ -59,6 +59,16 @@ M1C3 仍保持：
 - Shadow root 与正式 production Snapshot root 隔离。
 - 不新增客户回复分支、不新增绕过 RAG 的事实判断。
 
+## M1C3-FIX1 Shadow Reconciliation 归属
+
+M1C3-FIX1 只修复 Shadow reconciliation 对旧 rewrite index 与 Snapshot safe rewrite index 的离线一致性判断，不改变 RAG 客服链路：
+
+- community 集合比较统一使用 `normalize_listing_identity` 作为 Snapshot Shadow 对比身份，避免 display name、排序、Unicode 空格和全半角差异被误判为缺失。
+- `area_aliases` 仍单独作为 rewrite index warning 比较项，不进入 community 标准集合。
+- 旧 rewrite index 的 `viewing` 原文字段仍只产生 warning；报告不得输出真实 viewing、密码、手机号或 token。
+- 当 Shadow 调用方已经传入本轮 in-memory legacy index 时，reconciliation 优先使用该 index，避免 path 指向历史文件时混入当前批次。
+- 本修复不新增客户消息调用点，不接入 Snapshot Reader，不切换生产读取入口。
+
 ## M1B 修改归属声明模板
 
 后续提交说明需标明：

@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 from pathlib import Path
+import subprocess
 import time
 from typing import Any
 
@@ -17,7 +18,12 @@ from app.services.inventory_snapshot_models import (
     InventorySourceMetadata,
     SnapshotValidationResult,
 )
-from app.services.inventory_snapshot_reconciliation import reconcile_inventory_snapshot
+from app.services.inventory_snapshot_offline import scan_safe_artifacts_for_canaries
+from app.services.inventory_snapshot_reconciliation import (
+    compare_rewrite_inventory_index,
+    load_legacy_rewrite_index,
+    reconcile_inventory_snapshot,
+)
 from app.services.inventory_snapshot_shadow import (
     InventorySnapshotShadowCoordinator,
     build_shadow_source_metadata,
@@ -25,7 +31,7 @@ from app.services.inventory_snapshot_shadow import (
 )
 from app.services.inventory_snapshot_store import SnapshotStoreError
 from app.services.inventory_snapshot_validator import SnapshotValidator
-from app.services.rewrite_inventory_index import write_rewrite_inventory_index
+from app.services.rewrite_inventory_index import build_rewrite_inventory_index, write_rewrite_inventory_index
 
 
 def sample_rows(*, password: str = "1234#", price: str = "3200", room_no: str = "02-A") -> list[dict[str, Any]]:
@@ -70,6 +76,42 @@ def write_legacy_index(tmp_path: Path, rows: list[dict[str, Any]]) -> tuple[Path
     path = tmp_path / "legacy_rewrite_inventory_index.json"
     index = write_rewrite_inventory_index(rows, path=path, cache_meta={"hash": "legacy"})
     return path, index
+
+
+def rewrite_index_payload(
+    communities: list[dict[str, Any]],
+    *,
+    area_aliases: list[dict[str, str]] | None = None,
+    room_index: list[dict[str, Any]] | None = None,
+    row_count: int = 1,
+) -> dict[str, Any]:
+    return {
+        "row_count": row_count,
+        "areas": [{"name": "虚构区域"}],
+        "area_aliases": area_aliases or [],
+        "communities": communities,
+        "room_index": room_index or [],
+        "media_summary": {},
+    }
+
+
+def community_item(
+    name: str,
+    *,
+    normalized: str = "",
+    rooms: list[str] | None = None,
+    price_range: list[int] | None = None,
+    layouts: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "normalized": normalized or name,
+        "count": len(rooms or ["01"]),
+        "area": "虚构区域",
+        "rooms": rooms or ["01"],
+        "layouts": layouts or {"一室": 1},
+        "price_range": price_range or [3000, 3200],
+    }
 
 
 def test_default_mode_is_disabled() -> None:
@@ -210,6 +252,239 @@ def test_legacy_rewrite_index_viewing_is_flagged_but_not_copied(tmp_path: Path) 
     assert "legacy_sensitive_field_present" in text
     assert canary not in text
     assert "VIEWING_CANARY" not in text
+
+
+def test_rewrite_community_set_ignores_order_after_normalization() -> None:
+    left = rewrite_index_payload(
+        [
+            community_item("晨星花园", normalized="晨星花园", rooms=["01"]),
+            community_item("运河宸园", normalized="运河宸园", rooms=["02"]),
+        ],
+        row_count=2,
+    )
+    right = rewrite_index_payload(
+        [
+            community_item("运河宸园", normalized="运河宸园", rooms=["02"]),
+            community_item("晨星花园", normalized="晨星花园", rooms=["01"]),
+        ],
+        row_count=2,
+    )
+
+    mismatches, sensitive_present = compare_rewrite_inventory_index(left, right)
+
+    assert sensitive_present is False
+    assert not [item for item in mismatches if item["code"] == "rewrite_index_mismatch.communities"]
+
+
+def test_rewrite_duplicate_community_warns_without_false_missing() -> None:
+    legacy = rewrite_index_payload(
+        [
+            community_item("晨星花园", normalized="晨星花园", rooms=["01"]),
+            community_item("晨星 花园", normalized="晨星花园", rooms=["01"]),
+        ]
+    )
+    snapshot = rewrite_index_payload([community_item("晨星花园", normalized="晨星花园", rooms=["01"])])
+
+    mismatches, _ = compare_rewrite_inventory_index(legacy, snapshot)
+    codes = [item["code"] for item in mismatches]
+
+    assert "rewrite_index_duplicate_community" in codes
+    assert "rewrite_index_mismatch.communities" not in codes
+    assert all(item.get("severity") != "blocking" for item in mismatches)
+
+
+def test_rewrite_community_fullwidth_and_normal_spaces_normalize_equal() -> None:
+    legacy = rewrite_index_payload(
+        [community_item("晨星　花园", normalized="晨星花园", rooms=["01"])]
+    )
+    snapshot = rewrite_index_payload(
+        [community_item("晨星 花园", normalized="晨星 花园", rooms=["01"])]
+    )
+
+    mismatches, _ = compare_rewrite_inventory_index(legacy, snapshot)
+
+    assert not [item for item in mismatches if item["code"] == "rewrite_index_mismatch.communities"]
+
+
+def test_area_aliases_do_not_enter_rewrite_community_set() -> None:
+    legacy = rewrite_index_payload(
+        [community_item("石桥铭苑", normalized="石桥铭苑")],
+        area_aliases=[{"alias": "石桥", "canonical": "石桥街道 华丰 石桥 永佳 半山"}],
+    )
+    snapshot = rewrite_index_payload([community_item("石桥铭苑", normalized="石桥铭苑")])
+
+    mismatches, _ = compare_rewrite_inventory_index(legacy, snapshot)
+
+    assert any(item["code"] == "rewrite_index_mismatch.area_aliases" for item in mismatches)
+    assert not [item for item in mismatches if item["code"] == "rewrite_index_mismatch.communities"]
+    assert all(
+        item["severity"] == "warning"
+        for item in mismatches
+        if item["code"] == "rewrite_index_mismatch.area_aliases"
+    )
+
+
+def test_missing_rewrite_community_remains_blocking() -> None:
+    legacy = rewrite_index_payload(
+        [
+            community_item("晨星花园", normalized="晨星花园", rooms=["01"]),
+            community_item("运河宸园", normalized="运河宸园", rooms=["02"]),
+        ],
+        row_count=2,
+    )
+    snapshot = rewrite_index_payload(
+        [community_item("晨星花园", normalized="晨星花园", rooms=["01"])],
+        row_count=2,
+    )
+
+    mismatches, _ = compare_rewrite_inventory_index(legacy, snapshot)
+
+    assert any(
+        item["code"] == "rewrite_index_mismatch.communities" and item["severity"] == "blocking"
+        for item in mismatches
+    )
+
+
+def test_extra_rewrite_community_remains_blocking() -> None:
+    legacy = rewrite_index_payload(
+        [community_item("晨星花园", normalized="晨星花园", rooms=["01"])],
+        row_count=2,
+    )
+    snapshot = rewrite_index_payload(
+        [
+            community_item("晨星花园", normalized="晨星花园", rooms=["01"]),
+            community_item("运河宸园", normalized="运河宸园", rooms=["02"]),
+        ],
+        row_count=2,
+    )
+
+    mismatches, _ = compare_rewrite_inventory_index(legacy, snapshot)
+
+    assert any(
+        item["code"] == "rewrite_index_mismatch.communities" and item["severity"] == "blocking"
+        for item in mismatches
+    )
+
+
+def test_current_batch_legacy_index_is_not_replaced_by_historical_path(tmp_path: Path) -> None:
+    rows = sample_rows()
+    current_index = build_rewrite_inventory_index(rows)
+    historical_index = rewrite_index_payload([community_item("历史小区", normalized="历史小区")])
+    historical_path = tmp_path / "rewrite_inventory_index.json"
+    historical_path.write_text(json.dumps(historical_index, ensure_ascii=False), encoding="utf-8")
+
+    assert load_legacy_rewrite_index(historical_path, current_index) == current_index
+
+    result = InventorySnapshotShadowCoordinator(mode="shadow", root=tmp_path / "shadow").run(
+        legacy_rows=rows,
+        source_metadata=source_metadata("current-index"),
+        legacy_rewrite_index_path=historical_path,
+        legacy_rewrite_index=current_index,
+        sync_run_id="current-index-001",
+    )
+
+    assert result["ok"] is True
+    assert result["blocking_count"] == 0
+
+
+def test_merged_community_continuation_row_is_not_lost_in_snapshot_rewrite_compare() -> None:
+    first = sample_rows(room_no="01")[0]
+    second = {
+        **sample_rows(room_no="02")[0],
+        "区域": "",
+        "小区": "",
+    }
+    snapshot, _ = build_snapshot([first, second])
+    filled_legacy_rows = [first, {**second, "区域": first["区域"], "小区": first["小区"]}]
+    legacy_index = build_rewrite_inventory_index(filled_legacy_rows)
+
+    report = reconcile_inventory_snapshot(
+        legacy_rows=filled_legacy_rows,
+        snapshot=snapshot,
+        legacy_rewrite_index=legacy_index,
+    )
+    community = snapshot.rewrite_index["communities"][0]
+
+    assert community["name"] == first["小区"]
+    assert community["rooms"] == ["01", "02"]
+    assert report.severity_counts["blocking"] == 0
+
+
+def test_area_title_row_is_not_treated_as_rewrite_community() -> None:
+    area_title = {
+        "区域": "虚构万达板块",
+        "小区": "",
+        "房号": "",
+        "户型描述": "",
+        "户型分类": "",
+        "押一付一": "",
+        "押二付一": "",
+        "看房方式密码": "",
+        "备注": "",
+    }
+    listing = {**sample_rows(room_no="01")[0], "区域": "", "小区": "晨星花园"}
+    snapshot, _ = build_snapshot([area_title, listing])
+    filled_legacy_rows = [{**listing, "区域": "虚构万达板块"}]
+    legacy_index = build_rewrite_inventory_index(filled_legacy_rows)
+
+    report = reconcile_inventory_snapshot(
+        legacy_rows=filled_legacy_rows,
+        snapshot=snapshot,
+        legacy_rewrite_index=legacy_index,
+    )
+    community_names = {item["name"] for item in snapshot.rewrite_index["communities"]}
+
+    assert "虚构万达板块" not in community_names
+    assert community_names == {"晨星花园"}
+    assert report.severity_counts["blocking"] == 0
+
+
+def test_rewrite_sensitive_viewing_warning_does_not_leak_value() -> None:
+    rows = sample_rows(password="SECRET_CANARY_246810#")
+    snapshot, _ = build_snapshot(rows)
+    legacy_index = build_rewrite_inventory_index(rows)
+
+    report = reconcile_inventory_snapshot(
+        legacy_rows=rows,
+        snapshot=snapshot,
+        legacy_rewrite_index=legacy_index,
+    )
+    text = report.to_json()
+
+    assert any(item["code"] == "rewrite_index_sensitive_field_present" for item in report.rewrite_index_mismatches)
+    assert "SECRET_CANARY" not in text
+    assert "246810#" not in text
+
+
+def test_shadow_public_artifact_scan_still_passes_after_rewrite_compare(tmp_path: Path) -> None:
+    rows = sample_rows()
+    result = InventorySnapshotShadowCoordinator(mode="shadow", root=tmp_path / "shadow").run(
+        legacy_rows=rows,
+        source_metadata=source_metadata("public-scan"),
+        legacy_rewrite_index=build_rewrite_inventory_index(rows),
+        sync_run_id="public-scan-001",
+    )
+
+    scan_passed, issues = scan_safe_artifacts_for_canaries(tmp_path / "shadow")
+
+    assert result["ok"] is True
+    assert result["blocking_count"] == 0
+    assert scan_passed is True
+    assert issues == []
+
+
+def test_local_m1c3_diagnostics_are_not_tracked_by_git() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        ["git", "ls-files", ".local/m1c3-diagnostics"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+
+    assert result.stdout.strip() == ""
 
 
 def test_utf8_chinese_and_letter_room_roundtrip_in_shadow_report(tmp_path: Path) -> None:

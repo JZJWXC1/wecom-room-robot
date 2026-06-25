@@ -159,6 +159,29 @@ M1C3 内部收束：
 - CLI 人类输出和 JSON 输出复用同一套安全观察 payload，避免重复格式化逻辑。
 - Preflight 只做只读检查，不构建真实 Snapshot，不写 production pointer，不启动同步，不连接飞书或企业微信。
 
+## M1C3-FIX1 First Shadow Blocking Legacy Removal Gate
+
+M1C3-FIX1 只修复首次服务器 Shadow reconciliation 中 `rewrite_index_mismatch.communities` 的误判风险，不删除当前生产读取路径。
+
+本轮删除/替代的新 Shadow 内部重复点：
+
+- 删除 raw display-name community map 的比较语义，替换为标准化 community bucket；重复小区项单独输出 warning。
+- 删除 layouts fallback 的 raw community key 选择，替换为与 community bucket 相同的标准化 key。
+- 删除 `load_legacy_rewrite_index` 的 path-first current index 选择；当调用方已经传入本轮 in-memory index 时，不再读取 path 覆盖它。
+
+本轮明确保留到 M1D 或后续决策：
+
+| Legacy 路径 | M1C3-FIX1 状态 | M1D 候选处理 |
+| --- | --- | --- |
+| 旧 `data/inventory_cache.csv` | 保留，仍承担 `InventoryService` 生产读取 | M1D 候选删除 |
+| 旧 `data/rewrite_inventory_index.json` | 保留，RAG rewrite/实体解析仍读取旧 index | M1D 候选删除 |
+| 旧 `room_database/inventory_*.png` | 保留，客户要房源表仍走旧发送入口 | 是否删除取决于 Snapshot PNG 是否接管客户发房源表需求 |
+| 旧 `InventoryService` 读取 | 保留，客户查询仍依赖 | M1D 候选删除或降级为灾备 |
+| Shadow mode 临时兼容代码 | 保留，用于观察和门禁 | M1D 决策 |
+| `LegacyInventoryToSnapshotAdapter` | 保留，仍是 Shadow 唯一旧字段适配边界 | M1D 删除 |
+
+未删除 `normalize_search_text`、`canonical_community_display`、`InventoryService._normalize` 等旧生产 normalize 函数，因为它们仍属于当前客户查询/RAG 或旧同步链路。M1C3-FIX1 的唯一新增约束是：Shadow rewrite index reconciliation 的 community 身份比较归属 `normalize_listing_identity`，不得再直接比较 display name 集合。
+
 ## 删除前总门槛
 
 - `pytest -q` 通过。
