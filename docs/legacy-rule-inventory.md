@@ -182,6 +182,33 @@ M1C3-FIX1 只修复首次服务器 Shadow reconciliation 中 `rewrite_index_mism
 
 未删除 `normalize_search_text`、`canonical_community_display`、`InventoryService._normalize` 等旧生产 normalize 函数，因为它们仍属于当前客户查询/RAG 或旧同步链路。M1C3-FIX1 的唯一新增约束是：Shadow rewrite index reconciliation 的 community 身份比较归属 `normalize_listing_identity`，不得再直接比较 display name 集合。
 
+## M1C3-FIX2A 库存索引区域别名 Legacy Removal Gate
+
+M1C3-FIX2A 只修复 legacy rewrite index 与 Snapshot rewrite index 的区域别名一致性，不修改客户消息、Planner、LLM Prompt、自检或发送阶段。本轮不得宣称已经实现全仓唯一 alias 决策入口；当前只实现“库存索引链路唯一 alias 事实源”。
+
+库存索引链路的区域别名事实源集中在 `app/services/region_inventory_constants.py`，legacy rewrite index 与 Snapshot builder 均通过同一个 `area_alias_index_entries` API 生成 `area_aliases`。已确认有效别名：
+
+| alias | normalized_alias | canonical_area | provenance | status | ambiguity |
+| --- | --- | --- | --- | --- | --- |
+| 新填地 | 新填地 | 东新园 杭氧 新天地 | legacy_typo_alias | active | false |
+| 东新 | 东新 | 东新园 杭氧 新天地 | business_shorthand | active | false |
+
+本轮删除/替代的库存索引链路重复点：
+
+- 删除 `rewrite_inventory_index.py` 中独立维护的硬编码 `DEFAULT_AREA_ALIASES` 表；同名兼容视图改为由共享 `area_alias_index_entries` 派生，不再作为事实源。
+- 删除 `inventory_snapshot_builder.py` 中独立维护的 `DEFAULT_AREA_ALIASES`，改为共享 `area_alias_index_entries`。
+- Reconciliation 的 `area_aliases` 比较统一使用标准化 alias/canonical pair，并新增 coverage 门禁，确保 `missing_valid_aliases=0`、`unresolved_aliases=0`、`active_alias_conflicts=0`、`unknown_canonical_areas=0`。
+- 删除因客户链路恢复到 FIX1 后不再被库存索引链路调用的 alias 搜索/display/config-template helper，避免形成第二套客户 alias 决策入口。
+
+本轮明确保留到 M4 的客户链路兼容项：
+
+| Legacy/兼容项 | 当前状态 | removal_milestone | 原因 |
+| --- | --- | --- | --- |
+| `app/main.py` 中 `AREA_ALIASES` 和 `_area_alias_hits` 特判 | 与 FIX1 完全一致 | M4 | 属于客户消息/Planner 前后的旧兼容路径，本轮不改变客户回复行为 |
+| `app/services/llm.py` 中区域别名 Prompt/兼容规则 | 与 FIX1 完全一致 | M4 | 属于客户可见回复前的 Planner/LLM 语义，本轮不改变 Prompt 行为 |
+
+M4 清理前，客户链路 alias 兼容与库存索引 alias 事实源会短期并存；M1C3-FIX2A 只要求库存索引链路内部不再各自维护 alias 表。
+
 ## 删除前总门槛
 
 - `pytest -q` 通过。

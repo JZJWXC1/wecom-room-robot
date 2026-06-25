@@ -100,15 +100,6 @@ def normalize_area_alias_text(value: Any) -> str:
     return re.sub(r"\s+", " ", text)
 
 
-def area_alias_search_key(value: Any) -> str:
-    text = normalize_area_alias_text(value).lower()
-    return re.sub(r"[^0-9a-zA-Z一-鿿]", "", text)
-
-
-def canonical_area_label(canonical_area: str, *, separator: str = "\n") -> str:
-    return separator.join(part for part in normalize_area_alias_text(canonical_area).split(" ") if part)
-
-
 def canonical_area_title(canonical_area: str) -> str:
     canonical = normalize_area_alias_text(canonical_area)
     return CANONICAL_AREA_TITLES.get(canonical, canonical)
@@ -157,23 +148,6 @@ def active_area_alias_definitions(
     return tuple(item for item in definitions if item.status == "active" and not item.ambiguity)
 
 
-def active_area_alias_map(
-    definitions: tuple[AreaAliasDefinition, ...] | list[AreaAliasDefinition] = AREA_ALIAS_DEFINITIONS,
-) -> dict[str, str]:
-    return {item.alias: item.canonical_area for item in active_area_alias_definitions(definitions)}
-
-
-def active_area_display_alias_map(
-    *,
-    separator: str = "\n",
-    definitions: tuple[AreaAliasDefinition, ...] | list[AreaAliasDefinition] = AREA_ALIAS_DEFINITIONS,
-) -> dict[str, str]:
-    return {
-        item.alias: canonical_area_label(item.canonical_area, separator=separator)
-        for item in active_area_alias_definitions(definitions)
-    }
-
-
 def area_alias_index_entries(
     definitions: tuple[AreaAliasDefinition, ...] | list[AreaAliasDefinition] = AREA_ALIAS_DEFINITIONS,
     *,
@@ -200,51 +174,6 @@ def active_area_title_alias_map(
     for title in DEFAULT_TARGET_AREA_TITLES:
         result[title] = title
     return result
-
-
-def default_config_template_area_title_map() -> dict[str, str]:
-    aliases = active_area_title_alias_map()
-    return {
-        item.alias: aliases[item.alias]
-        for item in active_area_alias_definitions()
-        if item.alias in {"万达", "石桥", "东新", "东站"}
-    }
-
-
-def match_active_area_aliases(
-    text: str,
-    *,
-    canonical_separator: str = " ",
-    definitions: tuple[AreaAliasDefinition, ...] | list[AreaAliasDefinition] = AREA_ALIAS_DEFINITIONS,
-) -> list[dict[str, str]]:
-    query_key = area_alias_search_key(text)
-    if not query_key:
-        return []
-    hits: list[dict[str, str]] = []
-    seen: set[tuple[str, str]] = set()
-    for item in active_area_alias_definitions(definitions):
-        alias_key = area_alias_search_key(item.alias)
-        if not alias_key or alias_key not in query_key:
-            continue
-        key = (item.alias, item.canonical_area)
-        if key in seen:
-            continue
-        seen.add(key)
-        hits.append(
-            {
-                "raw_text": item.alias,
-                "alias": item.alias,
-                "normalized_alias": item.normalized_alias,
-                "canonical": canonical_area_label(item.canonical_area, separator=canonical_separator),
-                "canonical_area": item.canonical_area,
-                "status": "resolved",
-                "confidence": "high",
-                "reason": "area_alias",
-                "provenance": item.provenance,
-                "ambiguity": str(item.ambiguity).lower(),
-            }
-        )
-    return hits
 
 
 def validate_area_alias_definitions(

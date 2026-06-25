@@ -13,6 +13,12 @@ from app.services.fuzzy_match import canonical_community_display, normalize_sear
 from app.services.region_inventory_constants import area_alias_index_entries
 
 
+DEFAULT_AREA_ALIASES: dict[str, str] = {
+    str(item["alias"]): str(item["canonical_area"])
+    for item in area_alias_index_entries()
+}
+
+
 FIELD_SEMANTICS: dict[str, str] = {
     "区域": "房源所在区域/板块，用于区域筛选和区域别名归一。",
     "小区": "小区标准名。",

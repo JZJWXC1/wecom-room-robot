@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 from typing import Any
 
 import pytest
@@ -15,16 +16,29 @@ from app.services.inventory_snapshot_shadow import InventorySnapshotShadowCoordi
 from app.services.region_inventory_constants import (
     AREA_ALIAS_DEFINITIONS,
     AreaAliasDefinition,
-    active_area_alias_map,
-    active_area_display_alias_map,
     area_alias_index_entries,
-    match_active_area_aliases,
     validate_area_alias_definitions,
 )
-from app.services.rewrite_inventory_index import build_rewrite_inventory_index, slice_rewrite_inventory_index
+from app.services.rewrite_inventory_index import (
+    DEFAULT_AREA_ALIASES,
+    build_rewrite_inventory_index,
+    slice_rewrite_inventory_index,
+)
 
 
 DONGXIN_AREA = "东新园 杭氧 新天地"
+FIX1_SHA = "d0f080ddbacc15784b341c6cdc28d8d241f4a8a3"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def assert_matches_fix1(path: str) -> None:
+    result = subprocess.run(
+        ["git", "diff", "--exit-code", FIX1_SHA, "--", path],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def rows_with_viewing(password: str = "1234#") -> list[dict[str, Any]]:
@@ -55,13 +69,35 @@ def alias_pairs(index: dict[str, Any]) -> set[tuple[str, str]]:
     }
 
 
+@pytest.mark.parametrize("path", ["app/main.py", "app/services/llm.py"])
+def test_customer_chain_files_match_fix1(path: str) -> None:
+    assert_matches_fix1(path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "scripts/refresh_rag_inventory_cache.py",
+        "scripts/sync_feishu_region_inventory.py",
+    ],
+)
+def test_sync_scripts_match_fix1(path: str) -> None:
+    assert_matches_fix1(path)
+
+
 def test_confirmed_aliases_resolve_to_dongxin_area() -> None:
-    alias_map = active_area_alias_map()
+    alias_map = {
+        item["alias"]: item["canonical_area"]
+        for item in area_alias_index_entries()
+    }
 
     assert alias_map["新填地"] == DONGXIN_AREA
     assert alias_map["东新"] == DONGXIN_AREA
-    assert match_active_area_aliases("客户问新填地附近两室")[0]["canonical_area"] == DONGXIN_AREA
-    assert match_active_area_aliases("东新有没有一室")[0]["canonical_area"] == DONGXIN_AREA
+
+    legacy_hits = main._area_alias_hits("客户问新填地附近两室")
+    assert any(hit["raw_text"] == "新填地" and hit["canonical"] == "东新园\n杭氧\n新天地" for hit in legacy_hits)
+    legacy_hits = main._area_alias_hits("东新有没有一室")
+    assert any(hit["raw_text"] == "东新" and hit["canonical"] == "东新园\n杭氧\n新天地" for hit in legacy_hits)
 
 
 def test_legacy_and_snapshot_indexes_share_active_alias_set() -> None:
@@ -72,6 +108,17 @@ def test_legacy_and_snapshot_indexes_share_active_alias_set() -> None:
     assert report.ok
     assert alias_pairs(legacy_index) == alias_pairs(snapshot.rewrite_index)
     assert alias_pairs(legacy_index) == alias_pairs({"area_aliases": area_alias_index_entries()})
+
+
+def test_legacy_default_aliases_are_shared_api_projection() -> None:
+    expected = {
+        item["alias"]: item["canonical_area"]
+        for item in area_alias_index_entries()
+    }
+
+    assert DEFAULT_AREA_ALIASES == expected
+    assert DEFAULT_AREA_ALIASES["新填地"] == DONGXIN_AREA
+    assert DEFAULT_AREA_ALIASES["东新"] == DONGXIN_AREA
 
 
 def test_area_alias_coverage_validator_is_clean() -> None:
@@ -203,4 +250,8 @@ def test_local_shadow_reconciliation_has_no_area_alias_mismatch(tmp_path: Path) 
 
 def test_alias_helpers_do_not_depend_on_local_diagnostics() -> None:
     assert not Path(".local/m1c3-diagnostics/area_aliases.json").exists()
-    assert active_area_display_alias_map()["新填地"] == "东新园\n杭氧\n新天地"
+    alias_map = {
+        item["alias"]: item["canonical_area"]
+        for item in area_alias_index_entries()
+    }
+    assert alias_map["新填地"] == DONGXIN_AREA

@@ -17,7 +17,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.config import settings
 from app.services.inventory import InventoryService
 from app.services.inventory_snapshot_shadow import run_inventory_snapshot_shadow
-from app.services.rewrite_inventory_index import write_rewrite_inventory_index
+from app.services.rewrite_inventory_index import (
+    DEFAULT_AREA_ALIASES,
+    write_rewrite_inventory_index,
+)
 
 
 LOCK_STALE_SECONDS = 2 * 60 * 60
@@ -87,6 +90,7 @@ async def refresh_cache() -> dict[str, Any]:
     rows = frame.fillna("").to_dict(orient="records") if hasattr(frame, "fillna") else []
     index = write_rewrite_inventory_index(
         rows,
+        area_aliases=DEFAULT_AREA_ALIASES,
         cache_meta=service.cache_meta,
     )
     shadow = run_inventory_snapshot_shadow(
