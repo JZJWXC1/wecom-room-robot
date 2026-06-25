@@ -35,6 +35,12 @@ from app.services.inventory_query import (
 )
 from app.services.llm import ReplyGenerator
 from app.services.media_store import MediaStore
+from app.services.region_inventory_constants import (
+    active_area_alias_map,
+    active_area_display_alias_map,
+    area_alias_index_entries,
+    match_active_area_aliases,
+)
 from app.services.region_inventory_sync import RegionInventorySyncService
 from app.services.rewrite_inventory_index import (
     FIELD_SEMANTICS,
@@ -145,26 +151,7 @@ def _schedule_background_task(coro: Any, *, label: str) -> asyncio.Task[Any]:
     task.add_done_callback(_log_result)
     return task
 
-AREA_ALIASES: dict[str, str] = {
-    "万达": "拱墅万达\n北部软件园\n城北万象城",
-    "拱墅万达": "拱墅万达\n北部软件园\n城北万象城",
-    "北部软件园": "拱墅万达\n北部软件园\n城北万象城",
-    "城北万象城": "拱墅万达\n北部软件园\n城北万象城",
-    "新天地": "东新园\n杭氧\n新天地",
-    "鑫天地": "东新园\n杭氧\n新天地",
-    "新填地": "东新园\n杭氧\n新天地",
-    "东新": "东新园\n杭氧\n新天地",
-    "东新园": "东新园\n杭氧\n新天地",
-    "杭氧": "东新园\n杭氧\n新天地",
-    "石桥": "石桥街道\n华丰\n石桥\n永佳\n半山",
-    "华丰": "石桥街道\n华丰\n石桥\n永佳\n半山",
-    "永佳": "石桥街道\n华丰\n石桥\n永佳\n半山",
-    "半山": "石桥街道\n华丰\n石桥\n永佳\n半山",
-    "闸弄口": "闸弄口\n新塘\n元宝塘\n东站",
-    "新塘": "闸弄口\n新塘\n元宝塘\n东站",
-    "元宝塘": "闸弄口\n新塘\n元宝塘\n东站",
-    "东站": "闸弄口\n新塘\n元宝塘\n东站",
-}
+AREA_ALIASES: dict[str, str] = active_area_display_alias_map(separator="\n")
 
 TOOL_CATALOG: tuple[str, ...] = (
     "reference_confirmation",
@@ -1192,7 +1179,7 @@ def _write_rewrite_inventory_index(rows: list[dict[str, Any]]) -> dict[str, Any]
     try:
         index = write_rewrite_inventory_index(
             rows,
-            area_aliases=AREA_ALIASES,
+            area_aliases=active_area_alias_map(),
             cache_meta=_inventory_cache_meta_for_prompt(),
         )
         return {
@@ -1331,28 +1318,7 @@ def _reconcile_last_candidate_set_with_visible_reply(
 
 
 def _area_alias_hits(text: str) -> list[dict[str, str]]:
-    normalized = normalize_search_text(text)
-    hits: list[dict[str, str]] = []
-    for alias, canonical in AREA_ALIASES.items():
-        if normalize_search_text(alias) in normalized:
-            hits.append(
-                {
-                    "raw_text": alias,
-                    "canonical": canonical,
-                    "status": "resolved",
-                    "confidence": "high",
-                    "reason": "area_alias",
-                }
-            )
-    deduped: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for hit in hits:
-        key = f"{hit['raw_text']}->{hit['canonical']}"
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(hit)
-    return deduped
+    return match_active_area_aliases(text, canonical_separator="\n")
 
 
 def _community_names(rows: list[dict[str, Any]]) -> list[str]:
@@ -1822,7 +1788,7 @@ def _build_inventory_rewrite_index(
     if not persisted_index:
         persisted_index = write_rewrite_inventory_index(
             rows,
-            area_aliases=AREA_ALIASES,
+            area_aliases=active_area_alias_map(),
             cache_meta=_inventory_cache_meta_for_prompt(),
         )
     rewrite_index_query = _rewrite_inventory_index_query(
@@ -1855,10 +1821,7 @@ def _build_inventory_rewrite_index(
         "row_count": len(rows),
         "field_catalog": list(FIELD_SEMANTICS.keys()),
         "field_semantics": FIELD_SEMANTICS,
-        "area_aliases": [
-            {"alias": alias, "canonical": canonical}
-            for alias, canonical in AREA_ALIASES.items()
-        ],
+        "area_aliases": area_alias_index_entries(),
         "areas": _area_counts(rows),
         "communities": community_items,
         "communities_truncated": communities_truncated,

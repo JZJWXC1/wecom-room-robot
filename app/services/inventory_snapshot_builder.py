@@ -22,6 +22,7 @@ from app.services.inventory_snapshot_models import (
     redact_sensitive_text,
     sanitize_for_log,
 )
+from app.services.region_inventory_constants import area_alias_index_entries
 
 
 FIELD_ALIASES: dict[str, tuple[str, ...]] = {
@@ -56,25 +57,6 @@ VIDEO_FIELD_ALIASES: tuple[str, ...] = (
     "has_video",
 )
 
-DEFAULT_AREA_ALIASES: dict[str, str] = {
-    "万达": "拱墅万达 北部软件园 城北万象城",
-    "拱墅万达": "拱墅万达 北部软件园 城北万象城",
-    "北部软件园": "拱墅万达 北部软件园 城北万象城",
-    "城北万象城": "拱墅万达 北部软件园 城北万象城",
-    "新天地": "东新园 杭氧 新天地",
-    "鑫天地": "东新园 杭氧 新天地",
-    "东新园": "东新园 杭氧 新天地",
-    "杭氧": "东新园 杭氧 新天地",
-    "石桥": "石桥街道 华丰 石桥 永佳 半山",
-    "华丰": "石桥街道 华丰 石桥 永佳 半山",
-    "永佳": "石桥街道 华丰 石桥 永佳 半山",
-    "半山": "石桥街道 华丰 石桥 永佳 半山",
-    "闸弄口": "闸弄口 新塘 元宝塘 东站",
-    "新塘": "闸弄口 新塘 元宝塘 东站",
-    "元宝塘": "闸弄口 新塘 元宝塘 东站",
-    "东站": "闸弄口 新塘 元宝塘 东站",
-}
-
 PROMOTIONAL_MARKERS = ("欢迎", "推荐", "全佣", "免押", "联系方式", "电话", "咨询", "优惠")
 RENT_MIN = 100
 RENT_MAX = 100000
@@ -89,8 +71,7 @@ class SnapshotBuilder:
         area_aliases: dict[str, str] | None = None,
         generator_version: str = GENERATOR_VERSION,
     ) -> None:
-        self.area_aliases = dict(DEFAULT_AREA_ALIASES)
-        self.area_aliases.update(area_aliases or {})
+        self.area_aliases = dict(area_aliases or {})
         self.generator_version = generator_version
 
     def build(
@@ -350,8 +331,7 @@ def build_safe_rewrite_inventory_index(
     area_aliases: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Create the safe rewrite index without LLM calls or secret fields."""
-    aliases = dict(DEFAULT_AREA_ALIASES)
-    aliases.update(area_aliases or {})
+    alias_entries = area_alias_index_entries(extra_aliases=area_aliases)
     room_index = [_rewrite_room_item(listing) for listing in snapshot.listings]
     areas = _area_index(snapshot.listings)
     communities = _community_index(snapshot.listings)
@@ -369,15 +349,7 @@ def build_safe_rewrite_inventory_index(
             "remark": "备注字段表示水电费收取方式。",
             "viewing_summary": "只包含看房状态摘要，不含真实密码或原始看房文本。",
         },
-        "area_aliases": [
-            {
-                "alias": alias,
-                "canonical": canonical,
-                "normalized_alias": normalize_listing_identity(alias),
-                "normalized_canonical": normalize_listing_identity(canonical),
-            }
-            for alias, canonical in sorted(aliases.items())
-        ],
+        "area_aliases": alias_entries,
         "areas": areas,
         "communities": communities,
         "room_index": room_index,

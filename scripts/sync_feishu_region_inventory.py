@@ -17,11 +17,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.config import settings
 from app.services.inventory import InventoryService
 from app.services.inventory_snapshot_shadow import run_inventory_snapshot_shadow
+from app.services.region_inventory_constants import default_config_template_area_title_map
 from app.services.region_inventory_sync import RegionInventorySyncService
-from app.services.rewrite_inventory_index import (
-    DEFAULT_AREA_ALIASES,
-    write_rewrite_inventory_index,
-)
+from app.services.rewrite_inventory_index import write_rewrite_inventory_index
 
 
 LOCK_STALE_SECONDS = 6 * 60 * 60
@@ -40,12 +38,7 @@ def config_template() -> list[dict[str, Any]]:
             "view_id": "",
             "split_by_area": "true",
             "area_field": "区域",
-            "area_title_map": {
-                "万达": "拱墅万达 北部软件园 城北万象城 成交全部全佣🧧",
-                "石桥": "石桥街道 华丰 石桥 永佳 半山 成交全部全佣🧧",
-                "东新": "东新园 杭氧 新天地 成交全部全佣🧧",
-                "东站": "闸弄口 新塘 元宝塘 东站除特价成交全部全佣🧧",
-            },
+            "area_title_map": default_config_template_area_title_map(),
         },
     ]
 
@@ -119,7 +112,6 @@ async def refresh_rewrite_inventory_index() -> dict[str, Any]:
     rows = frame.fillna("").to_dict(orient="records") if hasattr(frame, "fillna") else []
     index = write_rewrite_inventory_index(
         rows,
-        area_aliases=DEFAULT_AREA_ALIASES,
         cache_meta=service.cache_meta,
     )
     shadow = run_inventory_snapshot_shadow(

@@ -24,6 +24,10 @@ from app.services.inventory_snapshot_models import (
     redact_sensitive_text,
     sanitize_for_log,
 )
+from app.services.region_inventory_constants import (
+    area_alias_index_entries,
+    normalize_area_alias_text,
+)
 
 
 REPORT_VERSION = "inventory_snapshot_reconciliation.v1"
@@ -179,6 +183,7 @@ def reconcile_inventory_snapshot(
         legacy_rewrite_index or {},
         snapshot.rewrite_index,
     )
+    area_alias_coverage = _area_alias_coverage(legacy_rewrite_index or {}, snapshot.rewrite_index)
     for mismatch in rewrite_mismatches:
         severity = str(mismatch.get("severity") or "warning")
         severity_counts[severity] = severity_counts.get(severity, 0) + 1
@@ -207,6 +212,7 @@ def reconcile_inventory_snapshot(
             "info_count": severity_counts.get("info", 0),
             "compare_fields": list(COMPARE_FIELDS),
             "password_policy": "password_match boolean only; raw viewing text is never written",
+            "area_alias_coverage": area_alias_coverage,
         },
     )
 
@@ -249,6 +255,16 @@ def compare_rewrite_inventory_index(
         _alias_pairs(snapshot_index.get("area_aliases") or []),
         "warning",
     )
+    alias_coverage = _area_alias_coverage(legacy_index, snapshot_index)
+    if any(int(value or 0) for value in alias_coverage.values()):
+        mismatches.append(
+            {
+                "severity": "blocking",
+                "code": "rewrite_index_area_alias_coverage",
+                "field": "area_aliases",
+                **alias_coverage,
+            }
+        )
     _compare_set(
         mismatches,
         "areas",
@@ -517,11 +533,62 @@ def _alias_pairs(items: list[Any]) -> set[tuple[str, str]]:
     result: set[tuple[str, str]] = set()
     for item in items:
         if isinstance(item, dict):
-            alias = str(item.get("alias") or "").strip()
-            canonical = str(item.get("canonical") or "").strip()
+            if str(item.get("status") or "active") != "active":
+                continue
+            alias = normalize_area_alias_text(item.get("normalized_alias") or item.get("alias") or "")
+            canonical = normalize_area_alias_text(item.get("canonical_area") or item.get("canonical") or "")
             if alias or canonical:
                 result.add((alias, canonical))
     return result
+
+
+def _area_alias_coverage(
+    legacy_index: dict[str, Any],
+    snapshot_index: dict[str, Any],
+) -> dict[str, int]:
+    if not legacy_index:
+        return {
+            "missing_valid_aliases": 0,
+            "unresolved_aliases": 0,
+            "active_alias_conflicts": 0,
+            "unknown_canonical_areas": 0,
+        }
+    if not legacy_index.get("area_aliases") and not snapshot_index.get("area_aliases"):
+        return {
+            "missing_valid_aliases": 0,
+            "unresolved_aliases": 0,
+            "active_alias_conflicts": 0,
+            "unknown_canonical_areas": 0,
+        }
+    expected = _alias_pairs(area_alias_index_entries())
+    known_canonicals = {canonical for _, canonical in expected if canonical}
+    legacy_pairs = _alias_pairs(legacy_index.get("area_aliases") or [])
+    snapshot_pairs = _alias_pairs(snapshot_index.get("area_aliases") or [])
+    combined_items = list(legacy_index.get("area_aliases") or []) + list(snapshot_index.get("area_aliases") or [])
+
+    active_by_alias: dict[str, set[str]] = {}
+    unresolved = 0
+    unknown = 0
+    for item in combined_items:
+        if not isinstance(item, dict) or str(item.get("status") or "active") != "active":
+            continue
+        alias = normalize_area_alias_text(item.get("normalized_alias") or item.get("alias") or "")
+        canonical = normalize_area_alias_text(item.get("canonical_area") or item.get("canonical") or "")
+        if not alias or not canonical:
+            unresolved += 1
+            continue
+        active_by_alias.setdefault(alias, set()).add(canonical)
+        if canonical not in known_canonicals:
+            unknown += 1
+
+    missing = len((expected - legacy_pairs) | (expected - snapshot_pairs))
+    conflicts = sum(1 for targets in active_by_alias.values() if len(targets) > 1)
+    return {
+        "missing_valid_aliases": missing,
+        "unresolved_aliases": unresolved,
+        "active_alias_conflicts": conflicts,
+        "unknown_canonical_areas": unknown,
+    }
 
 
 def _named_set(items: list[Any]) -> set[str]:

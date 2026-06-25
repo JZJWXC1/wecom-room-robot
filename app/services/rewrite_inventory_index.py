@@ -10,6 +10,7 @@ from typing import Any
 
 from app.config import settings
 from app.services.fuzzy_match import canonical_community_display, normalize_search_text
+from app.services.region_inventory_constants import area_alias_index_entries
 
 
 FIELD_SEMANTICS: dict[str, str] = {
@@ -56,28 +57,6 @@ VIDEO_FIELD_ALIASES: tuple[str, ...] = (
     "has_video",
 )
 
-DEFAULT_AREA_ALIASES: dict[str, str] = {
-    "万达": "拱墅万达 北部软件园 城北万象城",
-    "拱墅万达": "拱墅万达 北部软件园 城北万象城",
-    "北部软件园": "拱墅万达 北部软件园 城北万象城",
-    "城北万象城": "拱墅万达 北部软件园 城北万象城",
-    "新天地": "东新园 杭氧 新天地",
-    "鑫天地": "东新园 杭氧 新天地",
-    "新填地": "东新园 杭氧 新天地",
-    "东新": "东新园 杭氧 新天地",
-    "东新园": "东新园 杭氧 新天地",
-    "杭氧": "东新园 杭氧 新天地",
-    "石桥": "石桥街道 华丰 石桥 永佳 半山",
-    "华丰": "石桥街道 华丰 石桥 永佳 半山",
-    "永佳": "石桥街道 华丰 石桥 永佳 半山",
-    "半山": "石桥街道 华丰 石桥 永佳 半山",
-    "闸弄口": "闸弄口 新塘 元宝塘 东站",
-    "新塘": "闸弄口 新塘 元宝塘 东站",
-    "元宝塘": "闸弄口 新塘 元宝塘 东站",
-    "东站": "闸弄口 新塘 元宝塘 东站",
-}
-
-
 def row_value(row: dict[str, Any], canonical_field: str) -> str:
     for name in FIELD_ALIASES.get(canonical_field, (canonical_field,)):
         value = row.get(name)
@@ -102,8 +81,7 @@ def build_rewrite_inventory_index(
     area_aliases: dict[str, str] | None = None,
     cache_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    aliases = dict(DEFAULT_AREA_ALIASES)
-    aliases.update(area_aliases or {})
+    alias_entries = area_alias_index_entries(extra_aliases=area_aliases)
     row_pairs = [
         (row, canonicalize_row(row))
         for row in rows
@@ -118,7 +96,7 @@ def build_rewrite_inventory_index(
     media_summary = _media_summary(raw_rows, canonical_rows)
     payload_for_signature = {
         "rows": canonical_rows,
-        "aliases": aliases,
+        "area_aliases": alias_entries,
         "field_semantics": FIELD_SEMANTICS,
         "media_summary": media_summary,
         "cache_meta": cache_meta or {},
@@ -135,10 +113,7 @@ def build_rewrite_inventory_index(
         "primary_key": "小区 + 房号",
         "field_semantics": FIELD_SEMANTICS,
         "field_aliases": {key: list(value) for key, value in FIELD_ALIASES.items()},
-        "area_aliases": [
-            {"alias": alias, "canonical": canonical}
-            for alias, canonical in aliases.items()
-        ],
+        "area_aliases": alias_entries,
         "areas": _area_stats(canonical_rows),
         "communities": _community_stats(canonical_rows),
         "room_index": _room_index(canonical_rows),
@@ -464,11 +439,13 @@ def _area_hits(index: dict[str, Any], query_text: str) -> list[dict[str, Any]]:
     hits: list[dict[str, Any]] = []
     for item in index.get("area_aliases") or []:
         alias = str(item.get("alias") or "")
+        if str(item.get("status") or "active") != "active":
+            continue
         if alias and normalize_search_text(alias) in query_text:
             hits.append(
                 {
                     "alias": alias,
-                    "canonical": item.get("canonical") or "",
+                    "canonical": item.get("canonical_area") or item.get("canonical") or "",
                     "type": "area_alias",
                 }
             )
