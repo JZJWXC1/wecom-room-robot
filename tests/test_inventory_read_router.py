@@ -238,6 +238,25 @@ def test_shadow_customer_results_stay_legacy_and_ignore_snapshot_errors(tmp_path
     assert not any(item.source_kind == SOURCE_KIND_SNAPSHOT for item in rows)
 
 
+def test_shadow_chat_mode_can_skip_snapshot_health_probe(tmp_path: Path) -> None:
+    class ExplodingSnapshotProvider(SnapshotInventoryReadProvider):
+        def health(self):  # type: ignore[override]
+            raise AssertionError("chat shadow mode must not touch snapshot")
+
+    read_router = InventoryReadRouter(
+        mode=READ_MODE_SHADOW,
+        legacy_provider=legacy_provider(),
+        snapshot_provider=ExplodingSnapshotProvider(SnapshotReader(tmp_path)),
+        shadow_probe_snapshot_health=False,
+    )
+    session = read_router.start_turn(request_id="req-shadow-chat", turn_id="turn-1")
+    rows = run(session.search_inventory("云杉苑视频图片", limit=3))
+
+    assert session.context.source_kind == SOURCE_KIND_LEGACY
+    assert session.context.health_at_selection["details"]["shadow_snapshot"]["status"] == "not_queried"
+    assert rows
+
+
 def test_primary_healthy_selects_snapshot_locally(tmp_path: Path) -> None:
     snapshot = publish_snapshot(tmp_path)
     session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).start_turn(
@@ -404,13 +423,23 @@ def test_evidence_and_rewrite_index_do_not_expose_password_or_viewing_text(tmp_p
     )
     rows = run(session.search_inventory("晨星花园1-101A", limit=1))
     rewrite_index = run(session.get_rewrite_index())
-    legacy_rewrite = run(router(tmp_path).start_turn(request_id="req-legacy-secret", turn_id="turn-1").get_rewrite_index())
-    payload = public_payload(rows) + json.dumps(rewrite_index, ensure_ascii=False) + json.dumps(legacy_rewrite, ensure_ascii=False)
+    payload = public_payload(rows) + json.dumps(rewrite_index, ensure_ascii=False)
 
     assert SYNTHETIC_PASSWORD not in payload
     assert '"viewing_text":' not in payload
     assert '"viewing"' not in payload
     assert "看房方式密码" not in payload
+
+
+def test_legacy_rewrite_index_preserves_existing_prompt_payload_for_parity(tmp_path: Path) -> None:
+    legacy_rewrite = run(
+        router(tmp_path).start_turn(
+            request_id="req-legacy-prompt",
+            turn_id="turn-1",
+        ).get_rewrite_index()
+    )
+
+    assert legacy_rewrite["room_index"][0]["viewing"] == SYNTHETIC_PASSWORD
 
 
 def test_legacy_provider_reuses_inventory_service_search_without_copying_query_engine(tmp_path: Path) -> None:
@@ -481,12 +510,12 @@ def test_legacy_and_snapshot_parity_on_synthetic_queries(tmp_path: Path) -> None
         assert SYNTHETIC_PASSWORD not in public_payload(legacy_rows + snapshot_rows)
 
 
-def test_production_customer_path_is_not_switched_to_inventory_read_router() -> None:
+def test_production_customer_path_uses_read_router_without_snapshot_reader() -> None:
     main_source = Path("app/main.py").read_text(encoding="utf-8")
 
+    assert "inventory_read_turn" in main_source
     assert "InventoryReadRouter" not in main_source
     assert "SnapshotInventoryReadProvider" not in main_source
-    assert "inventory_read_router" not in main_source
     assert "inventory_snapshot_reader" not in main_source
 
 

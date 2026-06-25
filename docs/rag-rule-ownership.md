@@ -92,7 +92,34 @@ M1D1 仍保持：
 - 自检回流未读取新 Evidence。
 - 发送阶段继续使用旧 PNG。
 
-生产隔离证明由 `tests/test_inventory_read_router.py::test_production_customer_path_is_not_switched_to_inventory_read_router` 覆盖。
+M1D1 的生产隔离在 M1D2A 后升级为“接入但不切 Snapshot”，由 `tests/test_inventory_read_router.py::test_production_customer_path_uses_read_router_without_snapshot_reader` 覆盖。
+
+## M1D2A Inventory Read Router 接入归属
+
+M1D2A 将 `InventoryReadRouter` 接入客服 RAG turn 起点，但不接 primary、不部署、不改变客户回复。Router 构造、Provider 选择、Snapshot 禁用和 Evidence 整理集中在 `app/services/inventory_read_turn.py`，`app/main.py` 只负责创建一次 Context 并沿 rewrite/tools/selfcheck 编排传递。
+
+归属变更：
+
+- 问题重写/意图分析：`_understand_message` 通过同一 `InventoryReadContext` 读取 resolution rows 与旧 rewrite index，prompt 内容保持旧生产等价。
+- Planner：不选择数据源，仅继续消费 rewrite 结果和工具需求。
+- 房源事实工具：`_execute_tools` 的库存搜索、原始房号兜底、候选集兜底读取改为 `LegacyInventoryReadProvider`，原始 row 仍按旧 `InventoryService` 结果返回。
+- 结构化会话记忆：候选集和确认房源记录 `inventory_cache_meta` 改为本轮 Provider metadata，并在 candidate_state 摘要保留 `decision_id/source_kind/source_hash`。
+- 自检回流/发送阶段：工具 evidence 出现 source/context 不一致时清空房源事实、图片/视频待发路径；未切换发送动作。
+- 安全兜底：Provider 失败或 consistency failure 不再触发同位置旧直接读取，不让旧结果覆盖 Provider 结果。
+
+当前保持：
+
+- 客户路径 `disabled`/`shadow` 的 `context.source_kind` 均为 `legacy`。
+- `shadow` 聊天路径不调用 `SnapshotReader`，本轮不做双读。
+- `primary` 配置不会在客服聊天中启用，会明确回退到 `disabled`。
+- 房源表 PNG、图片/视频素材、看房密码专用读取、企业微信发送、部署均未纳入本轮。
+
+测试证明：
+
+- `tests/test_wecom_kf.py::InventoryReadRouterIntegrationTests`
+- `tests/test_inventory_read_turn.py`
+- `tests/test_inventory_read_router.py::test_production_customer_path_uses_read_router_without_snapshot_reader`
+- `tests/test_inventory_read_router.py::test_shadow_chat_mode_can_skip_snapshot_health_probe`
 
 ## M1B 修改归属声明模板
 

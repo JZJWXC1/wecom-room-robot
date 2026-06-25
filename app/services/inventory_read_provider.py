@@ -57,6 +57,24 @@ class InventoryReadProvider(Protocol):
     ) -> list[InventoryListingEvidence]:
         ...
 
+    async def search_inventory_rows(
+        self,
+        query_state: Any,
+        context: InventoryReadContext,
+        *,
+        limit: int = 8,
+    ) -> tuple[list[dict[str, Any]], list[InventoryListingEvidence]]:
+        ...
+
+    async def all_inventory_rows(
+        self,
+        context: InventoryReadContext,
+        *,
+        limit: int = 500,
+        refresh_if_needed: bool = True,
+    ) -> tuple[list[dict[str, Any]], list[InventoryListingEvidence]]:
+        ...
+
     async def get_listing(
         self,
         listing_id: str,
@@ -102,11 +120,41 @@ class LegacyInventoryReadProvider:
         *,
         limit: int = 8,
     ) -> list[InventoryListingEvidence]:
+        _rows, evidence = await self.search_inventory_rows(query_state, context, limit=limit)
+        return evidence
+
+    async def search_inventory_rows(
+        self,
+        query_state: Any,
+        context: InventoryReadContext,
+        *,
+        limit: int = 8,
+    ) -> tuple[list[dict[str, Any]], list[InventoryListingEvidence]]:
         ensure_provider_context(self.source_kind, context)
-        rows = await self.inventory_service.search(_query_text(query_state), limit=limit)
+        rows = list(await self.inventory_service.search(_query_text(query_state), limit=limit) or [])
         evidence = [_legacy_row_to_evidence(row, context, index=index) for index, row in enumerate(rows)]
         assert_evidence_consistency(context, evidence)
-        return evidence
+        return rows, evidence
+
+    async def all_inventory_rows(
+        self,
+        context: InventoryReadContext,
+        *,
+        limit: int = 500,
+        refresh_if_needed: bool = True,
+    ) -> tuple[list[dict[str, Any]], list[InventoryListingEvidence]]:
+        ensure_provider_context(self.source_kind, context)
+        try:
+            rows = await self.inventory_service.all_rows(
+                limit=limit,
+                refresh_if_needed=refresh_if_needed,
+            )
+        except TypeError:
+            rows = await self.inventory_service.all_rows(limit=limit)
+        rows = list(rows or [])
+        evidence = [_legacy_row_to_evidence(row, context, index=index) for index, row in enumerate(rows)]
+        assert_evidence_consistency(context, evidence)
+        return rows, evidence
 
     async def get_listing(
         self,
@@ -142,14 +190,14 @@ class LegacyInventoryReadProvider:
 
     async def get_rewrite_index(self, context: InventoryReadContext) -> dict[str, Any]:
         ensure_provider_context(self.source_kind, context)
-        return _strip_sensitive_payload(self.rewrite_index_loader())
+        return dict(self.rewrite_index_loader() or {})
 
     async def get_inventory_metadata(self, context: InventoryReadContext) -> dict[str, Any]:
         ensure_provider_context(self.source_kind, context)
-        return _strip_sensitive_payload(getattr(self.inventory_service, "cache_meta", {}) or {})
+        return _strip_sensitive_payload(_legacy_cache_meta(self.inventory_service))
 
     def health(self) -> InventoryReadHealth:
-        meta = _strip_sensitive_payload(getattr(self.inventory_service, "cache_meta", {}) or {})
+        meta = _strip_sensitive_payload(_legacy_cache_meta(self.inventory_service))
         source_hash = str(meta.get("hash") or meta.get("source_hash") or stable_safe_hash(meta))
         return InventoryReadHealth(
             status=str(meta.get("status") or "unknown"),
@@ -179,15 +227,39 @@ class SnapshotInventoryReadProvider:
         *,
         limit: int = 8,
     ) -> list[InventoryListingEvidence]:
+        _rows, evidence = await self.search_inventory_rows(query_state, context, limit=limit)
+        return evidence
+
+    async def search_inventory_rows(
+        self,
+        query_state: Any,
+        context: InventoryReadContext,
+        *,
+        limit: int = 8,
+    ) -> tuple[list[dict[str, Any]], list[InventoryListingEvidence]]:
         ensure_provider_context(self.source_kind, context)
         snapshot = self._snapshot_for_context(context)
         scored = _score_snapshot_listings(snapshot, _query_text(query_state))
-        evidence = [
-            _snapshot_listing_to_evidence(listing, context)
-            for _score, _index, listing in scored[:limit]
-        ]
+        listings = [listing for _score, _index, listing in scored[:limit]]
+        rows = [_listing_as_query_row(listing) for listing in listings]
+        evidence = [_snapshot_listing_to_evidence(listing, context) for listing in listings]
         assert_evidence_consistency(context, evidence)
-        return evidence
+        return rows, evidence
+
+    async def all_inventory_rows(
+        self,
+        context: InventoryReadContext,
+        *,
+        limit: int = 500,
+        refresh_if_needed: bool = True,
+    ) -> tuple[list[dict[str, Any]], list[InventoryListingEvidence]]:
+        ensure_provider_context(self.source_kind, context)
+        snapshot = self._snapshot_for_context(context)
+        listings = list(snapshot.listings[:limit])
+        rows = [_listing_as_query_row(listing) for listing in listings]
+        evidence = [_snapshot_listing_to_evidence(listing, context) for listing in listings]
+        assert_evidence_consistency(context, evidence)
+        return rows, evidence
 
     async def get_listing(
         self,
@@ -481,6 +553,13 @@ def _query_text(query_state: Any) -> str:
     if isinstance(budget_range, (list, tuple)) and len(budget_range) == 2:
         parts.append(f"{budget_range[0]}-{budget_range[1]}")
     return " ".join(parts).strip()
+
+
+def _legacy_cache_meta(inventory_service: Any) -> dict[str, Any]:
+    meta = getattr(inventory_service, "cache_meta", {}) or {}
+    if callable(meta):
+        meta = meta()
+    return dict(meta or {})
 
 
 def _row_value(row: dict[str, Any], aliases: tuple[str, ...]) -> str:

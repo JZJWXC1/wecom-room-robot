@@ -69,9 +69,19 @@ def alias_pairs(index: dict[str, Any]) -> set[tuple[str, str]]:
     }
 
 
-@pytest.mark.parametrize("path", ["app/main.py", "app/services/llm.py"])
+@pytest.mark.parametrize("path", ["app/services/llm.py"])
 def test_customer_chain_files_match_fix1(path: str) -> None:
     assert_matches_fix1(path)
+
+
+def test_main_customer_chain_keeps_m1d2a_inventory_read_router_gate() -> None:
+    source = (REPO_ROOT / "app/main.py").read_text(encoding="utf-8")
+
+    assert "inventory_read_turn" in source
+    assert "InventoryReadRouter" not in source
+    assert "inventory_read_context" in source
+    assert "SnapshotInventoryReadProvider" not in source
+    assert "inventory_snapshot_reader" not in source
 
 
 @pytest.mark.parametrize(

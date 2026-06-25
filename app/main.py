@@ -16,7 +16,13 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
 from app.models import IncomingMessage
-from app.services import kf_agentic_rag, kf_context_memory, kf_orchestrator_flow, kf_turn_flow
+from app.services import (
+    inventory_read_turn,
+    kf_agentic_rag,
+    kf_context_memory,
+    kf_orchestrator_flow,
+    kf_turn_flow,
+)
 from app.services.config_check import get_config_status
 from app.services.feishu import FeishuClient
 from app.services.fuzzy_match import (
@@ -28,6 +34,12 @@ from app.services.fuzzy_match import (
 from app.services.inventory import InventoryService
 from app.services.inventory_image_sync import InventoryImageSyncer
 from app.services.inventory_snapshot_shadow import run_inventory_snapshot_shadow
+from app.services.inventory_read_models import (
+    InventoryListingEvidence,
+    InventoryReadContext,
+    InventoryReadError,
+    assert_evidence_consistency,
+)
 from app.services.inventory_query import (
     parse_inventory_query,
     row_matches_hard_constraints,
@@ -219,6 +231,43 @@ def _pending_message_ids(items: list[dict[str, Any]]) -> list[str]:
         for item in items
         if str(item.get("msgid") or "").strip()
     ]
+
+
+def _create_inventory_read_context(
+    *,
+    prefix: str,
+    open_kfid: str,
+    external_userid: str,
+    content: str,
+    msgids: list[str] | None = None,
+    generation: int | str = "",
+) -> InventoryReadContext:
+    return inventory_read_turn.create_customer_inventory_read_context(
+        prefix=prefix,
+        open_kfid=open_kfid,
+        external_userid=external_userid,
+        content=content,
+        inventory_service=inventory,
+        rewrite_index_loader=load_rewrite_inventory_index,
+        inventory_snapshot_mode=settings.inventory_snapshot_mode,
+        msgids=msgids,
+        generation=generation,
+    )
+
+
+def _local_inventory_read_context(scope: str = "local") -> InventoryReadContext:
+    return inventory_read_turn.create_local_inventory_read_context(
+        scope=scope,
+        inventory_service=inventory,
+        rewrite_index_loader=load_rewrite_inventory_index,
+    )
+
+
+def _remember_inventory_read_context(
+    context: dict[str, Any],
+    inventory_read_context: InventoryReadContext,
+) -> dict[str, Any]:
+    return inventory_read_turn.remember_context(context, inventory_read_context)
 
 
 def _combined_pending_content(items: list[dict[str, Any]]) -> str:
@@ -1730,9 +1779,19 @@ def _assistant_text_confirms_community_correction(assistant_text: str, canonical
     return False
 
 
-async def _inventory_rows_for_resolution() -> list[dict[str, Any]]:
+async def _inventory_rows_for_resolution(
+    inventory_read_context: InventoryReadContext | None = None,
+) -> list[dict[str, Any]]:
+    inventory_read_context = inventory_read_context or _local_inventory_read_context("resolution")
     try:
-        return await inventory.all_rows(limit=500, refresh_if_needed=False)
+        rows, _evidence = await inventory_read_turn.all_rows_for_context(
+            inventory_read_context,
+            inventory_service=inventory,
+            rewrite_index_loader=load_rewrite_inventory_index,
+            limit=500,
+            refresh_if_needed=False,
+        )
+        return rows
     except Exception as exc:
         logger.debug("inventory rows for resolution unavailable: %s", exc)
         return []
@@ -1746,6 +1805,66 @@ def _inventory_cache_meta_for_prompt() -> dict[str, Any]:
         return dict(meta or {})
     except Exception:
         return {}
+
+
+async def _inventory_metadata_for_read_context(
+    inventory_read_context: InventoryReadContext | None = None,
+) -> dict[str, Any]:
+    inventory_read_context = inventory_read_context or _local_inventory_read_context("metadata")
+    try:
+        return await inventory_read_turn.metadata_for_context(
+            inventory_read_context,
+            inventory_service=inventory,
+            rewrite_index_loader=load_rewrite_inventory_index,
+        )
+    except Exception as exc:
+        logger.debug("inventory metadata unavailable from read provider: %s", exc)
+        return {}
+
+
+async def _inventory_rewrite_index_for_read_context(
+    inventory_read_context: InventoryReadContext | None = None,
+) -> dict[str, Any]:
+    inventory_read_context = inventory_read_context or _local_inventory_read_context("rewrite")
+    try:
+        return await inventory_read_turn.rewrite_index_for_context(
+            inventory_read_context,
+            inventory_service=inventory,
+            rewrite_index_loader=load_rewrite_inventory_index,
+        )
+    except Exception as exc:
+        logger.debug("inventory rewrite index unavailable from read provider: %s", exc)
+        return {}
+
+
+async def _inventory_search_rows_for_context(
+    inventory_read_context: InventoryReadContext,
+    query_state: Any,
+    *,
+    limit: int = 8,
+) -> tuple[list[dict[str, Any]], list[InventoryListingEvidence]]:
+    return await inventory_read_turn.search_rows_for_context(
+        inventory_read_context,
+        query_state,
+        inventory_service=inventory,
+        rewrite_index_loader=load_rewrite_inventory_index,
+        limit=limit,
+    )
+
+
+async def _inventory_all_rows_for_context(
+    inventory_read_context: InventoryReadContext,
+    *,
+    limit: int = 500,
+    refresh_if_needed: bool = True,
+) -> tuple[list[dict[str, Any]], list[InventoryListingEvidence]]:
+    return await inventory_read_turn.all_rows_for_context(
+        inventory_read_context,
+        inventory_service=inventory,
+        rewrite_index_loader=load_rewrite_inventory_index,
+        limit=limit,
+        refresh_if_needed=refresh_if_needed,
+    )
 
 
 def _area_counts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1817,13 +1936,25 @@ def _build_inventory_rewrite_index(
     rows: list[dict[str, Any]],
     signals: dict[str, Any],
     rewrite_view: dict[str, Any] | None = None,
+    persisted_index: dict[str, Any] | None = None,
+    cache_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    persisted_index = load_rewrite_inventory_index()
-    if not persisted_index:
+    should_build_persisted_index = persisted_index is None
+    persisted_index = (
+        load_rewrite_inventory_index()
+        if should_build_persisted_index
+        else dict(persisted_index)
+    )
+    cache_meta = (
+        _inventory_cache_meta_for_prompt()
+        if cache_meta is None
+        else dict(cache_meta)
+    )
+    if should_build_persisted_index and not persisted_index:
         persisted_index = write_rewrite_inventory_index(
             rows,
             area_aliases=AREA_ALIASES,
-            cache_meta=_inventory_cache_meta_for_prompt(),
+            cache_meta=cache_meta,
         )
     rewrite_index_query = _rewrite_inventory_index_query(
         content=content,
@@ -1849,7 +1980,7 @@ def _build_inventory_rewrite_index(
     similar_candidates = [item for item in similar_candidates if item["options"]]
     result = {
         "source": "latest_inventory_rows",
-        "cache_meta": _inventory_cache_meta_for_prompt(),
+        "cache_meta": cache_meta,
         "rewrite_index_query": rewrite_index_query,
         "rewrite_inventory_index": sliced_index,
         "row_count": len(rows),
@@ -3414,6 +3545,7 @@ async def _pending_video_label_rows(
     context: dict[str, Any],
     *,
     limit: int = KF_VIDEO_SEND_LIMIT,
+    inventory_read_context: InventoryReadContext | None = None,
 ) -> list[dict[str, Any]]:
     pending_video = kf_context_memory.pending_video_sends(context)
     labels = [
@@ -3424,8 +3556,13 @@ async def _pending_video_label_rows(
     labels = list(dict.fromkeys(labels))
     if not labels:
         return []
+    inventory_read_context = inventory_read_context or _local_inventory_read_context("pending_video")
     try:
-        all_rows = await inventory.all_rows(limit=1000)
+        all_rows, _evidence = await _inventory_all_rows_for_context(
+            inventory_read_context,
+            limit=1000,
+            refresh_if_needed=True,
+        )
     except Exception as exc:
         logger.debug("pending video label lookup unavailable: %s", exc)
         return []
@@ -4453,14 +4590,23 @@ async def _understand_message(
     context: dict[str, Any],
     signals: dict[str, Any],
     planner_feedback: dict[str, Any] | None = None,
+    inventory_read_context: InventoryReadContext | None = None,
 ) -> dict[str, Any]:
+    inventory_read_context = inventory_read_context or _local_inventory_read_context("rewrite")
     rewrite_view = kf_context_memory.rewrite_memory_view(context)
-    resolution_rows = await _inventory_rows_for_resolution()
+    try:
+        resolution_rows = await _inventory_rows_for_resolution(inventory_read_context)
+    except TypeError:
+        resolution_rows = await _inventory_rows_for_resolution()
+    provider_rewrite_index = await _inventory_rewrite_index_for_read_context(inventory_read_context)
+    inventory_cache_meta = await _inventory_metadata_for_read_context(inventory_read_context)
     inventory_index = _build_inventory_rewrite_index(
         content=content,
         rows=resolution_rows,
         signals=signals,
         rewrite_view=rewrite_view,
+        persisted_index=provider_rewrite_index,
+        cache_meta=inventory_cache_meta,
     )
     try:
         result = await asyncio.wait_for(
@@ -4933,10 +5079,18 @@ async def _execute_tools(
     content: str,
     context: dict[str, Any],
     understanding: dict[str, Any],
+    inventory_read_context: InventoryReadContext | None = None,
 ) -> dict[str, Any]:
+    inventory_read_context = inventory_read_context or _local_inventory_read_context("tools")
+    context = _remember_inventory_read_context(context, inventory_read_context)
+    inventory_source_metadata = await _inventory_metadata_for_read_context(inventory_read_context)
+    inventory_listing_evidence: list[InventoryListingEvidence] = []
     effective_query = str(understanding.get("effective_query") or content)
     evidence: dict[str, Any] = {
         "actions": actions,
+        "inventory_read_context": inventory_read_context.to_log_dict(),
+        "inventory_source_metadata": inventory_source_metadata,
+        "inventory_listing_evidence": [],
         "inventory_rows": [],
         "target_rows": [],
         "inventory_images": [],
@@ -5017,7 +5171,17 @@ async def _execute_tools(
             effective_query=effective_query,
             content=content,
         )
-        rows = await inventory.search(inventory_query, limit=10)
+        try:
+            rows, search_evidence = await _inventory_search_rows_for_context(
+                inventory_read_context,
+                inventory_query,
+                limit=10,
+            )
+            inventory_read_turn.extend_listing_evidence(inventory_listing_evidence, search_evidence)
+        except InventoryReadError as exc:
+            logger.warning("inventory search blocked by read router: %s", exc.to_dict())
+            inventory_read_turn.clear_fact_evidence(evidence, exc)
+            rows = []
         rows = _filter_rows_by_constraint_proof(
             rows,
             proof,
@@ -5025,8 +5189,16 @@ async def _execute_tools(
         )
         if _room_refs_from_text(original_room_text):
             try:
-                all_rows = await inventory.all_rows(limit=500)
+                all_rows, all_evidence = await _inventory_all_rows_for_context(
+                    inventory_read_context,
+                    limit=500,
+                    refresh_if_needed=True,
+                )
                 original_ref_rows = _rows_matching_original_room_refs(original_room_text, all_rows)
+                inventory_read_turn.extend_listing_evidence(
+                    inventory_listing_evidence,
+                    inventory_read_turn.evidence_for_rows(original_ref_rows, all_rows, all_evidence),
+                )
             except Exception as exc:
                 logger.debug("original room ref fallback unavailable: %s", exc)
                 original_ref_rows = []
@@ -5068,7 +5240,17 @@ async def _execute_tools(
             if not candidate_rows:
                 candidate_query = _last_candidate_query_from_memory(context)
                 if candidate_query:
-                    candidate_rows = await inventory.search(candidate_query, limit=10)
+                    try:
+                        candidate_rows, candidate_evidence = await _inventory_search_rows_for_context(
+                            inventory_read_context,
+                            candidate_query,
+                            limit=10,
+                        )
+                        inventory_read_turn.extend_listing_evidence(inventory_listing_evidence, candidate_evidence)
+                    except InventoryReadError as exc:
+                        logger.warning("candidate inventory search blocked by read router: %s", exc.to_dict())
+                        inventory_read_turn.clear_fact_evidence(evidence, exc)
+                        candidate_rows = []
                     candidate_rows = _filter_rows_by_constraint_proof(
                         candidate_rows,
                         {},
@@ -5082,7 +5264,7 @@ async def _execute_tools(
                             "created_at": time.time(),
                             "shown_count": min(len(candidate_rows), 10),
                             "total_count": len(candidate_rows),
-                            "inventory_cache_meta": _inventory_cache_meta_for_prompt(),
+                            "inventory_cache_meta": inventory_source_metadata,
                         }
             if candidate_rows:
                 rows = candidate_rows[:10]
@@ -5095,7 +5277,7 @@ async def _execute_tools(
                 "created_at": time.time(),
                 "shown_count": min(len(rows), 10),
                 "total_count": len(rows),
-                "inventory_cache_meta": _inventory_cache_meta_for_prompt(),
+                "inventory_cache_meta": inventory_source_metadata,
             }
         elif not rows and _should_clear_room_context_after_empty_inventory_search(
             content=content,
@@ -5133,7 +5315,10 @@ async def _execute_tools(
         and "send_video" in actions
         and proof.get("wants_original_video")
     ):
-        pending_rows = await _pending_video_label_rows(context)
+        pending_rows = await _pending_video_label_rows(
+            context,
+            inventory_read_context=inventory_read_context,
+        )
         if pending_rows:
             target_rows = pending_rows
             rows = pending_rows
@@ -5223,17 +5408,27 @@ async def _execute_tools(
         if not candidate_rows:
             candidate_query = _last_candidate_query_from_memory(context)
             if candidate_query:
-                candidate_rows = await inventory.search(candidate_query, limit=10)
-                if candidate_rows:
-                    context["last_candidate_set"] = {
-                        "intent": "inventory",
-                        "query": candidate_query,
-                        "candidates": candidate_rows[:10],
-                        "created_at": time.time(),
-                        "shown_count": min(len(candidate_rows), 10),
-                        "total_count": len(candidate_rows),
-                        "inventory_cache_meta": _inventory_cache_meta_for_prompt(),
-                    }
+                try:
+                    candidate_rows, candidate_evidence = await _inventory_search_rows_for_context(
+                        inventory_read_context,
+                        candidate_query,
+                        limit=10,
+                    )
+                    inventory_read_turn.extend_listing_evidence(inventory_listing_evidence, candidate_evidence)
+                except InventoryReadError as exc:
+                    logger.warning("viewing inventory search blocked by read router: %s", exc.to_dict())
+                    inventory_read_turn.clear_fact_evidence(evidence, exc)
+                    candidate_rows = []
+            if candidate_rows:
+                context["last_candidate_set"] = {
+                    "intent": "inventory",
+                    "query": candidate_query,
+                    "candidates": candidate_rows[:10],
+                    "created_at": time.time(),
+                    "shown_count": min(len(candidate_rows), 10),
+                    "total_count": len(candidate_rows),
+                    "inventory_cache_meta": inventory_source_metadata,
+                }
         if candidate_rows:
             target_rows = candidate_rows[:10]
     explicit_room_refs = bool(proof.get("room_refs"))
@@ -5250,6 +5445,24 @@ async def _execute_tools(
     if target_rows and selected_indices:
         rows = target_rows
         evidence["inventory_rows"] = target_rows
+
+    if evidence.get("inventory_read_error"):
+        rows = []
+        target_rows = []
+        evidence["inventory_rows"] = []
+        evidence["target_rows"] = []
+        evidence["inventory_listing_evidence"] = []
+    else:
+        try:
+            assert_evidence_consistency(inventory_read_context, inventory_listing_evidence)
+            evidence["inventory_listing_evidence"] = [
+                item.to_dict() for item in inventory_listing_evidence
+            ]
+        except InventoryReadError as exc:
+            logger.warning("inventory evidence consistency blocked outbound facts: %s", exc.to_dict())
+            inventory_read_turn.clear_fact_evidence(evidence, exc)
+            rows = []
+            target_rows = []
 
     media_collect_specs: list[tuple[str, Any]] = []
     if "send_image" in actions and target_rows:
@@ -5362,7 +5575,7 @@ async def _execute_tools(
             "label": _row_label(first),
             "intent": _normalize_intent(understanding.get("intent")),
             "created_at": time.time(),
-            "inventory_cache_meta": _inventory_cache_meta_for_prompt(),
+            "inventory_cache_meta": inventory_source_metadata,
         }
 
     context["active_query_state"] = dict(understanding.get("query_state") or {})
@@ -5407,6 +5620,10 @@ def _tool_evidence_summary(tool_evidence: dict[str, Any]) -> dict[str, Any]:
         "media_sync": tool_evidence.get("media_sync") or {},
         "planner_reply_result": tool_evidence.get("planner_reply_result") or {},
         "outbound_package": tool_evidence.get("outbound_package") or {},
+        "inventory_read_context": tool_evidence.get("inventory_read_context") or {},
+        "inventory_source_metadata": tool_evidence.get("inventory_source_metadata") or {},
+        "inventory_listing_evidence_count": len(tool_evidence.get("inventory_listing_evidence") or []),
+        "inventory_read_error": tool_evidence.get("inventory_read_error") or {},
         "selection_error": tool_evidence.get("selection_error") or {},
         "field_target_error": tool_evidence.get("field_target_error") or {},
         "field_semantics": FIELD_SEMANTICS,
@@ -7913,7 +8130,17 @@ async def _generate_reply_result(
     planner_result: dict[str, Any] | None = None,
     retry_reason: str = "",
     timer: kf_turn_flow.RagStageTimer | None = None,
+    inventory_read_context: InventoryReadContext | None = None,
 ) -> dict[str, Any]:
+    if inventory_read_context is not None:
+        tool_evidence.setdefault("inventory_read_context", inventory_read_context.to_log_dict())
+    if tool_evidence.get("inventory_read_error"):
+        tool_evidence["inventory_rows"] = []
+        tool_evidence["target_rows"] = []
+        tool_evidence["image_rows"] = []
+        tool_evidence["video_rows"] = []
+        tool_evidence["image_paths"] = []
+        tool_evidence["video_paths"] = []
     effective_query = str(understanding.get("effective_query") or content)
     deterministic_signals = _deterministic_signals(content)
     if deterministic_signals.get("wants_deposit"):
@@ -8634,6 +8861,9 @@ def _candidate_state_summary(context: dict[str, Any]) -> dict[str, Any]:
             "sent_count": pending.get("sent_count", 0),
             "labels": pending.get("labels", []),
         }
+    inventory_read_context = context.get("inventory_read_context")
+    if isinstance(inventory_read_context, dict):
+        summary["inventory_read_context"] = inventory_read_turn.context_summary(inventory_read_context)
     return summary
 
 
@@ -8720,6 +8950,7 @@ async def _finalize_clarification_reply(
     understanding: dict[str, Any],
     reply: str,
     timer: kf_turn_flow.RagStageTimer | None = None,
+    inventory_read_context: InventoryReadContext | None = None,
 ) -> dict[str, Any]:
     draft = _normalize_customer_visible_reply_text_before_selfcheck(reply)
     tool_evidence = {
@@ -8739,6 +8970,7 @@ async def _finalize_clarification_reply(
         tool_evidence=dict(tool_evidence),
         planner_result=planner_result,
         timer=timer,
+        inventory_read_context=inventory_read_context,
     )
     if not first.get("needs_planner_retry") and str(first.get("reply") or "").strip():
         return first
@@ -8751,6 +8983,7 @@ async def _finalize_clarification_reply(
         planner_result=planner_result,
         retry_reason=retry_reason,
         timer=timer,
+        inventory_read_context=inventory_read_context,
     )
     if str(second.get("reply") or "").strip():
         return second
@@ -8783,12 +9016,26 @@ async def _process_text_turn(
         return
     timer = kf_turn_flow.RagStageTimer()
     try:
+        inventory_read_context = _create_inventory_read_context(
+            prefix="kf",
+            open_kfid=open_kfid,
+            external_userid=external_userid,
+            content=content,
+            msgids=msgids,
+            generation=generation,
+        )
         context = _load_context(open_kfid, external_userid)
+        context = _remember_inventory_read_context(context, inventory_read_context)
         context = kf_context_memory.append_dialog_message(context, role="user", content=content) or context
         signals = _deterministic_signals(content)
 
         with timer.stage("rewrite_intent"):
-            understanding = await _understand_message(content=content, context=context, signals=signals)
+            understanding = await _understand_message(
+                content=content,
+                context=context,
+                signals=signals,
+                inventory_read_context=inventory_read_context,
+            )
         _raise_if_stale_kf_turn(conversation_key, generation)
         state = _state_from_understanding(understanding)
         context = kf_context_memory.start_structured_turn(
@@ -8815,6 +9062,7 @@ async def _process_text_turn(
                 understanding=understanding,
                 reply=reply,
                 timer=timer,
+                inventory_read_context=inventory_read_context,
             )
             reply = _normalize_customer_visible_reply_text_before_selfcheck(
                 str(clarification_result.get("reply") or reply)
@@ -8866,6 +9114,7 @@ async def _process_text_turn(
                             context=context,
                             signals=signals,
                             planner_feedback=planner_feedback,
+                            inventory_read_context=inventory_read_context,
                         )
                     _raise_if_stale_kf_turn(conversation_key, generation)
                     context["active_query_state"] = dict(understanding.get("query_state") or {})
@@ -8886,6 +9135,7 @@ async def _process_text_turn(
                         understanding=understanding,
                         reply=reply,
                         timer=timer,
+                        inventory_read_context=inventory_read_context,
                     )
                     reply = _normalize_customer_visible_reply_text_before_selfcheck(
                         str(clarification_result.get("reply") or reply)
@@ -8918,6 +9168,7 @@ async def _process_text_turn(
                     content=content,
                     context=context,
                     understanding=understanding,
+                    inventory_read_context=inventory_read_context,
                 )
             if preserved_sendable_evidence:
                 tool_evidence = _merge_preserved_sendable_evidence(tool_evidence, preserved_sendable_evidence)
@@ -8932,6 +9183,7 @@ async def _process_text_turn(
                 planner_result=planner_result,
                 retry_reason=retry_reason,
                 timer=timer,
+                inventory_read_context=inventory_read_context,
             )
             _raise_if_stale_kf_turn(conversation_key, generation)
             context = reply_result["context"]
@@ -8950,6 +9202,7 @@ async def _process_text_turn(
                         context=context,
                         signals=signals,
                         planner_feedback=planner_feedback,
+                        inventory_read_context=inventory_read_context,
                     )
                 _raise_if_stale_kf_turn(conversation_key, generation)
                 context["active_query_state"] = dict(understanding.get("query_state") or {})
@@ -8969,6 +9222,7 @@ async def _process_text_turn(
                         understanding=understanding,
                         reply=reply,
                         timer=timer,
+                        inventory_read_context=inventory_read_context,
                     )
                     final_reply = _normalize_customer_visible_reply_text_before_selfcheck(
                         str(clarification_result.get("reply") or reply)
@@ -9283,10 +9537,24 @@ async def receive_wecom_kf_callback(
 @app.post("/debug/message")
 async def debug_message(message: IncomingMessage) -> dict[str, Any]:
     content = message.content or ""
+    inventory_read_context = _create_inventory_read_context(
+        prefix="debug",
+        open_kfid="debug",
+        external_userid=message.user_id or "debug-user",
+        content=content,
+        msgids=[],
+        generation="debug",
+    )
     context = _load_context("debug", message.user_id or "debug-user")
+    context = _remember_inventory_read_context(context, inventory_read_context)
     context = kf_context_memory.append_dialog_message(context, role="user", content=content) or context
     signals = _deterministic_signals(content)
-    understanding = await _understand_message(content=content, context=context, signals=signals)
+    understanding = await _understand_message(
+        content=content,
+        context=context,
+        signals=signals,
+        inventory_read_context=inventory_read_context,
+    )
     retry_reason = ""
     planner_result: dict[str, Any] = {}
     tool_evidence: dict[str, Any] = {}
@@ -9310,6 +9578,7 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
                 context=context,
                 signals=signals,
                 planner_feedback=planner_feedback,
+                inventory_read_context=inventory_read_context,
             )
             if not understanding.get("needs_clarification"):
                 retry_reason = str(planner_feedback["missing_evidence"])
@@ -9320,6 +9589,7 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
             content=content,
             context=context,
             understanding=understanding,
+            inventory_read_context=inventory_read_context,
         )
         reply_result = await _generate_reply_result(
             content=content,
@@ -9328,6 +9598,7 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
             tool_evidence=tool_evidence,
             planner_result=planner_result,
             retry_reason=retry_reason,
+            inventory_read_context=inventory_read_context,
         )
         if reply_result.get("needs_planner_retry") and attempt == 0:
             retry_reason = str(reply_result.get("planner_retry_reason") or "final_selfcheck_retry")
@@ -9346,6 +9617,10 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
             "image_count": len(tool_evidence.get("image_paths") or []),
             "video_count": len(tool_evidence.get("video_paths") or []),
             "missing_media": tool_evidence.get("missing_media") or [],
+            "inventory_read_context": tool_evidence.get("inventory_read_context") or {},
+            "inventory_source_metadata": tool_evidence.get("inventory_source_metadata") or {},
+            "inventory_listing_evidence_count": len(tool_evidence.get("inventory_listing_evidence") or []),
+            "inventory_read_error": tool_evidence.get("inventory_read_error") or {},
         },
         "reply": reply,
         "selfcheck": reply_result.get("selfcheck") or {},

@@ -238,6 +238,34 @@ M1D1 新增本地读取路由底座，但尚未接管生产，因此继续保留
 | `SnapshotInventoryReadProvider` | `InventoryReadRouter` 本地测试 | 验证 snapshot_id 锁定和 primary readiness | M1D/M1E | `app/main.py` 未引用 |
 | `legacy_whole_request` fallback | `InventoryReadRouter` 本地测试 | 明确整体 fallback，不允许字段级拼接 | M1D/M1E | 当前生产未构造 Router |
 
+## M1D2A Inventory Read Router 接入后的 Legacy Gate
+
+M1D2A 已把读取路由接入客服 RAG turn，但客户可见读取仍是 Legacy：
+
+| Legacy 路径 | M1D2A 状态 | removal_milestone | 保留原因 |
+| --- | --- | --- | --- |
+| 旧 `data/inventory_cache.csv` | 保留，`LegacyInventoryReadProvider` 继续复用 `InventoryService` | M1D/M1E | disabled/shadow 客户结果必须与旧生产一致 |
+| 旧 `data/rewrite_inventory_index.json` | 保留，rewrite index 通过 Provider 读取原 payload | M1D/M1E | 本轮要求 prompt 内容等价旧生产 |
+| 旧 `room_database/inventory_*.png` | 保留，客户要房源表仍走旧发送入口 | M1D/M1E | 本轮禁止修改房源表 PNG 与发送阶段 |
+| `InventoryService.search/all_rows` | 客服工具不再直接调用，改由 `inventory_read_turn.py` 经 `LegacyInventoryReadProvider` 调用 | M1D/M1E | 保留旧排序/字段/筛选语义，Provider 只做适配和 Evidence |
+| `InventoryService.snapshot` | 保留在无 rows 的 RAG 背景 fallback | M1D/M1E | 不属于本轮 search/detail 工具迁移，避免改变旧 prompt 背景 |
+| `SnapshotInventoryReadProvider` | 仍仅限本地 Router/专项测试 | M1D/M1E | 客服 disabled/shadow 不读 Snapshot，不启用 primary |
+
+本轮删除/收敛：
+
+- 删除 `app/main.py` 同位置 `inventory.search(...)` 直接读取，改为 `inventory_read_turn.search_rows_for_context(...)`。
+- 删除 `app/main.py` 同位置 `inventory.all_rows(...)` 工具读取，改为 `inventory_read_turn.all_rows_for_context(...)`。
+- 删除 Provider 失败后的旧 rewrite index/cache meta 直接 fallback；失败时返回空安全输入或清空客户可见事实。
+- 将 Router 构造、Snapshot 禁用 Provider、Evidence 去重/转换和清空事实 helper 收敛到 `app/services/inventory_read_turn.py`，`app/main.py` 保留最小编排。
+
+M1D2A 约束：
+
+- 客服 turn 只创建一个 `InventoryReadContext`。
+- 工具 evidence 必须带 `inventory_read_context`、`inventory_source_metadata` 和脱敏 `inventory_listing_evidence`。
+- Evidence 与 Context 的 `source_kind/source_hash/snapshot_id` 不一致时，清空房源事实和素材待发路径。
+- `shadow` 聊天路径不得调用 `SnapshotReader`。
+- 未获得 `APPROVE_DEPLOY`，本轮只做本地代码、文档和离线测试。
+
 ## 删除前总门槛
 
 - `pytest -q` 通过。

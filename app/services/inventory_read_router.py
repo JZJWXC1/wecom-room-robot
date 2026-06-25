@@ -57,6 +57,7 @@ class InventoryReadRouter:
         snapshot_provider: SnapshotInventoryReadProvider | None = None,
         readiness_state: Mapping[str, Any] | ReadinessStateProvider | None = None,
         supported_schema_versions: tuple[str, ...] = (INVENTORY_SNAPSHOT_SCHEMA_VERSION,),
+        shadow_probe_snapshot_health: bool = True,
     ) -> None:
         self.mode = str(mode or READ_MODE_DISABLED).strip().lower()
         self.fallback_strategy = str(fallback_strategy or FALLBACK_STRICT).strip().lower()
@@ -64,6 +65,7 @@ class InventoryReadRouter:
         self.snapshot_provider = snapshot_provider or SnapshotInventoryReadProvider()
         self.readiness_state = readiness_state
         self.supported_schema_versions = supported_schema_versions
+        self.shadow_probe_snapshot_health = shadow_probe_snapshot_health
 
     def start_turn(self, *, request_id: str, turn_id: str) -> "InventoryReadSession":
         decision = self.select_context(request_id=request_id, turn_id=turn_id)
@@ -121,7 +123,15 @@ class InventoryReadRouter:
             )
         if self.mode == READ_MODE_SHADOW:
             legacy_health = self.legacy_provider.health()
-            shadow_health = self._safe_snapshot_health()
+            shadow_health = (
+                self._safe_snapshot_health()
+                if self.shadow_probe_snapshot_health
+                else InventoryReadHealth(
+                    status="not_queried",
+                    source_kind=SOURCE_KIND_SNAPSHOT,
+                    message="customer chat shadow mode does not query snapshot in this milestone",
+                )
+            )
             context = self._legacy_context(
                 request_id=request_id,
                 turn_id=turn_id,

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,7 +7,7 @@ from types import SimpleNamespace
 
 import app.main as main
 from app.models import ReplyPlan
-from app.services import kf_context_memory
+from app.services import inventory_read_turn, kf_context_memory
 from app.services.rewrite_inventory_index import FIELD_SEMANTICS, build_rewrite_inventory_index
 from app.services.wecom_kf import (
     WeComKfClient,
@@ -47,6 +48,354 @@ def test_constraint_selfcheck_does_not_force_search_terms_for_contract_followup(
     )
 
     assert result["status"] == "pass"
+
+
+class InventoryReadRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_same_inventory_read_context_flows_through_rewrite_and_tools(self) -> None:
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.kwargs: dict = {}
+
+            async def rewrite_kf_message(self, **kwargs):
+                self.kwargs = kwargs
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "合幢悦府1204",
+                    "effective_query": "合幢悦府1204",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": False,
+                }
+
+        class FakeInventory:
+            def cache_meta(self) -> dict:
+                return {"status": "success", "hash": "m1d2a_fake_hash", "row_count": 1}
+
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "合幢悦府",
+                        "房号": "6-1-1204B",
+                        "户型描述": "一室一厅",
+                        "押一付一": "1500",
+                        "看房方式密码": "1234#",
+                    }
+                ]
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return await self.all_rows(limit=limit)
+
+        fake_reply = FakeReplyGenerator()
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = fake_reply
+        main.inventory = FakeInventory()
+        try:
+            read_context = main._local_inventory_read_context("m1d2a")
+            context = kf_context_memory.empty_context()
+            understanding = await main._understand_message(
+                content="合幢悦府有哪些",
+                context=context,
+                signals=main._deterministic_signals("合幢悦府有哪些"),
+                inventory_read_context=read_context,
+            )
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "compact_listing"],
+                content="合幢悦府有哪些",
+                context=context,
+                understanding=understanding,
+                inventory_read_context=read_context,
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertEqual(fake_reply.kwargs["inventory_index"]["row_count"], 1)
+        self.assertEqual(evidence["inventory_read_context"]["decision_id"], read_context.decision_id)
+        self.assertEqual(evidence["inventory_source_metadata"]["hash"], "m1d2a_fake_hash")
+        self.assertEqual(evidence["inventory_rows"][0]["小区"], "合幢悦府")
+        self.assertEqual(evidence["inventory_listing_evidence"][0]["source_kind"], "legacy")
+        self.assertNotIn("看房方式密码", json.dumps(evidence["inventory_listing_evidence"], ensure_ascii=False))
+        self.assertEqual(context["inventory_read_context"]["decision_id"], read_context.decision_id)
+
+    def test_customer_shadow_context_stays_legacy_and_does_not_probe_snapshot(self) -> None:
+        original_mode = main.settings.inventory_snapshot_mode
+        main.settings.inventory_snapshot_mode = "shadow"
+        try:
+            read_context = main._create_inventory_read_context(
+                prefix="kf",
+                open_kfid="open-kf",
+                external_userid="external-user",
+                content="万达房源",
+                msgids=["msg-1"],
+                generation=1,
+            )
+        finally:
+            main.settings.inventory_snapshot_mode = original_mode
+
+        self.assertEqual(read_context.source_kind, "legacy")
+        self.assertEqual(read_context.selection_mode, "shadow")
+        self.assertEqual(read_context.health_at_selection["details"]["shadow_snapshot"]["status"], "not_queried")
+
+    async def test_provider_failure_does_not_fallback_to_direct_rewrite_reads(self) -> None:
+        class FakeInventory:
+            def cache_meta(self) -> dict:
+                return {"status": "success", "hash": "no_fallback_hash", "row_count": 0}
+
+        async def fail_metadata(*args, **kwargs):
+            raise RuntimeError("provider metadata failed")
+
+        async def fail_rewrite_index(*args, **kwargs):
+            raise RuntimeError("provider rewrite index failed")
+
+        def fail_direct_metadata():
+            raise AssertionError("direct metadata fallback must not run")
+
+        def fail_direct_rewrite_index():
+            raise AssertionError("direct rewrite index fallback must not run")
+
+        def fail_write_rewrite_index(*args, **kwargs):
+            raise AssertionError("direct rewrite index write fallback must not run")
+
+        originals = {
+            "inventory": main.inventory,
+            "metadata_for_context": inventory_read_turn.metadata_for_context,
+            "rewrite_index_for_context": inventory_read_turn.rewrite_index_for_context,
+            "_inventory_cache_meta_for_prompt": main._inventory_cache_meta_for_prompt,
+            "load_rewrite_inventory_index": main.load_rewrite_inventory_index,
+            "write_rewrite_inventory_index": main.write_rewrite_inventory_index,
+        }
+        main.inventory = FakeInventory()
+        read_context = main._local_inventory_read_context("no_fallback")
+        inventory_read_turn.metadata_for_context = fail_metadata
+        inventory_read_turn.rewrite_index_for_context = fail_rewrite_index
+        main._inventory_cache_meta_for_prompt = fail_direct_metadata
+        main.load_rewrite_inventory_index = fail_direct_rewrite_index
+        main.write_rewrite_inventory_index = fail_write_rewrite_index
+        try:
+            cache_meta = await main._inventory_metadata_for_read_context(read_context)
+            persisted_index = await main._inventory_rewrite_index_for_read_context(read_context)
+            inventory_index = main._build_inventory_rewrite_index(
+                content="合幢悦府有哪些",
+                rows=[],
+                signals={},
+                persisted_index=persisted_index,
+                cache_meta=cache_meta,
+            )
+        finally:
+            main.inventory = originals["inventory"]
+            inventory_read_turn.metadata_for_context = originals["metadata_for_context"]
+            inventory_read_turn.rewrite_index_for_context = originals["rewrite_index_for_context"]
+            main._inventory_cache_meta_for_prompt = originals["_inventory_cache_meta_for_prompt"]
+            main.load_rewrite_inventory_index = originals["load_rewrite_inventory_index"]
+            main.write_rewrite_inventory_index = originals["write_rewrite_inventory_index"]
+
+        self.assertEqual(cache_meta, {})
+        self.assertEqual(persisted_index, {})
+        self.assertEqual(inventory_index["cache_meta"], {})
+        self.assertEqual(inventory_index["row_count"], 0)
+
+    async def test_process_text_turn_selects_router_once_and_reuses_decision_id(self) -> None:
+        class FakeStateStore:
+            def __init__(self) -> None:
+                self.processed: set[str] = set()
+
+            def mark_processed(self, msgid: str) -> None:
+                self.processed.add(msgid)
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
+
+        class FakeContextStore:
+            def __init__(self) -> None:
+                self.data: dict[str, dict] = {}
+
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
+
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.inventory_indexes: list[dict] = []
+
+            async def rewrite_kf_message(self, **kwargs):
+                self.inventory_indexes.append(kwargs["inventory_index"])
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "合幢悦府有哪些",
+                    "effective_query": "合幢悦府有哪些",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": False,
+                    "tool_plan": {
+                        "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                        "source": "test_tool_plan",
+                    },
+                }
+
+        class FakeInventory:
+            def __init__(self) -> None:
+                self.search_calls: list[tuple[str, int]] = []
+                self.all_rows_calls: list[dict] = []
+
+            def cache_meta(self) -> dict:
+                return {"status": "success", "hash": "turn_hash", "row_count": 1}
+
+            async def all_rows(self, **kwargs):
+                self.all_rows_calls.append(dict(kwargs))
+                return [
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "合幢悦府",
+                        "房号": "6-1-1204B",
+                        "户型描述": "一室一厅",
+                        "押一付一": "1500",
+                    }
+                ]
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                self.search_calls.append((query, limit))
+                return await self.all_rows(limit=limit)
+
+        original_router = inventory_read_turn.InventoryReadRouter
+        select_calls: list[tuple[str, str]] = []
+
+        class CountingRouter(original_router):
+            def select_context(self, *, request_id: str, turn_id: str):
+                select_calls.append((request_id, turn_id))
+                return super().select_context(request_id=request_id, turn_id=turn_id)
+
+        rewrite_index_calls: list[int] = []
+
+        def fake_rewrite_index_loader() -> dict:
+            rewrite_index_calls.append(1)
+            return {"signature": "rewrite-fixture", "row_count": 1, "room_index": []}
+
+        reply_results: list[dict] = []
+        send_results: list[dict] = []
+
+        async def fake_generate_reply_result(**kwargs):
+            reply_results.append(kwargs)
+            return {
+                "reply": "有的，合幢悦府6-1-1204B在表里。",
+                "draft_reply": "有的，合幢悦府6-1-1204B在表里。",
+                "context": kwargs["context"],
+                "selfcheck": {"status": "pass"},
+                "needs_planner_retry": False,
+                "planner_retry_reason": "",
+            }
+
+        async def fake_send_final_actions(**kwargs):
+            send_results.append(kwargs)
+            return {"sent_actions": [{"type": "text", "count": 1}], "context": kwargs["context"]}
+
+        fake_inventory = FakeInventory()
+        fake_reply = FakeReplyGenerator()
+        originals = {
+            "wecom_kf": main.wecom_kf,
+            "wecom_kf_context_store": main.wecom_kf_context_store,
+            "reply_generator": main.reply_generator,
+            "inventory": main.inventory,
+            "load_rewrite_inventory_index": main.load_rewrite_inventory_index,
+            "_generate_reply_result": main._generate_reply_result,
+            "_send_final_actions": main._send_final_actions,
+            "kf_turn_generations": dict(main.kf_turn_generations),
+            "router": inventory_read_turn.InventoryReadRouter,
+        }
+        main.wecom_kf = FakeWeComKf()
+        main.wecom_kf_context_store = FakeContextStore()
+        main.reply_generator = fake_reply
+        main.inventory = fake_inventory
+        main.load_rewrite_inventory_index = fake_rewrite_index_loader
+        main._generate_reply_result = fake_generate_reply_result
+        main._send_final_actions = fake_send_final_actions
+        inventory_read_turn.InventoryReadRouter = CountingRouter
+        main.kf_turn_generations["kf:wm"] = 0
+        try:
+            await main._process_text_turn(
+                open_kfid="kf",
+                external_userid="wm",
+                pending_items=[{"msgid": "msg-turn", "content": "合幢悦府有哪些"}],
+                generation=0,
+            )
+        finally:
+            main.wecom_kf = originals["wecom_kf"]
+            main.wecom_kf_context_store = originals["wecom_kf_context_store"]
+            main.reply_generator = originals["reply_generator"]
+            main.inventory = originals["inventory"]
+            main.load_rewrite_inventory_index = originals["load_rewrite_inventory_index"]
+            main._generate_reply_result = originals["_generate_reply_result"]
+            main._send_final_actions = originals["_send_final_actions"]
+            inventory_read_turn.InventoryReadRouter = originals["router"]
+            main.kf_turn_generations.clear()
+            main.kf_turn_generations.update(originals["kf_turn_generations"])
+
+        self.assertEqual(len(select_calls), 1)
+        self.assertEqual(len(rewrite_index_calls), 1)
+        self.assertEqual(len(fake_reply.inventory_indexes), 1)
+        self.assertEqual(len(fake_inventory.search_calls), 1)
+        self.assertEqual(fake_inventory.search_calls[0], ("合幢悦府有哪些", 10))
+        self.assertEqual(len(reply_results), 1)
+        self.assertEqual(len(send_results), 1)
+        rewrite_decision = fake_reply.inventory_indexes[0]["cache_meta"]["hash"]
+        tool_context = send_results[0]["tool_evidence"]["inventory_read_context"]
+        self.assertEqual(rewrite_decision, "turn_hash")
+        self.assertEqual(tool_context["decision_id"], reply_results[0]["inventory_read_context"].decision_id)
+        self.assertEqual(tool_context["source_kind"], "legacy")
+        self.assertEqual(
+            send_results[0]["tool_evidence"]["inventory_listing_evidence"][0]["source_hash"],
+            "turn_hash",
+        )
+
+    async def test_inventory_evidence_mismatch_clears_customer_visible_facts(self) -> None:
+        class FakeInventory:
+            def cache_meta(self) -> dict:
+                return {"status": "success", "hash": "expected_hash", "row_count": 1}
+
+        original_inventory = main.inventory
+        original_search = main._inventory_search_rows_for_context
+        main.inventory = FakeInventory()
+        try:
+            read_context = main._local_inventory_read_context("mismatch")
+
+            async def mismatched_search(context, query_state, *, limit=8):
+                return [
+                    {"小区": "合幢悦府", "房号": "6-1-1204B"}
+                ], [
+                    main.InventoryListingEvidence(
+                        evidence_id="evd_bad",
+                        listing_id="lst_bad",
+                        source_kind=context.source_kind,
+                        source_hash="different_hash",
+                        schema_version=context.schema_version,
+                        area="拱墅万达",
+                        community="合幢悦府",
+                        room_no="6-1-1204B",
+                    )
+                ]
+
+            main._inventory_search_rows_for_context = mismatched_search
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "send_video"],
+                content="合幢悦府1204视频",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "合幢悦府1204视频",
+                    "query_state": {"intent": "inventory"},
+                    "constraint_proof": {},
+                },
+                inventory_read_context=read_context,
+            )
+        finally:
+            main.inventory = original_inventory
+            main._inventory_search_rows_for_context = original_search
+
+        self.assertEqual(evidence["inventory_rows"], [])
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertEqual(evidence["video_paths"], [])
+        self.assertEqual(evidence["inventory_read_error"]["code"], "mixed_source_hash")
 
 
 class MainUnderstandingGuardTests(unittest.IsolatedAsyncioTestCase):
