@@ -17,6 +17,7 @@ from app.config import settings
 from app.services.config_check import is_missing_or_placeholder
 from app.services.feishu import FeishuClient
 from app.services.fuzzy_match import canonical_community_display, fuzzy_contains_score
+from app.services.inventory_legacy_parser import spreadsheet_values_to_inventory_rows
 from app.services.inventory_query import (
     filter_scored_by_hard_constraints,
     parse_inventory_query,
@@ -851,74 +852,7 @@ class InventoryService:
         return token
 
     def _spreadsheet_values_to_frame(self, values: list[list[Any]]) -> pd.DataFrame:
-        header_aliases = {
-            "户型": "户型描述",
-            "描述": "户型描述",
-            "押一付": "押一付一",
-            "押二付": "押二付一",
-            "密码": "看房方式密码",
-            "看房密码": "看房方式密码",
-            "看房方式/密码": "看房方式密码",
-            "看房方式": "看房方式密码",
-            "房间号": "房号",
-            "编号": "房号",
-            "社区": "小区",
-            "楼盘": "小区",
-        }
-        target_headers = {
-            "区域",
-            "小区",
-            "房号",
-            "户型描述",
-            "户型分类",
-            "押一付一",
-            "押二付一",
-            "看房方式密码",
-            "备注",
-            "租期",
-        }
-        header_index = -1
-        headers: list[str] = []
-        for index, row in enumerate(values):
-            normalized = [
-                header_aliases.get(str(cell).strip(), str(cell).strip())
-                for cell in row
-            ]
-            if "小区" in normalized and "房号" in normalized:
-                header_index = index
-                headers = normalized
-                break
-        if header_index < 0:
-            return pd.DataFrame()
-
-        rows: list[dict[str, str]] = []
-        current_area = ""
-        current_community = ""
-        for raw_row in values[header_index + 1 :]:
-            padded = list(raw_row) + [""] * max(0, len(headers) - len(raw_row))
-            row = {
-                header: str(value).strip()
-                for header, value in zip(headers, padded)
-                if header in target_headers
-            }
-            if not any(row.values()):
-                continue
-            room_no = row.get("房号", "")
-            community = row.get("小区", "")
-            area = row.get("区域", "")
-            if area and not community and not room_no:
-                current_area = area
-                continue
-            if area:
-                current_area = area
-            if community:
-                current_community = community
-            if not room_no:
-                continue
-            row["区域"] = row.get("区域") or current_area
-            row["小区"] = row.get("小区") or current_community
-            rows.append(row)
-        return pd.DataFrame(rows)
+        return pd.DataFrame(spreadsheet_values_to_inventory_rows(values))
 
     def _normalize(self, frame: pd.DataFrame) -> pd.DataFrame:
         frame = frame.dropna(how="all").copy()

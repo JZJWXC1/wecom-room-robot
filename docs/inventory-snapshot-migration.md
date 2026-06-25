@@ -66,6 +66,13 @@ M1B-GATE 当前状态：
 - 指针在 turn 中途切换不会影响本轮读到的数据。
 - viewing tool 只有显式看房/密码问题才读取 `private/viewing_secrets.json`。
 
+M1C1/M1C2 当前状态：
+
+- 已接入 Shadow 旁路构建，但仅在旧同步成功后运行，不改变运行时 reader。
+- `INVENTORY_SNAPSHOT_MODE` 默认仍为 `disabled`；`shadow` 也只写独立 `data/inventory_snapshots_shadow/`。
+- M1C2 新增 health/readiness、`sync_run_id` 去重和离线全链路验证，门禁只表示“可进入切换评估”，不自动切换生产 pointer。
+- 客服消息回调、Planner、工具执行、自检回流、发送房源表 PNG 仍未读取 Shadow 目录；正式只读 Snapshot 切换仍需后续 M1C 步骤完成。
+
 ### M1D：清理旧活动文件直读
 
 目标：确认生产路径不再依赖 `data/inventory_cache.csv`、`data/rewrite_inventory_index.json`、`room_database/inventory_*.png` 活动文件后，删除或降级旧 fallback。

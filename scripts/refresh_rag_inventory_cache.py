@@ -100,6 +100,7 @@ async def refresh_cache() -> dict[str, Any]:
         cache_meta=service.cache_meta,
         legacy_rewrite_index_path=settings.rewrite_inventory_index_path,
         legacy_rewrite_index=index,
+        sync_run_id=f"rag_inventory_cache_sync:{time.time_ns()}",
     )
     return {
         "ok": True,

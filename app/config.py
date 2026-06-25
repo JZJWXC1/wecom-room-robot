@@ -259,6 +259,14 @@ class Settings(BaseSettings):
         default=Path("data/inventory_snapshots_shadow"),
         alias="INVENTORY_SNAPSHOT_SHADOW_ROOT",
     )
+    inventory_snapshot_shadow_stale_seconds: int = Field(
+        default=24 * 60 * 60,
+        alias="INVENTORY_SNAPSHOT_SHADOW_STALE_SECONDS",
+    )
+    inventory_snapshot_shadow_required_passes: int = Field(
+        default=3,
+        alias="INVENTORY_SNAPSHOT_SHADOW_REQUIRED_PASSES",
+    )
     room_database_path: Path = Path("room_database")
     inventory_image_path: Path = Path("room_database/inventory.png")
     inventory_image_glob: str = "room_database/inventory_*.png"

@@ -120,6 +120,25 @@ M1C1 保留的旧入口与原因：
 
 Shadow 失败、超时、报告写失败、reconciliation blocking 和并发冲突都不得改变旧同步返回值，不得删除旧产物，不得更新生产 pointer。Shadow 报告只允许记录 `has_password` 和 `password_match` 布尔，不写真实密码、完整 viewing 原文、token、手机号或开发机绝对路径。
 
+## M1C2 Shadow 健康和离线验证记录
+
+M1C2 仍不切换生产读取路径。新增 `InventorySnapshotShadowHealth` 只读取 Shadow 独立目录中的 `shadow_status.json`、公开 snapshot artifact 和安全扫描结果，用于回答“是否具备进入切换评估”的健康状态；它不写 `data/inventory_snapshots/current_snapshot.json`，也不修改 `INVENTORY_SNAPSHOT_MODE`。
+
+新增 `sync_run_id` 去重门禁：同一个旧同步 run 只能执行一次 Shadow，重复 run 只返回 `duplicate_skipped`，不再构建第二份 snapshot，不累计连续通过次数。连续通过门禁按不同 `source_hash` 计数，同一份房源内容即使用不同 `sync_run_id` 重跑也不能把 `consecutive_passes` 刷高。出现 blocking reconciliation 或 Shadow error 时，`consecutive_passes` 归零并记录 failure。
+
+新增 `InventorySnapshotOfflineComparisonRunner` 作为离线测试工具，显式以 `mode="shadow"` 运行，输入为脱敏飞书 values fixture。该 Runner 只生成安全摘要、Shadow report 和 health artifact，不连接飞书、不读生产 CSV、不写生产 pointer。它用于 M1C2 全链路验证，不是线上同步入口。
+
+M1C2 保留的旧入口与原因：
+
+| 入口 | M1C2 状态 | removal_milestone | 覆盖 |
+| --- | --- | --- | --- |
+| `scripts/refresh_rag_inventory_cache.py` | 旧 cache/index 成功后传入唯一 `sync_run_id` 非阻断触发 Shadow | M1C/M1D | M1C1/M1C2 Shadow 测试 |
+| `scripts/sync_feishu_region_inventory.py::refresh_rewrite_inventory_index` | Region 旧流程成功后传入唯一 `sync_run_id` 非阻断触发 Shadow | M1C/M1D | M1C2 脚本测试 |
+| `app/main.py::_refresh_inventory` | admin helper 传入唯一 `sync_run_id`，客服消息路径不调用 Shadow | M1C/M1D | M1C2 AST 调用范围测试 |
+| `InventorySnapshotOfflineComparisonRunner` | 离线测试入口，强制 Shadow 模式但只写测试 artifact root | M1C2 后可保留为回归工具 | M1C2 fixture 全链路测试 |
+
+M1C2 后，若要进入正式切换评估，至少需要 Shadow 模式、最近一次 reconciliation 无 blocking、公开产物扫描通过、状态未过期、连续不同 `source_hash` 通过次数达到门槛、且最近一次无 error。该状态仅表示“可进入人工/后续门禁评估”，不是自动切生产。
+
 ## 删除前总门槛
 
 - `pytest -q` 通过。

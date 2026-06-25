@@ -1171,6 +1171,7 @@ async def _refresh_inventory() -> dict[str, Any]:
             source_version=str(index_result.get("signature") or inventory.cache_meta.get("hash") or ""),
             cache_meta=inventory.cache_meta,
             legacy_rewrite_index_path=settings.rewrite_inventory_index_path,
+            sync_run_id=f"admin_inventory_refresh:{time.time_ns()}",
         )
     else:
         shadow_result = {

@@ -129,6 +129,7 @@ async def refresh_rewrite_inventory_index() -> dict[str, Any]:
         cache_meta=service.cache_meta,
         legacy_rewrite_index_path=settings.rewrite_inventory_index_path,
         legacy_rewrite_index=index,
+        sync_run_id=f"feishu_region_inventory_sync:{time.time_ns()}",
     )
     return {
         "ok": True,

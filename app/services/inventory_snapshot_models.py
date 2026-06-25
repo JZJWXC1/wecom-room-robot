@@ -45,6 +45,7 @@ _SAFE_SENSITIVE_SUMMARY_KEYS = {
     "availability_summary",
     "availability_status",
     "viewing_secret_ref",
+    "public_artifact_secret_scan_passed",
 }
 
 

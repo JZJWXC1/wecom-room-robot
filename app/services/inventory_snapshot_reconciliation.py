@@ -39,6 +39,7 @@ COMPARE_FIELDS = (
     "availability_summary",
     "has_image",
     "has_video",
+    "has_password",
     "password_match",
 )
 BLOCKING_FIELDS = {"community", "room_no", "rent_pay1", "rent_pay2", "password_match"}
@@ -57,6 +58,7 @@ WARNING_FIELDS = {
 class ReconciliationListing:
     listing_id: str
     key: str
+    source_row_ref: str
     area: str
     community: str
     room_no: str
@@ -75,6 +77,7 @@ class ReconciliationListing:
         return {
             "listing_id": self.listing_id,
             "key": self.key,
+            "source_row_ref": self.source_row_ref,
             "community": self.community,
             "room_no": self.room_no,
         }
@@ -149,10 +152,22 @@ def reconcile_inventory_snapshot(
         current = snapshot_by_id[listing_id]
         field_mismatches.extend(_compare_listing(legacy, current, severity_counts))
 
-    missing_in_snapshot = [_with_severity(legacy_by_id[item].safe_ref(), "blocking") for item in missing_ids]
-    extra_in_snapshot = [_with_severity(snapshot_by_id[item].safe_ref(), "blocking") for item in extra_ids]
-    duplicate_legacy_records = [_with_severity(item, "blocking") for item in duplicate_legacy]
-    duplicate_snapshot_records = [_with_severity(item, "blocking") for item in duplicate_snapshot]
+    missing_in_snapshot = [
+        _with_severity(legacy_by_id[item].safe_ref(), "blocking", code="missing_in_snapshot")
+        for item in missing_ids
+    ]
+    extra_in_snapshot = [
+        _with_severity(snapshot_by_id[item].safe_ref(), "blocking", code="extra_in_snapshot")
+        for item in extra_ids
+    ]
+    duplicate_legacy_records = [
+        _with_severity(item, "blocking", code="duplicate_legacy_record")
+        for item in duplicate_legacy
+    ]
+    duplicate_snapshot_records = [
+        _with_severity(item, "blocking", code="duplicate_snapshot_record")
+        for item in duplicate_snapshot
+    ]
     severity_counts["blocking"] += (
         len(missing_in_snapshot)
         + len(extra_in_snapshot)
@@ -218,6 +233,7 @@ def compare_rewrite_inventory_index(
         mismatches.append(
             {
                 "severity": "warning",
+                "code": "rewrite_index_sensitive_field_present",
                 "field": "room_index.viewing",
                 "legacy_sensitive_field_present": True,
                 "message": "旧 rewrite index 含 viewing 字段；报告只记录布尔标记，不复制原文。",
@@ -282,6 +298,7 @@ def _legacy_listing(row: dict[str, Any]) -> ReconciliationListing | None:
     return ReconciliationListing(
         listing_id=listing_id,
         key=f"{normalize_listing_identity(community)}\0{normalize_listing_identity(room_no)}",
+        source_row_ref=_source_row_ref(row),
         area=_row_value(row, FIELD_ALIASES["area"]),
         community=community,
         room_no=room_no,
@@ -310,6 +327,7 @@ def _snapshot_listing(
     return ReconciliationListing(
         listing_id=listing.listing_id,
         key=listing.listing_key,
+        source_row_ref=str(listing.source_row_number),
         area=listing.area,
         community=listing.community,
         room_no=listing.room_no,
@@ -344,6 +362,7 @@ def _compare_listing(
         "availability_summary": (legacy.availability_summary, current.availability_summary),
         "has_image": (legacy.has_image, current.has_image),
         "has_video": (legacy.has_video, current.has_video),
+        "has_password": (legacy.has_password, current.has_password),
     }
     for field_name, (legacy_value, snapshot_value) in comparisons.items():
         if legacy_value == snapshot_value:
@@ -352,6 +371,7 @@ def _compare_listing(
         severity_counts[severity] = severity_counts.get(severity, 0) + 1
         entry = {
             "severity": severity,
+            "code": f"field_mismatch.{field_name}",
             "listing": legacy.safe_ref(),
             "field": field_name,
             "legacy": _safe_compare_value(legacy_value),
@@ -366,6 +386,7 @@ def _compare_listing(
         mismatches.append(
             {
                 "severity": "blocking",
+                "code": "field_mismatch.password_match",
                 "listing": legacy.safe_ref(),
                 "field": "password_match",
                 "legacy": {"has_password": bool(legacy.has_password)},
@@ -405,8 +426,8 @@ def _safe_compare_value(value: Any) -> Any:
     return sanitize_for_log(redact_sensitive_text(value) if isinstance(value, str) else value)
 
 
-def _with_severity(value: dict[str, Any], severity: str) -> dict[str, Any]:
-    return {"severity": severity, **sanitize_for_log(value)}
+def _with_severity(value: dict[str, Any], severity: str, *, code: str) -> dict[str, Any]:
+    return {"severity": severity, "code": code, **sanitize_for_log(value)}
 
 
 def _legacy_index_has_viewing(index: dict[str, Any]) -> bool:
@@ -428,6 +449,7 @@ def _compare_value(
     mismatches.append(
         {
             "severity": severity,
+            "code": f"rewrite_index_mismatch.{field_name}",
             "field": field_name,
             "legacy": _safe_compare_value(legacy_value),
             "snapshot": _safe_compare_value(snapshot_value),
@@ -447,6 +469,7 @@ def _compare_set(
     mismatches.append(
         {
             "severity": severity,
+            "code": f"rewrite_index_mismatch.{field_name}",
             "field": field_name,
             "missing_in_snapshot": sorted(str(item) for item in legacy_value - snapshot_value)[:80],
             "extra_in_snapshot": sorted(str(item) for item in snapshot_value - legacy_value)[:80],
@@ -514,3 +537,11 @@ def _layouts_by_community(items: list[Any]) -> dict[str, dict[str, int]]:
         bucket = result.setdefault(community, {})
         bucket[layout] = bucket.get(layout, 0) + 1
     return result
+
+
+def _source_row_ref(row: dict[str, Any]) -> str:
+    for key in ("source_row_number", "__row_number", "row_number", "行号"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""

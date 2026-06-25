@@ -37,6 +37,17 @@ M1C1 属于“房源/素材同步”阶段，只在旧同步完成结构化 rows
 
 `LegacyInventoryToSnapshotAdapter` 的规则归属是“房源/素材同步”的临时字段映射，removal_milestone=M1D。它不是事实 reader，也不是 Planner/RAG 工具。
 
+## M1C2 Shadow Health 归属
+
+M1C2 新增的 Shadow health、`sync_run_id` 去重和 OfflineComparisonRunner 仍只属于“房源/素材同步/测试覆盖”阶段：
+
+- Shadow health 只用于运维和迁移门禁判断，不给 Planner 提供库存事实。
+- `ready_for_cutover_evaluation` 只表示后续可以进入人工/发布门禁评估，不表示已切换客服读取路径。
+- OfflineComparisonRunner 只读取测试 fixture values，输出安全摘要和测试 artifact，不读取飞书、不连接企业微信、不读写生产活动 CSV/PNG。
+- `app/main.py` 中唯一 Shadow 调用仍限定在 `_refresh_inventory` admin helper；客服消息回调、RAG Planner、工具执行、自检回流和发送阶段都不得调用 `run_inventory_snapshot_shadow` 或读取 Shadow 根目录。
+
+因此 M1C2 不改变客户可见回复，不改变 viewing tool 权限，不改变房源表 PNG 发送入口，也不允许用 Shadow report 作为“房源存在/不存在”的客服证据。
+
 ## M1B 修改归属声明模板
 
 后续提交说明需标明：
