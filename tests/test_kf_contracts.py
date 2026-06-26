@@ -1,0 +1,275 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+from pydantic import ValidationError
+
+from app.services.kf_contracts import (
+    REDACTED,
+    CandidateItem,
+    CandidateSet,
+    Claim,
+    ConstraintOperation,
+    EvidenceItem,
+    PreparedOutboundPackage,
+    ResponseStrategy,
+    RetryPacket,
+    SendAction,
+    SendReceipt,
+    StructuredTaskPacket,
+    TaskAtom,
+    ToolEvidenceBundle,
+)
+
+
+FAKE_VIEWING_PASSWORD = "9999#"
+
+
+def test_structured_task_packet_supports_multi_task_and_response_strategy() -> None:
+    packet = StructuredTaskPacket(
+        prompt_version="rewrite.v1",
+        conversation_id="conv-1",
+        turn_id="turn-2",
+        case_id="case-3",
+        audience="broker",
+        response_strategy=ResponseStrategy.TOOL_FIRST,
+        tasks=[
+            TaskAtom(
+                task_id="task-search",
+                task_type="inventory_search",
+                user_text="东新园 4000-5000 两室",
+                constraint_operation=ConstraintOperation.INHERIT,
+                constraints={"area": "东新园", "budget": [4000, 5000]},
+                required_tools=["inventory.search"],
+            ),
+            TaskAtom(
+                task_id="task-video",
+                task_type="send_video",
+                user_text="前两套视频",
+                constraint_operation=ConstraintOperation.REPLACE,
+                constraints={"candidate_numbers": [1, 2]},
+                depends_on_task_ids=["task-search"],
+                response_strategy=ResponseStrategy.SEND_MEDIA,
+            ),
+        ],
+        rewritten_query="东新园 4000-5000 两室，前两套视频",
+    )
+
+    payload = packet.to_legacy_dict()
+
+    assert payload["schema_version"] == "kf_rag_contracts.v1"
+    assert payload["response_strategy"] == "tool_first"
+    assert [item["task_id"] for item in payload["tasks"]] == ["task-search", "task-video"]
+    assert payload["tasks"][1]["depends_on_task_ids"] == ["task-search"]
+
+
+def test_candidate_set_enforces_candidate_numbers() -> None:
+    candidate_set = CandidateSet(
+        candidate_set_id="cand-1",
+        inventory_snapshot_id="snap-1",
+        candidates=[
+            CandidateItem(candidate_number=1, listing_id="lst-1", community="晨星花园", room_no="1-101A"),
+            CandidateItem(candidate_number=2, listing_id="lst-2", community="晨星花园", room_no="1-102"),
+        ],
+    )
+
+    assert [item["candidate_number"] for item in candidate_set.to_legacy_dict()["candidates"]] == [1, 2]
+
+    with pytest.raises(ValidationError):
+        CandidateSet(
+            candidate_set_id="cand-bad",
+            candidates=[
+                CandidateItem(candidate_number=1, listing_id="lst-1"),
+                CandidateItem(candidate_number=3, listing_id="lst-3"),
+            ],
+        )
+
+
+def test_constraint_operations_cover_inherit_replace_exclude_and_clear() -> None:
+    packet = StructuredTaskPacket(
+        conversation_id="conv-constraints",
+        turn_id="turn-constraints",
+        inherited_constraints={"area": "东新园"},
+        replaced_constraints={"budget": [4000, 5000]},
+        excluded_constraints={"layout": "两室"},
+        cleared_constraint_keys=["community"],
+        tasks=[
+            TaskAtom(task_id="inherit", task_type="search", constraint_operation=ConstraintOperation.INHERIT),
+            TaskAtom(task_id="replace", task_type="search", constraint_operation=ConstraintOperation.REPLACE),
+            TaskAtom(task_id="exclude", task_type="search", constraint_operation=ConstraintOperation.EXCLUDE),
+            TaskAtom(task_id="clear", task_type="search", constraint_operation=ConstraintOperation.CLEAR),
+        ],
+    )
+
+    operations = [item["constraint_operation"] for item in packet.to_legacy_dict()["tasks"]]
+
+    assert operations == ["inherit", "replace", "exclude", "clear"]
+    assert packet.to_legacy_dict()["cleared_constraint_keys"] == ["community"]
+
+
+def test_evidence_claim_and_send_action_contracts_share_trace_ids() -> None:
+    candidate = CandidateSet(
+        candidate_set_id="cand-claim",
+        inventory_snapshot_id="snap-claim",
+        candidates=[CandidateItem(candidate_number=1, listing_id="lst-claim", evidence_id="evd-claim")],
+    )
+    evidence = EvidenceItem(
+        evidence_id="evd-claim",
+        listing_id="lst-claim",
+        inventory_snapshot_id="snap-claim",
+        evidence_type="inventory_listing",
+        summary="晨星花园 1-101A 押一付一 1800",
+        metadata={"source_hash": "hash-1"},
+    )
+    claim = Claim(
+        claim_id="claim-price",
+        evidence_id="evd-claim",
+        listing_id="lst-claim",
+        text="1-101A 押一付一是 1800",
+        support=["evd-claim"],
+    )
+    package = PreparedOutboundPackage(
+        conversation_id="conv-claim",
+        turn_id="turn-claim",
+        candidate_set_id="cand-claim",
+        inventory_snapshot_id="snap-claim",
+        reply_text="这套押一付一 1800。",
+        response_strategy=ResponseStrategy.ANSWER,
+        candidate_set=candidate,
+        evidence_bundle=ToolEvidenceBundle(
+            tool_name="inventory.search",
+            evidence=[evidence],
+            candidate_set=candidate,
+        ),
+        claims=[claim],
+        send_actions=[SendAction(action_id="send-text", action_type="text", evidence_id="evd-claim")],
+    )
+
+    payload = package.to_legacy_dict()
+
+    assert payload["claims"][0]["support"] == ["evd-claim"]
+    assert payload["evidence_bundle"]["evidence"][0]["listing_id"] == "lst-claim"
+    assert payload["send_actions"][0]["evidence_id"] == "evd-claim"
+
+
+def test_sensitive_password_and_phone_are_redacted_from_safe_outputs_and_repr() -> None:
+    package = PreparedOutboundPackage(
+        conversation_id="conv-secret",
+        turn_id="turn-secret",
+        reply_text=f"看房密码是 {FAKE_VIEWING_PASSWORD}，电话 19900009999",
+        evidence_bundle=ToolEvidenceBundle(
+            tool_name="viewing.lookup",
+            evidence=[
+                EvidenceItem(
+                    evidence_id="evd-secret",
+                    listing_id="lst-secret",
+                    evidence_type="viewing",
+                    summary=f"门锁密码 {FAKE_VIEWING_PASSWORD}",
+                    sensitive_metadata={"viewing_password": FAKE_VIEWING_PASSWORD},
+                )
+            ],
+            raw_tool_result={"viewing_password": FAKE_VIEWING_PASSWORD},
+        ),
+        send_actions=[
+            SendAction(
+                action_id="send-secret",
+                action_type="text",
+                payload={"text": f"密码 {FAKE_VIEWING_PASSWORD}"},
+                sensitive_payload={"viewing_password": FAKE_VIEWING_PASSWORD},
+            )
+        ],
+    )
+
+    safe_json = json.dumps(package.to_legacy_dict(), ensure_ascii=False)
+    model_repr = repr(package)
+
+    assert FAKE_VIEWING_PASSWORD not in safe_json
+    assert "19900009999" not in safe_json
+    assert FAKE_VIEWING_PASSWORD not in model_repr
+    assert "raw_tool_result" not in package.to_legacy_dict()["evidence_bundle"]
+
+
+def test_legacy_dict_roundtrip_records_unknown_fields_without_silent_drop() -> None:
+    legacy = {
+        "reply_text": "有的，这套可以看。",
+        "strategy": "answer",
+        "conversation_id": "conv-legacy",
+        "turn_id": "turn-legacy",
+        "send_actions": [{"action_id": "send-1", "action_type": "text"}],
+        "legacy_extra": {"kept": True},
+        "raw_viewing_password": FAKE_VIEWING_PASSWORD,
+    }
+
+    package = PreparedOutboundPackage.from_legacy_dict(legacy)
+    payload = package.to_legacy_dict()
+
+    assert payload["conversation_id"] == "conv-legacy"
+    assert payload["response_strategy"] == "answer"
+    assert payload["legacy_unknown_fields"]["legacy_extra"] == {"kept": True}
+    assert payload["legacy_unknown_fields"]["raw_viewing_password"] == REDACTED
+    assert FAKE_VIEWING_PASSWORD not in json.dumps(payload, ensure_ascii=False)
+
+
+def test_unknown_constructor_fields_are_rejected() -> None:
+    with pytest.raises(ValidationError):
+        TaskAtom(task_id="task", task_type="search", unexpected_field=True)
+
+
+def test_candidate_item_from_legacy_aliases() -> None:
+    item = CandidateItem.from_legacy_dict(
+        {
+            "number": 1,
+            "listing_id": "lst-alias",
+            "community_name": "云杉苑",
+            "room": "A-302",
+            "ignored_future_field": "保留但不静默丢弃",
+        }
+    )
+
+    payload = item.to_legacy_dict()
+
+    assert payload["candidate_number"] == 1
+    assert payload["community"] == "云杉苑"
+    assert payload["room_no"] == "A-302"
+    assert payload["legacy_unknown_fields"]["ignored_future_field"] == "保留但不静默丢弃"
+
+
+def test_retry_packet_and_send_receipt_redact_error_text() -> None:
+    retry = RetryPacket(
+        conversation_id="conv-retry",
+        turn_id="turn-retry",
+        reason=f"自检发现密码 {FAKE_VIEWING_PASSWORD}",
+        retry_instruction="去掉看房密码后重写",
+    )
+    receipt = SendReceipt(
+        action_id="send-1",
+        action_type="text",
+        status="failed",
+        error_message="token=abc123 phone 19900009999",
+    )
+
+    assert FAKE_VIEWING_PASSWORD not in json.dumps(retry.to_legacy_dict(), ensure_ascii=False)
+    assert "19900009999" not in json.dumps(receipt.to_legacy_dict(), ensure_ascii=False)
+    assert "abc123" not in json.dumps(receipt.to_legacy_dict(), ensure_ascii=False)
+
+
+def test_utf8_chinese_integrity_in_contract_payload() -> None:
+    packet = StructuredTaskPacket(
+        conversation_id="中文会话",
+        turn_id="第2轮",
+        tasks=[
+            TaskAtom(
+                task_id="task-cn",
+                task_type="inventory_search",
+                user_text="新填地 4000-5000 的呢",
+                constraints={"区域": "新填地", "预算": "4000-5000"},
+            )
+        ],
+    )
+
+    payload = json.dumps(packet.to_legacy_dict(), ensure_ascii=False)
+
+    assert "中文会话" in payload
+    assert "新填地" in payload
+    assert "\\u65b0" not in payload
