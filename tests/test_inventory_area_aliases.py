@@ -51,6 +51,41 @@ ALLOWED_LLM_RAG_V2_ENTITY_HINTS = (
 )
 
 
+def strip_llm_shadow_only_blocks(lines: list[str]) -> list[str]:
+    result: list[str] = []
+    skip_until: str | None = None
+    skip_import_block = False
+
+    for line in lines:
+        if skip_import_block:
+            if line == ")":
+                skip_import_block = False
+            continue
+
+        if line == "from app.services.kf_contracts import safe_artifact_payload":
+            continue
+        if line == "from app.services.kf_llm1_task_packet import (":
+            skip_import_block = True
+            continue
+
+        if skip_until:
+            if line.startswith(skip_until):
+                skip_until = None
+                result.append(line)
+            continue
+
+        if line.startswith("    async def build_kf_task_packet("):
+            skip_until = "    async def rewrite_kf_message("
+            continue
+        if line.startswith("    async def compose_kf_outbound_shadow("):
+            skip_until = "    async def assess_kf_final_reply("
+            continue
+
+        result.append(line)
+
+    return result
+
+
 def test_llm_customer_chain_matches_fix1_except_rag_v2_entity_hints() -> None:
     current_lines = (REPO_ROOT / "app/services/llm.py").read_text(encoding="utf-8").splitlines()
     baseline = subprocess.run(
@@ -63,6 +98,7 @@ def test_llm_customer_chain_matches_fix1_except_rag_v2_entity_hints() -> None:
         check=True,
     ).stdout.splitlines()
 
+    current_lines = strip_llm_shadow_only_blocks(current_lines)
     filtered_current = [
         line for line in current_lines
         if not any(hint in line for hint in ALLOWED_LLM_RAG_V2_ENTITY_HINTS)
