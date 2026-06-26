@@ -191,9 +191,26 @@ M4A 新增 `app/services/kf_llm1_task_packet.py` 和 `ReplyGenerator.build_kf_ta
 - `build_kf_task_packet` 不生成客户可见回复，不写发送动作，不读取房源事实，不选择库存数据源。
 - `candidate_binding` 只能绑定显式传入的 candidate set；没有 candidate set 时清空候选编号并记录 `no_candidate_set`。
 - `tool_plan` 是 shadow 内部计划，只用于与 legacy rewrite/planner 差异记录，不改变生产 Planner 或工具执行。
-- `app/services/kf_dual_llm_shadow.py` 记录 LLM1 packet、tool_plan、candidate_binding 和 legacy diff；LLM2 仍只基于 legacy 文本与工具 evidence 适配。
+- `app/services/kf_dual_llm_shadow.py` 记录 LLM1 packet、tool_plan、candidate_binding 和 legacy diff；LLM2 仍只基于工具 evidence 和既定动作适配。
 - `app/services/llm.py` 只新增显式 shadow prompt/method；旧 `rewrite_kf_message`、Planner、自检、发送阶段语义不变。
 - 本轮不修改 `app/main.py`，当前生产链路不会自动调用该 shadow method。
+
+## M5A LLM2 Outbound Shadow 归属
+
+M5A 新增 `app/services/kf_llm2_outbound.py::compose_kf_outbound`，归属为“发送准备 shadow 包装/自检回流”，不属于生产发送阶段切换。
+
+职责边界：
+
+- LLM2 shadow 只生成 `reply_text`、`answered_task_ids`、`claims`、`action_captions`、`self_review`。
+- `candidate_set`、`listing_id`、`candidate_number` 和 `send_actions` 由 `ToolEvidenceBundle` 或程序输入继承，LLM2 不得新增、删除或改绑。
+- 未由工具证据返回的价格、房态、密码、链接、素材目标会被 guard 拦截；失败时只输出 retry/rewrite reason，保留既有动作，不生成客户事实文本。
+- `app/services/llm.py` 仅新增 shadow prompt/method `compose_kf_outbound_shadow`；旧生产 rewrite、planner 和 selfcheck 方法语义不变。
+- `app/services/kf_dual_llm_shadow.py` 只适配 shadow record 的 LLM2 包装，不接 `app/main.py`，不改变客户可见回复、素材发送、库存读取、飞书或企微配置。
+
+测试覆盖：
+
+- `tests/test_kf_llm2_outbound.py` 覆盖 LLM2 出包、事实边界、动作继承和脱敏。
+- `tests/test_kf_dual_llm_shadow.py` 覆盖 legacy 双轨 shadow 继续生成安全 artifact。
 
 ## M1.5 契约对齐归属
 

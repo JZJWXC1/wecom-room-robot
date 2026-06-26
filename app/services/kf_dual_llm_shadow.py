@@ -25,6 +25,7 @@ from app.services.kf_llm1_task_packet import (
     LLM1_TASK_PACKET_PROMPT_VERSION,
     build_kf_task_packet_shadow,
 )
+from app.services.kf_llm2_outbound import compose_kf_outbound
 
 
 DUAL_LLM_SHADOW_SCHEMA_VERSION = "rag_v2_dual_llm_shadow.v1"
@@ -138,24 +139,27 @@ def compose_shadow_outbound(
         evidence_bundle=evidence_bundle,
         legacy_reply_text=legacy_reply_text,
     )
-
-    return PreparedOutboundPackage(
-        prompt_version=prompt_version,
-        conversation_id=task_packet.conversation_id,
-        turn_id=task_packet.turn_id,
-        case_id=task_packet.case_id,
-        inventory_snapshot_id=task_packet.inventory_snapshot_id,
-        candidate_set_id=task_packet.candidate_set_id,
-        reply_text=str(reply_result.get("reply") or legacy_reply_text or ""),
-        response_strategy=_strategy_from(_actions_from(planner, evidence), planner, evidence, fallback=task_packet.response_strategy),
-        answered_task_ids=_answered_task_ids(task_packet, claims, send_actions),
-        candidate_set=candidate_set,
-        evidence_bundle=evidence_bundle,
-        claims=claims,
-        action_captions=action_captions,
+    response_strategy = _strategy_from(
+        _actions_from(planner, evidence),
+        planner,
+        evidence,
+        fallback=task_packet.response_strategy,
+    )
+    llm2_output = {
+        "reply_text": str(reply_result.get("reply") or legacy_reply_text or ""),
+        "answered_task_ids": _answered_task_ids(task_packet, claims, send_actions),
+        "claims": [claim.to_legacy_dict() for claim in claims if claim.evidence_ref or claim.evidence_id],
+        "action_captions": [caption.to_legacy_dict() for caption in action_captions],
+        "missing_items": _string_list(evidence.get("missing_items") or reply_result.get("missing_items")),
+        "self_review": _self_review_payload(claims=claims, send_actions=send_actions, reply_result=reply_result),
+    }
+    return compose_kf_outbound(
+        task_packet,
+        evidence_bundle,
+        response_strategy,
+        llm_output=llm2_output,
         send_actions=send_actions,
-        missing_items=_string_list(evidence.get("missing_items") or reply_result.get("missing_items")),
-        self_review=_self_review_payload(claims=claims, send_actions=send_actions, reply_result=reply_result),
+        prompt_version=prompt_version,
         selfcheck_profile=str(
             reply_result.get("selfcheck_profile")
             or planner.get("selfcheck_profile")

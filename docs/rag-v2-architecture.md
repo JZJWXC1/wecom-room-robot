@@ -1,6 +1,6 @@
 # RAG V2 Architecture
 
-本文记录 M1.5 契约对齐后的双 LLM 终态边界。M4A 在不接入 `app/main.py` 的前提下新增真 LLM1 shadow：`build_kf_task_packet` 只做问题理解、意图分析、上下文继承、实体绑定和工具计划，输出 `StructuredTaskPacket`，不生成客户可见回复。
+本文记录 M1.5 契约对齐后的双 LLM 终态边界，以及 M4A LLM1 task packet shadow、M5A LLM2 outbound shadow 的非生产接入边界。M4A/M5A 都不接入 `app/main.py`，不修改客户可见回复、Planner 生产语义、自检生产语义、素材发送或库存读取 primary 切换。
 
 ## 终态两 LLM 分工
 
@@ -74,6 +74,17 @@
 
 `to_legacy_dict()` 继续提供安全 dict 视图，但 `response_strategy` 输出为结构化对象。需要旧 mode 的调用方读取 `response_strategy.mode`。本轮没有把该结构接入生产发送路径。
 
+## M5A LLM2 Outbound Shadow
+
+`app/services/kf_llm2_outbound.py` 新增 `compose_kf_outbound`，输入是 `StructuredTaskPacket + ToolEvidenceBundle + ResponseStrategy`，输出强类型 `PreparedOutboundPackage`。它只校验和包装 LLM2 shadow 的说法，不决定房源候选、素材目标或发送动作：
+
+- `reply_text`、`claims`、`action_captions`、`answered_task_ids`、`self_review` 可以来自 LLM2 shadow 输出。
+- `candidate_set`、`listing_id`、`candidate_number`、`send_actions` 只能来自工具证据或程序传入的已定动作。
+- 价格、房态、密码、链接和素材目标必须由 evidence 支撑；发现模型新增未证实高风险事实时，输出 retry 包，保留既有动作但清空客户文本、claims 和 captions。
+- 密码、链接、完整手机号、token 和 raw tool result 不进入 shadow artifact。
+
+`app/services/llm.py` 仅新增 `compose_kf_outbound_shadow` prompt/method，用于未来 shadow 调用 LLM2 生成候选话术；旧 `rewrite_kf_message`、`plan_kf_reply_text`、`assess_kf_final_reply` 语义不变。
+
 ## 敏感信息边界
 
 安全序列化、repr、shadow record 和测试 artifact 不得输出：
@@ -89,7 +100,7 @@
 ## 本轮不变项
 
 - 不改 `app/main.py`。
-- 不改旧 production LLM 方法语义；`app/services/llm.py` 只新增显式 LLM1 shadow method。
+- 不改旧 production LLM 方法语义；`app/services/llm.py` 只新增显式 LLM1/LLM2 shadow methods。
 - 不改变客户可见回复。
 - 不改变素材发送决策。
 - 不改变库存读取 primary 切换。

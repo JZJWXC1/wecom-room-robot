@@ -471,6 +471,103 @@ Planner 相关规则卡片：
         data["source"] = "llm_planner_reply_from_tools"
         return data
 
+    async def compose_kf_outbound_shadow(
+        self,
+        *,
+        task_packet: dict[str, Any],
+        evidence_bundle: dict[str, Any],
+        response_strategy: dict[str, Any] | str | None = None,
+        retry_reason: str = "",
+    ) -> dict[str, Any]:
+        if self._stage_api_key_missing("reply"):
+            return {
+                "reply_text": "",
+                "answered_task_ids": [],
+                "claims": [],
+                "action_captions": [],
+                "self_review": {
+                    "status": "retry",
+                    "source": "missing_llm_key",
+                    "retry_reason": "LLM2 outbound shadow 缺少 reply 阶段 API key，未生成客户可见文本。",
+                    "rewrite_retry_reason": "LLM2 outbound shadow missing reply API key",
+                    "llm2_decides_media_targets": False,
+                },
+                "source": "missing_llm_key",
+            }
+        safe_task = safe_artifact_payload(task_packet or {})
+        safe_evidence = safe_artifact_payload(evidence_bundle or {})
+        safe_strategy = safe_artifact_payload(response_strategy or {})
+        system_prompt = (
+            "你是租房客服 Agentic RAG 的 LLM2 outbound shadow，只负责怎么说。"
+            "你必须基于 StructuredTaskPacket、ToolEvidenceBundle 和 ResponseStrategy 生成 PreparedOutboundPackage 的文本字段。"
+            "不得决定发哪套房、发什么素材、改 candidate_number、改 listing_id、改 send action。"
+            "价格、房态、密码、链接、素材目标只能来自 ToolEvidenceBundle；证据没有返回就不能写。"
+            "密码和链接属于高风险内容：不要抄写真值，只引用 evidence_id/slot 让受控发送边界处理。"
+            "如果证据不足或发现会越界，只返回 retry/rewrite reason，不生成事实文本。"
+            "只返回 JSON，不要 Markdown。"
+        )
+        user_prompt = f"""
+StructuredTaskPacket：
+{json.dumps(safe_task, ensure_ascii=False, default=str)[:4000]}
+
+ToolEvidenceBundle：
+{json.dumps(safe_evidence, ensure_ascii=False, default=str)[:5000]}
+
+ResponseStrategy：
+{json.dumps(safe_strategy, ensure_ascii=False, default=str)[:1500]}
+
+上一轮 retry/rewrite reason：
+{retry_reason or "无"}
+
+返回 JSON：
+{{
+  "reply_text": "客户可见文本；证据不足时留空",
+  "answered_task_ids": ["已回答的 task_id"],
+  "claims": [
+    {{"claim_id":"claim-1","task_id":"task-id","field":"字段名","value":"只填证据支持的值","evidence_ref":"evidence_id","text":"声明文本"}}
+  ],
+  "action_captions": [
+    {{"caption_id":"caption-1","action_id":"既有 send action id","text":"动作说明，只描述该 evidence 对应素材"}}
+  ],
+  "self_review": {{
+    "status": "pass|retry",
+    "reason": "retry 时说明不通过原因",
+    "retry_reason": "给 Orchestrator 的重试原因",
+    "rewrite_retry_reason": "需要回到 LLM1 时的原因",
+    "llm2_decides_media_targets": false
+  }}
+}}
+
+规则：
+- claims 必须有 evidence_ref，且只能声明该 evidence 里已有的事实。
+- action_captions 只能引用已有 action_id，不能新增 send_actions。
+- 不要输出真实密码、完整手机号、token、URL 真值。
+- 不要把房号数字当价格，不要新增工具证据外的价格或房态。
+- 失败时 reply_text 为空，self_review.status=retry，并写 retry_reason。
+"""
+        response = await self._client_for_stage("reply").chat.completions.create(
+            model=self._stage_model("reply"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+        )
+        text = response.choices[0].message.content or "{}"
+        data = self._parse_json_object(text)
+        review = data.get("self_review")
+        if not isinstance(review, dict):
+            review = {"status": "retry", "reason": "LLM2 shadow 未返回 self_review"}
+        status = str(review.get("status") or "retry").strip().lower()
+        if status not in {"pass", "retry"}:
+            status = "retry"
+        review["status"] = status
+        review["source"] = "llm2_outbound_shadow"
+        review["llm2_decides_media_targets"] = False
+        data["self_review"] = review
+        data["source"] = "llm2_outbound_shadow"
+        return data
+
     async def assess_kf_final_reply(
         self,
         *,
