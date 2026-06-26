@@ -166,6 +166,7 @@ $L1Tests = @(
 $L2Tests = @(
     "tests/test_wecom_kf.py",
     "tests/test_kf_agentic_rag.py",
+    "tests/test_kf_dual_llm_shadow.py",
     "tests/test_llm.py",
     "tests/test_media_store.py",
     "tests/test_media_manifest.py",
