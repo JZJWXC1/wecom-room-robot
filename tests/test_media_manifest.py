@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,11 +8,15 @@ from typing import Any
 
 from app.services.inventory_snapshot_models import generate_listing_id
 from app.services.media_manifest import (
+    BINDING_METHOD_LISTING_ID,
     MEDIA_KIND_IMAGE,
     MEDIA_KIND_ORIGINAL_VIDEO,
     MEDIA_KIND_VIDEO,
+    MEDIA_VARIANT_ORIGINAL_VIDEO,
+    MEDIA_VARIANT_WECOM_VIDEO,
     FeishuDriveMediaManifestAdapter,
     MediaManifest,
+    MediaManifestShadowAdapter,
 )
 
 
@@ -46,6 +51,50 @@ def file_item(name: str, token: str, payloads: dict[str, bytes], **extra: Any) -
 
 
 class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_shadow_adapter_exposes_listing_media_id_local_path_sha_and_utf8_name(self) -> None:
+        listing_id = generate_listing_id("寓你花园", "1-101A")
+        payloads = {"video-token": "中文视频内容".encode("utf-8")}
+        tree = {
+            "root": [folder(f"{listing_id} 素材", "listing-folder")],
+            "listing-folder": [
+                file_item(
+                    "客厅视频.mp4",
+                    "video-token",
+                    payloads,
+                    modified_at="2026-06-27T08:00:00Z",
+                )
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            target_root = Path(directory) / "room_database"
+            adapter = FeishuDriveMediaManifestAdapter(
+                client=FakeDriveClient(tree, payloads),
+                listing_ids=[listing_id],
+                target_root=target_root,
+            )
+
+            manifest, report = await adapter.sync_from_drive(root_folder_token="root")
+            shadow = MediaManifestShadowAdapter(manifest, local_root=target_root)
+            evidence = shadow.evidence_for_listing(listing_id)
+
+            self.assertEqual(report.fuzzy_candidates, [])
+            self.assertEqual(len(evidence), 1)
+            item = evidence[0]
+            expected_sha = hashlib.sha256(payloads["video-token"]).hexdigest()
+            expected_token_hash = hashlib.sha256("video-token".encode("utf-8")).hexdigest()
+            self.assertEqual(item.listing_id, listing_id)
+            self.assertEqual(item.variant, MEDIA_VARIANT_WECOM_VIDEO)
+            self.assertEqual(item.sha256, expected_sha)
+            self.assertEqual(item.source_file_token, expected_token_hash)
+            self.assertNotEqual(item.source_file_token, "video-token")
+            self.assertEqual(item.modified_at, "2026-06-27T08:00:00Z")
+            self.assertEqual(item.binding_method, BINDING_METHOD_LISTING_ID)
+            self.assertTrue(item.access_verified)
+            self.assertTrue(Path(item.local_path).is_file())
+            self.assertIn("客厅视频.mp4", item.local_path)
+            self.assertEqual(shadow.evidence_by_media_id(item.media_id), item)
+
     async def test_same_listing_binds_multiple_media_and_reuses_local_files(self) -> None:
         listing_id = generate_listing_id("测试花园", "1-101A")
         payloads = {
@@ -190,6 +239,10 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(report.fuzzy_candidates[0]["candidates"][0]["listing_id"], listing_id)
             self.assertEqual(report.fuzzy_candidates[0]["reason"], "fuzzy_candidate_only_not_bound")
             self.assertTrue(Path(report.isolated_items[0]["target_path"]).is_file())
+            self.assertEqual(
+                MediaManifestShadowAdapter(manifest, local_root=Path(directory)).evidence_for_listing(listing_id),
+                [],
+            )
 
     async def test_original_video_link_exists_without_wecom_sendable_video(self) -> None:
         listing_with_original = generate_listing_id("测试花园", "1-101A")
@@ -227,7 +280,17 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(manifest.has_wecom_sendable_video(listing_with_original))
             self.assertEqual(manifest.original_videos_for_listing(listing_with_original)[0].relative_path, "")
             self.assertEqual(
+                manifest.original_videos_for_listing(listing_with_original)[0].variant,
+                MEDIA_VARIANT_ORIGINAL_VIDEO,
+            )
+            self.assertEqual(
                 manifest.original_videos_for_listing(listing_with_original)[0].original_url,
+                "https://media.example.invalid/source-file",
+            )
+            self.assertEqual(
+                MediaManifestShadowAdapter(manifest, local_root=Path(directory))
+                .evidence_for_listing(listing_with_original)[0]
+                .source_url,
                 "https://media.example.invalid/source-file",
             )
             self.assertEqual(report.downloaded, [])

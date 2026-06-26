@@ -4,10 +4,53 @@ import unittest
 from pathlib import Path
 
 from app.config import settings
+from app.services.inventory_snapshot_models import generate_listing_id
+from app.services.media_manifest import MEDIA_KIND_VIDEO, MediaItem, MediaManifest
 from app.services.media_store import MediaStore
 
 
 class MediaStoreVideoMatchingTests(unittest.TestCase):
+    def test_media_manifest_evidence_is_read_only_and_does_not_replace_legacy_matching(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                legacy_dir = settings.room_database_path / "video" / "寓你花园1-101A"
+                legacy_dir.mkdir(parents=True)
+                legacy_video = legacy_dir / "旧发送路径.mp4"
+                legacy_video.write_bytes(b"legacy-video")
+
+                listing_id = generate_listing_id("寓你花园", "1-101A")
+                manifest_video = settings.room_database_path / "video" / listing_id / "manifest证据.mp4"
+                manifest_video.parent.mkdir(parents=True)
+                manifest_video.write_bytes(b"manifest-video")
+                MediaManifest.build(
+                    listing_ids=[listing_id],
+                    items=[
+                        MediaItem(
+                            listing_id=listing_id,
+                            kind=MEDIA_KIND_VIDEO,
+                            file_name=manifest_video.name,
+                            relative_path=f"video/{listing_id}/{manifest_video.name}",
+                            sha256="",
+                            binding_method="listing_id",
+                            access_verified=True,
+                        )
+                    ],
+                    generated_at="2026-06-27T08:00:00Z",
+                ).write_json(settings.room_database_path / "media_manifest.json")
+
+                evidence = MediaStore().media_manifest_evidence_for_listing(listing_id)
+                matches = MediaStore().list_room_database_videos("寓你花园1-101A视频", limit=3)
+
+                self.assertEqual(len(evidence), 1)
+                self.assertEqual(evidence[0]["listing_id"], listing_id)
+                self.assertEqual(evidence[0]["binding_method"], "listing_id")
+                self.assertIn("manifest证据.mp4", evidence[0]["local_path"])
+                self.assertEqual(matches, [legacy_video])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
     def test_matches_video_request_with_quantity_words(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             previous_room_database_path = settings.room_database_path

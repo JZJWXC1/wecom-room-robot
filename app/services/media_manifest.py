@@ -24,6 +24,18 @@ MEDIA_KIND_VIDEO = "video"
 MEDIA_KIND_ORIGINAL_VIDEO = "original_video"
 MEDIA_KINDS = {MEDIA_KIND_IMAGE, MEDIA_KIND_VIDEO, MEDIA_KIND_ORIGINAL_VIDEO}
 
+MEDIA_VARIANT_IMAGE = "image"
+MEDIA_VARIANT_WECOM_VIDEO = "wecom_video"
+MEDIA_VARIANT_ORIGINAL_VIDEO = "original_video"
+MEDIA_VARIANTS = {
+    MEDIA_VARIANT_IMAGE,
+    MEDIA_VARIANT_WECOM_VIDEO,
+    MEDIA_VARIANT_ORIGINAL_VIDEO,
+}
+
+BINDING_METHOD_LISTING_ID = "listing_id"
+BINDING_METHOD_MANUAL = "manual"
+
 LISTING_ID_RE = re.compile(r"lst_[0-9a-f]{16}", re.IGNORECASE)
 ORIGINAL_VIDEO_MARKERS = (
     "原视频",
@@ -58,14 +70,21 @@ class MediaItem:
     kind: str
     file_name: str
     relative_path: str = ""
+    variant: str = ""
     size: int = 0
     sha256: str = ""
+    local_path: str = ""
     media_id: str = ""
     source: str = "feishu_drive"
     source_path: str = ""
     source_id_hash: str = ""
+    source_file_token: str = ""
+    source_url: str = ""
     original_url: str = ""
     material_page_url: str = ""
+    modified_at: str = ""
+    binding_method: str = BINDING_METHOD_LISTING_ID
+    access_verified: bool = False
     wecom_sendable: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -74,6 +93,20 @@ class MediaItem:
             raise ValueError(f"unsupported media kind: {self.kind}")
         if not is_safe_listing_id(self.listing_id):
             raise ValueError(f"invalid listing_id: {self.listing_id}")
+        if not self.variant:
+            object.__setattr__(self, "variant", _variant_for_kind(self.kind))
+        if self.variant not in MEDIA_VARIANTS:
+            raise ValueError(f"unsupported media variant: {self.variant}")
+        if not self.local_path and self.relative_path:
+            object.__setattr__(self, "local_path", self.relative_path)
+        if not self.source_file_token and self.source_id_hash:
+            object.__setattr__(self, "source_file_token", self.source_id_hash)
+        if not self.source_id_hash and self.source_file_token:
+            object.__setattr__(self, "source_id_hash", self.source_file_token)
+        if not self.source_url and self.original_url:
+            object.__setattr__(self, "source_url", self.original_url)
+        if not self.original_url and self.source_url and self.kind == MEDIA_KIND_ORIGINAL_VIDEO:
+            object.__setattr__(self, "original_url", self.source_url)
         if not self.media_id:
             object.__setattr__(self, "media_id", self._build_media_id())
         if self.kind == MEDIA_KIND_VIDEO and not self.wecom_sendable:
@@ -84,11 +117,18 @@ class MediaItem:
             {
                 "listing_id": self.listing_id,
                 "kind": self.kind,
+                "variant": self.variant,
                 "relative_path": self.relative_path,
+                "local_path": self.local_path,
                 "file_name": self.file_name,
                 "source_path": self.source_path,
+                "source_file_token": self.source_file_token,
+                "source_url": self.source_url,
                 "original_url": self.original_url,
                 "material_page_url": self.material_page_url,
+                "modified_at": self.modified_at,
+                "binding_method": self.binding_method,
+                "access_verified": self.access_verified,
                 "size": self.size,
                 "sha256": self.sha256,
             }
@@ -100,15 +140,22 @@ class MediaItem:
             "media_id": self.media_id,
             "listing_id": self.listing_id,
             "kind": self.kind,
+            "variant": self.variant,
             "file_name": self.file_name,
             "relative_path": self.relative_path,
+            "local_path": self.local_path,
             "size": self.size,
             "sha256": self.sha256,
             "source": self.source,
             "source_path": self.source_path,
             "source_id_hash": self.source_id_hash,
+            "source_file_token": self.source_file_token,
+            "source_url": self.source_url,
             "original_url": self.original_url,
             "material_page_url": self.material_page_url,
+            "modified_at": self.modified_at,
+            "binding_method": self.binding_method,
+            "access_verified": self.access_verified,
             "wecom_sendable": self.wecom_sendable,
             "metadata": self.metadata,
         }
@@ -121,13 +168,20 @@ class MediaItem:
             kind=str(data.get("kind") or ""),
             file_name=str(data.get("file_name") or ""),
             relative_path=str(data.get("relative_path") or ""),
+            variant=str(data.get("variant") or ""),
+            local_path=str(data.get("local_path") or ""),
             size=int(data.get("size") or 0),
             sha256=str(data.get("sha256") or ""),
             source=str(data.get("source") or "feishu_drive"),
             source_path=str(data.get("source_path") or ""),
             source_id_hash=str(data.get("source_id_hash") or ""),
+            source_file_token=str(data.get("source_file_token") or ""),
+            source_url=str(data.get("source_url") or ""),
             original_url=str(data.get("original_url") or ""),
             material_page_url=str(data.get("material_page_url") or ""),
+            modified_at=str(data.get("modified_at") or ""),
+            binding_method=str(data.get("binding_method") or BINDING_METHOD_LISTING_ID),
+            access_verified=bool(data.get("access_verified")),
             wecom_sendable=bool(data.get("wecom_sendable")),
             metadata=dict(data.get("metadata") or {}),
         )
@@ -322,6 +376,104 @@ class MediaBindingReport:
         }
 
 
+@dataclass(frozen=True)
+class MediaManifestEvidence:
+    media_id: str
+    listing_id: str
+    variant: str
+    sha256: str = ""
+    local_path: str = ""
+    source_file_token: str = ""
+    source_url: str = ""
+    modified_at: str = ""
+    binding_method: str = ""
+    access_verified: bool = False
+    kind: str = ""
+    file_name: str = ""
+    source_path: str = ""
+    material_page_url: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "media_id": self.media_id,
+            "listing_id": self.listing_id,
+            "variant": self.variant,
+            "sha256": self.sha256,
+            "local_path": self.local_path,
+            "source_file_token": self.source_file_token,
+            "source_url": self.source_url,
+            "modified_at": self.modified_at,
+            "binding_method": self.binding_method,
+            "access_verified": self.access_verified,
+            "kind": self.kind,
+            "file_name": self.file_name,
+            "source_path": self.source_path,
+            "material_page_url": self.material_page_url,
+        }
+
+
+class MediaManifestShadowAdapter:
+    """Read-only evidence adapter for listing_id -> media_id -> local/source material."""
+
+    def __init__(self, manifest: MediaManifest, *, local_root: Path | None = None) -> None:
+        self.manifest = manifest
+        self.local_root = local_root
+        self._by_media_id = {item.media_id: item for item in manifest.items}
+
+    @classmethod
+    def from_path(cls, path: Path, *, local_root: Path | None = None) -> "MediaManifestShadowAdapter":
+        return cls(MediaManifest.read_json(path), local_root=local_root or path.parent)
+
+    def evidence_for_listing(
+        self,
+        listing_id: str,
+        *,
+        variant: str | None = None,
+    ) -> list[MediaManifestEvidence]:
+        items = self.manifest.items_for_listing(listing_id)
+        if variant is not None:
+            items = [item for item in items if item.variant == variant]
+        return [self._evidence_for_item(item) for item in items]
+
+    def evidence_by_media_id(self, media_id: str) -> MediaManifestEvidence | None:
+        item = self._by_media_id.get(media_id)
+        return self._evidence_for_item(item) if item else None
+
+    def local_file_for_media_id(self, media_id: str) -> Path | None:
+        item = self._by_media_id.get(media_id)
+        if not item or not item.local_path:
+            return None
+        path = Path(item.local_path)
+        return path if path.is_absolute() else (self.local_root / path if self.local_root else path)
+
+    def _evidence_for_item(self, item: MediaItem) -> MediaManifestEvidence:
+        resolved_local = self.local_file_for_media_id(item.media_id)
+        local_path = str(resolved_local) if resolved_local else item.local_path
+        access_verified = item.access_verified
+        if resolved_local and item.sha256:
+            access_verified = resolved_local.is_file() and _file_sha256(resolved_local) == item.sha256
+        elif resolved_local:
+            access_verified = resolved_local.is_file()
+        elif item.source_url:
+            access_verified = item.access_verified
+        return MediaManifestEvidence(
+            media_id=item.media_id,
+            listing_id=item.listing_id,
+            variant=item.variant,
+            sha256=item.sha256,
+            local_path=local_path,
+            source_file_token=item.source_file_token,
+            source_url=item.source_url,
+            modified_at=item.modified_at,
+            binding_method=item.binding_method,
+            access_verified=access_verified,
+            kind=item.kind,
+            file_name=item.file_name,
+            source_path=item.source_path,
+            material_page_url=item.material_page_url,
+        )
+
+
 class FeishuDriveMediaManifestAdapter:
     """Build a local media manifest from Feishu Drive without fuzzy binding."""
 
@@ -498,12 +650,19 @@ class FeishuDriveMediaManifestAdapter:
             kind=kind,
             file_name=name,
             relative_path=relative_path,
+            variant=_variant_for_kind(kind),
             size=size,
             sha256=sha256,
+            local_path=relative_path,
             source_path=source_path,
             source_id_hash=source_token_hash,
+            source_file_token=source_token_hash,
+            source_url=original_url,
             original_url=original_url if kind == MEDIA_KIND_ORIGINAL_VIDEO else "",
             material_page_url=material_page_url,
+            modified_at=_item_modified_at(item),
+            binding_method=BINDING_METHOD_LISTING_ID,
+            access_verified=bool(sha256 or original_url),
             wecom_sendable=kind == MEDIA_KIND_VIDEO,
         )
 
@@ -659,6 +818,14 @@ def _item_size(item: dict[str, Any]) -> int:
         return 0
 
 
+def _item_modified_at(item: dict[str, Any]) -> str:
+    for field in ("modified_at", "modified_time", "updated_at", "update_time", "created_at"):
+        value = str(item.get(field) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _source_path(path_parts: list[str], name: str) -> str:
     return PurePosixPath(*(safe_name(part) for part in [*path_parts, name] if str(part).strip())).as_posix()
 
@@ -697,6 +864,14 @@ def _manifest_relative_path(kind: str, listing_id: str, file_name: str) -> str:
     return PurePosixPath(root, listing_id, file_name).as_posix()
 
 
+def _variant_for_kind(kind: str) -> str:
+    return {
+        MEDIA_KIND_IMAGE: MEDIA_VARIANT_IMAGE,
+        MEDIA_KIND_VIDEO: MEDIA_VARIANT_WECOM_VIDEO,
+        MEDIA_KIND_ORIGINAL_VIDEO: MEDIA_VARIANT_ORIGINAL_VIDEO,
+    }[kind]
+
+
 def _existing_file_matches(path: Path, expected_size: int) -> bool:
     if not path.is_file() or path.stat().st_size <= 0:
         return False
@@ -730,8 +905,14 @@ __all__ = [
     "MEDIA_KIND_IMAGE",
     "MEDIA_KIND_VIDEO",
     "MEDIA_KIND_ORIGINAL_VIDEO",
+    "MEDIA_VARIANT_IMAGE",
+    "MEDIA_VARIANT_WECOM_VIDEO",
+    "MEDIA_VARIANT_ORIGINAL_VIDEO",
+    "BINDING_METHOD_LISTING_ID",
     "MediaBindingReport",
+    "MediaManifestEvidence",
     "MediaItem",
     "MediaManifest",
+    "MediaManifestShadowAdapter",
     "FeishuDriveMediaManifestAdapter",
 ]
