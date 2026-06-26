@@ -4567,6 +4567,34 @@ def _has_room_binding_context(context: dict[str, Any]) -> bool:
     return bool(_candidate_rows(context) or _confirmed_row(context))
 
 
+def _original_video_followup_without_explicit_target(
+    content: str,
+    understanding: dict[str, Any],
+) -> bool:
+    proof = dict(understanding.get("constraint_proof") or {})
+    if not proof.get("wants_original_video"):
+        return False
+    task = dict(understanding.get("structured_task") or {})
+    query_text = " ".join(
+        str(part).strip()
+        for part in (
+            content,
+            task.get("original_text"),
+            understanding.get("effective_query"),
+            understanding.get("rewritten_query"),
+        )
+        if str(part or "").strip()
+    )
+    if proof.get("room_refs") or _room_refs_from_text(query_text):
+        return False
+    if _selected_indices_from_understanding(understanding, query_text) or _has_explicit_candidate_selection(query_text):
+        return False
+    return any(
+        word in query_text
+        for word in ("原视频", "原片", "高清", "源文件", "素材源", "下载链接", "太糊", "模糊", "糊", "清楚", "保存", "转发")
+    )
+
+
 def _should_skip_unresolved_community_for_context_action(
     *,
     content: str,
@@ -5416,6 +5444,12 @@ async def _execute_tools(
                 "labels": [_row_label(row) for row in pending_rows],
             }
             target_rows = _enforce_target_rows_community_constraints(target_rows, rows, proof)
+    original_video_target_error = (
+        not target_rows
+        and not pending_video_handled
+        and "send_video" in actions
+        and _original_video_followup_without_explicit_target(content, understanding)
+    )
     if not target_rows and not pending_video_handled and _has_bound_room_field_followup(content):
         confirmed_row = _confirmed_row(context)
         if confirmed_row and not _has_explicit_candidate_selection(content):
@@ -5488,6 +5522,36 @@ async def _execute_tools(
         evidence["inventory_rows"] = []
     if (
         not target_rows
+        and not evidence.get("selection_error")
+        and not evidence.get("field_target_error")
+        and original_video_target_error
+    ):
+        pending_labels = [
+            str(label).strip()
+            for label in (pending_video or {}).get("labels") or []
+            if str(label).strip()
+        ]
+        pending_labels = list(dict.fromkeys(pending_labels))[:KF_VIDEO_SEND_LIMIT]
+        evidence["field_target_error"] = {
+            "field": "原视频",
+            "reason": "original_video_followup_missing_stable_video_target",
+            "candidate_count": 0,
+            "candidate_labels": [],
+            "pending_labels": pending_labels,
+        }
+        original_video_request = dict(evidence.get("original_video_request") or {})
+        if original_video_request.get("requested"):
+            original_video_request["target_binding"] = {
+                "stable": False,
+                "reason": "previous_video_target_not_bound",
+                "pending_labels": pending_labels,
+            }
+            original_video_request["reason"] = "上一轮没有稳定匹配到视频目标，不能直接给原视频/高清源。"
+            evidence["original_video_request"] = original_video_request
+        rows = []
+        evidence["inventory_rows"] = []
+    if (
+        not target_rows
         and "explain_unavailable_viewing" in actions
         and wants_bound_viewing_context
         and not invalid_candidate_selection
@@ -5526,6 +5590,7 @@ async def _execute_tools(
         and not explicit_room_refs
         and not invalid_candidate_selection
         and not media_target_error
+        and not original_video_target_error
         and any(action in actions for action in ("send_image", "send_video"))
     ):
         target_rows = rows[:KF_VIDEO_SEND_LIMIT]
@@ -6170,6 +6235,23 @@ def _constraint_consistency_selfcheck(
                 "reason": "；".join(fail_reasons),
             }
         return {"status": "pass", "source": "constraint_consistency", "scope": "candidate_selection_error"}
+    field_target_error = dict(tool_evidence.get("field_target_error") or {})
+    if field_target_error.get("reason") == "original_video_followup_missing_stable_video_target":
+        field_failures: list[str] = []
+        if not any(word in draft_reply for word in ("没稳定匹配到视频目标", "没有稳定匹配到视频目标", "不能直接给原视频", "不能直接给高清源")):
+            field_failures.append("原视频追问目标未绑定时，回复必须明确说明上一轮没有稳定视频目标")
+        if not any(word in draft_reply for word in ("回房源序号", "回我序号", "小区名+房号", "小区+房号")):
+            field_failures.append("原视频追问目标未绑定时，回复必须引导客户补充序号或小区房号")
+        if any(word in draft_reply for word in ("原视频已发", "高清已发", "源文件已发", "这是")):
+            field_failures.append("原视频追问目标未绑定时，回复不能声称已发送或绑定到某套视频")
+        if field_failures:
+            return {
+                "status": "retry",
+                "action": "retry",
+                "source": "constraint_consistency",
+                "reason": "；".join(field_failures),
+            }
+        return {"status": "pass", "source": "constraint_consistency", "scope": "original_video_target_unbound"}
     answered_existence_words = ("有的", "查到", "找到了", "暂时没查到", "没有", "没找到", "还在")
     fulfilled_action_words = ("发你了", "发给你", "已发")
     if asks_inventory_existence and not any(word in draft_reply for word in answered_existence_words) and not (
@@ -7150,6 +7232,11 @@ def _reply_for_field_target_error(tool_evidence: dict[str, Any]) -> str:
     error = dict(tool_evidence.get("field_target_error") or {})
     if not error:
         return ""
+    if error.get("reason") == "original_video_followup_missing_stable_video_target":
+        return (
+            "上一轮没稳定匹配到视频目标，所以我不能直接给原视频/高清源，避免发错房源。"
+            "你回房源序号，或者直接发小区名+房号，我马上按那套查普通视频和原视频链接。"
+        )
     field = str(error.get("field") or "这个信息").strip()
     candidate_labels = [str(label).strip() for label in error.get("candidate_labels") or [] if str(label).strip()]
     if field in {"素材", "视频", "图片"}:
@@ -8363,6 +8450,26 @@ async def _generate_reply_result(
         planner_result["post_tool_reply_result"] = planner_reply_result
         tool_evidence["planner_reply_result"] = planner_reply_result
         tool_evidence["planner_invalid_inventory_reply_replaced"] = True
+    pre_gate_field_target_error = dict(tool_evidence.get("field_target_error") or {})
+    if (
+        planner_missing_reply
+        and pre_gate_field_target_error.get("reason") == "original_video_followup_missing_stable_video_target"
+    ):
+        planner_reply = _reply_for_field_target_error(tool_evidence)
+        if planner_reply:
+            planner_missing_reply = False
+            planner_result = dict(planner_result or {})
+            planner_result["reply_text"] = planner_reply
+            planner_result["reply_source"] = "tool_grounded_original_video_target_error"
+            planner_reply_result = {
+                "reply_text": planner_reply,
+                "source": "tool_grounded_original_video_target_error",
+                "selfcheck": {"status": "pass", "source": "field_target_error_contract"},
+                "reason": "原视频追问没有稳定上一轮视频目标，使用工具证据生成目标未绑定说明。",
+            }
+            planner_result["post_tool_reply_result"] = planner_reply_result
+            tool_evidence["planner_reply_result"] = planner_reply_result
+            tool_evidence["planner_missing_original_video_target_fallback"] = True
     if planner_missing_reply and not retry_reason:
         gate_selfcheck = {
             "status": "retry",

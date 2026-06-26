@@ -7586,6 +7586,174 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([main._row_label(row) for row in rows], ["棠润府15-2-801B"])
 
+    async def test_original_video_followup_without_stable_video_target_says_previous_target_unbound(self) -> None:
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return [
+                    {"小区": "嘉樘星绣府", "房号": "9-603"},
+                    {"小区": "新柠长木府", "房号": "3-1002A"},
+                ]
+
+        class FakeMediaStore:
+            def list_room_database_videos(self, *args, **kwargs):
+                raise AssertionError("没有稳定视频目标时不应收集或发送视频")
+
+            def list_room_database_images(self, *args, **kwargs):
+                return []
+
+            def original_video_sources_for_paths(self, paths):
+                return {"original_video_paths": [], "original_video_urls": [], "material_page_urls": []}
+
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        context = kf_context_memory.empty_context()
+        context["structured_memory"] = {
+            "turn_records": [
+                {
+                    "turn_id": "t1",
+                    "assistant_sent_summary": {
+                        "final_reply": "我这边暂时没稳定匹配到对应素材，不能乱发视频。你回我序号，或者小区名+房号。"
+                    },
+                }
+            ],
+            "raw_dialog_context": [],
+        }
+        understanding = {
+            "intent": "media",
+            "effective_query": "有原视频或者清楚一点的吗",
+            "rewritten_query": "有原视频或者清楚一点的吗",
+            "constraint_proof": {
+                "intent": "media",
+                "wants_video": True,
+                "wants_original_video": True,
+            },
+            "structured_task": {
+                "intent": "media",
+                "original_text": "有原视频或者清楚一点的吗？客户嫌转发后有点糊。",
+                "tool_requirements": {"needs_video": True},
+            },
+        }
+        originals = {
+            "inventory": main.inventory,
+            "media_store": main.media_store,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.inventory = FakeInventory()
+        main.media_store = FakeMediaStore()
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                content="有原视频或者清楚一点的吗？客户嫌转发后有点糊。",
+                context=context,
+                understanding=understanding,
+            )
+            result = await main._generate_reply_result(
+                content="有原视频或者清楚一点的吗？客户嫌转发后有点糊。",
+                context=context,
+                understanding=understanding,
+                tool_evidence=evidence,
+                planner_result={
+                    "actions": ["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                    "reply_text": "",
+                },
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        reply = main._reply_for_field_target_error(evidence)
+        self.assertEqual(evidence["field_target_error"]["reason"], "original_video_followup_missing_stable_video_target")
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertEqual(evidence["video_paths"], [])
+        self.assertIn("上一轮没稳定匹配到视频目标", reply)
+        self.assertIn("不能直接给原视频/高清源", reply)
+        self.assertNotIn("这是嘉樘星绣府9-603的视频", reply)
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("上一轮没稳定匹配到视频目标", result["reply"])
+        self.assertEqual(
+            evidence["planner_reply_result"]["source"],
+            "tool_grounded_original_video_target_error",
+        )
+
+    async def test_original_video_followup_binds_pending_video_labels_without_wrong_send(self) -> None:
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return []
+
+            async def all_rows(self, limit=1000):
+                return [
+                    {"小区": "小洋坝家园三区", "房号": "12-1003B"},
+                    {"小区": "星桥锦绣嘉苑", "房号": "17-503B"},
+                    {"小区": "嘉樘星绣府", "房号": "9-603"},
+                ]
+
+        class FakeMediaStore:
+            def list_room_database_videos(self, query: str, limit: int = 6):
+                return []
+
+            def list_room_database_images(self, query: str, limit: int = 6):
+                return []
+
+            def original_video_sources_for_paths(self, paths):
+                return {"original_video_paths": [], "original_video_urls": [], "material_page_urls": []}
+
+        context = kf_context_memory.remember_pending_video_sends(
+            kf_context_memory.empty_context(),
+            paths=[],
+            labels=["小洋坝家园三区12-1003B", "星桥锦绣嘉苑17-503B"],
+            reason="missing_or_pending_video",
+            requested_count=2,
+            sent_count=0,
+        )
+        originals = {"inventory": main.inventory, "media_store": main.media_store}
+        main.inventory = FakeInventory()
+        main.media_store = FakeMediaStore()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                content="有原视频或者清楚一点的吗？",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "有原视频或者清楚一点的吗",
+                    "constraint_proof": {
+                        "intent": "media",
+                        "wants_video": True,
+                        "wants_original_video": True,
+                    },
+                    "structured_task": {
+                        "intent": "media",
+                        "original_text": "有原视频或者清楚一点的吗？",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertEqual(
+            [main._row_label(row) for row in evidence["target_rows"]],
+            ["小洋坝家园三区12-1003B", "星桥锦绣嘉苑17-503B"],
+        )
+        self.assertNotIn("field_target_error", evidence)
+        self.assertIn("小洋坝家园三区12-1003B:视频", evidence["missing_media"])
+        self.assertIn("星桥锦绣嘉苑17-503B:视频", evidence["missing_media"])
+        self.assertNotIn("嘉樘星绣府9-603:视频", evidence["missing_media"])
+        self.assertEqual(evidence["video_paths"], [])
+
     async def test_continue_pending_video_uses_pending_missing_labels(self) -> None:
         class FakeInventory:
             async def search(self, *args, **kwargs):
