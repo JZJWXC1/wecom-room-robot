@@ -25,12 +25,15 @@ if (-not $Python) {
     }
 }
 
-if (-not $env:PYTHONPATH) {
-    $DefaultDeps = Join-Path $env:TEMP "wecom-room-robot-local-test-deps"
-    if (Test-Path $DefaultDeps) {
-        $env:PYTHONPATH = $DefaultDeps
-    }
+$DefaultDeps = Join-Path $env:TEMP "wecom-room-robot-local-test-deps"
+$PythonPathParts = @([string]$RepoRoot)
+if ((Test-Path $DefaultDeps) -and ($DefaultDeps -ne [string]$RepoRoot)) {
+    $PythonPathParts += $DefaultDeps
 }
+if ($env:PYTHONPATH) {
+    $PythonPathParts += ($env:PYTHONPATH -split [System.IO.Path]::PathSeparator)
+}
+$env:PYTHONPATH = ($PythonPathParts | Where-Object { $_ } | Select-Object -Unique) -join [System.IO.Path]::PathSeparator
 
 $env:RUN_ONLINE_QA = "0"
 
