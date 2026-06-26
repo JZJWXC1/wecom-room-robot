@@ -233,8 +233,14 @@ def test_shadow_customer_results_stay_legacy_and_ignore_snapshot_errors(tmp_path
     rows = run(session.search_inventory("云杉苑视频图片", limit=3))
 
     assert session.context.source_kind == SOURCE_KIND_LEGACY
+    assert session.context.source_hash == "legacy_fixture_hash"
     assert "shadow_snapshot" in session.context.health_at_selection["details"]
-    assert all(item.source_kind == SOURCE_KIND_LEGACY and not item.snapshot_id for item in rows)
+    assert all(
+        item.source_kind == SOURCE_KIND_LEGACY
+        and item.source_hash == "legacy_fixture_hash"
+        and not item.snapshot_id
+        for item in rows
+    )
     assert not any(item.source_kind == SOURCE_KIND_SNAPSHOT for item in rows)
 
 
@@ -253,6 +259,7 @@ def test_shadow_chat_mode_can_skip_snapshot_health_probe(tmp_path: Path) -> None
     rows = run(session.search_inventory("云杉苑视频图片", limit=3))
 
     assert session.context.source_kind == SOURCE_KIND_LEGACY
+    assert session.context.source_hash == "legacy_fixture_hash"
     assert session.context.health_at_selection["details"]["shadow_snapshot"]["status"] == "not_queried"
     assert rows
 

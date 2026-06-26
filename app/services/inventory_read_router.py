@@ -212,7 +212,7 @@ class InventoryReadRouter:
     ) -> InventoryReadContext:
         selected_health = health or self.legacy_provider.health()
         details = dict(selected_health.details)
-        source_hash = str(details.get("source_hash") or stable_safe_hash(selected_health.to_dict()))
+        source_hash = _legacy_source_hash_from_health(selected_health)
         schema_version = str(details.get("schema_version") or "legacy_inventory_service.v1")
         return InventoryReadContext(
             request_id=request_id,
@@ -345,6 +345,21 @@ class InventoryReadRouter:
 
     def _provider_for_context(self, context: InventoryReadContext) -> InventoryReadProvider:
         return self.snapshot_provider if context.source_kind == SOURCE_KIND_SNAPSHOT else self.legacy_provider
+
+
+def _legacy_source_hash_from_health(health: InventoryReadHealth) -> str:
+    details = dict(health.details)
+    direct = str(details.get("source_hash") or "")
+    if direct:
+        return direct
+    legacy = details.get("legacy")
+    if isinstance(legacy, Mapping):
+        legacy_details = legacy.get("details")
+        if isinstance(legacy_details, Mapping):
+            nested = str(legacy_details.get("source_hash") or "")
+            if nested:
+                return nested
+    return stable_safe_hash(health.to_dict())
 
 
 class InventoryReadSession:

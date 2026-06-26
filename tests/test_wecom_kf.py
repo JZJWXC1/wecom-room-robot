@@ -134,6 +134,7 @@ class InventoryReadRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(read_context.source_kind, "legacy")
         self.assertEqual(read_context.selection_mode, "shadow")
+        self.assertEqual(read_context.source_hash, main._inventory_cache_meta_for_prompt().get("hash"))
         self.assertEqual(read_context.health_at_selection["details"]["shadow_snapshot"]["status"], "not_queried")
 
     async def test_provider_failure_does_not_fallback_to_direct_rewrite_reads(self) -> None:
