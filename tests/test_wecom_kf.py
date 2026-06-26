@@ -1077,6 +1077,63 @@ class MainUnderstandingGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target_rows, [rows[0], rows[4]])
 
+    def test_selected_indices_do_not_partially_bind_current_search_rows(self) -> None:
+        rows = [{"小区": "东新园", "房号": "8-1201"}]
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "前两套视频",
+                "rewritten_query": "发送前两套视频",
+                "intent": "media",
+                "selected_indices": [1, 2],
+                "constraint_proof": {
+                    "communities": ["东新园"],
+                    "selected_indices": [1, 2],
+                    "wants_video": True,
+                },
+                "structured_task": {
+                    "original_text": "前两套视频发我",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            kf_context_memory.empty_context(),
+            rows,
+        )
+
+        self.assertEqual(target_rows, [])
+
+    def test_selected_indices_do_not_partially_bind_candidate_context_rows(self) -> None:
+        row = {"小区": "东新园", "房号": "8-1201"}
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "东新园",
+            "candidates": [row],
+            "shown_count": 1,
+            "total_count": 1,
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "前两套视频",
+                "rewritten_query": "发送前两套视频",
+                "intent": "media",
+                "selected_indices": [1, 2],
+                "constraint_proof": {
+                    "selected_indices": [1, 2],
+                    "wants_video": True,
+                },
+                "structured_task": {
+                    "original_text": "前两套视频发我",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            [],
+        )
+
+        self.assertEqual(target_rows, [])
+
     def test_single_room_pronoun_prefers_confirmed_room_over_llm_selected_index(self) -> None:
         confirmed = {"小区": "兴业杨家府", "房号": "4-1502"}
         stale_candidates = [
@@ -7008,6 +7065,63 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             ["石桥铭苑"],
         )
 
+    async def test_understand_message_strips_area_alias_constraint_proof_community(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "华丰半山附近4500左右整租两室还有吗？ 石桥街道 华丰 石桥 永佳 半山 华丰欣苑 4000到5000预算",
+                    "effective_query": "华丰半山附近4500左右整租两室还有吗？ 石桥街道 华丰 石桥 永佳 半山 华丰欣苑 4000到5000预算",
+                    "query_state": {},
+                    "constraint_proof": {
+                        "intent": "inventory",
+                        "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "communities": ["华丰欣苑"],
+                        "budget_range": [4000, 5000],
+                        "layout": "两室",
+                        "hard_constraints": {
+                            "area": True,
+                            "community": True,
+                            "budget_range": True,
+                            "layout": True,
+                        },
+                    },
+                    "needs_clarification": False,
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "石桥铭苑", "房号": "6-1102"},
+                    {"区域": "石桥街道\n华丰\n石桥\n永佳\n半山", "小区": "华丰欣苑", "房号": "14-2-901"},
+                ]
+
+            def cache_meta(self):
+                return {"source_detail": "test"}
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="华丰半山附近4500左右整租两室还有吗？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("华丰半山附近4500左右整租两室还有吗？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        proof = result["constraint_proof"]
+        self.assertEqual(proof.get("communities"), None)
+        self.assertFalse(proof["hard_constraints"]["community"])
+        self.assertEqual(proof.get("area"), "石桥街道\n华丰\n石桥\n永佳\n半山")
+        self.assertNotIn("华丰欣苑", str(result.get("effective_query") or ""))
+        self.assertEqual(
+            result.get("area_alias_community_stripped", {}).get("removed_communities"),
+            ["华丰欣苑"],
+        )
+
     async def test_current_room_query_overrides_stale_inventory_sheet_state(self) -> None:
         class FakeReplyGenerator:
             async def rewrite_kf_message(self, **kwargs):
@@ -7545,6 +7659,51 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["inventory_rows"], [])
         self.assertEqual(evidence["target_rows"], [])
         self.assertEqual(evidence["selection_error"]["reason"], "missing_current_candidate_set")
+
+    async def test_selected_indices_out_of_range_candidate_context_blocks_fallback(self) -> None:
+        row = {"小区": "东新园", "房号": "8-1201"}
+
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return [row]
+
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "东新园",
+            "candidates": [row],
+            "shown_count": 1,
+            "total_count": 1,
+        }
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "send_video", "context_tools", "explain_missing_media"],
+                content="前两套视频发我。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "前两套视频发我。",
+                    "rewritten_query": "前两套视频发我。",
+                    "selected_indices": [1, 2],
+                    "constraint_proof": {
+                        "selected_indices": [1, 2],
+                        "wants_video": True,
+                    },
+                    "structured_task": {
+                        "original_text": "前两套视频发我。",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(evidence["inventory_rows"], [])
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertEqual(evidence["selection_error"]["reason"], "requested_candidate_index_out_of_range")
+        self.assertEqual(evidence["selection_error"]["candidate_count"], 1)
 
     def test_target_rows_must_match_rewrite_community_constraint(self) -> None:
         target_rows = [{"小区": "兴业杨家府", "房号": "4-1502"}]
@@ -9046,7 +9205,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         summary = main._row_viewing_summary({"看房方式密码": "336699#"})
 
         self.assertNotIn("#", summary)
-        self.assertIn("密码", summary)
+        self.assertNotIn("密码", summary)
+        self.assertIn("看房方式", summary)
 
     def test_selfcheck_rejects_unasked_empty_time_in_price_reply(self) -> None:
         result = main._constraint_consistency_selfcheck(
@@ -9306,6 +9466,80 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("押一付一1500", result["reply"])
         self.assertIn("提前联系", result["reply"])
         self.assertIn("18758141785", result["reply"])
+
+    def test_viewing_reply_without_password_request_redacts_password_code(self) -> None:
+        row = {
+            "小区": "棠润府",
+            "房号": "15-2-801B",
+            "户型分类": "一室一厅",
+            "押一付一": "1600",
+            "押二付一": "1400",
+            "备注": "水30/月 电1元/度",
+            "看房方式密码": "101004# 6.19空出",
+        }
+
+        reply = main._reply_for_inventory_search(
+            {
+                "intent": "viewing",
+                "effective_query": "棠润府15-2-801B今天能不能自己看",
+                "constraint_proof": {"room_refs": ["15-2-801B"]},
+                "structured_task": {
+                    "original_text": "这套今天能不能自己看？",
+                    "tool_requirements": {"needs_viewing_policy": True},
+                },
+            },
+            {
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "inventory_rows": [row],
+            },
+        )
+
+        self.assertIn("6.19空出", reply)
+        self.assertNotIn("101004#", reply)
+
+    def test_viewing_reply_without_password_request_avoids_password_word(self) -> None:
+        tool_evidence = {
+            "rule_evidence": {
+                "viewing": {
+                    "rooms": [
+                        {
+                            "room": "石桥铭苑6-1102",
+                            "viewing": "101004# 看房提前联系",
+                            "has_password": True,
+                            "needs_contact": True,
+                        }
+                    ]
+                }
+            }
+        }
+
+        reply = main._reply_for_viewing(tool_evidence, allow_password=False)
+
+        self.assertIn("石桥铭苑6-1102", reply)
+        self.assertIn("看房提前联系", reply)
+        self.assertNotIn("101004#", reply)
+        self.assertNotIn("密码", reply)
+
+    def test_viewing_reply_keeps_password_when_explicitly_requested(self) -> None:
+        tool_evidence = {
+            "rule_evidence": {
+                "viewing": {
+                    "rooms": [
+                        {
+                            "room": "石桥铭苑6-1102",
+                            "viewing": "101004# 看房提前联系",
+                            "has_password": True,
+                            "needs_contact": True,
+                        }
+                    ]
+                }
+            }
+        }
+
+        reply = main._reply_for_viewing(tool_evidence, allow_password=True)
+
+        self.assertIn("101004#", reply)
+        self.assertIn("密码不对", reply)
 
     async def test_reply_generation_uses_no_match_evidence_when_llm_waits(self) -> None:
         class FakeReplyGenerator:

@@ -1087,6 +1087,10 @@ def _content_wants_price(content: str) -> bool:
     return any(word in content for word in ("价格", "多少钱", "租金", "月租", "押一付一", "押二付一", "多少一月"))
 
 
+def _content_wants_password(content: str) -> bool:
+    return any(word in content for word in ("密码", "门锁码", "开门码", "门禁码"))
+
+
 def _understanding_wants_utilities(understanding: dict[str, Any], *, content: str = "") -> bool:
     proof = dict(understanding.get("constraint_proof") or {})
     query_state = dict(understanding.get("query_state") or {})
@@ -1518,10 +1522,23 @@ def _strip_llm_inferred_community_for_area_alias(
     result: dict[str, Any],
     rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if not _area_alias_hits(content):
-        return result
     query_state = dict(result.get("query_state") or {})
-    communities = _query_state_communities(query_state)
+    proof = dict(result.get("constraint_proof") or {})
+    area_scope_present = bool(
+        _area_alias_hits(content)
+        or query_state.get("area")
+        or query_state.get("areas")
+        or proof.get("area")
+        or proof.get("areas")
+    )
+    if not area_scope_present or not _area_query_context_is_clear(content):
+        return result
+    proof_communities = [
+        str(item).strip()
+        for item in proof.get("communities") or []
+        if str(item).strip()
+    ]
+    communities = list(dict.fromkeys([*_query_state_communities(query_state), *proof_communities]))
     if not communities:
         return result
     known_communities = set(_community_names(rows))
@@ -1548,6 +1565,28 @@ def _strip_llm_inferred_community_for_area_alias(
         elif str(value or "").strip() in inferred:
             updated_query_state.pop(key, None)
     updated["query_state"] = updated_query_state
+
+    if proof:
+        updated_proof = dict(proof)
+        kept_proof_communities = [
+            item
+            for item in proof.get("communities") or []
+            if str(item).strip() not in inferred
+        ]
+        if kept_proof_communities:
+            updated_proof["communities"] = kept_proof_communities
+        else:
+            updated_proof.pop("communities", None)
+        hard_constraints = dict(updated_proof.get("hard_constraints") or {})
+        if not kept_proof_communities and "community" in hard_constraints:
+            hard_constraints["community"] = False
+        if hard_constraints:
+            updated_proof["hard_constraints"] = hard_constraints
+        updated["constraint_proof"] = updated_proof
+        structured_task = dict(updated.get("structured_task") or {})
+        if structured_task:
+            structured_task["constraint_proof"] = updated_proof
+            updated["structured_task"] = structured_task
 
     for key in ("rewritten_query", "effective_query"):
         text = str(updated.get(key) or "")
@@ -2084,6 +2123,7 @@ def _build_entity_resolution(text: str, rows: list[dict[str, Any]]) -> dict[str,
         for mention in _possible_community_mentions(text)
         if not _looks_like_area_alias_mention(mention, area_hits)
     ]
+    suppress_area_fuzzy_community = bool(area_hits and _area_query_context_is_clear(text))
     community_corrections: list[dict[str, str]] = []
     unique_room_communities = list(
         dict.fromkeys(
@@ -2142,6 +2182,8 @@ def _build_entity_resolution(text: str, rows: list[dict[str, Any]]) -> dict[str,
         for mention in possible_mentions:
             options = _similar_community_options(mention, communities)
             risky_options = [] if options else _risky_similar_community_options(mention, communities)
+            if suppress_area_fuzzy_community and (options or risky_options):
+                continue
             if not options:
                 if not risky_options:
                     continue
@@ -3784,18 +3826,20 @@ def _target_rows_from_understanding(
         or _content_wants_viewing(query_text)
     )
     candidates = _candidate_rows(context)
-    matched_by_room_ref = _target_rows_from_room_refs(understanding, search_rows)
-    if matched_by_room_ref:
-        return matched_by_room_ref
-    if explicit_room_refs:
-        candidate_room_ref_rows = _candidate_rows_from_room_ref_hint(
-            candidates=candidates,
-            query_text=query_text,
-            proof=proof,
-        )
-        if candidate_room_ref_rows:
-            return candidate_room_ref_rows
-        return []
+    selected = _selected_indices_from_understanding(understanding, query_text)
+    if not selected:
+        matched_by_room_ref = _target_rows_from_room_refs(understanding, search_rows)
+        if matched_by_room_ref:
+            return matched_by_room_ref
+        if explicit_room_refs:
+            candidate_room_ref_rows = _candidate_rows_from_room_ref_hint(
+                candidates=candidates,
+                query_text=query_text,
+                proof=proof,
+            )
+            if candidate_room_ref_rows:
+                return candidate_room_ref_rows
+            return []
 
     confirmed = _confirmed_row(context)
     if (
@@ -3809,7 +3853,6 @@ def _target_rows_from_understanding(
     ):
         return [confirmed]
 
-    selected = _selected_indices_from_understanding(understanding, query_text)
     proof_communities = {
         normalize_search_text(str(item))
         for item in proof.get("communities") or []
@@ -3821,6 +3864,8 @@ def _target_rows_from_understanding(
             for row in search_rows
             if normalize_search_text(_row_value(row, ("小区", "小区名"))) in proof_communities
         ]
+        if current_search_rows and any(index > len(current_search_rows) for index in selected):
+            return []
         current_selected_rows = [
             current_search_rows[index - 1]
             for index in selected
@@ -3829,6 +3874,8 @@ def _target_rows_from_understanding(
         if current_selected_rows:
             return current_selected_rows
 
+    if selected and candidates and any(index > len(candidates) for index in selected):
+        return []
     selected_rows = [
         candidates[index - 1]
         for index in selected
@@ -3836,6 +3883,8 @@ def _target_rows_from_understanding(
     ]
     if selected_rows:
         return selected_rows
+    if selected:
+        return []
     selected_has_current_scope = bool(
         proof_communities
         or proof.get("area")
@@ -4751,6 +4800,8 @@ async def _understand_message(
         result = {}
     if not isinstance(result, dict) or not result:
         result = _fallback_understanding(content, signals)
+    result.setdefault("needs_clarification", False)
+    result.setdefault("clarification_text", "")
     if signals.get("wants_inventory_sheet"):
         result = _force_inventory_sheet_task(content, result)
     if signals.get("wants_deposit"):
@@ -5497,6 +5548,12 @@ async def _execute_tools(
         and not target_rows
         and any(index > len(candidate_rows_for_selection) for index in selected_indices)
     )
+    invalid_search_selection = bool(
+        selected_indices
+        and not candidate_rows_for_selection
+        and rows
+        and any(index > len(rows) for index in selected_indices)
+    )
     missing_candidate_selection_context = bool(
         selected_indices
         and not candidate_rows_for_selection
@@ -5504,15 +5561,17 @@ async def _execute_tools(
         and not rows
         and not original_video_target_error
     )
-    if invalid_candidate_selection:
-        candidate_labels = [_row_label(row) for row in candidate_rows_for_selection[:10]]
+    if invalid_candidate_selection or invalid_search_selection:
+        selection_rows = candidate_rows_for_selection or rows
+        candidate_labels = [_row_label(row) for row in selection_rows[:10]]
         evidence["selection_error"] = {
             "requested_indices": selected_indices,
-            "candidate_count": len(candidate_rows_for_selection),
+            "candidate_count": len(selection_rows),
             "candidate_labels": candidate_labels,
             "reason": "requested_candidate_index_out_of_range",
         }
         rows = []
+        target_rows = []
         evidence["inventory_rows"] = []
     elif missing_candidate_selection_context:
         evidence["selection_error"] = {
@@ -5581,6 +5640,7 @@ async def _execute_tools(
         and "explain_unavailable_viewing" in actions
         and wants_bound_viewing_context
         and not invalid_candidate_selection
+        and not invalid_search_selection
     ):
         candidate_rows = _candidate_rows(context)
         if not candidate_rows:
@@ -5615,6 +5675,7 @@ async def _execute_tools(
         and rows
         and not explicit_room_refs
         and not invalid_candidate_selection
+        and not invalid_search_selection
         and not media_target_error
         and not original_video_target_error
         and any(action in actions for action in ("send_image", "send_video"))
@@ -6885,6 +6946,19 @@ def _reply_for_deposit_and_utilities(
     )
 
 
+def _customer_visible_viewing_text(viewing_text: str, *, allow_password: bool = False) -> str:
+    text = str(viewing_text or "").strip()
+    if not text:
+        return ""
+    if allow_password:
+        return text
+    text = re.sub(r"\b\d{3,8}#?\b", "", text)
+    text = re.sub(r"(?:密码|门锁码|开门码|门禁码)(?:不对|错误|失效)?[、，,；; ]*", "", text)
+    text = text.replace("看房方式/密码", "看房方式")
+    text = text.strip(" #，,；;。")
+    return text
+
+
 def _reply_for_utilities_and_viewing(
     understanding: dict[str, Any],
     tool_evidence: dict[str, Any],
@@ -6909,19 +6983,25 @@ def _reply_for_utilities_and_viewing(
     }
     lines: list[str] = []
     contact_needed = False
+    allow_password = _content_wants_password(content)
     for row in rows[:5]:
         label = _row_label(row)
         utilities = _row_value(row, ("备注", "水电", "水电费", "水电备注")) or "水电备注暂时没写"
         viewing_item = viewing_by_label.get(label) or {}
-        viewing_text = str(viewing_item.get("viewing") or _row_viewing_summary(row, allow_password=True)).strip()
+        raw_viewing_text = str(viewing_item.get("viewing") or _row_viewing_summary(row, allow_password=allow_password)).strip()
+        viewing_text = _customer_visible_viewing_text(raw_viewing_text, allow_password=allow_password)
         if not viewing_text:
             viewing_text = "看房方式需要联系确认"
         if bool(viewing_item.get("needs_contact")):
             contact_needed = True
-        lines.append(f"{label}：水电是{utilities}；看房方式/密码是{viewing_text}。")
+        viewing_label = "看房方式/密码" if allow_password else "看房方式"
+        lines.append(f"{label}：水电是{utilities}；{viewing_label}是{viewing_text}。")
     reply = "\n".join(lines)
     if contact_needed:
-        reply += "\n如果密码不对、打不开门，或者还没空出，直接联系 18758141785 / 13282125992 / 19941091943 预约或核对。"
+        if allow_password:
+            reply += "\n如果密码不对、打不开门，或者还没空出，直接联系 18758141785 / 13282125992 / 19941091943 预约或核对。"
+        else:
+            reply += "\n如果打不开门、现场情况不一致，或者还没空出，直接联系 18758141785 / 13282125992 / 19941091943 预约或核对。"
     return reply
 
 
@@ -6955,7 +7035,7 @@ def _reply_for_contract_contact(
     )
 
 
-def _reply_for_viewing(tool_evidence: dict[str, Any]) -> str:
+def _reply_for_viewing(tool_evidence: dict[str, Any], *, allow_password: bool = False) -> str:
     rule_evidence = dict(tool_evidence.get("rule_evidence") or {})
     viewing = rule_evidence.get("viewing")
     if not isinstance(viewing, dict):
@@ -6966,17 +7046,20 @@ def _reply_for_viewing(tool_evidence: dict[str, Any]) -> str:
     lines: list[str] = []
     for item in rooms[:5]:
         room = str(item.get("room") or "这套房源").strip()
-        viewing_text = str(item.get("viewing") or "").strip()
+        viewing_text = _customer_visible_viewing_text(str(item.get("viewing") or ""), allow_password=allow_password)
         has_password = bool(item.get("has_password"))
         needs_contact = bool(item.get("needs_contact"))
-        if has_password and viewing_text:
+        if has_password and allow_password and viewing_text:
             lines.append(f"{room}：看房方式是 {viewing_text}。")
         elif viewing_text:
             lines.append(f"{room}：{viewing_text}。")
         else:
-            lines.append(f"{room}：暂时没有稳定密码。")
+            lines.append(f"{room}：看房方式需要联系确认。")
         if needs_contact:
-            lines.append("如果密码不对、打不开门，或者还没空出，直接联系 18758141785 / 13282125992 / 19941091943 预约或核对。")
+            if allow_password:
+                lines.append("如果密码不对、打不开门，或者还没空出，直接联系 18758141785 / 13282125992 / 19941091943 预约或核对。")
+            else:
+                lines.append("如果打不开门、现场情况不一致，或者还没空出，直接联系 18758141785 / 13282125992 / 19941091943 预约或核对。")
     return "\n".join(lines)
 
 
@@ -7115,7 +7198,7 @@ def _row_viewing_summary(row: dict[str, Any], *, allow_password: bool = False) -
     safe = re.sub(r"\b\d{4,8}#?\b", "", viewing).strip(" #，,；;。")
     if safe:
         return safe
-    return "可自助看房，具体密码按房源确认"
+    return "可自助看房，具体看房方式需联系确认"
 
 
 def _room_line_with_viewing(row: dict[str, Any], index: int, *, allow_password: bool = False) -> str:
@@ -7194,8 +7277,18 @@ def _reply_for_inventory_search(understanding: dict[str, Any], tool_evidence: di
         exact_room_refs = _exact_room_refs_from_understanding(understanding, proof)
         if len(rows) == 1 and exact_room_refs:
             if wants_viewing:
+                viewing_query = " ".join(
+                    str(part).strip()
+                    for part in (
+                        task.get("original_text"),
+                        understanding.get("effective_query"),
+                        understanding.get("rewritten_query"),
+                    )
+                    if str(part or "").strip()
+                )
+                allow_password = _content_wants_password(viewing_query)
                 return (
-                    f"还在，{_room_facts_text(rows[0])}，{_row_viewing_summary(rows[0], allow_password=True)}。\n"
+                    f"还在，{_room_facts_text(rows[0])}，{_row_viewing_summary(rows[0], allow_password=allow_password)}。\n"
                     "今天想看的话，建议先联系18758141785 / 13282125992 / 19941091943确认时间。"
                 )
             return f"还在，{_room_facts_text(rows[0])}。\n要视频、图片或者看房方式的话，直接说这套就行。"
@@ -8685,7 +8778,7 @@ async def _generate_reply_result(
             )
         )
     ):
-        viewing_reply = _reply_for_viewing(tool_evidence)
+        viewing_reply = _reply_for_viewing(tool_evidence, allow_password=_content_wants_password(content))
     if planner_missing_reply:
         draft_reply = ""
         deterministic_reply_source = "planner_missing_reply_text"
