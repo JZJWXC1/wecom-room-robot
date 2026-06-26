@@ -314,6 +314,28 @@ M1D2B2 只做本地 primary 全链路演练、故障回退、cutover readiness e
 - 客户回复 golden、Planner/selfcheck/send 回归通过。
 - 生产观察期无 blocking、secret scan failure、stale 或 alias coverage failure。
 
+## M1.5 Contract Alignment Legacy Gate
+
+M1.5 只对齐 `kf_contracts.py` 和 `kf_dual_llm_shadow.py` 的终态双 LLM 数据契约，不删除旧生产规则，不接入生产发送和库存切换。
+
+本轮新增或扩展的契约字段只作为强类型边界：
+
+- 结构化 `ResponseStrategy` 兼容旧字符串/枚举输入。
+- 字段级 `Claim` 兼容旧 `text/support/risk`。
+- `EvidenceItem`/`ToolEvidenceBundle` 兼容旧 metadata 和 raw tool result 安全省略。
+- `PreparedOutboundPackage` 兼容旧 `reply_text/send_actions`，新增 answered task、action caption、missing item 和 selfcheck 元数据。
+
+本轮明确保留：
+
+| Legacy/兼容项 | M1.5 状态 | removal_milestone | 保留原因 |
+| --- | --- | --- | --- |
+| 旧 `strategy` 字符串和枚举常量 | 保留并映射到 `ResponseStrategy.mode` | 后续生产迁移完成后复审 | shadow 和旧测试仍需 legacy dict roundtrip |
+| 旧 `Claim.text/support/risk` | 保留 | 后续 LLM2 输出完全字段级后复审 | 不改变现有证据断言和自检语义 |
+| 旧 `SendAction` | 保留，`ActionCaption` 仅补充说明契约 | 发送阶段迁移后复审 | 本轮禁止改素材发送决策 |
+| 旧 raw tool result 输入 | 允许进入模型私有字段，安全输出继续省略 | 不删除 | 便于 shadow 适配 legacy 工具结果，同时不泄露敏感数据 |
+
+删除或切换这些兼容项前，仍需客户回复 golden、Planner/selfcheck/send 回归、敏感字段扫描和生产切换批准。
+
 ## 删除前总门槛
 
 - `pytest -q` 通过。

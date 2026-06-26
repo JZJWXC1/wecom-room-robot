@@ -27,7 +27,8 @@ def test_build_shadow_task_packet_supports_multi_task_and_candidate_numbers() ->
     payload = packet.to_legacy_dict()
 
     assert isinstance(packet, StructuredTaskPacket)
-    assert payload["response_strategy"] == ResponseStrategy.SEND_MEDIA
+    assert payload["response_strategy"]["mode"] == ResponseStrategy.SEND_MEDIA.mode
+    assert payload["response_strategy"]["detail_level"] == "normal"
     assert [task["task_type"] for task in payload["tasks"]] == ["inventory_search", "send_video", "reply_text"]
     assert payload["tasks"][1]["constraints"]["candidate_numbers"] == [1, 2]
     assert payload["rewritten_query"] == "棠润府前两套视频"
@@ -68,8 +69,12 @@ def test_compose_shadow_outbound_binds_candidate_numbers_and_video_actions_from_
     assert package.response_strategy == ResponseStrategy.SEND_MEDIA
     assert [item.candidate_number for item in package.candidate_set.candidates] == [1, 2]
     assert [action.action_type for action in package.send_actions] == ["video", "video"]
+    assert [caption.action_id for caption in package.action_captions] == ["send-video-1", "send-video-2"]
+    assert package.selfcheck_profile == "dual_llm_shadow.selfcheck.v1"
     assert record["llm2"]["candidate_binding"]["media"][0]["candidate_number"] == 1
     assert record["llm2"]["candidate_binding"]["media"][1]["candidate_number"] == 2
+    assert record["llm2"]["response_strategy"]["mode"] == "send_media"
+    assert record["llm2"]["action_captions"][0]["action_id"] == "send-video-1"
 
 
 def test_continue_search_strategy_records_tool_plan_without_media_decision() -> None:
@@ -80,9 +85,25 @@ def test_continue_search_strategy_records_tool_plan_without_media_decision() -> 
         legacy_reply_text="我再帮你继续找符合预算的房源。",
     )
 
-    assert record["llm1"]["response_strategy"] == ResponseStrategy.TOOL_FIRST
+    assert record["llm1"]["response_strategy"]["mode"] == ResponseStrategy.TOOL_FIRST.mode
     assert record["llm1"]["tool_plan"]["continue_search"] is True
     assert record["llm2"]["self_review"]["llm2_decides_media_targets"] is False
+
+
+def test_invalid_legacy_strategy_falls_back_without_breaking_shadow() -> None:
+    packet = build_shadow_task_packet(
+        {"response_strategy": "future_unknown_strategy"},
+        {"actions": ["generate_reply"]},
+        content="帮我看看还有没有",
+    )
+    package = compose_shadow_outbound(
+        packet,
+        {"actions": ["generate_reply"], "response_strategy": "future_unknown_strategy"},
+        "我帮你继续看一下。",
+    )
+
+    assert packet.response_strategy == ResponseStrategy.ANSWER
+    assert package.response_strategy == ResponseStrategy.ANSWER
 
 
 def test_claims_evidence_and_legacy_roundtrip_are_safe_and_supported() -> None:
@@ -111,7 +132,10 @@ def test_claims_evidence_and_legacy_roundtrip_are_safe_and_supported() -> None:
     roundtrip = PreparedOutboundPackage.from_legacy_dict(package.to_legacy_dict())
 
     assert roundtrip.to_legacy_dict()["claims"][0]["support"] == ["evd-candidate-1"]
+    assert roundtrip.to_legacy_dict()["claims"][0]["field"] == "candidate_summary"
+    assert roundtrip.to_legacy_dict()["claims"][0]["evidence_ref"] == "evd-candidate-1"
     assert roundtrip.to_legacy_dict()["evidence_bundle"]["evidence"][0]["listing_id"] == "lst-9"
+    assert roundtrip.to_legacy_dict()["evidence_bundle"]["evidence"][0]["field_values"]["community"] == "新塘河"
     assert roundtrip.to_legacy_dict()["reply_text"] == "新塘河 9-402B 押一付一 4200。"
 
 

@@ -9,6 +9,7 @@ from app.services.kf_contracts import (
     ORCHESTRATOR_SHADOW_SCHEMA_VERSION,
     ORCHESTRATOR_SHADOW_TOP_LEVEL_KEYS,
     REDACTED,
+    ActionCaption,
     CandidateItem,
     CandidateSet,
     Claim,
@@ -63,9 +64,49 @@ def test_structured_task_packet_supports_multi_task_and_response_strategy() -> N
     payload = packet.to_legacy_dict()
 
     assert payload["schema_version"] == "kf_rag_contracts.v1"
-    assert payload["response_strategy"] == "tool_first"
+    assert payload["response_strategy"]["mode"] == "tool_first"
+    assert payload["response_strategy"]["max_questions"] == 1
     assert [item["task_id"] for item in payload["tasks"]] == ["task-search", "task-video"]
+    assert payload["tasks"][1]["response_strategy"]["mode"] == "send_media"
     assert payload["tasks"][1]["depends_on_task_ids"] == ["task-search"]
+
+
+def test_response_strategy_accepts_legacy_string_and_structured_fields() -> None:
+    packet = StructuredTaskPacket.from_legacy_dict(
+        {
+            "strategy": {
+                "mode": "answer",
+                "detail_level": "brief",
+                "direct_answer_required": True,
+                "acknowledge_context": False,
+                "max_sentences": 1,
+                "max_questions": 0,
+                "avoid_repeat_fields": ["押金", "楼层"],
+                "action_tense": "future",
+                "future_knob": "保留未知字段",
+            },
+            "tasks": [
+                {
+                    "id": "task-answer",
+                    "type": "reply_text",
+                    "strategy": "answer",
+                }
+            ],
+        }
+    )
+
+    payload = packet.to_legacy_dict()
+
+    assert payload["response_strategy"]["mode"] == "answer"
+    assert payload["response_strategy"]["detail_level"] == "brief"
+    assert payload["response_strategy"]["direct_answer_required"] is True
+    assert payload["response_strategy"]["acknowledge_context"] is False
+    assert payload["response_strategy"]["max_sentences"] == 1
+    assert payload["response_strategy"]["max_questions"] == 0
+    assert payload["response_strategy"]["avoid_repeat_fields"] == ["押金", "楼层"]
+    assert payload["response_strategy"]["action_tense"] == "future"
+    assert payload["response_strategy"]["legacy_unknown_fields"]["future_knob"] == "保留未知字段"
+    assert payload["tasks"][0]["response_strategy"]["mode"] == "answer"
 
 
 def test_candidate_set_enforces_candidate_numbers() -> None:
@@ -122,14 +163,24 @@ def test_evidence_claim_and_send_action_contracts_share_trace_ids() -> None:
         evidence_id="evd-claim",
         listing_id="lst-claim",
         inventory_snapshot_id="snap-claim",
+        source_record_id="row-claim",
         evidence_type="inventory_listing",
         summary="晨星花园 1-101A 押一付一 1800",
+        field_values={"rent_pay1": 1800, "看房密码": FAKE_VIEWING_PASSWORD},
+        sensitivity="public",
+        fetched_at="2026-06-27T00:00:00Z",
         metadata={"source_hash": "hash-1"},
     )
     claim = Claim(
         claim_id="claim-price",
+        task_id="task-answer",
         evidence_id="evd-claim",
         listing_id="lst-claim",
+        field="rent_pay1",
+        value=1800,
+        evidence_ref="evd-claim",
+        text_span={"start": 8, "end": 12},
+        sensitivity="public",
         text="1-101A 押一付一是 1800",
         support=["evd-claim"],
     )
@@ -140,21 +191,52 @@ def test_evidence_claim_and_send_action_contracts_share_trace_ids() -> None:
         inventory_snapshot_id="snap-claim",
         reply_text="这套押一付一 1800。",
         response_strategy=ResponseStrategy.ANSWER,
+        answered_task_ids=["task-answer"],
         candidate_set=candidate,
         evidence_bundle=ToolEvidenceBundle(
             tool_name="inventory.search",
+            source_record_id="tool-run-1",
+            field_values={"result_count": 1},
+            sensitivity="public",
+            fetched_at="2026-06-27T00:00:00Z",
             evidence=[evidence],
             candidate_set=candidate,
         ),
         claims=[claim],
+        action_captions=[
+            ActionCaption(
+                caption_id="caption-send-text",
+                action_id="send-text",
+                action_type="text",
+                text="文本回复",
+            )
+        ],
         send_actions=[SendAction(action_id="send-text", action_type="text", evidence_id="evd-claim")],
+        missing_items=["video"],
+        self_review={"status": "pass"},
+        selfcheck_profile="contract.selfcheck.v1",
     )
 
     payload = package.to_legacy_dict()
 
+    assert payload["answered_task_ids"] == ["task-answer"]
+    assert payload["claims"][0]["task_id"] == "task-answer"
+    assert payload["claims"][0]["field"] == "rent_pay1"
+    assert payload["claims"][0]["value"] == 1800
+    assert payload["claims"][0]["evidence_ref"] == "evd-claim"
+    assert payload["claims"][0]["text_span"] == {"start": 8, "end": 12}
+    assert payload["claims"][0]["sensitivity"] == "public"
     assert payload["claims"][0]["support"] == ["evd-claim"]
     assert payload["evidence_bundle"]["evidence"][0]["listing_id"] == "lst-claim"
+    assert payload["evidence_bundle"]["evidence"][0]["source_record_id"] == "row-claim"
+    assert payload["evidence_bundle"]["evidence"][0]["field_values"]["rent_pay1"] == 1800
+    assert payload["evidence_bundle"]["evidence"][0]["field_values"]["看房密码"] == REDACTED
+    assert payload["evidence_bundle"]["evidence"][0]["fetched_at"] == "2026-06-27T00:00:00Z"
+    assert payload["action_captions"][0]["action_id"] == "send-text"
     assert payload["send_actions"][0]["evidence_id"] == "evd-claim"
+    assert payload["missing_items"] == ["video"]
+    assert payload["self_review"]["status"] == "pass"
+    assert payload["selfcheck_profile"] == "contract.selfcheck.v1"
 
 
 def test_sensitive_password_and_phone_are_redacted_from_safe_outputs_and_repr() -> None:
@@ -209,7 +291,7 @@ def test_legacy_dict_roundtrip_records_unknown_fields_without_silent_drop() -> N
     payload = package.to_legacy_dict()
 
     assert payload["conversation_id"] == "conv-legacy"
-    assert payload["response_strategy"] == "answer"
+    assert payload["response_strategy"]["mode"] == "answer"
     assert payload["legacy_unknown_fields"]["legacy_extra"] == {"kept": True}
     assert payload["legacy_unknown_fields"]["raw_viewing_password"] == REDACTED
     assert FAKE_VIEWING_PASSWORD not in json.dumps(payload, ensure_ascii=False)

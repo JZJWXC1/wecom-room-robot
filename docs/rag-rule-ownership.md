@@ -178,6 +178,18 @@ D 线新增的 `app/services/kf_dual_llm_shadow.py` 只属于“问题重写/意
 
 本归属不改变客户可见回复、不改变 Planner/Prompt/selfcheck/send 语义，不删除旧 LLM 阶段，也不修改客户回复 golden。
 
+## M1.5 契约对齐归属
+
+M1.5 只补齐终态两 LLM 所需的强类型契约，归属为“问题重写/意图分析、Planner/工具证据、发送准备、自检回流的结构化数据边界”，不属于生产客服回复链路切换。
+
+- `ResponseStrategy` 从 legacy mode 字符串扩展为结构化策略，保留旧字符串、枚举常量和 `strategy` alias 输入兼容。
+- `Claim` 补齐字段级事实声明，绑定 `task_id/listing_id/field/value/evidence_ref/text_span/sensitivity`。
+- `EvidenceItem` 和 `ToolEvidenceBundle` 补齐 `source_record_id/field_values/sensitivity/fetched_at`，继续禁止 raw tool result 出现在安全输出中。
+- `PreparedOutboundPackage` 补齐 `answered_task_ids/action_captions/missing_items/self_review/selfcheck_profile`。
+- `app/services/kf_dual_llm_shadow.py` 只做 legacy 数据到新契约字段的 shadow 适配，不决定素材目标，不改变发送动作。
+
+本轮仍不修改 `app/main.py`、`app/services/llm.py`、图片/视频/PNG 发送逻辑、库存读取 primary 切换、飞书/企业微信/服务器配置。密码、token、飞书密钥和完整手机号必须在 `to_legacy_dict()`、repr、shadow record 和测试 JSON 中脱敏。
+
 ## M1B 修改归属声明模板
 
 后续提交说明需标明：
