@@ -1,6 +1,6 @@
 # RAG V2 Architecture
 
-本文记录 M1.5 契约对齐后的双 LLM 终态边界。本轮只补齐 `app/services/kf_contracts.py` 和 `app/services/kf_dual_llm_shadow.py` 的结构化数据契约，不接入 `app/main.py`，不修改客户可见回复、Planner、Prompt、自检规则、素材发送或库存读取 primary 切换。
+本文记录 M1.5 契约对齐后的双 LLM 终态边界。M4A 在不接入 `app/main.py` 的前提下新增真 LLM1 shadow：`build_kf_task_packet` 只做问题理解、意图分析、上下文继承、实体绑定和工具计划，输出 `StructuredTaskPacket`，不生成客户可见回复。
 
 ## 终态两 LLM 分工
 
@@ -10,6 +10,18 @@
 | Planner/工具层 | `ToolEvidenceBundle`、`EvidenceItem`、`CandidateSet` | 读取房源、素材和受控事实，所有房源事实必须带 evidence 与 snapshot 追踪 |
 | LLM2 待发送包 | `PreparedOutboundPackage`、`Claim`、`ActionCaption`、`SendAction` | 只组合 legacy 文本和工具证据；不自行决定视频、图片、密码或房源表目标 |
 | 自检回流 | `self_review`、`selfcheck_profile`、`RetryPacket` | 校验 claims、证据引用、敏感字段和发送动作，失败时生成重试输入 |
+
+## M4A LLM1 Shadow
+
+`app/services/kf_llm1_task_packet.py` 是 LLM1 shadow 的本地契约边界：
+
+- 接收脱敏后的用户消息、结构化记忆、候选集摘要、库存索引摘要和 legacy rewrite/planner 基线。
+- 将 LLM1 JSON 归一为 `StructuredTaskPacket`，支持多 `task_atoms`、`inherit/replace/exclude/clear` 约束操作、`candidate_binding` 和 `tool_plan`。
+- 没有候选集时会清空候选编号，只记录 `no_candidate_set`，不猜 `candidate_number`。
+- 会过滤 `reply_text`、`clarification_text` 等客户可见话术字段；shadow artifact 继续通过契约脱敏。
+- `app/services/kf_dual_llm_shadow.py` 只把新 LLM1 packet、tool_plan、candidate_binding 和 legacy diff 写入 shadow record；LLM2 仍只适配 legacy 文本和工具 evidence，不决定发送目标。
+
+`app/services/llm.py::ReplyGenerator.build_kf_task_packet` 只是显式 shadow method，不替换旧 `rewrite_kf_message`，当前不接入生产编排。
 
 ## 关键契约字段
 
@@ -77,7 +89,7 @@
 ## 本轮不变项
 
 - 不改 `app/main.py`。
-- 不改 `app/services/llm.py`。
+- 不改旧 production LLM 方法语义；`app/services/llm.py` 只新增显式 LLM1 shadow method。
 - 不改变客户可见回复。
 - 不改变素材发送决策。
 - 不改变库存读取 primary 切换。

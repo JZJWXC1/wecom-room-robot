@@ -21,6 +21,10 @@ from app.services.kf_contracts import (
     ToolEvidenceBundle,
     safe_artifact_payload,
 )
+from app.services.kf_llm1_task_packet import (
+    LLM1_TASK_PACKET_PROMPT_VERSION,
+    build_kf_task_packet_shadow,
+)
 
 
 DUAL_LLM_SHADOW_SCHEMA_VERSION = "rag_v2_dual_llm_shadow.v1"
@@ -71,81 +75,36 @@ def build_shadow_task_packet(
     legacy_rewrite: dict[str, Any] | None = None,
     legacy_planner: dict[str, Any] | None = None,
     *,
+    llm1_shadow_output: dict[str, Any] | None = None,
     content: str = "",
+    raw_dialog_context: list[dict[str, Any]] | None = None,
+    structured_memory: dict[str, Any] | None = None,
+    inventory_index: dict[str, Any] | None = None,
+    candidate_set: dict[str, Any] | list[dict[str, Any]] | None = None,
     conversation_id: str = "",
     turn_id: str = "",
     case_id: str = "",
-    prompt_version: str = "dual_llm_shadow.llm1.v1",
+    prompt_version: str = LLM1_TASK_PACKET_PROMPT_VERSION,
     inventory_snapshot_id: str = "",
     candidate_set_id: str = "",
 ) -> StructuredTaskPacket:
-    """把 legacy rewrite/planner 输出适配成未来 LLM1 的 shadow 任务包。"""
-    rewrite = dict(legacy_rewrite or {})
-    planner = dict(legacy_planner or {})
-    direct_packet = _direct_packet_payload(rewrite, planner)
-    if direct_packet:
-        direct_packet = _normalize_direct_packet_payload(direct_packet)
-        data = {
-            "prompt_version": prompt_version,
-            "conversation_id": conversation_id,
-            "turn_id": turn_id,
-            "case_id": case_id,
-            "inventory_snapshot_id": inventory_snapshot_id,
-            "candidate_set_id": candidate_set_id,
-            **direct_packet,
-        }
-        return StructuredTaskPacket.from_legacy_dict(data)
-
-    actions = _actions_from(rewrite, planner)
-    constraints = _constraints_from(rewrite, planner)
-    candidate_numbers = _candidate_numbers_from(rewrite, planner)
-    if candidate_numbers:
-        constraints.setdefault("candidate_numbers", candidate_numbers)
-    tasks = [
-        _task_from_action(
-            action=action,
-            index=index,
-            content=content,
-            constraints=constraints,
-            candidate_numbers=candidate_numbers,
-        )
-        for index, action in enumerate(actions, start=1)
-    ]
-    if not tasks:
-        tasks = [
-            TaskAtom(
-                task_id="task-1-reply",
-                task_type="reply_text",
-                user_text=content,
-                constraint_operation=ConstraintOperation.INHERIT,
-                constraints=constraints,
-                response_strategy=ResponseStrategy.ANSWER,
-                required_tools=["reply.compose"],
-            )
-        ]
-
-    return StructuredTaskPacket(
-        prompt_version=prompt_version,
+    """构建未来 LLM1 shadow 任务包；无 LLM1 输出时仅作为 legacy baseline fallback。"""
+    return build_kf_task_packet_shadow(
+        llm1_shadow_output,
+        content=content,
+        raw_dialog_context=raw_dialog_context,
+        structured_memory=structured_memory,
+        inventory_index=inventory_index,
+        candidate_set=candidate_set,
+        legacy_rewrite=legacy_rewrite,
+        legacy_planner=legacy_planner,
         conversation_id=conversation_id,
         turn_id=turn_id,
         case_id=case_id,
+        prompt_version=prompt_version,
         inventory_snapshot_id=inventory_snapshot_id,
         candidate_set_id=candidate_set_id,
-        response_strategy=_strategy_from(actions, rewrite, planner),
-        tasks=tasks,
-        inherited_constraints=_safe_dict(rewrite.get("inherited_constraints") or planner.get("inherited_constraints")),
-        replaced_constraints=_safe_dict(rewrite.get("replaced_constraints") or planner.get("replaced_constraints")),
-        excluded_constraints=_safe_dict(rewrite.get("excluded_constraints") or planner.get("excluded_constraints")),
-        cleared_constraint_keys=_string_list(rewrite.get("cleared_constraint_keys") or planner.get("cleared_constraint_keys")),
-        rewritten_query=str(
-            rewrite.get("rewritten_query")
-            or rewrite.get("rewrite")
-            or rewrite.get("query")
-            or planner.get("rewritten_query")
-            or content
-            or ""
-        ),
-    )
+    ).packet
 
 
 def compose_shadow_outbound(
@@ -209,24 +168,35 @@ def compose_shadow_outbound(
 
 def build_dual_llm_shadow_record(
     *,
+    llm1_shadow_output: dict[str, Any] | None = None,
     legacy_rewrite: dict[str, Any] | None = None,
     legacy_planner: dict[str, Any] | None = None,
     tool_evidence: dict[str, Any] | None = None,
     legacy_reply_text: str = "",
     legacy_reply_result: dict[str, Any] | None = None,
     content: str = "",
+    raw_dialog_context: list[dict[str, Any]] | None = None,
+    structured_memory: dict[str, Any] | None = None,
+    inventory_index: dict[str, Any] | None = None,
+    candidate_set: dict[str, Any] | list[dict[str, Any]] | None = None,
     conversation_id: str = "",
     turn_id: str = "",
     case_id: str = "",
 ) -> dict[str, Any]:
-    packet = build_shadow_task_packet(
-        legacy_rewrite,
-        legacy_planner,
+    llm1_build = build_kf_task_packet_shadow(
+        llm1_shadow_output,
         content=content,
+        raw_dialog_context=raw_dialog_context,
+        structured_memory=structured_memory,
+        inventory_index=inventory_index,
+        candidate_set=candidate_set,
+        legacy_rewrite=legacy_rewrite,
+        legacy_planner=legacy_planner,
         conversation_id=conversation_id,
         turn_id=turn_id,
         case_id=case_id,
     )
+    packet = llm1_build.packet
     package = compose_shadow_outbound(
         packet,
         tool_evidence,
@@ -241,11 +211,14 @@ def build_dual_llm_shadow_record(
         "schema_version": DUAL_LLM_SHADOW_SCHEMA_VERSION,
         "mode": "shadow",
         "llm1": {
+            "source": llm1_build.source,
             "task_atoms": [task.to_safe_dict() for task in packet.tasks],
             "constraints": _packet_constraints(packet),
-            "candidate_binding": _candidate_binding(packet, evidence),
+            "candidate_binding": llm1_build.candidate_binding,
             "response_strategy": packet.response_strategy.to_safe_dict(),
-            "tool_plan": _tool_plan(packet, planner, evidence),
+            "tool_plan": _tool_plan(packet, planner, evidence, llm1_tool_plan=llm1_build.tool_plan),
+            "legacy_diff": llm1_build.legacy_diff,
+            "prompt_artifact": llm1_build.prompt_artifact,
         },
         "llm2": {
             "response_strategy": package.response_strategy.to_safe_dict(),
@@ -757,15 +730,32 @@ def _candidate_binding(packet: StructuredTaskPacket, evidence: dict[str, Any]) -
     )
 
 
-def _tool_plan(packet: StructuredTaskPacket, planner: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+def _tool_plan(
+    packet: StructuredTaskPacket,
+    planner: dict[str, Any],
+    evidence: dict[str, Any],
+    *,
+    llm1_tool_plan: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    llm1_plan = dict(llm1_tool_plan or {})
     planned = _actions_from(planner)
     observed = _actions_from(evidence)
+    actions = _string_list(llm1_plan.get("actions")) or observed or planned
+    required_tools = _string_list(llm1_plan.get("required_tools")) or _dedupe([tool for task in packet.tasks for tool in task.required_tools])
     return safe_artifact_payload(
         {
-            "actions": observed or planned,
-            "required_tools": _dedupe([tool for task in packet.tasks for tool in task.required_tools]),
-            "continue_search": "continue_search" in set(observed or planned),
-            "source": str(planner.get("source") or planner.get("reply_source") or evidence.get("deterministic_reply_source") or ""),
+            "actions": actions,
+            "required_tools": required_tools,
+            "continue_search": "continue_search" in set(actions),
+            "source": str(
+                llm1_plan.get("source")
+                or planner.get("source")
+                or planner.get("reply_source")
+                or evidence.get("deterministic_reply_source")
+                or ""
+            ),
+            "legacy_planner_actions": planned,
+            "observed_tool_actions": observed,
         }
     )
 

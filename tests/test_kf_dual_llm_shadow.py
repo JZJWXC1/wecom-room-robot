@@ -20,6 +20,13 @@ def test_build_shadow_task_packet_supports_multi_task_and_candidate_numbers() ->
         },
         {"actions": ["search_inventory", "send_video", "generate_reply"]},
         content="前两套发视频",
+        candidate_set={
+            "candidate_set_id": "cset-dual-1",
+            "candidates": [
+                {"candidate_number": 1, "小区": "棠润府", "房号": "15-2-801B"},
+                {"candidate_number": 2, "小区": "棠润府", "房号": "15-2-802B"},
+            ],
+        },
         conversation_id="conv-cn",
         turn_id="turn-1",
     )
@@ -39,6 +46,13 @@ def test_compose_shadow_outbound_binds_candidate_numbers_and_video_actions_from_
         {"candidate_numbers": [1, 2], "constraints": {"小区": "棠润府"}},
         {"actions": ["send_video"]},
         content="这两套视频",
+        candidate_set={
+            "candidate_set_id": "cset-dual-2",
+            "candidates": [
+                {"candidate_number": 1, "小区": "棠润府", "房号": "15-2-801B"},
+                {"candidate_number": 2, "小区": "棠润府", "房号": "15-2-802B"},
+            ],
+        },
     )
     package = compose_shadow_outbound(
         packet,
@@ -88,6 +102,27 @@ def test_continue_search_strategy_records_tool_plan_without_media_decision() -> 
     assert record["llm1"]["response_strategy"]["mode"] == ResponseStrategy.TOOL_FIRST.mode
     assert record["llm1"]["tool_plan"]["continue_search"] is True
     assert record["llm2"]["self_review"]["llm2_decides_media_targets"] is False
+
+
+def test_dual_shadow_record_prefers_true_llm1_packet_and_records_legacy_diff() -> None:
+    record = build_dual_llm_shadow_record(
+        llm1_shadow_output={
+            "rewritten_query": "房源表发一下",
+            "task_atoms": [{"task_id": "task-1-sheet", "task_type": "send_inventory_sheet"}],
+            "tool_plan": {"actions": ["send_inventory_sheet"], "required_tools": ["inventory.sheet_artifact"]},
+        },
+        legacy_rewrite={"rewritten_query": "拱墅万达房源查询"},
+        legacy_planner={"actions": ["search_inventory", "generate_reply"]},
+        tool_evidence={"actions": ["send_inventory_sheet"], "inventory_image_paths": ["room_database/sheet/current.png"]},
+        legacy_reply_text="房源表发你了，可以先给客户看整体。",
+    )
+
+    assert record["llm1"]["source"] == "llm1_shadow"
+    assert [task["task_type"] for task in record["llm1"]["task_atoms"]] == ["send_inventory_sheet"]
+    assert record["llm1"]["tool_plan"]["actions"] == ["send_inventory_sheet"]
+    assert record["llm1"]["legacy_diff"]["status"] == "diff"
+    assert "tool_actions" in record["llm1"]["legacy_diff"]["changed_fields"]
+    assert record["llm2"]["send_actions"][0]["action_type"] == "image"
 
 
 def test_invalid_legacy_strategy_falls_back_without_breaking_shadow() -> None:

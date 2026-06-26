@@ -179,10 +179,21 @@ D 线新增的 `app/services/kf_dual_llm_shadow.py` 只属于“问题重写/意
 - LLM1 shadow 记录 `task_atoms`、约束、候选绑定摘要、`response_strategy` 和 `tool_plan`。
 - LLM2 shadow 记录候选绑定摘要、`response_strategy`、`claims`、`send_actions` 和 `self_review`。
 - shadow LLM2 只表达 legacy 文本和程序 evidence，不能决定视频、图片、密码或房源表目标；这些动作只能来自工具 evidence/program。
-- 本轮不接入 `app/main.py`，不调用真实 LLM，不访问网络，不连接飞书、企业微信或服务器。
+- D 线不接入 `app/main.py`，不访问飞书、企业微信或服务器。
 - 输出 artifact、repr 和测试 JSON 必须通过契约脱敏，不能包含真实密码、手机号、token、raw tool result 或客户原文敏感字段。
 
 本归属不改变客户可见回复、不改变 Planner/Prompt/selfcheck/send 语义，不删除旧 LLM 阶段，也不修改客户回复 golden。
+
+## M4A LLM1 Shadow 归属
+
+M4A 新增 `app/services/kf_llm1_task_packet.py` 和 `ReplyGenerator.build_kf_task_packet`，归属为“问题重写/意图分析 shadow”。它只理解客户问题、继承上下文、绑定候选编号、声明工具计划，并输出 `StructuredTaskPacket`：
+
+- `build_kf_task_packet` 不生成客户可见回复，不写发送动作，不读取房源事实，不选择库存数据源。
+- `candidate_binding` 只能绑定显式传入的 candidate set；没有 candidate set 时清空候选编号并记录 `no_candidate_set`。
+- `tool_plan` 是 shadow 内部计划，只用于与 legacy rewrite/planner 差异记录，不改变生产 Planner 或工具执行。
+- `app/services/kf_dual_llm_shadow.py` 记录 LLM1 packet、tool_plan、candidate_binding 和 legacy diff；LLM2 仍只基于 legacy 文本与工具 evidence 适配。
+- `app/services/llm.py` 只新增显式 shadow prompt/method；旧 `rewrite_kf_message`、Planner、自检、发送阶段语义不变。
+- 本轮不修改 `app/main.py`，当前生产链路不会自动调用该 shadow method。
 
 ## M1.5 契约对齐归属
 
@@ -194,7 +205,7 @@ M1.5 只补齐终态两 LLM 所需的强类型契约，归属为“问题重写/
 - `PreparedOutboundPackage` 补齐 `answered_task_ids/action_captions/missing_items/self_review/selfcheck_profile`。
 - `app/services/kf_dual_llm_shadow.py` 只做 legacy 数据到新契约字段的 shadow 适配，不决定素材目标，不改变发送动作。
 
-本轮仍不修改 `app/main.py`、`app/services/llm.py`、图片/视频/PNG 发送逻辑、库存读取 primary 切换、飞书/企业微信/服务器配置。密码、token、飞书密钥和完整手机号必须在 `to_legacy_dict()`、repr、shadow record 和测试 JSON 中脱敏。
+本轮仍不修改 `app/main.py`、旧 production LLM 方法语义、图片/视频/PNG 发送逻辑、库存读取 primary 切换、飞书/企业微信/服务器配置。密码、token、飞书密钥和完整手机号必须在 `to_legacy_dict()`、repr、shadow record 和测试 JSON 中脱敏。
 
 ## M1B 修改归属声明模板
 

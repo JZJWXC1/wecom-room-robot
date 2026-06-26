@@ -6,6 +6,11 @@ from openai import AsyncOpenAI
 
 from app.config import settings
 from app.services.config_check import is_missing_or_placeholder
+from app.services.kf_contracts import safe_artifact_payload
+from app.services.kf_llm1_task_packet import (
+    build_kf_task_packet_prompt_artifact,
+    build_kf_task_packet_shadow,
+)
 from app.services.rule_knowledge import RuleKnowledgeService
 
 
@@ -44,6 +49,138 @@ class ReplyGenerator:
     def _stage_api_key_missing(stage: str, *, retry: bool = False) -> bool:
         provider = settings.llm_provider_for(stage, retry=retry)
         return is_missing_or_placeholder(settings.llm_api_key_for(provider))
+
+    async def build_kf_task_packet(
+        self,
+        *,
+        content: str,
+        raw_dialog_context: list[dict[str, Any]] | None = None,
+        structured_memory: dict[str, Any] | None = None,
+        inventory_index: dict[str, Any] | None = None,
+        candidate_set: dict[str, Any] | list[dict[str, Any]] | None = None,
+        legacy_rewrite: dict[str, Any] | None = None,
+        legacy_planner: dict[str, Any] | None = None,
+        planner_feedback: dict[str, Any] | None = None,
+        conversation_id: str = "",
+        turn_id: str = "",
+        case_id: str = "",
+    ):
+        """LLM1 shadow：只输出 StructuredTaskPacket，不生成客户可见回复。"""
+        if self._stage_api_key_missing("rewrite"):
+            return build_kf_task_packet_shadow(
+                None,
+                content=content,
+                raw_dialog_context=raw_dialog_context,
+                structured_memory=structured_memory,
+                inventory_index=inventory_index,
+                candidate_set=candidate_set,
+                legacy_rewrite=legacy_rewrite,
+                legacy_planner=legacy_planner,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                case_id=case_id,
+            ).packet
+        safe_planner_feedback = safe_artifact_payload(planner_feedback or {})
+        rule_cards = self.rule_knowledge.retrieve_text(
+            stage="rewrite",
+            query_text=content,
+            query_state=(structured_memory or {}).get("last_turn_record", {}).get("query_state", {}),
+            retry_packet=json.dumps(safe_planner_feedback, ensure_ascii=False, default=str),
+            tool_result_summary=inventory_index or {},
+        )
+        safe_rule_cards = safe_artifact_payload(rule_cards or "无")
+        prompt_artifact = build_kf_task_packet_prompt_artifact(
+            content=content,
+            raw_dialog_context=raw_dialog_context,
+            structured_memory=structured_memory,
+            inventory_index=inventory_index,
+            candidate_set=candidate_set,
+            legacy_rewrite=legacy_rewrite,
+            legacy_planner=legacy_planner,
+        )
+        system_prompt = (
+            "你是长租公寓客服 Agentic RAG 的 LLM1 shadow。"
+            "你只做问题理解、意图分析、上下文继承、实体绑定和工具计划，不生成客户可见回复。"
+            "输出必须能转换为 StructuredTaskPacket：task_atoms 支持多任务，constraint_operation 只能是 inherit/replace/exclude/clear。"
+            "constraints 要表达继承、替换、排除、清空；本轮明确修改的条件用 replace，明确不要的条件用 exclude，清空条件用 clear。"
+            "candidate_binding 只能绑定输入 candidate_set 中存在的编号；没有 candidate_set 或无法唯一绑定时 selected_candidate_numbers 必须为空。"
+            "tool_plan 只列工具动作和内部原因，不能包含 reply_text、clarification_text、客户可见话术、真实看房密码、完整手机号、token 或密钥。"
+            "房源、价格、房态、图片、视频事实只能交给工具计划去取证，不得在 LLM1 中编造。"
+            "只返回 JSON，不要 Markdown。"
+        )
+        user_prompt = f"""
+脱敏 shadow 输入：
+{json.dumps(prompt_artifact, ensure_ascii=False, default=str)}
+
+Planner 回流证据：
+{json.dumps(safe_planner_feedback, ensure_ascii=False, default=str)}
+
+问题重写规则卡片：
+{safe_rule_cards}
+
+返回 JSON：
+{{
+  "rewritten_query": "结合上下文重写后的需求，不含客户可见回复",
+  "response_strategy": {{"mode": "tool_first|send_media|ask_clarification|answer|handoff|safe_fallback"}},
+  "constraints": {{
+    "inherit": {{}},
+    "replace": {{}},
+    "exclude": {{}},
+    "clear": []
+  }},
+  "task_atoms": [
+    {{
+      "task_id": "task-1-search",
+      "task_type": "inventory_search|send_video|send_image|send_inventory_sheet|deposit_policy|contract_contact|viewing_guidance|clarification|reply_text",
+      "user_text": "脱敏后的用户本轮需求",
+      "constraint_operation": "inherit|replace|exclude|clear",
+      "constraints": {{}},
+      "required_tools": ["inventory.search"]
+    }}
+  ],
+  "candidate_binding": {{
+    "selected_candidate_numbers": [],
+    "reason": "如何绑定；没有候选集时写 no_candidate_set"
+  }},
+  "tool_plan": {{
+    "actions": ["search_inventory", "generate_reply"],
+    "required_tools": ["inventory.search", "reply.compose"],
+    "need_rewrite_clarification": false,
+    "reason": "内部取证计划，不是客户回复"
+  }}
+}}
+
+规则：
+- 需要房源、价格、房态、预算、户型：tool_plan.actions 包含 search_inventory 和 generate_reply；多套列表加 compact_listing。
+- 需要视频/图片：包含 search_inventory、context_tools、send_video/send_image、explain_missing_media、generate_reply。
+- 需要房源表：包含 send_inventory_sheet；如果同时要视频或看房，再补对应动作。
+- 需要看房、密码、今天能看：包含 search_inventory、context_tools、explain_unavailable_viewing、generate_reply，但不得输出真实密码。
+- 需要免押：包含 send_deposit_policy 和 generate_reply；合同、订房、交定金包含 send_contract_contact 和 generate_reply。
+- “第几套/前两套/这几套视频”只有在 candidate_set 存在且编号有效时才能写入 selected_candidate_numbers。
+- 不确定或无法绑定时，使用 clarification task 和 need_rewrite_clarification=true，但不要写客户可见追问句。
+"""
+        response = await self._client_for_stage("rewrite").chat.completions.create(
+            model=self._stage_model("rewrite"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+        )
+        raw_output = self._parse_json_object(response.choices[0].message.content or "{}")
+        return build_kf_task_packet_shadow(
+            raw_output,
+            content=content,
+            raw_dialog_context=raw_dialog_context,
+            structured_memory=structured_memory,
+            inventory_index=inventory_index,
+            candidate_set=candidate_set,
+            legacy_rewrite=legacy_rewrite,
+            legacy_planner=legacy_planner,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            case_id=case_id,
+        ).packet
 
     async def rewrite_kf_message(
         self,
