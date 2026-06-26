@@ -37,8 +37,41 @@ def assert_matches_fix1(path: str) -> None:
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+ALLOWED_LLM_RAG_V2_ENTITY_HINTS = (
+    "房号里的数字不能拆出来当预算或价格",
+    "“客户又问/客户问/又问/再问/那小区”等只是话语前缀",
+    "房号数字不能进入 query_state.budget / budget_range / budget_label",
+    "“客户又问杨家新雅苑有没有三室的”里的小区是“杨家新雅苑”",
+)
+
+
+def test_llm_customer_chain_matches_fix1_except_rag_v2_entity_hints() -> None:
+    current_lines = (REPO_ROOT / "app/services/llm.py").read_text(encoding="utf-8").splitlines()
+    baseline = subprocess.run(
+        ["git", "show", f"{FIX1_SHA}:app/services/llm.py"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
+    ).stdout.splitlines()
+
+    filtered_current = [
+        line for line in current_lines
+        if not any(hint in line for hint in ALLOWED_LLM_RAG_V2_ENTITY_HINTS)
+    ]
+    current_text = "\n".join(current_lines)
+
+    assert filtered_current == baseline
+    for hint in ALLOWED_LLM_RAG_V2_ENTITY_HINTS:
+        assert hint in current_text
 
 
 def rows_with_viewing(password: str = "1234#") -> list[dict[str, Any]]:
@@ -67,11 +100,6 @@ def alias_pairs(index: dict[str, Any]) -> set[tuple[str, str]]:
         for item in index.get("area_aliases") or []
         if item.get("status", "active") == "active"
     }
-
-
-@pytest.mark.parametrize("path", ["app/services/llm.py"])
-def test_customer_chain_files_match_fix1(path: str) -> None:
-    assert_matches_fix1(path)
 
 
 def test_main_customer_chain_keeps_m1d2a_inventory_read_router_gate() -> None:
