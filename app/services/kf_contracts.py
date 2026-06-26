@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 SCHEMA_VERSION = "kf_rag_contracts.v1"
+ORCHESTRATOR_SHADOW_SCHEMA_VERSION = "rag_v2_orchestrator_shadow.v1"
 REDACTED = "[REDACTED]"
 SENSITIVE_KEY_MARKERS = (
     "password",
@@ -24,6 +25,25 @@ SENSITIVE_KEY_MARKERS = (
     "手机号",
 )
 SAFE_OUTPUT_OMIT_KEYS = {"raw_tool_result", "sensitive_metadata", "sensitive_payload"}
+SAFE_ARTIFACT_OMIT_KEYS = SAFE_OUTPUT_OMIT_KEYS | {
+    "raw_customer_content",
+    "customer_content",
+    "message_content",
+    "original_content",
+    "raw_message",
+}
+ORCHESTRATOR_SHADOW_TOP_LEVEL_KEYS = (
+    "schema_version",
+    "mode",
+    "artifact_id",
+    "created_at",
+    "baseline_commit",
+    "turn",
+    "inventory_read",
+    "legacy_pipeline",
+    "shadow_a",
+    "integration_notes",
+)
 PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 PASSWORD_CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])\d{3,8}#(?![A-Za-z0-9])")
 TOKEN_CONTEXT_PATTERN = re.compile(r"\b(token|secret|password)\s*[:=]\s*[^\s,;]+", re.IGNORECASE)
@@ -339,3 +359,81 @@ def _redact_text(text: str) -> str:
 def _is_sensitive_key(key: str) -> bool:
     lowered = key.lower()
     return any(marker in lowered for marker in SENSITIVE_KEY_MARKERS)
+
+
+def safe_artifact_payload(value: Any) -> Any:
+    return _redact_sensitive(_omit_shadow_unsafe(value))
+
+
+def _omit_shadow_unsafe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(item_key): _omit_shadow_unsafe(item_value)
+            for item_key, item_value in value.items()
+            if str(item_key).lower() not in SAFE_ARTIFACT_OMIT_KEYS
+        }
+    if isinstance(value, list):
+        return [_omit_shadow_unsafe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_omit_shadow_unsafe(item) for item in value]
+    return value
+
+
+class OrchestratorShadowArtifact(ContractModel):
+    schema_version: str = ORCHESTRATOR_SHADOW_SCHEMA_VERSION
+    mode: str = "shadow"
+    artifact_id: str
+    created_at: str
+    baseline_commit: str
+    turn: dict[str, Any] = Field(default_factory=dict)
+    inventory_read: dict[str, Any] = Field(default_factory=dict)
+    legacy_pipeline: dict[str, Any] = Field(default_factory=dict)
+    shadow_a: dict[str, Any] = Field(default_factory=dict)
+    integration_notes: list[str] = Field(default_factory=list)
+
+    @field_validator("schema_version")
+    @classmethod
+    def _require_shadow_schema(cls, value: str) -> str:
+        if value != ORCHESTRATOR_SHADOW_SCHEMA_VERSION:
+            raise ValueError("invalid orchestrator shadow schema_version")
+        return value
+
+    @field_validator("mode")
+    @classmethod
+    def _require_shadow_mode(cls, value: str) -> str:
+        mode = str(value or "").strip()
+        if mode != "shadow":
+            raise ValueError("orchestrator shadow artifact mode must be shadow")
+        return mode
+
+    @field_validator("artifact_id", "created_at", "baseline_commit", mode="before")
+    @classmethod
+    def _require_artifact_text(cls, value: Any) -> str:
+        text = "" if value is None else str(value).strip()
+        if not text:
+            raise ValueError("field must not be empty")
+        return _redact_text(text)
+
+    @field_validator("turn", "inventory_read", "legacy_pipeline", "shadow_a", mode="before")
+    @classmethod
+    def _safe_artifact_dict(cls, value: Any) -> dict[str, Any]:
+        return safe_artifact_payload(dict(value or {}))
+
+    @field_validator("integration_notes", mode="before")
+    @classmethod
+    def _safe_integration_notes(cls, value: Any) -> list[str]:
+        return [
+            _redact_text(str(item).strip())
+            for item in (value or [])
+            if str(item).strip()
+        ]
+
+    def to_safe_dict(self) -> dict[str, Any]:
+        payload = self.model_dump(mode="json", include=set(ORCHESTRATOR_SHADOW_TOP_LEVEL_KEYS))
+        return safe_artifact_payload(
+            {
+                key: payload.get(key)
+                for key in ORCHESTRATOR_SHADOW_TOP_LEVEL_KEYS
+                if key in payload
+            }
+        )

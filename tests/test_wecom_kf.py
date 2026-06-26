@@ -381,6 +381,249 @@ class InventoryReadRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "turn_hash",
         )
 
+    async def test_process_text_turn_shadow_success_does_not_change_send_result(self) -> None:
+        send_results, shadow_calls, processed, sent_texts = await self._run_shadow_process_text_turn(
+            shadow_builder=lambda **kwargs: {
+                "schema_version": "rag_v2_orchestrator_shadow.v1",
+                "shadow_a": {"verdict": "pass"},
+            }
+        )
+
+        self.assertEqual(len(shadow_calls), 1)
+        self.assertEqual(len(send_results), 1)
+        self.assertEqual(send_results[0]["final_reply"], "影子观测不改变发送。")
+        self.assertEqual(sent_texts, [])
+        self.assertEqual(processed, {"msg-shadow"})
+
+    async def test_process_text_turn_shadow_failure_only_warns_and_still_sends(self) -> None:
+        shadow_calls: list[dict] = []
+
+        def failing_shadow_builder(**kwargs):
+            shadow_calls.append(kwargs)
+            raise RuntimeError("shadow failed")
+
+        send_results, _, processed, sent_texts = await self._run_shadow_process_text_turn(
+            shadow_builder=failing_shadow_builder
+        )
+
+        self.assertEqual(len(shadow_calls), 1)
+        self.assertEqual(len(send_results), 1)
+        self.assertEqual(send_results[0]["final_reply"], "影子观测不改变发送。")
+        self.assertEqual(sent_texts, [])
+        self.assertEqual(processed, {"msg-shadow"})
+
+    async def test_process_text_turn_shadow_uses_clarification_result_after_selfcheck_retry(self) -> None:
+        async def fake_understand_message(**kwargs):
+            if kwargs.get("planner_feedback"):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "合幢悦府有哪些",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": True,
+                    "clarification_text": "你确认下是合幢悦府哪套，我再按最新房源表查。",
+                }
+            return {
+                "intent": "inventory",
+                "rewritten_query": "合幢悦府有哪些",
+                "effective_query": "合幢悦府有哪些",
+                "query_state": {"intent": "inventory"},
+                "needs_clarification": False,
+                "tool_plan": {
+                    "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                    "source": "test_tool_plan",
+                },
+            }
+
+        failed_reply_result = {
+            "reply": "旧失败草稿，不应该进入 shadow。",
+            "draft_reply": "旧失败草稿，不应该进入 shadow。",
+            "context": {},
+            "selfcheck": {"status": "retry", "source": "test_failed_selfcheck"},
+            "needs_planner_retry": True,
+            "planner_retry_reason": "test_retry",
+        }
+        clarification_result = {
+            "reply": "你确认下是合幢悦府哪套，我再按最新房源表查。",
+            "draft_reply": "你确认下是合幢悦府哪套，我再按最新房源表查。",
+            "context": {},
+            "selfcheck": {"status": "pass", "source": "test_clarification_selfcheck"},
+            "needs_planner_retry": False,
+            "planner_retry_reason": "",
+        }
+        generate_calls: list[dict] = []
+
+        async def fake_generate_reply_result(**kwargs):
+            generate_calls.append(kwargs)
+            if len(generate_calls) == 1:
+                return {**failed_reply_result, "context": kwargs["context"]}
+            return {**clarification_result, "context": kwargs["context"]}
+
+        send_results, shadow_calls, processed, sent_texts = await self._run_shadow_process_text_turn(
+            shadow_builder=lambda **kwargs: {
+                "schema_version": "rag_v2_orchestrator_shadow.v1",
+                "shadow_a": {"verdict": "pass"},
+            },
+            understand_message=fake_understand_message,
+            generate_reply_result=fake_generate_reply_result,
+        )
+
+        self.assertEqual(len(generate_calls), 2)
+        self.assertEqual(len(shadow_calls), 1)
+        self.assertEqual(
+            shadow_calls[0]["reply_result"]["selfcheck"],
+            {"status": "pass", "source": "test_clarification_selfcheck"},
+        )
+        self.assertFalse(shadow_calls[0]["reply_result"]["needs_planner_retry"])
+        self.assertEqual(
+            shadow_calls[0]["reply_result"]["reply"],
+            "你确认下是合幢悦府哪套，我再按最新房源表查。",
+        )
+        self.assertEqual(
+            shadow_calls[0]["planner_result"],
+            {"actions": ["clarification"], "reply_source": "rewrite_clarification"},
+        )
+        self.assertEqual(
+            shadow_calls[0]["tool_evidence"],
+            {"actions": ["clarification"], "deterministic_reply_source": "rewrite_clarification"},
+        )
+        self.assertEqual(len(send_results), 1)
+        self.assertEqual(send_results[0]["final_reply"], "你确认下是合幢悦府哪套，我再按最新房源表查。")
+        self.assertEqual(sent_texts, [])
+        self.assertEqual(processed, {"msg-shadow"})
+
+    async def _run_shadow_process_text_turn(
+        self,
+        *,
+        shadow_builder,
+        reply_generator=None,
+        understand_message=None,
+        generate_reply_result=None,
+    ):
+        class FakeStateStore:
+            def __init__(self) -> None:
+                self.processed: set[str] = set()
+
+            def mark_processed(self, msgid: str) -> None:
+                self.processed.add(msgid)
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
+                self.texts: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+        class FakeContextStore:
+            def __init__(self) -> None:
+                self.data: dict[str, dict] = {}
+
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
+
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "合幢悦府有哪些",
+                    "effective_query": "合幢悦府有哪些",
+                    "query_state": {"intent": "inventory"},
+                    "needs_clarification": False,
+                    "tool_plan": {
+                        "actions": ["search_inventory", "compact_listing", "generate_reply"],
+                        "source": "test_tool_plan",
+                    },
+                }
+
+        class FakeInventory:
+            def cache_meta(self) -> dict:
+                return {"status": "success", "hash": "shadow_hash", "row_count": 1}
+
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "拱墅万达",
+                        "小区": "合幢悦府",
+                        "房号": "6-1-1204B",
+                        "户型描述": "一室一厅",
+                        "押一付一": "1500",
+                    }
+                ]
+
+            async def search(self, query: str, limit: int = 10):
+                return await self.all_rows(limit=limit)
+
+        async def fake_generate_reply_result(**kwargs):
+            return {
+                "reply": "影子观测不改变发送。",
+                "draft_reply": "影子观测不改变发送。",
+                "context": kwargs["context"],
+                "selfcheck": {"status": "pass"},
+                "needs_planner_retry": False,
+                "planner_retry_reason": "",
+            }
+
+        send_results: list[dict] = []
+
+        async def fake_send_final_actions(**kwargs):
+            send_results.append(kwargs)
+            return {"sent_actions": [{"type": "text", "count": 1}], "context": kwargs["context"]}
+
+        shadow_calls: list[dict] = []
+
+        def recording_shadow_builder(**kwargs):
+            result = shadow_builder(**kwargs)
+            if shadow_calls is not result:
+                shadow_calls.append(kwargs)
+            return result
+
+        fake_wecom = FakeWeComKf()
+        originals = {
+            "wecom_kf": main.wecom_kf,
+            "wecom_kf_context_store": main.wecom_kf_context_store,
+            "reply_generator": main.reply_generator,
+            "inventory": main.inventory,
+            "_understand_message": main._understand_message,
+            "_generate_reply_result": main._generate_reply_result,
+            "_send_final_actions": main._send_final_actions,
+            "shadow_builder": main.kf_orchestrator_shadow.build_shadow_artifact,
+            "kf_turn_generations": dict(main.kf_turn_generations),
+        }
+        main.wecom_kf = fake_wecom
+        main.wecom_kf_context_store = FakeContextStore()
+        main.reply_generator = reply_generator or FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        if understand_message is not None:
+            main._understand_message = understand_message
+        main._generate_reply_result = generate_reply_result or fake_generate_reply_result
+        main._send_final_actions = fake_send_final_actions
+        main.kf_orchestrator_shadow.build_shadow_artifact = recording_shadow_builder
+        main.kf_turn_generations["kf:wm"] = 0
+        try:
+            await main._process_text_turn(
+                open_kfid="kf",
+                external_userid="wm",
+                pending_items=[{"msgid": "msg-shadow", "content": "合幢悦府有哪些"}],
+                generation=0,
+            )
+        finally:
+            main.wecom_kf = originals["wecom_kf"]
+            main.wecom_kf_context_store = originals["wecom_kf_context_store"]
+            main.reply_generator = originals["reply_generator"]
+            main.inventory = originals["inventory"]
+            main._understand_message = originals["_understand_message"]
+            main._generate_reply_result = originals["_generate_reply_result"]
+            main._send_final_actions = originals["_send_final_actions"]
+            main.kf_orchestrator_shadow.build_shadow_artifact = originals["shadow_builder"]
+            main.kf_turn_generations.clear()
+            main.kf_turn_generations.update(originals["kf_turn_generations"])
+
+        return send_results, shadow_calls, fake_wecom.state_store.processed, fake_wecom.texts
+
     async def test_inventory_evidence_mismatch_clears_customer_visible_facts(self) -> None:
         class FakeInventory:
             def cache_meta(self) -> dict:

@@ -6,11 +6,14 @@ import pytest
 from pydantic import ValidationError
 
 from app.services.kf_contracts import (
+    ORCHESTRATOR_SHADOW_SCHEMA_VERSION,
+    ORCHESTRATOR_SHADOW_TOP_LEVEL_KEYS,
     REDACTED,
     CandidateItem,
     CandidateSet,
     Claim,
     ConstraintOperation,
+    OrchestratorShadowArtifact,
     EvidenceItem,
     PreparedOutboundPackage,
     ResponseStrategy,
@@ -20,6 +23,7 @@ from app.services.kf_contracts import (
     StructuredTaskPacket,
     TaskAtom,
     ToolEvidenceBundle,
+    safe_artifact_payload,
 )
 
 
@@ -273,3 +277,61 @@ def test_utf8_chinese_integrity_in_contract_payload() -> None:
     assert "中文会话" in payload
     assert "新填地" in payload
     assert "\\u65b0" not in payload
+
+
+def test_orchestrator_shadow_artifact_schema_and_redaction() -> None:
+    artifact = OrchestratorShadowArtifact(
+        artifact_id="orch_shadow_test",
+        created_at="2026-06-27T00:00:00Z",
+        baseline_commit="693a9c899d1cb1a4565ad67e4e600fc9559da4dd",
+        turn={
+            "content_hash": "hash-only",
+            "raw_customer_content": "客户原文 19900009999",
+        },
+        inventory_read={
+            "decision_id": "ird_test",
+            "source_kind": "legacy",
+            "selection_mode": "disabled",
+            "source_hash": "source-hash",
+        },
+        legacy_pipeline={
+            "raw_tool_result": {"token": "abc", "password": FAKE_VIEWING_PASSWORD},
+            "safe_note": f"token=abc123 电话 19900009999 密码 {FAKE_VIEWING_PASSWORD}",
+        },
+        shadow_a={"diff": {}, "verdict": "pass", "risk_reasons": []},
+        integration_notes=[f"不要泄漏 {FAKE_VIEWING_PASSWORD} 和 19900009999"],
+    )
+
+    payload = artifact.to_safe_dict()
+    dumped = json.dumps(payload, ensure_ascii=False)
+
+    assert payload["schema_version"] == ORCHESTRATOR_SHADOW_SCHEMA_VERSION
+    assert payload["mode"] == "shadow"
+    assert tuple(payload.keys()) == ORCHESTRATOR_SHADOW_TOP_LEVEL_KEYS
+    assert "raw_customer_content" not in payload["turn"]
+    assert "raw_tool_result" not in payload["legacy_pipeline"]
+    assert "19900009999" not in dumped
+    assert FAKE_VIEWING_PASSWORD not in dumped
+    assert "abc123" not in dumped
+
+
+def test_safe_artifact_payload_omits_raw_customer_content_and_tool_results() -> None:
+    payload = safe_artifact_payload(
+        {
+            "content_hash": "kept",
+            "message_content": "客户原文不应出现",
+            "nested": {
+                "raw_tool_result": {"secret": "plain"},
+                "text": "phone 19900009999 token=abc123 password=secret",
+            },
+        }
+    )
+    dumped = json.dumps(payload, ensure_ascii=False)
+
+    assert payload["content_hash"] == "kept"
+    assert "message_content" not in payload
+    assert "raw_tool_result" not in payload["nested"]
+    assert "客户原文不应出现" not in dumped
+    assert "19900009999" not in dumped
+    assert "abc123" not in dumped
+    assert "secret" not in dumped

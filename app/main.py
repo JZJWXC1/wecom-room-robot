@@ -22,6 +22,7 @@ from app.services import (
     kf_agentic_rag,
     kf_context_memory,
     kf_orchestrator_flow,
+    kf_orchestrator_shadow,
     kf_turn_flow,
 )
 from app.services.config_check import get_config_status
@@ -8838,6 +8839,41 @@ async def _send_text(open_kfid: str, external_userid: str, text: str) -> None:
     await _await_if_needed(wecom_kf.send_text(open_kfid, external_userid, text))
 
 
+def _build_orchestrator_shadow_artifact(
+    *,
+    content: str,
+    open_kfid: str,
+    external_userid: str,
+    msgids: list[str],
+    generation: int | str,
+    inventory_read_context: InventoryReadContext | None,
+    understanding: dict[str, Any],
+    planner_result: dict[str, Any] | None = None,
+    tool_evidence: dict[str, Any] | None = None,
+    reply_result: dict[str, Any] | None = None,
+    final_reply: str = "",
+) -> dict[str, Any]:
+    try:
+        artifact = kf_orchestrator_shadow.build_shadow_artifact(
+            content=content,
+            open_kfid=open_kfid,
+            external_userid=external_userid,
+            msgids=msgids,
+            generation=generation,
+            inventory_read_context=inventory_read_context,
+            understanding=understanding,
+            planner_result=planner_result or {},
+            tool_evidence=tool_evidence or {},
+            reply_result=reply_result or {},
+            final_reply=final_reply,
+        )
+        logger.info("KF orchestrator shadow artifact: %s", json.dumps(artifact, ensure_ascii=False, default=str))
+        return artifact
+    except Exception as exc:
+        logger.warning("KF orchestrator shadow artifact failed: %s", exc)
+        return {}
+
+
 async def _send_images(open_kfid: str, external_userid: str, paths: list[str]) -> list[dict[str, Any]]:
     sent: list[dict[str, Any]] = []
     for raw_path in paths:
@@ -9111,6 +9147,19 @@ async def _process_text_turn(
             )
             context = clarification_result.get("context") or context
             _raise_if_stale_kf_turn(conversation_key, generation)
+            _build_orchestrator_shadow_artifact(
+                content=content,
+                open_kfid=open_kfid,
+                external_userid=external_userid,
+                msgids=msgids,
+                generation=generation,
+                inventory_read_context=inventory_read_context,
+                understanding=understanding,
+                planner_result={"actions": ["clarification"], "reply_source": "rewrite_clarification"},
+                tool_evidence={"actions": ["clarification"], "deterministic_reply_source": "rewrite_clarification"},
+                reply_result=clarification_result,
+                final_reply=reply,
+            )
             with timer.stage("send"):
                 await _send_text(open_kfid, external_userid, reply)
             context = kf_context_memory.append_dialog_message(context, role="assistant", content=reply) or context
@@ -9129,6 +9178,7 @@ async def _process_text_turn(
         retry_reason = ""
         planner_result: dict[str, Any] = {}
         tool_evidence: dict[str, Any] = {}
+        reply_result: dict[str, Any] = {}
         preserved_sendable_evidence: dict[str, Any] = {}
         final_reply = settings.default_fallback_reply
         final_draft_reply = settings.default_fallback_reply
@@ -9184,6 +9234,19 @@ async def _process_text_turn(
                     )
                     context = clarification_result.get("context") or context
                     _raise_if_stale_kf_turn(conversation_key, generation)
+                    _build_orchestrator_shadow_artifact(
+                        content=content,
+                        open_kfid=open_kfid,
+                        external_userid=external_userid,
+                        msgids=msgids,
+                        generation=generation,
+                        inventory_read_context=inventory_read_context,
+                        understanding=understanding,
+                        planner_result={"actions": ["clarification"], "reply_source": "rewrite_clarification"},
+                        tool_evidence={"actions": ["clarification"], "deterministic_reply_source": "rewrite_clarification"},
+                        reply_result=clarification_result,
+                        final_reply=reply,
+                    )
                     with timer.stage("send"):
                         await _send_text(open_kfid, external_userid, reply)
                     context = kf_context_memory.append_dialog_message(context, role="assistant", content=reply) or context
@@ -9271,7 +9334,12 @@ async def _process_text_turn(
                     )
                     final_draft_reply = str(clarification_result.get("draft_reply") or final_reply)
                     context = clarification_result.get("context") or context
-                    tool_evidence = {"actions": ["clarification"]}
+                    planner_result = {"actions": ["clarification"], "reply_source": "rewrite_clarification"}
+                    tool_evidence = {
+                        "actions": ["clarification"],
+                        "deterministic_reply_source": "rewrite_clarification",
+                    }
+                    reply_result = clarification_result
                     break
                 continue
             final_reply = str(reply_result.get("reply") or settings.default_fallback_reply)
@@ -9280,6 +9348,19 @@ async def _process_text_turn(
             final_draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_draft_reply)
             break
 
+        _build_orchestrator_shadow_artifact(
+            content=content,
+            open_kfid=open_kfid,
+            external_userid=external_userid,
+            msgids=msgids,
+            generation=generation,
+            inventory_read_context=inventory_read_context,
+            understanding=understanding,
+            planner_result=planner_result,
+            tool_evidence=tool_evidence,
+            reply_result=reply_result,
+            final_reply=final_reply,
+        )
         context = kf_context_memory.record_structured_assistant_output(
             context,
             draft_reply=final_draft_reply,
@@ -9648,6 +9729,19 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
         break
     actions = _safe_action_list(planner_result)
     reply = str(reply_result.get("reply") or "")
+    orchestrator_shadow = _build_orchestrator_shadow_artifact(
+        content=content,
+        open_kfid="debug",
+        external_userid=message.user_id or "debug-user",
+        msgids=[],
+        generation="debug",
+        inventory_read_context=inventory_read_context,
+        understanding=understanding,
+        planner_result=planner_result,
+        tool_evidence=tool_evidence,
+        reply_result=reply_result,
+        final_reply=reply,
+    )
     return {
         "understanding": understanding,
         "planner_result": planner_result,
@@ -9666,4 +9760,5 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
         },
         "reply": reply,
         "selfcheck": reply_result.get("selfcheck") or {},
+        "orchestrator_shadow": orchestrator_shadow,
     }
