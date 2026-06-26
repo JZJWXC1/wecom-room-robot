@@ -346,6 +346,39 @@ class InventoryFuzzyMatchingTests(unittest.IsolatedAsyncioTestCase):
         finally:
             settings.inventory_source = previous_source
 
+    async def test_negated_community_does_not_override_area_search(self) -> None:
+        previous_source = settings.inventory_source
+        try:
+            settings.inventory_source = "local_cache"
+            inventory = InventoryService()
+            inventory._cache = pd.DataFrame(
+                [
+                    {
+                        "区域": "石桥街道 华丰 石桥 永佳 半山",
+                        "小区": "华丰欣苑",
+                        "房号": "14-2-901",
+                        "户型分类": "两室一厅",
+                        "押一付一": "4900",
+                    },
+                    {
+                        "区域": "石桥街道 华丰 石桥 永佳 半山",
+                        "小区": "石桥铭苑",
+                        "房号": "6-1102",
+                        "户型分类": "两室一厅",
+                        "押一付一": "4800",
+                    },
+                ]
+            )
+
+            rows = await inventory.search("石桥区域就行，不是只问石桥铭苑。", limit=8)
+
+            self.assertEqual(
+                [(row["小区"], row["房号"]) for row in rows],
+                [("华丰欣苑", "14-2-901"), ("石桥铭苑", "6-1102")],
+            )
+        finally:
+            settings.inventory_source = previous_source
+
     async def test_low_price_request_sorts_by_lowest_monthly_rent(self) -> None:
         previous_source = settings.inventory_source
         try:

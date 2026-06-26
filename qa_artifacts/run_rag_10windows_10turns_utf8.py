@@ -365,6 +365,10 @@ def _turn_problem(turn: dict[str, Any]) -> dict[str, Any]:
     if chain.get("status") in {"error", "no_output", "retry_needed"}:
         problem["severity"] = "high"
         return problem
+    if chain.get("status") == "clarification" and _has_real_entity_clarification_options(turn):
+        problem["severity"] = "info"
+        problem["reason"] = "基于真实房源候选的小区确认，不计入人工复核失败。"
+        return problem
     if chain.get("status") in {"clarification", "planner_feedback"}:
         problem["severity"] = "medium"
         return problem
@@ -425,6 +429,7 @@ def _turn_problem(turn: dict[str, Any]) -> dict[str, Any]:
         and target_rows
         and not has_current_scope
         and int(blackbox.get("last_candidate_count_after_turn") or 0) == 0
+        and not _selected_binding_has_prior_context(selected_indices, target_rows, blackbox)
     ):
         problem["severity"] = "high"
         problem["likely_link"] = "Planner/工具目标绑定"
@@ -455,6 +460,66 @@ def _turn_problem(turn: dict[str, Any]) -> dict[str, Any]:
         problem["severity"] = "medium"
         problem["reason"] = "回复可能要求重复已给信息，需要人工复核上下文是否已足够。"
     return problem
+
+
+def _selected_binding_has_prior_context(
+    selected_indices: Any,
+    target_rows: list[str],
+    blackbox: dict[str, Any],
+) -> bool:
+    try:
+        max_selected = max(int(index) for index in selected_indices or [])
+    except (TypeError, ValueError):
+        return False
+    if max_selected <= 0 or len(target_rows) < max_selected:
+        return False
+    if int(blackbox.get("last_candidate_count_before_turn") or 0) >= max_selected:
+        return True
+    return _pending_labels_cover_targets(
+        blackbox.get("pending_video_sends_before_turn"),
+        target_rows,
+    )
+
+
+def _pending_labels_cover_targets(pending: Any, target_rows: list[str]) -> bool:
+    if not isinstance(pending, dict):
+        return False
+    labels = [
+        str(label).strip()
+        for label in pending.get("labels") or []
+        if str(label).strip()
+    ]
+    if not labels:
+        return False
+    return all(any(target == label for label in labels) for target in target_rows)
+
+
+def _has_real_entity_clarification_options(turn: dict[str, Any]) -> bool:
+    rewrite = turn.get("rewrite") or {}
+    clarification = "\n".join(
+        [
+            str(rewrite.get("clarification_text") or ""),
+            *[str(text) for text in (turn.get("bot") or {}).get("texts") or []],
+        ]
+    )
+    if not clarification:
+        return False
+    if "暂时没查到" in clarification and "你说的是" not in clarification and "相近小区" not in clarification:
+        return False
+    entity_resolution = _last_stage_summary(turn, "rewrite_intent").get("entity_resolution") or {}
+    options: list[str] = []
+    for item in entity_resolution.get("community_options") or []:
+        if not isinstance(item, dict):
+            continue
+        for option in item.get("options") or []:
+            text = str(option).strip()
+            if text and text not in options:
+                options.append(text)
+    if not options:
+        return False
+    if not any(option in clarification for option in options):
+        return False
+    return any(word in clarification for word in ("确认", "哪一个", "哪个", "你说的是", "相近小区"))
 
 
 def _stage_entries(turn: dict[str, Any], stage: str) -> list[dict[str, Any]]:
@@ -614,7 +679,12 @@ def _first_context_summary(store: base.MemoryContextStore) -> dict[str, Any]:
     return {}
 
 
-def _enrich_turn_report(turn: dict[str, Any], store: base.MemoryContextStore) -> None:
+def _enrich_turn_report(
+    turn: dict[str, Any],
+    store: base.MemoryContextStore,
+    *,
+    pre_context_snapshot: dict[str, Any] | None = None,
+) -> None:
     rewrite = _last_stage_summary(turn, "rewrite_intent")
     planner_entries = _stage_entries(turn, "planner")
     planner_summaries = [
@@ -626,6 +696,7 @@ def _enrich_turn_report(turn: dict[str, Any], store: base.MemoryContextStore) ->
     selfcheck_summary = _last_stage_summary(turn, "final_selfcheck")
     send_summary = _last_stage_summary(turn, "send")
     context_snapshot = _first_context_summary(store)
+    pre_context_snapshot = pre_context_snapshot or {}
     selected_indices = rewrite.get("selected_indices") or []
     target_rows = tool_summary.get("target_rows") or []
 
@@ -661,6 +732,11 @@ def _enrich_turn_report(turn: dict[str, Any], store: base.MemoryContextStore) ->
     turn["send"] = send_summary
     turn["blackbox"] = {
         "read_by_rewrite": bool(rewrite),
+        "raw_dialog_context_count_before_turn": pre_context_snapshot.get("raw_dialog_context_count", 0),
+        "turn_record_count_before_turn": pre_context_snapshot.get("turn_record_count", 0),
+        "last_candidate_count_before_turn": pre_context_snapshot.get("last_candidate_count", 0),
+        "confirmed_room_before_turn": pre_context_snapshot.get("confirmed_room"),
+        "pending_video_sends_before_turn": pre_context_snapshot.get("pending_video_sends"),
         "raw_dialog_context_count_after_turn": context_snapshot.get("raw_dialog_context_count", 0),
         "turn_record_count_after_turn": context_snapshot.get("turn_record_count", 0),
         "last_candidate_count_after_turn": context_snapshot.get("last_candidate_count", 0),
@@ -833,6 +909,7 @@ async def run_all(
             all_results.append(window_result)
             write_artifact(False)
             for turn_index, user_text in enumerate(window["turns"], start=1):
+                pre_context_snapshot = _first_context_summary(store)
                 turn = await base.send_turn(
                     fake,
                     conversation_id=conversation_id,
@@ -840,7 +917,7 @@ async def run_all(
                     user_text=user_text,
                     turn_timeout=turn_timeout,
                 )
-                _enrich_turn_report(turn, store)
+                _enrich_turn_report(turn, store, pre_context_snapshot=pre_context_snapshot)
                 turn["problem"] = _turn_problem(turn)
                 turn["problems"] = [turn["problem"]]
                 turns.append(turn)

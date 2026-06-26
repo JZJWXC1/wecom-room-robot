@@ -2,6 +2,7 @@ from app.services.fuzzy_match import fuzzy_contains_score, normalize_search_text
 from app.services.inventory_query import (
     has_new_anchor_outside_rows,
     parse_inventory_query,
+    row_matches_query_anchor,
     row_matches_hard_constraints,
 )
 
@@ -46,11 +47,23 @@ def test_parse_inventory_query_removes_business_filler_from_anchor() -> None:
     shiqiao_query = parse_inventory_query("石桥附近5000左右有两室吗？最好整租。")
     deposit_query = parse_inventory_query("荣润府有没有押一付一的？预算1600到1800。")
     repeated_query = parse_inventory_query("客户又问杨家新雅苑有没有三室的。")
+    send_all_query = parse_inventory_query("能发的都发，先不要超过5套。")
 
     assert wanda_query.anchor_terms == ("万达",)
     assert shiqiao_query.anchor_terms == ("石桥",)
     assert deposit_query.anchor_terms == ("荣润府",)
     assert repeated_query.anchor_terms == ("杨家新雅苑",)
+    assert send_all_query.anchor_terms == ()
+
+
+def test_negated_community_is_not_positive_anchor_for_area_search() -> None:
+    query = parse_inventory_query("石桥区域就行，不是只问石桥铭苑。")
+    shiqiao_area = {"区域": "石桥街道 华丰 石桥 永佳 半山", "小区": "华丰欣苑", "房号": "14-2-901"}
+    named_community = {"区域": "石桥街道 华丰 石桥 永佳 半山", "小区": "石桥铭苑", "房号": "6-1102"}
+
+    assert query.anchor_terms == ("石桥",)
+    assert row_matches_query_anchor(shiqiao_area, query)
+    assert row_matches_query_anchor(named_community, query)
 
 
 def test_room_ref_does_not_swallow_following_price() -> None:

@@ -642,6 +642,14 @@ class KfAgenticRagService:
             "多少",
             "附近",
             "左右",
+            "能发的都发",
+            "能发的都",
+            "能发都发",
+            "可发的都发",
+            "可发的都",
+            "发的都",
+            "不要超过",
+            "不超过",
         }
         terms: list[str] = []
         for token in compact.split():

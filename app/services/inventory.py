@@ -22,6 +22,7 @@ from app.services.inventory_query import (
     filter_scored_by_hard_constraints,
     parse_inventory_query,
     row_prices,
+    _strip_negated_anchor_phrases,
 )
 
 
@@ -195,6 +196,7 @@ class InventoryService:
                 await self.refresh()
             rows = self._parse_image_rows(self._image_text)
             text = self._normalize_query(query)
+            scoring_text = _strip_negated_anchor_phrases(text)
             parsed_query = parse_inventory_query(text)
             room_refs = list(parsed_query.room_refs)
             if room_refs:
@@ -204,20 +206,21 @@ class InventoryService:
             scored: list[tuple[int, dict[str, Any]]] = []
             for row in rows:
                 merged = " ".join(str(value).lower() for value in row.values())
-                score = self._score_row(text, merged, row)
+                score = self._score_row(scoring_text, merged, row)
                 if score > 0 or not text.strip():
                     scored.append((score, row))
             if parsed_query.has_hard_constraints:
                 scored = filter_scored_by_hard_constraints(scored, parsed_query)
                 if not scored:
                     return []
-            scored = self._filter_scored_rows(scored, text=text)
+            scored = self._filter_scored_rows(scored, text=scoring_text)
             return [self._with_inventory_meta(row) for _, row in scored[:limit]]
         self._reload_cache_if_file_changed()
         frame = self._cache if self._cache is not None else await self.refresh()
         if frame.empty:
             return []
         text = self._normalize_query(query)
+        scoring_text = _strip_negated_anchor_phrases(text)
         parsed_query = parse_inventory_query(text)
         room_refs = list(parsed_query.room_refs)
         records = frame.fillna("").to_dict(orient="records")
@@ -228,20 +231,20 @@ class InventoryService:
         scored: list[tuple[int, dict[str, Any]]] = []
         for row in records:
             merged = " ".join(str(value).lower() for value in row.values())
-            score = self._score_row(text, merged, row)
+            score = self._score_row(scoring_text, merged, row)
             if score > 0 or not text.strip():
                 scored.append((score, row))
-        exact_scored = self._exact_community_scored_rows(text, scored)
+        exact_scored = self._exact_community_scored_rows(scoring_text, scored)
         if exact_scored:
             scored = exact_scored
-        area_scored = self._area_scored_rows(text, scored)
+        area_scored = self._area_scored_rows(scoring_text, scored)
         if area_scored:
             scored = area_scored
         if parsed_query.has_hard_constraints:
             scored = filter_scored_by_hard_constraints(scored, parsed_query)
             if not scored:
                 return []
-        strict_price = None if room_refs or parsed_query.price_range else self._requested_strict_price(text)
+        strict_price = None if room_refs or parsed_query.price_range else self._requested_strict_price(scoring_text)
         if strict_price is not None:
             scored = [
                 (score + 10, row)
@@ -250,7 +253,7 @@ class InventoryService:
             ]
             if not scored:
                 return []
-        scored = self._filter_scored_rows(scored, text=text)
+        scored = self._filter_scored_rows(scored, text=scoring_text)
         return [self._with_inventory_meta(row) for _, row in scored[:limit]]
 
     def _score_row(self, text: str, merged: str, row: dict[str, Any]) -> int:

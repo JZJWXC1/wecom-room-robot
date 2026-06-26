@@ -83,6 +83,15 @@ GENERIC_ANCHOR_WORDS = {
     "发给我",
     "给我发",
     "先发",
+    "先不要超过",
+    "不要超过",
+    "不超过",
+    "能发的都发",
+    "能发的都",
+    "能发都发",
+    "可发的都发",
+    "可发的都",
+    "发的都",
     "都发",
     "都发我",
     "全部",
@@ -90,6 +99,7 @@ GENERIC_ANCHOR_WORDS = {
     "看看",
     "看一下",
     "筛一下",
+    "就行",
     "资料",
     "详情",
     "户型",
@@ -97,6 +107,14 @@ GENERIC_ANCHOR_WORDS = {
     "最好",
     "合适",
     "最合适",
+    "不是只问",
+    "不是只看",
+    "不是只",
+    "不只问",
+    "不只看",
+    "不只是",
+    "不只",
+    "不限定",
     "押一付",
     "押二付",
     "押一付一",
@@ -479,10 +497,23 @@ def _anchor_terms(text: str, room_refs: tuple[str, ...], room_type_labels: tuple
     cleaned = re.sub(r"\d{3,5}", "", cleaned)
     for label in room_type_labels:
         cleaned = cleaned.replace(label, "")
+    cleaned = _strip_negated_anchor_phrases(cleaned)
     for word in sorted(GENERIC_ANCHOR_WORDS, key=len, reverse=True):
         cleaned = cleaned.replace(word, "")
     terms = re.findall(r"[a-zA-Z]{2,}|[一-鿿]{2,}", cleaned)
     return list(dict.fromkeys(term for term in terms if term not in GENERIC_ANCHOR_WORDS))
+
+
+def _strip_negated_anchor_phrases(text: str) -> str:
+    community_suffixes = "府苑园城湾郡邸寓里庄庭汇府邸公寓小区"
+    patterns = (
+        rf"(?:不一定是|不一定|不是只问|不是只看|不是只|不是|不要|不限定|不只问|不只看|不只是|不只|不光)[一-鿿]{{1,16}}[{community_suffixes}]",
+        r"(?:不一定是|不一定|不是只问|不是只看|不是只|不是|不要|不限定|不只问|不只看|不只是|不只|不光)[一-鿿]{1,12}(?=[，。；、,.!?！？]|$)",
+    )
+    cleaned = text
+    for pattern in patterns:
+        cleaned = re.sub(pattern, "", cleaned)
+    return cleaned
 
 
 def _row_matches_any_room_ref(row: dict[str, Any], room_refs: list[str]) -> bool:

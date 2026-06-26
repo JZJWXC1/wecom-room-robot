@@ -1640,7 +1640,12 @@ def _looks_like_possible_community_mention(value: str) -> bool:
         "怎么收",
         "怎么安排",
         "怎么定",
+        "能发",
+        "可发",
+        "发的都",
         "都发",
+        "不要超过",
+        "不超过",
         "筛一下",
         "带厅",
         "也算",
@@ -2427,9 +2432,15 @@ def _negated_community_names(content: str, communities: list[str]) -> set[str]:
             f"不一定是{name}",
             f"不一定{name}",
             f"不是{name}",
+            f"不是只{name}",
+            f"不是只问{name}",
+            f"不是只看{name}",
             f"不要{name}",
             f"不限定{name}",
             f"不只{name}",
+            f"不只问{name}",
+            f"不只看{name}",
+            f"不只是{name}",
             f"不光{name}",
         )
         if any(pattern in text for pattern in negated_patterns):
@@ -3825,6 +3836,16 @@ def _target_rows_from_understanding(
     ]
     if selected_rows:
         return selected_rows
+    selected_has_current_scope = bool(
+        proof_communities
+        or proof.get("area")
+        or proof.get("budget_range")
+        or proof.get("layout")
+        or proof.get("features")
+        or explicit_room_refs
+    )
+    if selected and not candidates and not selected_has_current_scope:
+        return []
     if selected and candidates:
         return []
 
@@ -4587,8 +4608,6 @@ def _original_video_followup_without_explicit_target(
     )
     if proof.get("room_refs") or _room_refs_from_text(query_text):
         return False
-    if _selected_indices_from_understanding(understanding, query_text) or _has_explicit_candidate_selection(query_text):
-        return False
     return any(
         word in query_text
         for word in ("原视频", "原片", "高清", "源文件", "素材源", "下载链接", "太糊", "模糊", "糊", "清楚", "保存", "转发")
@@ -5339,7 +5358,12 @@ async def _execute_tools(
             or proof.get("room_refs")
             or _room_refs_from_text(original_room_text)
         )
-        if early_selected_indices and not _candidate_rows(context) and not selection_has_current_scope:
+        if (
+            early_selected_indices
+            and not _candidate_rows(context)
+            and not selection_has_current_scope
+            and not proof.get("wants_original_video")
+        ):
             rows = []
             evidence["selection_error"] = {
                 "requested_indices": early_selected_indices,
@@ -5478,6 +5502,7 @@ async def _execute_tools(
         and not candidate_rows_for_selection
         and not target_rows
         and not rows
+        and not original_video_target_error
     )
     if invalid_candidate_selection:
         candidate_labels = [_row_label(row) for row in candidate_rows_for_selection[:10]]
@@ -5502,6 +5527,7 @@ async def _execute_tools(
         not target_rows
         and not evidence.get("selection_error")
         and field_followup_requires_specific_room
+        and not original_video_target_error
     ):
         candidate_labels = [_row_label(row) for row in candidate_rows_for_selection[:10]]
         evidence["field_target_error"] = {

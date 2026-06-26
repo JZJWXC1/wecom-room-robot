@@ -76,13 +76,60 @@ function Invoke-PytestFiles {
     Invoke-External -FilePath $Python -Arguments $args
 }
 
+function Get-SecretScanValue {
+    param([Parameter(Mandatory = $true)][string]$MatchText)
+
+    $parts = $MatchText -split "[:=]", 2
+    if ($parts.Count -lt 2) {
+        return ""
+    }
+    $value = $parts[1].Trim()
+    if ($value.StartsWith("'") -or $value.StartsWith('"')) {
+        $value = $value.Substring(1)
+    }
+    return $value.Trim()
+}
+
+function Test-AllowedSecretScanFinding {
+    param(
+        [Parameter(Mandatory = $true)][string]$File,
+        [Parameter(Mandatory = $true)][string]$PatternName,
+        [Parameter(Mandatory = $true)][string]$MatchText
+    )
+
+    if ($PatternName -ne "assigned runtime secret") {
+        return $false
+    }
+
+    $normalized = $File -replace "\\", "/"
+    $value = Get-SecretScanValue -MatchText $MatchText
+    if (-not $value) {
+        return $false
+    }
+
+    $isEnvExample = $normalized.EndsWith(".env.example") -or $normalized.EndsWith("/safe_runtime.env.example")
+    if ($isEnvExample -and ($value -match "^(your[_-]|missing[_-])[A-Za-z0-9_-]+$")) {
+        return $true
+    }
+
+    if ($value -match "^\{[A-Za-z_][A-Za-z0-9_]*\}(&|$)") {
+        return $true
+    }
+
+    if ($normalized.StartsWith("tests/") -and ($value -in @("previous_secret", "previous_key"))) {
+        return $true
+    }
+
+    return $false
+}
+
 function Invoke-SecretScan {
     $patterns = @(
         @{ Name = "private key"; Regex = "-----BEGIN (RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----" },
         @{ Name = "OpenAI-style key"; Regex = "\bsk-(proj-)?[A-Za-z0-9_-]{20,}\b" },
         @{ Name = "GitHub token"; Regex = "\bgh[pousr]_[A-Za-z0-9_]{20,}\b" },
         @{ Name = "AWS access key"; Regex = "\bAKIA[0-9A-Z]{16}\b" },
-        @{ Name = "assigned runtime secret"; Regex = "\b(FEISHU_APP_SECRET|WECOM_(KF_)?(SECRET|TOKEN|AES_KEY|ENCODING_AES_KEY)|DASHSCOPE_API_KEY|OPENAI_API_KEY|ACCESS_TOKEN)\s*[:=]\s*['""]?[^'""\s#]{12,}" }
+        @{ Name = "assigned runtime secret"; Regex = "\b(FEISHU_APP_SECRET|WECOM_(KF_)?(SECRET|TOKEN|AES_KEY|ENCODING_AES_KEY)|DASHSCOPE_API_KEY|OPENAI_API_KEY|ACCESS_TOKEN)[^\S\r\n]*[:=][^\S\r\n]*['""]?[^'""\s#]{12,}" }
     )
     $excludePrefixes = @(
         ".git/",
@@ -120,6 +167,9 @@ function Invoke-SecretScan {
         foreach ($pattern in $patterns) {
             $matches = [regex]::Matches($text, $pattern.Regex, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
             foreach ($match in $matches) {
+                if (Test-AllowedSecretScanFinding -File $file -PatternName $pattern.Name -MatchText $match.Value) {
+                    continue
+                }
                 $line = ($text.Substring(0, $match.Index) -split "`n").Count
                 $findings.Add("${file}:$line $($pattern.Name)")
             }

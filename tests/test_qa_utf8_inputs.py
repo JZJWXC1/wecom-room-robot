@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import csv
 import json
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +75,22 @@ def test_required_single_window_inputs_pass_chinese_integrity() -> None:
     assert report["full"]["passed"], report
     assert report["window"]["passed"], report
     assert report["window"]["first_user_raw"] == run_rag_10windows_10turns_utf8.WINDOWS[0]["turns"][0]
+
+
+def test_l4_qa_inventory_fixture_contains_required_entities() -> None:
+    fixture_path = Path("tests/fixtures/qa/test_inventory_cache.csv")
+    index_path = Path("tests/fixtures/qa/test_rewrite_inventory_index.json")
+    rows = list(csv.DictReader(fixture_path.read_text(encoding="utf-8-sig").splitlines()))
+    labels = {f"{row.get('小区', '')}{row.get('房号', '')}" for row in rows}
+    communities = {row.get("小区", "") for row in rows}
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+
+    assert "兴业杨家府" in communities
+    assert "杨家新雅苑" in communities
+    assert "杨乐府" in communities
+    assert "棠润府15-2-801B" in labels
+    assert index["cache_meta"]["source_detail"] == "tests/fixtures/qa/test_inventory_cache.csv"
+    assert index["row_count"] == len(rows)
 
 
 def test_fixture_questions_match_windows_constant_without_importing_source_script() -> None:
@@ -293,6 +310,68 @@ def test_qa_problem_detects_target_rows_violating_rewrite_community() -> None:
     assert problem["likely_link"] == "Planner/工具目标绑定"
 
 
+def test_qa_problem_allows_real_entity_clarification_options() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "杨家府还有房子吗？客户说名字可能没记准。",
+            "bot": {
+                "texts": [
+                    "你说的“杨家府”我这边有几个相近小区：兴业杨家府、杨乐府、杨家新雅苑。你确认下是哪一个，我再按最新房源表查。"
+                ]
+            },
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你说的“杨家府”我这边有几个相近小区：兴业杨家府、杨乐府、杨家新雅苑。你确认下是哪一个，我再按最新房源表查。",
+                "constraint_proof": {},
+            },
+            "stage_timings": [
+                {
+                    "stage": "rewrite_intent",
+                    "summary": {
+                        "entity_resolution": {
+                            "community_options": [
+                                {
+                                    "raw_text": "杨家府",
+                                    "options": ["兴业杨家府", "杨乐府", "杨家新雅苑"],
+                                }
+                            ]
+                        }
+                    },
+                }
+            ],
+        }
+    )
+
+    assert problem["severity"] == "info"
+
+
+def test_qa_problem_keeps_not_found_clarification_as_medium() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "杨家府还有房子吗？客户说名字可能没记准。",
+            "bot": {"texts": ["最新房源表里暂时没查到杨家府这个小区。你确认一下小区名。"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "最新房源表里暂时没查到杨家府这个小区。你确认一下小区名。",
+                "constraint_proof": {},
+            },
+            "stage_timings": [
+                {"stage": "rewrite_intent", "summary": {"entity_resolution": {"community_options": []}}}
+            ],
+        }
+    )
+
+    assert problem["severity"] == "medium"
+
+
 def test_qa_problem_detects_area_query_narrowed_to_specific_community() -> None:
     problem = run_rag_10windows_10turns_utf8._turn_problem(
         {
@@ -371,3 +450,36 @@ def test_qa_problem_detects_selected_indices_bound_without_candidates() -> None:
 
     assert problem["severity"] == "high"
     assert problem["likely_link"] == "Planner/工具目标绑定"
+
+
+def test_qa_problem_allows_selected_indices_bound_to_prior_pending_media_targets() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "这两套有没有原视频或者高清点的？",
+            "bot": {
+                "texts": ["我这边暂时没稳定匹配到对应素材，不能乱发视频或图片。"],
+                "video_count": 0,
+            },
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {
+                "constraint_proof": {
+                    "selected_indices": [1, 2],
+                    "wants_video": True,
+                    "wants_original_video": True,
+                }
+            },
+            "tool": {
+                "target_rows": ["石桥铭苑6-1102", "华丰欣苑14-2-901"],
+                "video_count": 0,
+            },
+            "blackbox": {
+                "last_candidate_count_after_turn": 0,
+                "pending_video_sends_before_turn": {
+                    "labels": ["石桥铭苑6-1102", "华丰欣苑14-2-901"],
+                    "requested_count": 2,
+                },
+            },
+        }
+    )
+
+    assert problem["severity"] == "info"
