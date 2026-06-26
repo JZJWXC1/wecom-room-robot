@@ -112,6 +112,11 @@ function Test-AllowedSecretScanFinding {
         return $true
     }
 
+    $isTestFixture = $normalized.StartsWith("tests/fixtures/")
+    if (($isEnvExample -or $isTestFixture) -and ($value -match "^(your|missing|dummy|fake|test|example|placeholder)[_-][A-Za-z0-9_-]+$")) {
+        return $true
+    }
+
     if ($value -match "^\{[A-Za-z_][A-Za-z0-9_]*\}(&|$)") {
         return $true
     }

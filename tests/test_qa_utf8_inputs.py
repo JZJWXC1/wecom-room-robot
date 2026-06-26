@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import csv
 import json
@@ -394,6 +395,66 @@ def test_qa_problem_detects_area_query_narrowed_to_specific_community() -> None:
     assert problem["likely_link"] == "问题重写/实体归一"
 
 
+def test_qa_problem_detects_negated_community_bound_as_positive_constraint() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "石桥区域就行，不是只问石桥铭苑。",
+            "bot": {"texts": ["暂时没查到石桥铭苑符合条件的房源。"]},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {
+                "constraint_proof": {
+                    "area": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                    "communities": ["石桥铭苑"],
+                }
+            },
+            "tool": {"target_rows": []},
+        }
+    )
+
+    assert problem["severity"] == "high"
+    assert problem["likely_link"] == "问题重写/实体归一"
+    assert "否定" in problem["reason"]
+
+
+def test_qa_problem_detects_confusable_community_target_pollution_without_rewrite_proof() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "杨家新雅苑那套也发视频，最好清楚一点。",
+            "bot": {"texts": ["本地暂时没找到视频：杨乐府9-604B。"], "video_count": 0},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {"constraint_proof": {"wants_video": True}},
+            "tool": {"target_rows": ["杨乐府9-604B"], "video_count": 0},
+        }
+    )
+
+    assert problem["severity"] == "high"
+    assert problem["likely_link"] == "问题重写/实体归一"
+    assert "相似小区" in problem["reason"]
+
+
+def test_qa_problem_detects_selected_indices_with_same_turn_scope_but_no_prior_candidates() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "新天地前两套视频发我。",
+            "bot": {"texts": ["先发这两套。"], "video_count": 0},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {
+                "constraint_proof": {
+                    "area": "东新园 杭氧 新天地",
+                    "budget_range": [4000, 5000],
+                    "selected_indices": [1, 2],
+                    "wants_video": True,
+                }
+            },
+            "tool": {"target_rows": ["白田畈龙吟府4-902B", "杨乐府9-604B"], "video_count": 0},
+            "blackbox": {"last_candidate_count_before_turn": 0, "last_candidate_count_after_turn": 2},
+        }
+    )
+
+    assert problem["severity"] == "high"
+    assert problem["likely_link"] == "Planner/工具目标绑定"
+
+
 def test_qa_problem_detects_unrequested_original_video_batch() -> None:
     problem = run_rag_10windows_10turns_utf8._turn_problem(
         {
@@ -414,6 +475,94 @@ def test_qa_problem_detects_unrequested_original_video_batch() -> None:
 
     assert problem["severity"] == "high"
     assert problem["likely_link"] == "素材目标绑定"
+
+
+def test_qa_problem_detects_media_send_without_stable_listing_id() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "这套视频发我。",
+            "bot": {"texts": ["找到了，这套视频先发你。"], "video_count": 1},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {"constraint_proof": {"wants_video": True}},
+            "tool": {
+                "target_rows": ["棠润府15-2-801B"],
+                "video_rows": ["棠润府15-2-801B"],
+                "video_count": 1,
+                "video_listing_ids": [],
+            },
+        }
+    )
+
+    assert problem["severity"] == "high"
+    assert problem["likely_link"] == "素材目标绑定"
+    assert "listing_id" in problem["reason"]
+
+
+def test_qa_problem_allows_media_send_with_stable_listing_id() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "这套视频发我。",
+            "bot": {"texts": ["找到了，这套视频先发你。"], "video_count": 1},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {"constraint_proof": {"wants_video": True}},
+            "tool": {
+                "target_rows": ["棠润府15-2-801B"],
+                "video_rows": ["棠润府15-2-801B"],
+                "video_count": 1,
+                "video_listing_ids": ["lst_fixture_tangrun"],
+            },
+            "send": {"sent_actions": [{"type": "video", "count": 1}]},
+        }
+    )
+
+    assert problem["severity"] == "info"
+
+
+def test_qa_problem_detects_unsolicited_password_text() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "这套水电怎么收？",
+            "bot": {"texts": ["这套水电是民用，另外看房密码是123456#。"]},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {"constraint_proof": {"wants_water_electric": True}},
+            "tool": {"target_rows": ["棠润府15-2-801B"]},
+        }
+    )
+
+    assert problem["severity"] == "high"
+    assert problem["likely_link"] == "看房密码边界"
+
+
+def test_qa_problem_detects_media_action_tense_mismatch() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "这套视频发我。",
+            "bot": {"texts": ["视频已准备好。"], "video_count": 1},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {"constraint_proof": {"wants_video": True}},
+            "tool": {"video_count": 1, "video_listing_ids": ["lst_fixture_tangrun"]},
+            "send": {"sent_actions": [{"type": "video", "count": 1}]},
+        }
+    )
+
+    assert problem["severity"] == "high"
+    assert problem["likely_link"] == "发送阶段"
+
+
+def test_qa_problem_detects_sent_claim_without_send_action() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "这套视频发我。",
+            "bot": {"texts": ["视频已经发送给你了。"], "video_count": 0},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {"constraint_proof": {"wants_video": True}},
+            "tool": {"video_count": 0, "video_listing_ids": []},
+            "send": {"sent_actions": []},
+        }
+    )
+
+    assert problem["severity"] == "high"
+    assert problem["likely_link"] == "发送阶段"
 
 
 def test_qa_problem_detects_unbound_original_video_followup() -> None:
@@ -483,3 +632,95 @@ def test_qa_problem_allows_selected_indices_bound_to_prior_pending_media_targets
     )
 
     assert problem["severity"] == "info"
+
+
+def test_qa_problem_allows_confirmation_question_without_stage_options() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "荣润府有吗？客户可能写错了。",
+            "bot": {"texts": ["你说的是棠润府吗？确认一下，我再按最新房源表查。"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你说的是棠润府吗？确认一下，我再按最新房源表查。",
+                "constraint_proof": {},
+            },
+            "stage_timings": [{"stage": "rewrite_intent", "summary": {"entity_resolution": {}}}],
+        }
+    )
+
+    assert problem["severity"] == "info"
+
+
+def test_qa_tool_summary_keeps_listing_ids_for_media_binding_audit() -> None:
+    summary = run_rag_test_text_window_utf8._summarize_stage_result(
+        "tools",
+        {
+            "target_rows": [
+                {"小区": "棠润府", "房号": "15-2-801B", "listing_id": "lst_fixture_tangrun"},
+            ],
+            "video_rows": [
+                {"小区": "棠润府", "房号": "15-2-801B", "listing_id": "lst_fixture_tangrun"},
+            ],
+            "image_rows": [
+                {"小区": "棠润府", "房号": "15-2-801B", "listing_id": "lst_fixture_tangrun"},
+            ],
+            "video_paths": ["video.mp4"],
+            "image_paths": ["image.png"],
+        },
+    )
+
+    assert summary["target_listing_ids"] == ["lst_fixture_tangrun"]
+    assert summary["video_listing_ids"] == ["lst_fixture_tangrun"]
+    assert summary["image_listing_ids"] == ["lst_fixture_tangrun"]
+
+
+def test_qa_runner_installs_and_restores_offline_feishu_stub() -> None:
+    import app.main as app_main
+
+    original = app_main.FeishuClient
+    originals = run_rag_test_text_window_utf8.install_offline_service_stubs()
+    try:
+        assert app_main.FeishuClient is run_rag_test_text_window_utf8.OfflineFeishuClient
+        result = asyncio.run(app_main.FeishuClient().sync_media_for_rooms([]))
+        assert result["skipped"][0]["source"] == "offline_qa_replay"
+    finally:
+        run_rag_test_text_window_utf8.restore_offline_service_stubs(originals)
+
+    assert app_main.FeishuClient is original
+
+
+def test_qa_quality_status_marks_high_risk_as_business_failure() -> None:
+    quality = run_rag_10windows_10turns_utf8.build_quality_status(
+        [
+            {
+                "window_id": "sample",
+                "turns": [
+                    {
+                        "turn": 1,
+                        "user": "这套视频发我。",
+                        "bot": {"texts": ["视频已经发送给你了。"]},
+                        "problem": {"severity": "high", "likely_link": "发送阶段", "reason": "sent mismatch"},
+                    }
+                ],
+            }
+        ],
+        completed=True,
+    )
+
+    assert quality["passed"] is False
+    assert quality["business_failure"] is True
+    assert quality["exit_code"] == 3
+    assert quality["business_failures"][0]["severity"] == "high"
+
+
+def test_fast_gate_secret_scan_allows_only_obvious_fixture_placeholders() -> None:
+    script = Path("scripts/rag-v2-test-gates.ps1").read_text(encoding="utf-8")
+
+    assert "dummy|fake|test|example|placeholder" in script
+    assert "OpenAI-style key" in script
+    assert "assigned runtime secret" in script
+    assert "sk-(proj-)?" in script

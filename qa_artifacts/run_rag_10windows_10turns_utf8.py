@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -302,6 +303,27 @@ REQUIRED_TOKENS = (
     "定房",
 )
 BAD_TOKENS = ("???", "�", "锟", "涓", "鑽", "鐭", "鎴")
+CONFUSABLE_COMMUNITY_GROUPS = (
+    ("兴业杨家府", "杨乐府", "杨家新雅苑"),
+    ("棠润府", "荣润府"),
+)
+NEGATION_PREFIXES = (
+    "不是只问",
+    "不只是问",
+    "不只问",
+    "不是问",
+    "不是非要",
+    "不一定是",
+    "不限定",
+    "不限于",
+    "别只看",
+    "不要只看",
+    "不是",
+)
+PASSWORD_VALUE_RE = re.compile(r"(?:看房)?密码(?:是|为|[:：])?\s*[A-Za-z0-9]{4,}#|[A-Za-z0-9]{4,}#")
+SENT_MARKERS = ("已发送", "已经发送", "已经发", "已发给", "已发你", "发给你了", "都发你了")
+PREPARED_MARKERS = ("已准备好", "准备发送", "准备发")
+FAILED_MARKERS = ("发送失败", "上传失败", "发不出去", "没发出去")
 
 
 def chinese_integrity_report(
@@ -395,6 +417,15 @@ def _turn_problem(turn: dict[str, Any]) -> dict[str, Any]:
         main.normalize_search_text(community) in normalized_user
         for community in proof_communities
     )
+    negated_communities = _negated_communities(user_text, proof_communities)
+    if negated_communities:
+        problem["severity"] = "high"
+        problem["likely_link"] = "问题重写/实体归一"
+        problem["reason"] = (
+            "用户明确否定的小区被重写成正向小区约束："
+            f"negated={negated_communities} communities={proof_communities}"
+        )
+        return problem
     if proof.get("area") and proof_communities and area_alias_hit and not user_mentions_exact_community:
         problem["severity"] = "high"
         problem["likely_link"] = "问题重写/实体归一"
@@ -417,26 +448,49 @@ def _turn_problem(turn: dict[str, Any]) -> dict[str, Any]:
                 f"communities={proof_communities} target_rows={wrong_targets[:3]}"
             )
             return problem
-    selected_indices = proof.get("selected_indices") or []
-    has_current_scope = bool(
-        proof.get("communities")
-        or proof.get("area")
-        or proof.get("room_refs")
-        or proof.get("budget_range")
+    confusable_pollution = _confusable_community_pollution(
+        user_text,
+        proof_communities=proof_communities,
+        target_rows=target_rows,
     )
+    if confusable_pollution:
+        problem["severity"] = "high"
+        problem["likely_link"] = "问题重写/实体归一"
+        problem["reason"] = (
+            "相似小区或别名互相污染："
+            f"allowed={confusable_pollution['allowed']} polluted={confusable_pollution['polluted']}"
+        )
+        return problem
+    selected_indices = proof.get("selected_indices") or []
     if (
         selected_indices
         and target_rows
-        and not has_current_scope
-        and int(blackbox.get("last_candidate_count_after_turn") or 0) == 0
         and not _selected_binding_has_prior_context(selected_indices, target_rows, blackbox)
     ):
         problem["severity"] = "high"
         problem["likely_link"] = "Planner/工具目标绑定"
         problem["reason"] = (
-            "纯序号请求没有当前候选或明确范围，却绑定到了房源："
+            "序号请求没有当前候选或上一轮待发素材上下文，却绑定到了房源："
             f"selected_indices={selected_indices} target_rows={target_rows[:3]}"
         )
+        return problem
+    media_listing_problem = _media_request_without_stable_listing_id(user_text, proof, bot, tool)
+    if media_listing_problem:
+        problem["severity"] = "high"
+        problem["likely_link"] = "素材目标绑定"
+        problem["reason"] = media_listing_problem
+        return problem
+    password_problem = _password_boundary_problem(user_text, texts, proof)
+    if password_problem:
+        problem["severity"] = "high"
+        problem["likely_link"] = "看房密码边界"
+        problem["reason"] = password_problem
+        return problem
+    action_tense_problem = _action_tense_problem(texts, bot, tool, turn.get("send") or {})
+    if action_tense_problem:
+        problem["severity"] = "high"
+        problem["likely_link"] = "发送阶段"
+        problem["reason"] = action_tense_problem
         return problem
     asks_original_followup = any(word in user_text for word in ("原视频", "高清", "视频糊", "有点糊", "太糊", "清楚一点", "保存转发", "源文件"))
     explicit_batch = any(word in user_text for word in ("这几套", "这些", "都发", "全部", "前两套", "前三套", "两套", "三套", "1和", "1 和"))
@@ -494,6 +548,135 @@ def _pending_labels_cover_targets(pending: Any, target_rows: list[str]) -> bool:
     return all(any(target == label for label in labels) for target in target_rows)
 
 
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def _negated_communities(user_text: str, communities: list[str]) -> list[str]:
+    compact = _compact_text(user_text)
+    negated: list[str] = []
+    for community in communities:
+        community_text = _compact_text(community)
+        if not community_text:
+            continue
+        if any(f"{prefix}{community_text}" in compact for prefix in NEGATION_PREFIXES):
+            negated.append(community)
+    return negated
+
+
+def _mentioned_confusable_communities(user_text: str) -> dict[tuple[str, ...], set[str]]:
+    normalized_user = main.normalize_search_text(user_text)
+    mentioned: dict[tuple[str, ...], set[str]] = {}
+    for group in CONFUSABLE_COMMUNITY_GROUPS:
+        hits = {
+            community
+            for community in group
+            if main.normalize_search_text(community) in normalized_user
+        }
+        if hits:
+            mentioned[group] = hits
+    return mentioned
+
+
+def _confusable_community_pollution(
+    user_text: str,
+    *,
+    proof_communities: list[str],
+    target_rows: list[str],
+) -> dict[str, Any] | None:
+    mentioned = _mentioned_confusable_communities(user_text)
+    if not mentioned:
+        return None
+    polluted: list[str] = []
+    for group, allowed in mentioned.items():
+        negated = set(_negated_communities(user_text, list(group)))
+        allowed = {item for item in allowed if item not in negated}
+        if not allowed:
+            continue
+        group_set = set(group)
+        for community in proof_communities:
+            if community in group_set and community not in allowed:
+                polluted.append(f"rewrite:{community}")
+        for label in target_rows:
+            row_hits = [community for community in group if community in label]
+            polluted.extend(f"target:{community}" for community in row_hits if community not in allowed)
+        if polluted:
+            return {"allowed": sorted(allowed), "polluted": polluted}
+    return None
+
+
+def _int_count(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _media_request_without_stable_listing_id(
+    user_text: str,
+    proof: dict[str, Any],
+    bot: dict[str, Any],
+    tool: dict[str, Any],
+) -> str:
+    wants_video = bool(proof.get("wants_video") or proof.get("wants_original_video")) or any(
+        word in user_text for word in ("视频", "原视频", "高清", "清楚一点", "源文件")
+    )
+    wants_image = bool(proof.get("wants_image")) or any(word in user_text for word in ("图片", "图也发", "照片"))
+    video_count = _int_count(tool.get("video_count") or bot.get("video_count"))
+    image_count = _int_count(tool.get("image_count"))
+    if wants_image and not image_count:
+        image_count = _int_count(bot.get("image_count"))
+    video_listing_ids = [str(item).strip() for item in tool.get("video_listing_ids") or [] if str(item).strip()]
+    image_listing_ids = [str(item).strip() for item in tool.get("image_listing_ids") or [] if str(item).strip()]
+    if wants_video and video_count > 0 and len(video_listing_ids) < video_count:
+        return f"视频请求发送了素材但缺少稳定 listing_id：video_count={video_count} listing_ids={len(video_listing_ids)}"
+    if wants_image and image_count > 0 and len(image_listing_ids) < image_count:
+        return f"图片请求发送了素材但缺少稳定 listing_id：image_count={image_count} listing_ids={len(image_listing_ids)}"
+    return ""
+
+
+def _password_boundary_problem(user_text: str, reply_text: str, proof: dict[str, Any]) -> str:
+    if "密码" in user_text or bool(proof.get("wants_password")):
+        return ""
+    if "密码" in reply_text or PASSWORD_VALUE_RE.search(reply_text):
+        return "用户没有询问密码，但回复出现密码字样或密码格式。"
+    return ""
+
+
+def _sent_action_count(send: dict[str, Any], *types: str) -> int:
+    total = 0
+    for action in send.get("sent_actions") or []:
+        if not isinstance(action, dict) or action.get("type") not in types:
+            continue
+        total += _int_count(action.get("count") or 1)
+    return total
+
+
+def _action_tense_problem(texts: str, bot: dict[str, Any], tool: dict[str, Any], send: dict[str, Any]) -> str:
+    sent_text = any(marker in texts for marker in SENT_MARKERS)
+    prepared_text = any(marker in texts for marker in PREPARED_MARKERS)
+    failed_text = any(marker in texts for marker in FAILED_MARKERS)
+    if sum(bool(item) for item in (sent_text, prepared_text, failed_text)) > 1:
+        return "回复同时混用准备发送、已发送或发送失败状态。"
+    sent_media_count = (
+        _sent_action_count(send, "image", "video")
+        or _int_count(bot.get("image_count"))
+        + _int_count(bot.get("video_count"))
+        or _int_count(tool.get("image_count"))
+        + _int_count(tool.get("video_count"))
+    )
+    failed_media_count = _sent_action_count(send, "image_failed", "video_failed")
+    if sent_text and sent_media_count == 0:
+        return "回复宣称素材已发送，但发送阶段没有成功素材动作。"
+    if prepared_text and sent_media_count > 0:
+        return "回复宣称素材只是准备发送，但发送阶段已经成功发送素材。"
+    if failed_text and sent_media_count > 0:
+        return "回复宣称素材发送失败，但发送阶段已有成功素材动作。"
+    if sent_text and failed_media_count > 0 and sent_media_count == 0:
+        return "回复宣称素材已发送，但发送阶段只有失败动作。"
+    return ""
+
+
 def _has_real_entity_clarification_options(turn: dict[str, Any]) -> bool:
     rewrite = turn.get("rewrite") or {}
     clarification = "\n".join(
@@ -516,10 +699,22 @@ def _has_real_entity_clarification_options(turn: dict[str, Any]) -> bool:
             if text and text not in options:
                 options.append(text)
     if not options:
-        return False
+        return _looks_like_confirmation_clarification(clarification)
     if not any(option in clarification for option in options):
         return False
     return any(word in clarification for word in ("确认", "哪一个", "哪个", "你说的是", "相近小区"))
+
+
+def _looks_like_confirmation_clarification(clarification: str) -> bool:
+    if "暂时没查到" in clarification:
+        return False
+    if not any(word in clarification for word in ("确认", "你说的是", "是不是", "是指", "指的是")):
+        return False
+    return any(
+        community in clarification
+        for group in CONFUSABLE_COMMUNITY_GROUPS
+        for community in group
+    )
 
 
 def _stage_entries(turn: dict[str, Any], stage: str) -> list[dict[str, Any]]:
@@ -746,6 +941,9 @@ def _enrich_turn_report(
     turn["candidate_binding"] = {
         "selected_indices": selected_indices,
         "target_rows": target_rows,
+        "target_listing_ids": tool_summary.get("target_listing_ids") or [],
+        "video_listing_ids": tool_summary.get("video_listing_ids") or [],
+        "image_listing_ids": tool_summary.get("image_listing_ids") or [],
         "bound_last_candidate": bool(selected_indices and target_rows),
     }
 
@@ -887,6 +1085,7 @@ async def run_all(
         "kf_turn_tasks": dict(main.kf_turn_tasks),
         "kf_turn_generations": dict(main.kf_turn_generations),
         "kf_turn_pending_messages": dict(main.kf_turn_pending_messages),
+        "offline_service_stubs": base.install_offline_service_stubs(),
     }
     try:
         for window_index, window in enumerate(selected_windows, start=1):
@@ -932,6 +1131,7 @@ async def run_all(
         main.kf_turn_generations.update(originals["kf_turn_generations"])
         main.kf_turn_pending_messages.clear()
         main.kf_turn_pending_messages.update(originals["kf_turn_pending_messages"])
+        base.restore_offline_service_stubs(originals["offline_service_stubs"])
 
     completed = (
         len(all_results) == len(selected_windows)

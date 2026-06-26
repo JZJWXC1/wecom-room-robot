@@ -14,6 +14,7 @@ from tests.offline_guard import activate_offline_test_mode, offline_guard_status
 activate_offline_test_mode()
 
 import app.main as main
+from qa_artifacts import run_rag_test_text_window_utf8 as qa_base
 
 
 SCRIPT_PATH = Path(__file__)
@@ -244,6 +245,7 @@ async def run() -> Path:
         "kf_turn_tasks": dict(main.kf_turn_tasks),
         "kf_turn_generations": dict(main.kf_turn_generations),
         "kf_turn_pending_messages": dict(main.kf_turn_pending_messages),
+        "offline_service_stubs": qa_base.install_offline_service_stubs(),
     }
     main.wecom_kf = fake
     main.wecom_kf_context_store = store
@@ -271,6 +273,7 @@ async def run() -> Path:
         main.kf_turn_generations.update(originals["kf_turn_generations"])
         main.kf_turn_pending_messages.clear()
         main.kf_turn_pending_messages.update(originals["kf_turn_pending_messages"])
+        qa_base.restore_offline_service_stubs(originals["offline_service_stubs"])
 
     completed = (
         len(conversations) == len(SEEDS)

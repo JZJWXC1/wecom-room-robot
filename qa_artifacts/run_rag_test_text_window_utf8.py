@@ -113,6 +113,27 @@ class MemoryContextStore:
         self.data[key] = copy.deepcopy(context)
 
 
+class OfflineFeishuClient:
+    async def sync_media_for_rooms(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"skipped": [{"source": "offline_qa_replay", "reason": "external_feishu_sync_disabled"}]}
+
+    async def sync_drive_media_for_rooms(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        return {"skipped": [{"source": "offline_qa_replay", "reason": "external_feishu_sync_disabled"}]}
+
+
+def install_offline_service_stubs() -> dict[str, Any]:
+    originals: dict[str, Any] = {}
+    if hasattr(main, "FeishuClient"):
+        originals["FeishuClient"] = main.FeishuClient
+        main.FeishuClient = OfflineFeishuClient
+    return originals
+
+
+def restore_offline_service_stubs(originals: dict[str, Any]) -> None:
+    if "FeishuClient" in originals:
+        main.FeishuClient = originals["FeishuClient"]
+
+
 def load_questions(path: Path = INPUT_SOURCE_PATH) -> list[str]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(data, dict) and isinstance(data.get("turns"), list):
@@ -219,6 +240,22 @@ def _room_labels(rows: Any, limit: int = 8) -> list[str]:
     return [label for label in labels if label][:limit]
 
 
+def _row_listing_id(row: Any) -> str:
+    if isinstance(row, dict):
+        for key in ("listing_id", "listingId", "房源ID", "房源编号"):
+            value = str(row.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _row_listing_ids(rows: Any, limit: int = 8) -> list[str]:
+    if not isinstance(rows, list):
+        return []
+    listing_ids = [_row_listing_id(row) for row in rows]
+    return [listing_id for listing_id in listing_ids if listing_id][:limit]
+
+
 def _summarize_stage_result(stage: str, result: Any) -> dict[str, Any]:
     if stage == "rewrite_intent" and isinstance(result, dict):
         return {
@@ -249,6 +286,9 @@ def _summarize_stage_result(stage: str, result: Any) -> dict[str, Any]:
             "target_rows": _room_labels(result.get("target_rows")),
             "video_rows": _room_labels(result.get("video_rows")),
             "image_rows": _room_labels(result.get("image_rows")),
+            "target_listing_ids": _row_listing_ids(result.get("target_rows")),
+            "video_listing_ids": _row_listing_ids(result.get("video_rows")),
+            "image_listing_ids": _row_listing_ids(result.get("image_rows")),
             "video_count": len(result.get("video_paths") or []),
             "image_count": len(result.get("image_paths") or []),
             "inventory_image_count": len(result.get("inventory_images") or []),
@@ -462,6 +502,7 @@ async def run_window(
         "kf_turn_tasks": dict(main.kf_turn_tasks),
         "kf_turn_generations": dict(main.kf_turn_generations),
         "kf_turn_pending_messages": dict(main.kf_turn_pending_messages),
+        "offline_service_stubs": install_offline_service_stubs(),
     }
     main.wecom_kf = fake
     main.wecom_kf_context_store = store
@@ -526,6 +567,7 @@ async def run_window(
         main.kf_turn_generations.update(originals["kf_turn_generations"])
         main.kf_turn_pending_messages.clear()
         main.kf_turn_pending_messages.update(originals["kf_turn_pending_messages"])
+        restore_offline_service_stubs(originals["offline_service_stubs"])
 
     write_artifact(completed=len(turns) == len(selected) and not any(turn.get("error") for turn in turns))
     return artifact

@@ -22,6 +22,15 @@
 - 密码只能在明确看房/密码意图且目标房源已绑定时进入回复。
 - 公共 artifact、日志、报告和安全输出不得泄露 token、App Secret、真实密码或运行凭证。
 
+QA replay artifact 的业务审计必须保留这些高风险判定：
+
+- 没有当前候选集或上一轮待发素材上下文时，`第一套`、`前两套`、`1和3` 等序号请求不能绑定到同轮任意搜索结果。
+- `不是只问石桥铭苑`、`不是杨家府` 等否定约束不能被重写成正向精确小区。
+- `杨家府`、`杨乐府`、`杨家新雅苑`、`棠润府`、`荣润府` 等相似小区不能互相污染；确认式追问可以是 `info`，不能误标成业务失败。
+- 视频、图片等房源素材请求必须带稳定 `listing_id` 证据；只有房源 label 不足以证明可以发送。
+- 用户没有问密码时，客户可见回复不能出现密码字样或密码格式。
+- `准备发送`、`已发送`、`发送失败` 必须和发送阶段动作一致，不能互相混用。
+
 ## L1: 最快结构门禁
 
 面向小改动和提交前快速自检。
@@ -62,6 +71,7 @@
 - 最近候选集、序号选择、上下文继承和新锚点识别。
 - 图片、视频、原视频链接与目标房源绑定。
 - 看房密码和敏感访问边界。
+- QA replay 审计函数的 UTF-8 输入、候选绑定、否定约束、相似小区污染、素材 listing_id、发送时态和 high/medium 分级。
 
 ## L3: 单次全量门禁
 
@@ -84,7 +94,7 @@ L3 只把全量 pytest 跑一次，用于开发效率；它不替代发布前的
 - 连续 3 次全量 `pytest -q`。
 - 20+ parity QA：默认运行两个 10-window UTF-8 RAG parity runner。
 - rollback/cutover safety：`tests/test_inventory_snapshot.py` 与 `tests/test_inventory_snapshot_m1d2b2.py`。
-- secret scan：扫描已跟踪文件中的私钥、OpenAI/GitHub/AWS 样式密钥和运行时凭证赋值。
+- secret scan：扫描已跟踪文件中的私钥、OpenAI/GitHub/AWS 样式密钥和运行时凭证赋值；仅允许 `.env.example` 或测试 fixture 中显然是 `your_`、`missing_`、`dummy_`、`fake_`、`test_`、`example_`、`placeholder_` 这类占位值。
 - `python -m compileall app`。
 - `git diff --check`。
 
