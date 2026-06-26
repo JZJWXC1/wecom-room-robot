@@ -12,8 +12,11 @@ from app.services.inventory_read_models import (
     REASON_ALIAS_COVERAGE_FAILED,
     REASON_FALLBACK_NOT_ALLOWED_AFTER_READ,
     REASON_INVALID_MODE,
+    REASON_FALLBACK_USED,
+    REASON_MISSING_SNAPSHOT,
     REASON_RECONCILIATION_BLOCKING,
     REASON_SECRET_SCAN_FAILED,
+    REASON_SOURCE_UNAVAILABLE,
     REASON_SNAPSHOT_INTEGRITY_FAILED,
     REASON_SNAPSHOT_POINTER_MISSING,
     REASON_SNAPSHOT_READ_FAILED,
@@ -187,7 +190,7 @@ class InventoryReadRouter:
                 decision_id=fallback_context.decision_id,
                 context=fallback_context,
                 error=snapshot_context_or_error,
-                reasons=(snapshot_context_or_error.code,),
+                reasons=(REASON_FALLBACK_USED, snapshot_context_or_error.code),
             )
         return InventoryReadDecision(
             ok=False,
@@ -263,12 +266,22 @@ class InventoryReadRouter:
         reader = self.snapshot_provider.reader
         pointer = reader.get_current_pointer()
         if not pointer.ok:
-            code = REASON_SNAPSHOT_POINTER_MISSING if pointer.status == "missing" else REASON_SNAPSHOT_INTEGRITY_FAILED
+            issue_codes = {
+                str(issue.get("code") if isinstance(issue, Mapping) else getattr(issue, "code", ""))
+                for issue in pointer.issues
+            }
+            if pointer.status == "missing":
+                code = REASON_SNAPSHOT_POINTER_MISSING
+            elif "pointer_snapshot_missing" in issue_codes:
+                code = REASON_MISSING_SNAPSHOT
+            else:
+                code = REASON_SNAPSHOT_INTEGRITY_FAILED
             return InventoryReadError(code, pointer.message, details=pointer.to_dict())
         snapshot_result = reader.get_snapshot(pointer.value.snapshot_id)
         if not snapshot_result.ok:
+            code = REASON_MISSING_SNAPSHOT if snapshot_result.status == "missing" else REASON_SNAPSHOT_INTEGRITY_FAILED
             return InventoryReadError(
-                REASON_SNAPSHOT_INTEGRITY_FAILED,
+                code,
                 snapshot_result.message,
                 details=snapshot_result.to_dict(),
             )
@@ -339,7 +352,7 @@ class InventoryReadRouter:
             return InventoryReadHealth(
                 status="error",
                 source_kind=SOURCE_KIND_SNAPSHOT,
-                code=type(exc).__name__.lower(),
+                code=REASON_SOURCE_UNAVAILABLE,
                 message=str(exc)[:300],
             )
 

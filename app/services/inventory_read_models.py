@@ -29,6 +29,9 @@ REASON_SECRET_SCAN_FAILED = "secret_scan_failed"
 REASON_ALIAS_COVERAGE_FAILED = "alias_coverage_failed"
 REASON_UNSUPPORTED_SCHEMA = "unsupported_schema"
 REASON_SNAPSHOT_READ_FAILED = "snapshot_read_failed"
+REASON_MISSING_SNAPSHOT = "missing_snapshot"
+REASON_SOURCE_UNAVAILABLE = "source_unavailable"
+REASON_FALLBACK_USED = "fallback_used"
 REASON_FALLBACK_NOT_ALLOWED_AFTER_READ = "fallback_not_allowed_after_read"
 REASON_INVALID_MODE = "invalid_inventory_read_mode"
 REASON_CONTEXT_PROVIDER_MISMATCH = "context_provider_mismatch"
@@ -162,6 +165,7 @@ class InventoryReadContext:
 @dataclass(frozen=True)
 class InventoryListingEvidence:
     evidence_id: str
+    decision_id: str
     listing_id: str
     source_kind: str
     source_hash: str
@@ -192,6 +196,7 @@ class InventoryListingEvidence:
     def to_dict(self) -> dict[str, Any]:
         payload = {
             "evidence_id": self.evidence_id,
+            "decision_id": self.decision_id,
             "listing_id": self.listing_id,
             "source_kind": self.source_kind,
             "snapshot_id": self.snapshot_id,
@@ -291,6 +296,13 @@ def assert_evidence_consistency(
             REASON_MIXED_SOURCE_HASH,
             "one evidence result set must not mix multiple source_hash values",
             details={"source_hashes": sorted(source_hashes), "context_source_hash": context.source_hash},
+        )
+    decision_ids = {item.decision_id for item in evidence}
+    if decision_ids != {context.decision_id}:
+        raise InventoryReadError(
+            REASON_CONTEXT_PROVIDER_MISMATCH,
+            "evidence decision_id must match the request context",
+            details={"decision_ids": sorted(decision_ids), "context_decision_id": context.decision_id},
         )
 
 

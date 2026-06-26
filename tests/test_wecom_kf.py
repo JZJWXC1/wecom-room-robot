@@ -641,6 +641,7 @@ class InventoryReadRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ], [
                     main.InventoryListingEvidence(
                         evidence_id="evd_bad",
+                        decision_id=context.decision_id,
                         listing_id="lst_bad",
                         source_kind=context.source_kind,
                         source_hash="different_hash",

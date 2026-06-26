@@ -7,7 +7,7 @@ from typing import Any, Callable
 from app.services.inventory_read_models import (
     READ_MODE_DISABLED,
     READ_MODE_SHADOW,
-    REASON_SNAPSHOT_READ_FAILED,
+    REASON_SOURCE_UNAVAILABLE,
     SOURCE_KIND_LEGACY,
     SOURCE_KIND_SNAPSHOT,
     InventoryListingEvidence,
@@ -94,7 +94,7 @@ def create_customer_inventory_read_context(
     if decision.ok and decision.context is not None:
         return decision.context
     raise decision.error or InventoryReadError(
-        REASON_SNAPSHOT_READ_FAILED,
+        REASON_SOURCE_UNAVAILABLE,
         "inventory read source selection failed",
     )
 
@@ -115,7 +115,7 @@ def create_local_inventory_read_context(
     if decision.ok and decision.context is not None:
         return decision.context
     raise decision.error or InventoryReadError(
-        REASON_SNAPSHOT_READ_FAILED,
+        REASON_SOURCE_UNAVAILABLE,
         "local inventory read source selection failed",
     )
 
@@ -287,6 +287,6 @@ def _safe_hash(*parts: Any) -> str:
 
 def _snapshot_disabled_error() -> InventoryReadError:
     return InventoryReadError(
-        REASON_SNAPSHOT_READ_FAILED,
+        REASON_SOURCE_UNAVAILABLE,
         "customer inventory read path must not query snapshot in this milestone",
     )

@@ -366,6 +366,7 @@ def _legacy_row_to_evidence(
     viewing_text = _row_value(row, FIELD_ALIASES["viewing_text"])
     return InventoryListingEvidence(
         evidence_id=make_evidence_id(context, listing_id),
+        decision_id=context.decision_id,
         listing_id=listing_id,
         source_kind=context.source_kind,
         snapshot_id="",
@@ -392,6 +393,7 @@ def _snapshot_listing_to_evidence(
 ) -> InventoryListingEvidence:
     return InventoryListingEvidence(
         evidence_id=make_evidence_id(context, listing.listing_id),
+        decision_id=context.decision_id,
         listing_id=listing.listing_id,
         source_kind=context.source_kind,
         snapshot_id=context.snapshot_id,

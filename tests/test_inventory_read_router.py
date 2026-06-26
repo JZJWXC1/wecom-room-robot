@@ -19,13 +19,16 @@ from app.services.inventory_read_models import (
     READ_MODE_SHADOW,
     REASON_ALIAS_COVERAGE_FAILED,
     REASON_CONTEXT_PROVIDER_MISMATCH,
+    REASON_FALLBACK_USED,
     REASON_FALLBACK_NOT_ALLOWED_AFTER_READ,
+    REASON_MISSING_SNAPSHOT,
     REASON_MIXED_SOURCE_HASH,
     REASON_RECONCILIATION_BLOCKING,
     REASON_SECRET_SCAN_FAILED,
     REASON_SNAPSHOT_POINTER_MISSING,
     REASON_SNAPSHOT_READ_FAILED,
     REASON_SNAPSHOT_STALE,
+    REASON_SOURCE_UNAVAILABLE,
     REASON_UNSUPPORTED_SCHEMA,
     SOURCE_KIND_LEGACY,
     SOURCE_KIND_SNAPSHOT,
@@ -38,6 +41,7 @@ from app.services.inventory_read_provider import (
     LegacyInventoryReadProvider,
     SnapshotInventoryReadProvider,
 )
+from app.services import inventory_read_turn
 from app.services.inventory_read_router import InventoryReadRouter
 from app.services.inventory_snapshot_builder import SnapshotBuilder
 from app.services.inventory_snapshot_models import InventorySourceMetadata, generate_listing_id, now_utc_iso
@@ -264,6 +268,27 @@ def test_shadow_chat_mode_can_skip_snapshot_health_probe(tmp_path: Path) -> None
     assert rows
 
 
+def test_customer_shadow_context_never_calls_snapshot_primary_reader() -> None:
+    class FakeInventory:
+        cache_meta = {"status": "success", "hash": "customer_hash", "row_count": 0}
+
+    context = inventory_read_turn.create_customer_inventory_read_context(
+        prefix="unit",
+        open_kfid="kf",
+        external_userid="wm",
+        content="影子模式也不能读 snapshot",
+        inventory_service=FakeInventory(),
+        rewrite_index_loader=lambda: {},
+        inventory_snapshot_mode=READ_MODE_SHADOW,
+        msgids=["msg-1"],
+    )
+
+    assert context.source_kind == SOURCE_KIND_LEGACY
+    assert context.selection_mode == READ_MODE_SHADOW
+    assert context.snapshot_id == ""
+    assert context.health_at_selection["details"]["shadow_snapshot"]["status"] == "not_queried"
+
+
 def test_primary_healthy_selects_snapshot_locally(tmp_path: Path) -> None:
     snapshot = publish_snapshot(tmp_path)
     session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).start_turn(
@@ -276,6 +301,8 @@ def test_primary_healthy_selects_snapshot_locally(tmp_path: Path) -> None:
     assert session.context.snapshot_id == snapshot.snapshot_id
     assert listing_ids(rows) == [generate_listing_id("晨星花园", "1-101A")]
     assert all(item.snapshot_id == snapshot.snapshot_id for item in rows)
+    assert all(item.decision_id == session.context.decision_id for item in rows)
+    assert "decision_id" in rows[0].to_dict()
 
 
 def test_primary_pointer_missing_strict_fails_and_whole_request_fallback_uses_legacy(tmp_path: Path) -> None:
@@ -295,6 +322,22 @@ def test_primary_pointer_missing_strict_fails_and_whole_request_fallback_uses_le
     assert fallback_session.context.source_kind == SOURCE_KIND_LEGACY
     assert fallback_session.context.fallback_used is True
     assert fallback_session.context.fallback_reason == REASON_SNAPSHOT_POINTER_MISSING
+    assert fallback_session.decision.reasons == (REASON_FALLBACK_USED, REASON_SNAPSHOT_POINTER_MISSING)
+
+
+def test_primary_pointer_to_missing_snapshot_returns_missing_snapshot_reason(tmp_path: Path) -> None:
+    snapshot = publish_snapshot(tmp_path)
+    shutil.rmtree(tmp_path / "snapshots" / snapshot.snapshot_id)
+
+    decision = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).select_context(
+        request_id="req-missing-snapshot",
+        turn_id="turn-1",
+    )
+
+    assert decision.ok is False
+    assert decision.error is not None
+    assert decision.error.code == REASON_MISSING_SNAPSHOT
+    assert decision.error.to_dict()["details"]["issues"][0]["code"] == "pointer_snapshot_missing"
 
 
 def test_primary_readiness_gates_return_structured_reason_codes(tmp_path: Path) -> None:
@@ -374,6 +417,7 @@ def test_context_provider_mismatch_and_mixed_evidence_are_blocked(tmp_path: Path
     good = run(legacy_session.search_inventory("晨星花园1-101A", limit=1))[0]
     bad = InventoryListingEvidence(
         evidence_id="evd_bad",
+        decision_id=good.decision_id,
         listing_id=good.listing_id,
         source_kind=SOURCE_KIND_LEGACY,
         source_hash="different_hash",
@@ -385,6 +429,26 @@ def test_context_provider_mismatch_and_mixed_evidence_are_blocked(tmp_path: Path
     with pytest.raises(InventoryReadError) as mixed_error:
         assert_evidence_consistency(legacy_session.context, [good, bad])
     assert mixed_error.value.code == REASON_MIXED_SOURCE_HASH
+
+
+def test_evidence_decision_id_must_match_turn_context(tmp_path: Path) -> None:
+    session = router(tmp_path).start_turn(request_id="req-decision", turn_id="turn-1")
+    good = run(session.search_inventory("晨星花园1-101A", limit=1))[0]
+    bad = InventoryListingEvidence(
+        evidence_id="evd_bad_decision",
+        decision_id="ird_other",
+        listing_id=good.listing_id,
+        source_kind=good.source_kind,
+        source_hash=good.source_hash,
+        schema_version=good.schema_version,
+        area=good.area,
+        community=good.community,
+        room_no=good.room_no,
+    )
+
+    with pytest.raises(InventoryReadError) as excinfo:
+        assert_evidence_consistency(session.context, [bad])
+    assert excinfo.value.code == REASON_CONTEXT_PROVIDER_MISMATCH
 
 
 def test_snapshot_context_locks_snapshot_id_across_pointer_update_and_deleted_old_snapshot_errors(tmp_path: Path) -> None:
@@ -436,6 +500,22 @@ def test_evidence_and_rewrite_index_do_not_expose_password_or_viewing_text(tmp_p
     assert '"viewing_text":' not in payload
     assert '"viewing"' not in payload
     assert "看房方式密码" not in payload
+
+
+def test_same_turn_source_hash_and_decision_id_are_stable_across_reads(tmp_path: Path) -> None:
+    publish_snapshot(tmp_path)
+    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).start_turn(
+        request_id="req-stable",
+        turn_id="turn-1",
+    )
+
+    first = run(session.search_inventory("晨星花园", limit=2))
+    second = run(session.search_inventory("云杉苑", limit=1))
+    combined = first + second
+
+    assert {item.source_hash for item in combined} == {session.context.source_hash}
+    assert {item.decision_id for item in combined} == {session.context.decision_id}
+    assert {item.snapshot_id for item in combined} == {session.context.snapshot_id}
 
 
 def test_legacy_rewrite_index_preserves_existing_prompt_payload_for_parity(tmp_path: Path) -> None:
@@ -544,3 +624,10 @@ def test_router_does_not_access_network_or_production_data_paths(tmp_path: Path,
 
     assert rows
     assert before == after
+
+
+def test_customer_snapshot_provider_disabled_reports_source_unavailable() -> None:
+    with pytest.raises(InventoryReadError) as excinfo:
+        run(inventory_read_turn.CUSTOMER_SNAPSHOT_PROVIDER_DISABLED.search_inventory("晨星"))
+
+    assert excinfo.value.code == REASON_SOURCE_UNAVAILABLE
