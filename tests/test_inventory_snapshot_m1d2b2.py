@@ -241,6 +241,7 @@ def test_sensitive_scan_regression_hash_ids_pass_and_business_text_blocks(tmp_pa
                 "snapshot_id": "20260625T010203Z_199000099999",
                 "decision_id": "ird_17435665458f662a",
                 "evidence_id": "evd_17435665458f662a",
+                "listing_id": "lst_17435665458f662a",
             },
             ensure_ascii=False,
         ),
@@ -255,6 +256,9 @@ def test_sensitive_scan_regression_hash_ids_pass_and_business_text_blocks(tmp_pa
     blocked_cases = {
         "phone_desc.json": {"description": "联系 " + "199" + "0000" + "9999"},
         "nested_phone.json": {"items": [{"note": "电话 " + "199" + "0000" + "9999"}]},
+        "password_key.json": {"password": "123"},
+        "token_key.json": {"token": "abc"},
+        "nested_credentials.json": {"items": [{"metadata": {"access_token": "abc"}}, {"credentials": ["x"]}]},
         "canary.json": {"note": "SECRET_CANARY_M1D2B2 TOKEN_CANARY_M1D2B2"},
         "manifest_leak.json": {"files": {}, "business_note": "联系 " + "199" + "0000" + "9999"},
     }
@@ -266,15 +270,28 @@ def test_sensitive_scan_regression_hash_ids_pass_and_business_text_blocks(tmp_pa
         assert case_scan["passed"] is False, filename
         assert case_scan["findings"][0]["path"] == filename
 
+    text_cases = {
+        "token_text.txt": "本地演练 token_abc123 不得进入公开 artifact",
+        "password_text.txt": "本地演练 password=123456 不得进入公开 artifact",
+    }
+    for filename, text in text_cases.items():
+        case_root = tmp_path / filename
+        case_root.mkdir()
+        (case_root / filename).write_text(text, encoding="utf-8")
+        case_scan = scan_public_artifacts_for_sensitive_text(case_root)
+        assert case_scan["passed"] is False, filename
+        assert case_scan["findings"][0]["path"] == filename
+
 
 def test_sanitize_and_prepared_outbound_package_keep_internal_ids_but_strip_sensitive_text() -> None:
     phone = "199" + "0000" + "9999"
     package = PreparedOutboundPackage(
-        text=f"本地演练文本，不应带出 {phone} SECRET_CANARY_M1D2B2 token abc123",
+        text=f"本地演练文本，不应带出 {phone} SECRET_CANARY_M1D2B2 token_abc123 password=123456",
         metadata={
             "decision_id": "ird_17435665458f662a",
             "evidence_id": "evd_17435665458f662a",
             "token": "TOKEN_CANARY_M1D2B2",
+            "password": "123456",
         },
         send_actions=(
             {
@@ -282,12 +299,15 @@ def test_sanitize_and_prepared_outbound_package_keep_internal_ids_but_strip_sens
                 "metadata": {
                     "decision_id": "ird_17435665458f662a",
                     "evidence_id": "evd_17435665458f662a",
-                    "note": f"手机号 {phone} SECRET_CANARY_M1D2B2",
+                    "note": f"手机号 {phone} SECRET_CANARY_M1D2B2 token: abc123 password=123456",
                 },
             },
         ),
     ).to_dict()
-    payload = json.dumps({"package": package, "sanitized": sanitize_for_log({"note": f"token abc {phone}"})}, ensure_ascii=False)
+    payload = json.dumps(
+        {"package": package, "sanitized": sanitize_for_log({"note": f"token abc123 password=123456 {phone}"})},
+        ensure_ascii=False,
+    )
 
     assert "ird_17435665458f662a" in payload
     assert "evd_17435665458f662a" in payload
@@ -295,7 +315,30 @@ def test_sanitize_and_prepared_outbound_package_keep_internal_ids_but_strip_sens
     assert "SECRET_CANARY" not in payload
     assert "TOKEN_CANARY" not in payload
     assert "abc123" not in payload
+    assert "123456" not in payload
     assert "token abc" not in payload
+    assert "token_abc" not in payload
+    assert "password=" not in payload
+
+
+def test_cutover_readiness_report_redacts_secret_scan_findings(tmp_path: Path) -> None:
+    root = tmp_path / "cutover-report-redaction"
+    build = build_local_snapshot(root, synthetic_inventory_rows(), version="redaction")
+    leak_path = root / "snapshots" / build.snapshot.snapshot_id / "leak.json"
+    leak_path.write_text(
+        json.dumps({"note": "token_abc123 password=123456"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    report = evaluate_cutover_readiness(root)
+    payload = json.dumps(report, ensure_ascii=False)
+
+    assert report["ready"] is False
+    assert "public_artifact_secret_scan_failed" in report["not_ready_reasons"]
+    assert "token_abc123" not in payload
+    assert "password=123456" not in payload
+    assert "abc123" not in payload
+    assert "123456" not in payload
 
 
 def test_concurrent_primary_replays_are_case_isolated_and_do_not_write_repo_data(tmp_path: Path) -> None:

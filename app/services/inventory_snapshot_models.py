@@ -24,14 +24,29 @@ _PASSWORD_CONTEXT_PATTERN = re.compile(
 _PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
 _SECRET_CANARY_PATTERN = re.compile(r"TEST_SECRET_[A-Za-z0-9_#-]+")
 _CANARY_PATTERN = re.compile(r"\b[\w-]*canary[\w#-]*", re.IGNORECASE)
-_TOKEN_CONTEXT_PATTERN = re.compile(r"\b(token|access_token|secret)\s*[:= ]+\S+", re.IGNORECASE)
+_TOKEN_CONTEXT_PATTERN = re.compile(
+    r"\b(access[_-]?token|app[_-]?secret|api[_-]?key|credential|credentials|password|passwd|pwd|secret|token)"
+    r"(?:(?:\s*[:=]\s*|\s+)[A-Za-z0-9][A-Za-z0-9_#./+=-]{2,}"
+    r"|[_-](?=[A-Za-z0-9_#./+=-]*\d)[A-Za-z0-9][A-Za-z0-9_#./+=-]{2,})",
+    re.IGNORECASE,
+)
 SNAPSHOT_ID_PATTERN = re.compile(r"^\d{8}T\d{6}Z_[0-9a-f]{12}(?:_[A-Za-z0-9][A-Za-z0-9_-]{0,31})?$")
 LISTING_ID_PATTERN = re.compile(r"^lst_[0-9a-f]{16}$")
 INTERNAL_SAFE_ID_PATTERN = re.compile(r"^(?:ird|evd)_[0-9a-f]{16}$")
 _SENSITIVE_KEY_TOKENS = (
     "password",
+    "passwd",
+    "pwd",
     "secret",
+    "app_secret",
+    "appsecret",
     "token",
+    "access_token",
+    "accesstoken",
+    "api_key",
+    "apikey",
+    "credential",
+    "credentials",
     "viewing_text",
     "private",
     "phone",
@@ -42,6 +57,9 @@ _SENSITIVE_KEY_TOKENS = (
 )
 _SAFE_SENSITIVE_SUMMARY_KEYS = {
     "has_password",
+    "password_match",
+    "password_policy",
+    "password_available",
     "has_viewing_text",
     "viewing_summary",
     "viewing_mode",

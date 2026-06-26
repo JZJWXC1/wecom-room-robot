@@ -22,6 +22,7 @@ from app.services.inventory_snapshot_models import (
     InventorySourceMetadata,
     InventorySnapshot,
     InventorySyncReport,
+    looks_sensitive_key,
     now_utc_iso,
     parse_iso_datetime,
     redact_sensitive_text,
@@ -45,6 +46,27 @@ _ARTIFACT_HASHLIKE_PATTERN = re.compile(r"[0-9a-fA-F]{12,128}")
 _ARTIFACT_SNAPSHOT_ID_PATTERN = re.compile(
     r"\d{8}T\d{6}Z_[0-9a-fA-F]{12}(?:_[A-Za-z0-9][A-Za-z0-9_-]{0,31})?"
 )
+_ARTIFACT_INTERNAL_SAFE_ID_PATTERN = re.compile(r"(?:ird|evd|lst)_[0-9a-fA-F]{16}")
+_ARTIFACT_SECRET_TEXT_PATTERN = re.compile(
+    r"\b(access[_-]?token|app[_-]?secret|api[_-]?key|credential|credentials|password|passwd|pwd|secret|token)"
+    r"(?:(?:\s*[:=]\s*|\s+)[A-Za-z0-9][A-Za-z0-9_#./+=-]{2,}"
+    r"|[_-](?=[A-Za-z0-9_#./+=-]*\d)[A-Za-z0-9][A-Za-z0-9_#./+=-]{2,})",
+    re.IGNORECASE,
+)
+_ARTIFACT_PASSWORD_VALUE_PATTERN = re.compile(r"(?<!\d)\d{3,8}#(?!\d)")
+_ARTIFACT_SAFE_SENSITIVE_KEYS = {
+    "has_password",
+    "password_match",
+    "password_policy",
+    "password_available",
+    "has_viewing_text",
+    "viewing_summary",
+    "viewing_mode",
+    "availability_summary",
+    "availability_status",
+    "viewing_secret_ref",
+    "public_artifact_secret_scan_passed",
+}
 
 
 class InventorySnapshotMode(str, Enum):
@@ -771,13 +793,11 @@ def scan_public_artifacts_for_sensitive_text(root: Path, *, snapshot_id: str = "
 
 
 def contains_sensitive_artifact_text(text: str) -> bool:
-    if re.search(r"canary", text, flags=re.IGNORECASE):
-        return True
-    if _artifact_text_contains_phone(text):
-        return True
-    if re.search(r"[A-Za-z]:\\Users\\", text):
-        return True
-    return False
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return _free_text_contains_sensitive_text(text)
+    return _artifact_json_contains_sensitive_text(parsed)
 
 
 def _artifact_text_contains_phone(text: str) -> bool:
@@ -786,6 +806,26 @@ def _artifact_text_contains_phone(text: str) -> bool:
     except json.JSONDecodeError:
         return _free_text_contains_phone(text)
     return _artifact_json_contains_phone(parsed)
+
+
+def _artifact_json_contains_sensitive_text(value: Any, *, key: str = "") -> bool:
+    if isinstance(value, dict):
+        for raw_key, item in value.items():
+            key_text = str(raw_key)
+            if _is_sensitive_artifact_key(key_text):
+                return True
+            if _free_text_contains_sensitive_text(key_text) and not _is_public_artifact_safe_sensitive_key(key_text):
+                return True
+            if _artifact_json_contains_sensitive_text(item, key=key_text):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_artifact_json_contains_sensitive_text(item, key=key) for item in value)
+    if isinstance(value, str):
+        if _is_artifact_hashlike_text(value):
+            return False
+        return _free_text_contains_sensitive_text(value)
+    return False
 
 
 def _artifact_json_contains_phone(value: Any) -> bool:
@@ -813,6 +853,20 @@ def _free_text_contains_phone(text: str) -> bool:
     return False
 
 
+def _free_text_contains_sensitive_text(text: str) -> bool:
+    if re.search(r"canary", text, flags=re.IGNORECASE):
+        return True
+    if _free_text_contains_phone(text):
+        return True
+    if re.search(r"[A-Za-z]:\\Users\\", text):
+        return True
+    if _ARTIFACT_SECRET_TEXT_PATTERN.search(text):
+        return True
+    if _ARTIFACT_PASSWORD_VALUE_PATTERN.search(text):
+        return True
+    return False
+
+
 def _alnum_token_around(text: str, start: int, end: int) -> str:
     left = start
     while left > 0 and text[left - 1].isalnum():
@@ -828,7 +882,18 @@ def _is_artifact_hashlike_text(value: str) -> bool:
     return bool(
         _ARTIFACT_HASHLIKE_PATTERN.fullmatch(text)
         or _ARTIFACT_SNAPSHOT_ID_PATTERN.fullmatch(text)
+        or _ARTIFACT_INTERNAL_SAFE_ID_PATTERN.fullmatch(text)
     )
+
+
+def _is_sensitive_artifact_key(key: str) -> bool:
+    if _is_public_artifact_safe_sensitive_key(key):
+        return False
+    return looks_sensitive_key(key)
+
+
+def _is_public_artifact_safe_sensitive_key(key: str) -> bool:
+    return str(key or "").strip().lower() in _ARTIFACT_SAFE_SENSITIVE_KEYS
 
 
 def _is_private_artifact_path(path: Path, scan_root: Path) -> bool:
