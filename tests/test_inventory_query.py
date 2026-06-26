@@ -45,16 +45,28 @@ def test_parse_inventory_query_removes_business_filler_from_anchor() -> None:
     wanda_query = parse_inventory_query("万达有什么2000以下的一室")
     shiqiao_query = parse_inventory_query("石桥附近5000左右有两室吗？最好整租。")
     deposit_query = parse_inventory_query("荣润府有没有押一付一的？预算1600到1800。")
+    repeated_query = parse_inventory_query("客户又问杨家新雅苑有没有三室的。")
 
     assert wanda_query.anchor_terms == ("万达",)
     assert shiqiao_query.anchor_terms == ("石桥",)
     assert deposit_query.anchor_terms == ("荣润府",)
+    assert repeated_query.anchor_terms == ("杨家新雅苑",)
 
 
 def test_room_ref_does_not_swallow_following_price() -> None:
     query = parse_inventory_query("合峙悦府6-1-1204B是不是1500？今天能看吗？")
 
     assert query.room_refs == ("6-1-1204b",)
+
+
+def test_room_ref_digits_do_not_become_budget() -> None:
+    query = parse_inventory_query("你说的是棠润府的话，15-2-801B还在吗？")
+    polluted_query = parse_inventory_query("你说的是棠润府的话，15-2-801B预算还在吗？")
+
+    assert query.room_refs == ("15-2-801b",)
+    assert query.price_range is None
+    assert polluted_query.room_refs == ("15-2-801b",)
+    assert polluted_query.price_range is None
 
 
 def test_room_ref_supports_letter_prefix_building() -> None:

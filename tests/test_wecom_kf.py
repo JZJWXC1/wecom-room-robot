@@ -3221,6 +3221,100 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("棠润府", result["constraint_proof"].get("communities") or [])
         self.assertIn("你说的是棠润府吗", result["clarification_text"])
 
+    async def test_discourse_prefix_is_not_part_of_fuzzy_community(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "客户又问杨家新雅苑有没有三室的",
+                    "effective_query": "客户又问杨家新雅苑有没有三室的",
+                    "query_state": {"intent": "inventory", "community": "又问杨家新雅苑", "layout": "三室"},
+                    "needs_clarification": False,
+                    "clarification_text": "",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "小区": "杨家新雅苑",
+                        "房号": "15-603",
+                        "户型分类": "三室一厅",
+                        "押一付一": "5600",
+                    },
+                    {
+                        "区域": "石桥街道\n华丰\n石桥\n永佳\n半山",
+                        "小区": "兴业杨家府",
+                        "房号": "3-601",
+                        "户型分类": "一室一厅",
+                        "押一付一": "4500",
+                    },
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="客户又问杨家新雅苑有没有三室的。",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("客户又问杨家新雅苑有没有三室的。"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["entity_resolution"]["status"], "resolved")
+        self.assertEqual(result["constraint_proof"]["communities"], ["杨家新雅苑"])
+        self.assertNotIn("又问杨家新雅苑", result["constraint_proof"]["communities"])
+        self.assertIn("杨家新雅苑", result["effective_query"])
+        self.assertNotIn("又问杨家新雅苑", result["effective_query"])
+
+    async def test_room_ref_digits_are_not_promoted_to_budget_constraint(self) -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                return {
+                    "intent": "inventory",
+                    "rewritten_query": "你说的是棠润府的话，15-2-801B还在吗？801预算",
+                    "effective_query": "你说的是棠润府的话，15-2-801B还在吗？801预算",
+                    "query_state": {"intent": "inventory", "community": "棠润府", "budget": "15-2-801B预算"},
+                    "needs_clarification": False,
+                    "clarification_text": "",
+                }
+
+        class FakeInventory:
+            async def all_rows(self, **kwargs):
+                return [
+                    {
+                        "区域": "拱墅万达\n北部软件园\n城北万象城",
+                        "小区": "棠润府",
+                        "房号": "15-2-801B",
+                        "户型分类": "一室一厅",
+                        "押一付一": "1600",
+                    }
+                ]
+
+        originals = {"reply_generator": main.reply_generator, "inventory": main.inventory}
+        main.reply_generator = FakeReplyGenerator()
+        main.inventory = FakeInventory()
+        try:
+            result = await main._understand_message(
+                content="你说的是棠润府的话，15-2-801B还在吗？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("你说的是棠润府的话，15-2-801B还在吗？"),
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertEqual(result["constraint_proof"]["communities"], ["棠润府"])
+        self.assertEqual(result["constraint_proof"]["room_refs"], ["15-2-801b"])
+        self.assertNotIn("budget_range", result["constraint_proof"])
+        self.assertNotIn("budget_label", result["constraint_proof"])
+        self.assertNotIn("801预算", result["effective_query"])
+
     async def test_contextual_community_correction_reuses_previous_typo_resolution(self) -> None:
         class FakeReplyGenerator:
             async def rewrite_kf_message(self, **kwargs):

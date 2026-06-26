@@ -43,6 +43,8 @@ def test_rewrite_kf_message_returns_orchestrator_tool_plan_contract(monkeypatch)
     assert "tool_plan" in prompt
     assert "工具前阶段" in system_prompt
     assert "最终话术只能在工具执行后生成" in prompt
+    assert "15-2-801B 不能生成 801预算" in system_prompt
+    assert "不能输出“又问杨家新雅苑”" in prompt
 
 
 def test_plan_kf_reply_text_uses_tool_evidence_after_tools(monkeypatch) -> None:

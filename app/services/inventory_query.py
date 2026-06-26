@@ -69,6 +69,7 @@ GENERIC_ANCHOR_WORDS = {
     "以下",
     "价格",
     "多少钱",
+    "多少",
     "视频",
     "照片",
     "图片",
@@ -103,6 +104,12 @@ GENERIC_ANCHOR_WORDS = {
     "推荐",
     "客户",
     "租客",
+    "客户问",
+    "客户又问",
+    "又问",
+    "再问",
+    "问下",
+    "问一下",
     "这边",
     "那边",
     "这里",
@@ -127,6 +134,9 @@ GENERIC_ANCHOR_WORDS = {
     "那套",
     "这个",
     "那个",
+    "那小区",
+    "这个小区",
+    "那个小区",
     "一室",
     "两室",
     "二室",
@@ -379,6 +389,7 @@ def _looks_like_price_range_ref(ref: str) -> bool:
 
 
 def _requested_price_range(text: str) -> tuple[int, int] | None:
+    text = _mask_room_refs_for_price_parse(text)
     range_match = re.search(r"(\d{3,5})\s*(?:到|至|-|~|～)\s*(\d{3,5})", text)
     if range_match:
         low, high = sorted((int(range_match.group(1)), int(range_match.group(2))))
@@ -398,6 +409,19 @@ def _requested_price_range(text: str) -> tuple[int, int] | None:
             amount = int(amount_match.group(1))
             return (max(0, amount - 500), amount + 500)
     return None
+
+
+def _mask_room_refs_for_price_parse(text: str) -> str:
+    cleaned = str(text or "")
+    for ref in _room_number_references(cleaned):
+        cleaned = cleaned.replace(ref, "")
+        cleaned = cleaned.replace(ref.replace("-", ""), "")
+    for match in re.finditer(r"[a-zA-Z]?\d+(?:[-－—]\d+)+(?:[-－—][a-zA-Z])?(?:[a-zA-Z])?", cleaned):
+        ref = match.group(0)
+        if _looks_like_price_range_ref(ref):
+            continue
+        cleaned = cleaned.replace(ref, "")
+    return cleaned
 
 
 def _requested_room_types(text: str) -> tuple[list[tuple[str, ...]], list[str]]:

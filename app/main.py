@@ -1460,15 +1460,31 @@ def _possible_community_mentions(text: str) -> list[str]:
     parsed = parse_inventory_query(text)
     mentions: list[str] = []
     for match in re.findall(r"[一-鿿]{2,8}(?:府|苑|园|城|湾|都|邸|庭|府邸)", text):
+        match = _clean_community_mention_candidate(match)
         if not _looks_like_possible_community_mention(match):
             continue
         mentions.append(match)
     mentions.extend(
-        term
+        _clean_community_mention_candidate(str(term))
         for term in parsed.anchor_terms
-        if _looks_like_possible_community_mention(str(term))
+        if _looks_like_possible_community_mention(_clean_community_mention_candidate(str(term)))
     )
     return list(dict.fromkeys(mentions))
+
+
+def _clean_community_mention_candidate(value: str) -> str:
+    text = str(value or "").strip(" ，,。；;：:？?！!")
+    if not text:
+        return ""
+    text = re.sub(
+        r"^(?:客户|租客)?(?:又问|再问|问下|问一下|问|想问|咨询|说|要问|在问)",
+        "",
+        text,
+    )
+    text = re.sub(r"^(?:客户|租客)(?:又|再)?", "", text)
+    text = re.sub(r"^(?:这个|那个|这边|那边|这|那)?小区", "", text)
+    text = re.sub(r"^(?:你说的是|说的是|是|换成|改成)", "", text)
+    return text.strip(" ，,。；;：:？?！!")
 
 
 def _looks_like_area_alias_mention(mention: str, area_hits: list[dict[str, Any]]) -> bool:
@@ -1550,7 +1566,7 @@ def _strip_llm_inferred_community_for_area_alias(
 
 
 def _looks_like_possible_community_mention(value: str) -> bool:
-    text = str(value or "").strip()
+    text = _clean_community_mention_candidate(str(value or ""))
     if not 2 <= len(text) <= 8:
         return False
     if text in AREA_ALIASES:
@@ -1589,6 +1605,7 @@ def _looks_like_possible_community_mention(value: str) -> bool:
         "更低",
         "最低",
         "是多少",
+        "多少",
         "多少钱",
         "是民用",
         "怎么回",
@@ -1633,6 +1650,7 @@ def _looks_like_possible_community_mention(value: str) -> bool:
         "联系谁",
         "今天",
         "是多少",
+        "多少",
         "多少钱",
         "是民用",
         "怎么回",
@@ -2300,13 +2318,25 @@ def _budget_range_from_query_state(query_state: dict[str, Any]) -> list[int]:
         value = str(query_state.get(key) or "").strip()
         if not value:
             continue
-        numbers = [int(item) for item in re.findall(r"\d{1,5}", value)]
+        parsed = parse_inventory_query(value)
+        if parsed.price_range:
+            return list(parsed.price_range)
+        cleaned_value = _strip_room_refs_for_budget_parse(value)
+        numbers = [int(item) for item in re.findall(r"\d{3,5}", cleaned_value)]
         if len(numbers) >= 2:
             low, high = sorted(numbers[:2])
             return [low, high]
-        if len(numbers) == 1 and any(marker in value for marker in ("以内", "以下", "内", "以下")):
+        if len(numbers) == 1 and any(marker in cleaned_value for marker in ("以内", "以下", "内", "以下")):
             return [0, numbers[0]]
     return []
+
+
+def _strip_room_refs_for_budget_parse(value: str) -> str:
+    text = str(value or "")
+    for ref in parse_inventory_query(text).room_refs:
+        text = text.replace(str(ref), "")
+        text = text.replace(str(ref).replace("-", ""), "")
+    return re.sub(r"[A-Za-z]?\d+(?:[-－—]\d+)+(?:[-－—][A-Za-z])?(?:[A-Za-z])?", "", text)
 
 
 def _build_constraint_proof(
@@ -2362,7 +2392,7 @@ def _build_constraint_proof(
         "communities": communities,
         "room_refs": room_refs,
         "budget_range": budget_range,
-        "budget_label": f"{budget_range[0]}-{budget_range[1]}" if budget_range else str(query_state.get("budget") or ""),
+        "budget_label": f"{budget_range[0]}-{budget_range[1]}" if budget_range else "",
         "layout": layout or str(query_state.get("layout") or ""),
         "features": features or query_state.get("features") or [],
         "selected_indices": selected_indices,
@@ -3170,12 +3200,46 @@ def _drop_unasked_llm_inferred_layout_features(
 def _community_like_mentions(text: str) -> list[str]:
     return list(
         dict.fromkeys(
-            re.findall(
-                r"[一-鿿]{2,}(?:府|苑|湾|城|轩|庭|阁|寓|郡|院|邸)",
-                str(text or ""),
+            mention
+            for mention in (
+                _clean_community_mention_candidate(match)
+                for match in re.findall(
+                    r"[一-鿿]{2,}(?:府|苑|湾|城|轩|庭|阁|寓|郡|院|邸)",
+                    str(text or ""),
+                )
             )
+            if _looks_like_possible_community_mention(mention)
         )
     )
+
+
+def _strip_room_ref_derived_budget_text(text: str, room_refs: list[str] | tuple[str, ...]) -> str:
+    cleaned = str(text or "")
+    if not cleaned or not room_refs:
+        return cleaned
+    for ref in room_refs:
+        parts = [part for part in re.split(r"[-－—]", str(ref or "")) if part]
+        if not parts:
+            continue
+        tail = re.sub(r"\D", "", parts[-1])
+        if len(tail) < 3:
+            continue
+        cleaned = re.sub(rf"(?<!\d){re.escape(tail)}\s*(?:预算|元预算|块预算|价格|元)(?!\d)", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip(" ，,、")
+
+
+def _strip_discourse_prefix_before_communities(text: str, communities: list[str] | tuple[str, ...]) -> str:
+    cleaned = str(text or "")
+    if not cleaned or not communities:
+        return cleaned
+    prefixes = r"(?:客户|租客)?(?:又问|再问|问下|问一下|问|想问|咨询|说|要问|在问)"
+    for community in communities:
+        community_text = str(community or "").strip()
+        if not community_text:
+            continue
+        cleaned = re.sub(rf"{prefixes}{re.escape(community_text)}", community_text, cleaned)
+        cleaned = re.sub(rf"(?:这个|那个|这边|那边|这|那)?小区{re.escape(community_text)}", community_text, cleaned)
+    return cleaned.strip(" ，,、")
 
 
 def _tool_requirements_from_task(
@@ -3213,6 +3277,14 @@ def _enforce_effective_query(
             understanding.get("effective_query") or understanding.get("rewritten_query") or content
         )
     ]
+    parts[0] = _strip_room_ref_derived_budget_text(
+        parts[0],
+        [str(ref) for ref in constraint_proof.get("room_refs") or [] if str(ref).strip()],
+    )
+    parts[0] = _strip_discourse_prefix_before_communities(
+        parts[0],
+        [str(community) for community in constraint_proof.get("communities") or [] if str(community).strip()],
+    )
     area = str(constraint_proof.get("area") or "").strip()
     if area and area not in parts[0]:
         parts.append(area.replace("\n", " "))
