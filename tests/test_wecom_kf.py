@@ -50,6 +50,36 @@ def test_constraint_selfcheck_does_not_force_search_terms_for_contract_followup(
     assert result["status"] == "pass"
 
 
+def test_constraint_selfcheck_passes_when_tool_has_single_matching_inventory_row() -> None:
+    result = main._constraint_consistency_selfcheck(
+        content="万达1500左右一室有吗？",
+        draft_reply="有的，合嵣悦府6-1-1204B还在，一室一厅，押一付一1500。",
+        understanding={
+            "intent": "inventory",
+            "constraint_proof": {
+                "area": "拱墅万达\n北部软件园\n城北万象城",
+                "budget_range": [1300, 1700],
+                "layout": "一室",
+            },
+            "structured_task": {"tool_requirements": {"needs_inventory_search": True}},
+        },
+        tool_evidence={
+            "actions": ["search_inventory", "compact_listing", "generate_reply"],
+            "inventory_rows": [
+                {
+                    "小区": "合嵣悦府",
+                    "房号": "6-1-1204B",
+                    "户型描述": "一室一厅",
+                    "押一付一": "1500",
+                    "押二付一": "1400",
+                }
+            ],
+        },
+    )
+
+    assert result["status"] == "pass"
+
+
 class InventoryReadRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_same_inventory_read_context_flows_through_rewrite_and_tools(self) -> None:
         class FakeReplyGenerator:
