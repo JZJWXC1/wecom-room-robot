@@ -5,7 +5,13 @@ from pathlib import Path
 
 from app.config import settings
 from app.services.inventory_snapshot_models import generate_listing_id
-from app.services.media_manifest import MEDIA_KIND_VIDEO, MediaItem, MediaManifest
+from app.services.media_manifest import (
+    BINDING_METHOD_FUZZY_FILENAME,
+    MEDIA_KIND_VIDEO,
+    MEDIA_SOURCE_KIND_WECOM_VIDEO_FILE,
+    MediaItem,
+    MediaManifest,
+)
 from app.services.media_store import MediaStore
 
 
@@ -45,9 +51,43 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
 
                 self.assertEqual(len(evidence), 1)
                 self.assertEqual(evidence[0]["listing_id"], listing_id)
+                self.assertEqual(evidence[0]["media_type"], MEDIA_KIND_VIDEO)
+                self.assertEqual(evidence[0]["source_kind"], MEDIA_SOURCE_KIND_WECOM_VIDEO_FILE)
                 self.assertEqual(evidence[0]["binding_method"], "listing_id")
+                self.assertTrue(evidence[0]["send_ready"])
+                self.assertFalse(evidence[0]["ambiguity"])
+                self.assertFalse(evidence[0]["candidate_only"])
                 self.assertIn("manifest证据.mp4", evidence[0]["local_path"])
                 self.assertEqual(matches, [legacy_video])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
+    def test_media_manifest_candidate_only_items_are_hidden_from_store_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                settings.room_database_path.mkdir(parents=True)
+                listing_id = generate_listing_id("寓你花园", "1-101A")
+                MediaManifest.build(
+                    listing_ids=[listing_id],
+                    items=[
+                        MediaItem(
+                            listing_id=listing_id,
+                            kind=MEDIA_KIND_VIDEO,
+                            file_name="候选视频.mp4",
+                            relative_path="video/candidate/候选视频.mp4",
+                            binding_method=BINDING_METHOD_FUZZY_FILENAME,
+                            confidence=0.75,
+                            ambiguity=True,
+                            candidate_only=True,
+                        )
+                    ],
+                ).write_json(settings.room_database_path / "media_manifest.json")
+
+                evidence = MediaStore().media_manifest_evidence_for_listing(listing_id)
+
+                self.assertEqual(evidence, [])
             finally:
                 settings.room_database_path = previous_room_database_path
 

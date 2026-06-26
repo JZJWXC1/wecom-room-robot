@@ -16,8 +16,8 @@ from app.services.inventory_snapshot_models import (
 from app.services.region_inventory_utils import safe_name
 
 
-MEDIA_MANIFEST_SCHEMA_VERSION = "media_manifest.v1"
-MEDIA_MANIFEST_GENERATOR_VERSION = "media_manifest_foundation.v1"
+MEDIA_MANIFEST_SCHEMA_VERSION = "media_manifest.v2"
+MEDIA_MANIFEST_GENERATOR_VERSION = "media_manifest_foundation.v2"
 
 MEDIA_KIND_IMAGE = "image"
 MEDIA_KIND_VIDEO = "video"
@@ -33,8 +33,21 @@ MEDIA_VARIANTS = {
     MEDIA_VARIANT_ORIGINAL_VIDEO,
 }
 
+MEDIA_SOURCE_KIND_IMAGE_FILE = "image_file"
+MEDIA_SOURCE_KIND_WECOM_VIDEO_FILE = "wecom_video_file"
+MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_FILE = "original_video_file"
+MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_LINK = "original_video_link"
+MEDIA_SOURCE_KINDS = {
+    MEDIA_SOURCE_KIND_IMAGE_FILE,
+    MEDIA_SOURCE_KIND_WECOM_VIDEO_FILE,
+    MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_FILE,
+    MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_LINK,
+}
+
 BINDING_METHOD_LISTING_ID = "listing_id"
 BINDING_METHOD_MANUAL = "manual"
+BINDING_METHOD_FUZZY_FILENAME = "fuzzy_filename"
+SEND_READY_MIN_CONFIDENCE = 0.99
 
 LISTING_ID_RE = re.compile(r"lst_[0-9a-f]{16}", re.IGNORECASE)
 ORIGINAL_VIDEO_MARKERS = (
@@ -69,6 +82,7 @@ class MediaItem:
     listing_id: str
     kind: str
     file_name: str
+    media_type: str = ""
     relative_path: str = ""
     variant: str = ""
     size: int = 0
@@ -76,37 +90,87 @@ class MediaItem:
     local_path: str = ""
     media_id: str = ""
     source: str = "feishu_drive"
+    source_kind: str = ""
     source_path: str = ""
+    source_path_hash: str = ""
     source_id_hash: str = ""
     source_file_token: str = ""
+    source_record_id: str = ""
     source_url: str = ""
     original_url: str = ""
     material_page_url: str = ""
     modified_at: str = ""
     binding_method: str = BINDING_METHOD_LISTING_ID
+    confidence: float = 1.0
+    ambiguity: bool = False
+    candidate_only: bool = False
+    snapshot_id: str = ""
+    manifest_version: str = MEDIA_MANIFEST_SCHEMA_VERSION
     access_verified: bool = False
     wecom_sendable: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.kind not in MEDIA_KINDS:
-            raise ValueError(f"unsupported media kind: {self.kind}")
-        if not is_safe_listing_id(self.listing_id):
+        listing_id = str(self.listing_id or "").strip().lower()
+        if not is_safe_listing_id(listing_id):
             raise ValueError(f"invalid listing_id: {self.listing_id}")
+        object.__setattr__(self, "listing_id", listing_id)
+
+        kind = str(self.kind or self.media_type or "").strip().lower()
+        if kind not in MEDIA_KINDS:
+            raise ValueError(f"unsupported media kind: {self.kind or self.media_type}")
+        object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "media_type", str(self.media_type or kind).strip().lower())
+        if self.media_type not in MEDIA_KINDS:
+            raise ValueError(f"unsupported media type: {self.media_type}")
+
         if not self.variant:
             object.__setattr__(self, "variant", _variant_for_kind(self.kind))
         if self.variant not in MEDIA_VARIANTS:
             raise ValueError(f"unsupported media variant: {self.variant}")
         if not self.local_path and self.relative_path:
             object.__setattr__(self, "local_path", self.relative_path)
-        if not self.source_file_token and self.source_id_hash:
-            object.__setattr__(self, "source_file_token", self.source_id_hash)
-        if not self.source_id_hash and self.source_file_token:
-            object.__setattr__(self, "source_id_hash", self.source_file_token)
+        source_file_token = _safe_hash_identifier(self.source_file_token)
+        source_id_hash = _safe_hash_identifier(self.source_id_hash)
+        if not source_file_token and source_id_hash:
+            source_file_token = source_id_hash
+        if not source_id_hash and source_file_token:
+            source_id_hash = source_file_token
+        if source_file_token != self.source_file_token:
+            object.__setattr__(self, "source_file_token", source_file_token)
+        if source_id_hash != self.source_id_hash:
+            object.__setattr__(self, "source_id_hash", source_id_hash)
+        source_path_hash = _safe_hash_identifier(self.source_path_hash) or (
+            _hash_text(self.source_path) if self.source_path else ""
+        )
+        if source_path_hash != self.source_path_hash:
+            object.__setattr__(self, "source_path_hash", source_path_hash)
+        source_record_id = (
+            _safe_hash_identifier(self.source_record_id)
+            or source_id_hash
+            or source_file_token
+            or source_path_hash
+        )
+        object.__setattr__(self, "source_record_id", source_record_id)
         if not self.source_url and self.original_url:
             object.__setattr__(self, "source_url", self.original_url)
         if not self.original_url and self.source_url and self.kind == MEDIA_KIND_ORIGINAL_VIDEO:
             object.__setattr__(self, "original_url", self.source_url)
+        source_kind = str(self.source_kind or "").strip().lower()
+        if not source_kind:
+            source_kind = _source_kind_for_kind(
+                self.kind,
+                relative_path=self.relative_path or self.local_path,
+                source_url=self.source_url or self.original_url,
+            )
+        if source_kind not in MEDIA_SOURCE_KINDS:
+            raise ValueError(f"unsupported media source_kind: {self.source_kind}")
+        object.__setattr__(self, "source_kind", source_kind)
+        object.__setattr__(self, "confidence", _bounded_confidence(self.confidence))
+        object.__setattr__(self, "ambiguity", bool(self.ambiguity))
+        object.__setattr__(self, "candidate_only", bool(self.candidate_only))
+        if not self.manifest_version:
+            object.__setattr__(self, "manifest_version", MEDIA_MANIFEST_SCHEMA_VERSION)
         if not self.media_id:
             object.__setattr__(self, "media_id", self._build_media_id())
         if self.kind == MEDIA_KIND_VIDEO and not self.wecom_sendable:
@@ -117,17 +181,26 @@ class MediaItem:
             {
                 "listing_id": self.listing_id,
                 "kind": self.kind,
+                "media_type": self.media_type,
                 "variant": self.variant,
                 "relative_path": self.relative_path,
                 "local_path": self.local_path,
                 "file_name": self.file_name,
+                "source_kind": self.source_kind,
                 "source_path": self.source_path,
+                "source_path_hash": self.source_path_hash,
                 "source_file_token": self.source_file_token,
+                "source_record_id": self.source_record_id,
                 "source_url": self.source_url,
                 "original_url": self.original_url,
                 "material_page_url": self.material_page_url,
                 "modified_at": self.modified_at,
                 "binding_method": self.binding_method,
+                "confidence": self.confidence,
+                "ambiguity": self.ambiguity,
+                "candidate_only": self.candidate_only,
+                "snapshot_id": self.snapshot_id,
+                "manifest_version": self.manifest_version,
                 "access_verified": self.access_verified,
                 "size": self.size,
                 "sha256": self.sha256,
@@ -140,6 +213,7 @@ class MediaItem:
             "media_id": self.media_id,
             "listing_id": self.listing_id,
             "kind": self.kind,
+            "media_type": self.media_type,
             "variant": self.variant,
             "file_name": self.file_name,
             "relative_path": self.relative_path,
@@ -147,14 +221,22 @@ class MediaItem:
             "size": self.size,
             "sha256": self.sha256,
             "source": self.source,
+            "source_kind": self.source_kind,
             "source_path": self.source_path,
+            "source_path_hash": self.source_path_hash,
             "source_id_hash": self.source_id_hash,
             "source_file_token": self.source_file_token,
+            "source_record_id": self.source_record_id,
             "source_url": self.source_url,
             "original_url": self.original_url,
             "material_page_url": self.material_page_url,
             "modified_at": self.modified_at,
             "binding_method": self.binding_method,
+            "confidence": self.confidence,
+            "ambiguity": self.ambiguity,
+            "candidate_only": self.candidate_only,
+            "snapshot_id": self.snapshot_id,
+            "manifest_version": self.manifest_version,
             "access_verified": self.access_verified,
             "wecom_sendable": self.wecom_sendable,
             "metadata": self.metadata,
@@ -165,24 +247,33 @@ class MediaItem:
         return cls(
             media_id=str(data.get("media_id") or ""),
             listing_id=str(data.get("listing_id") or ""),
-            kind=str(data.get("kind") or ""),
+            kind=str(data.get("kind") or data.get("media_type") or ""),
             file_name=str(data.get("file_name") or ""),
+            media_type=str(data.get("media_type") or data.get("kind") or ""),
             relative_path=str(data.get("relative_path") or ""),
             variant=str(data.get("variant") or ""),
             local_path=str(data.get("local_path") or ""),
             size=int(data.get("size") or 0),
             sha256=str(data.get("sha256") or ""),
             source=str(data.get("source") or "feishu_drive"),
+            source_kind=str(data.get("source_kind") or ""),
             source_path=str(data.get("source_path") or ""),
+            source_path_hash=str(data.get("source_path_hash") or ""),
             source_id_hash=str(data.get("source_id_hash") or ""),
             source_file_token=str(data.get("source_file_token") or ""),
+            source_record_id=str(data.get("source_record_id") or ""),
             source_url=str(data.get("source_url") or ""),
             original_url=str(data.get("original_url") or ""),
             material_page_url=str(data.get("material_page_url") or ""),
             modified_at=str(data.get("modified_at") or ""),
             binding_method=str(data.get("binding_method") or BINDING_METHOD_LISTING_ID),
-            access_verified=bool(data.get("access_verified")),
-            wecom_sendable=bool(data.get("wecom_sendable")),
+            confidence=_bounded_confidence(data.get("confidence", 1.0)),
+            ambiguity=_truthy(data.get("ambiguity")),
+            candidate_only=_truthy(data.get("candidate_only")),
+            snapshot_id=str(data.get("snapshot_id") or ""),
+            manifest_version=str(data.get("manifest_version") or MEDIA_MANIFEST_SCHEMA_VERSION),
+            access_verified=_truthy(data.get("access_verified")),
+            wecom_sendable=_truthy(data.get("wecom_sendable")),
             metadata=dict(data.get("metadata") or {}),
         )
 
@@ -193,10 +284,14 @@ class MediaManifest:
     items: list[MediaItem] = field(default_factory=list)
     generated_at: str = field(default_factory=now_utc_iso)
     source_hash: str = ""
+    snapshot_id: str = ""
+    manifest_version: str = MEDIA_MANIFEST_SCHEMA_VERSION
     schema_version: str = MEDIA_MANIFEST_SCHEMA_VERSION
     generator_version: str = MEDIA_MANIFEST_GENERATOR_VERSION
 
     def __post_init__(self) -> None:
+        if not self.manifest_version:
+            self.manifest_version = self.schema_version or MEDIA_MANIFEST_SCHEMA_VERSION
         self.listing_ids = _dedupe_listing_ids(self.listing_ids)
         indexed_ids = set(self.listing_ids)
         for item in self.items:
@@ -213,6 +308,8 @@ class MediaManifest:
         listing_ids: Iterable[str],
         items: Iterable[MediaItem],
         generated_at: str | None = None,
+        snapshot_id: str = "",
+        manifest_version: str = MEDIA_MANIFEST_SCHEMA_VERSION,
     ) -> "MediaManifest":
         sorted_items = sorted(
             list(items),
@@ -228,12 +325,16 @@ class MediaManifest:
             listing_ids=_dedupe_listing_ids(listing_ids),
             items=sorted_items,
             generated_at=generated_at or now_utc_iso(),
+            snapshot_id=snapshot_id,
+            manifest_version=manifest_version,
         )
 
     def _build_source_hash(self) -> str:
         payload = {
             "schema_version": self.schema_version,
             "generator_version": self.generator_version,
+            "manifest_version": self.manifest_version,
+            "snapshot_id": self.snapshot_id,
             "listing_ids": self.listing_ids,
             "items": [item.to_dict() for item in self.items],
         }
@@ -267,6 +368,8 @@ class MediaManifest:
         return {
             "schema_version": self.schema_version,
             "generator_version": self.generator_version,
+            "manifest_version": self.manifest_version,
+            "snapshot_id": self.snapshot_id,
             "generated_at": self.generated_at,
             "source_hash": self.source_hash,
             "listing_ids": self.listing_ids,
@@ -309,6 +412,8 @@ class MediaManifest:
         return cls(
             schema_version=str(data.get("schema_version") or MEDIA_MANIFEST_SCHEMA_VERSION),
             generator_version=str(data.get("generator_version") or MEDIA_MANIFEST_GENERATOR_VERSION),
+            manifest_version=str(data.get("manifest_version") or data.get("schema_version") or MEDIA_MANIFEST_SCHEMA_VERSION),
+            snapshot_id=str(data.get("snapshot_id") or ""),
             generated_at=str(data.get("generated_at") or now_utc_iso()),
             source_hash=str(data.get("source_hash") or ""),
             listing_ids=[str(item) for item in data.get("listing_ids") or []],
@@ -381,6 +486,16 @@ class MediaManifestEvidence:
     media_id: str
     listing_id: str
     variant: str
+    media_type: str = ""
+    source_kind: str = ""
+    source_path_hash: str = ""
+    source_record_id: str = ""
+    confidence: float = 0.0
+    ambiguity: bool = False
+    candidate_only: bool = False
+    send_ready: bool = False
+    snapshot_id: str = ""
+    manifest_version: str = MEDIA_MANIFEST_SCHEMA_VERSION
     sha256: str = ""
     local_path: str = ""
     source_file_token: str = ""
@@ -398,6 +513,16 @@ class MediaManifestEvidence:
             "media_id": self.media_id,
             "listing_id": self.listing_id,
             "variant": self.variant,
+            "media_type": self.media_type,
+            "source_kind": self.source_kind,
+            "source_path_hash": self.source_path_hash,
+            "source_record_id": self.source_record_id,
+            "confidence": self.confidence,
+            "ambiguity": self.ambiguity,
+            "candidate_only": self.candidate_only,
+            "send_ready": self.send_ready,
+            "snapshot_id": self.snapshot_id,
+            "manifest_version": self.manifest_version,
             "sha256": self.sha256,
             "local_path": self.local_path,
             "source_file_token": self.source_file_token,
@@ -433,11 +558,17 @@ class MediaManifestShadowAdapter:
         items = self.manifest.items_for_listing(listing_id)
         if variant is not None:
             items = [item for item in items if item.variant == variant]
-        return [self._evidence_for_item(item) for item in items]
+        return [
+            self._evidence_for_item(item)
+            for item in items
+            if self._is_send_ready_item(item)
+        ]
 
     def evidence_by_media_id(self, media_id: str) -> MediaManifestEvidence | None:
         item = self._by_media_id.get(media_id)
-        return self._evidence_for_item(item) if item else None
+        if not item or not self._is_send_ready_item(item):
+            return None
+        return self._evidence_for_item(item)
 
     def local_file_for_media_id(self, media_id: str) -> Path | None:
         item = self._by_media_id.get(media_id)
@@ -460,6 +591,16 @@ class MediaManifestShadowAdapter:
             media_id=item.media_id,
             listing_id=item.listing_id,
             variant=item.variant,
+            media_type=item.media_type,
+            source_kind=item.source_kind,
+            source_path_hash=item.source_path_hash,
+            source_record_id=item.source_record_id,
+            confidence=item.confidence,
+            ambiguity=item.ambiguity,
+            candidate_only=item.candidate_only,
+            send_ready=self._is_send_ready_item(item),
+            snapshot_id=item.snapshot_id or self.manifest.snapshot_id,
+            manifest_version=item.manifest_version or self.manifest.manifest_version,
             sha256=item.sha256,
             local_path=local_path,
             source_file_token=item.source_file_token,
@@ -471,6 +612,15 @@ class MediaManifestShadowAdapter:
             file_name=item.file_name,
             source_path=item.source_path,
             material_page_url=item.material_page_url,
+        )
+
+    def _is_send_ready_item(self, item: MediaItem) -> bool:
+        return (
+            item.listing_id in self.manifest.listing_ids
+            and item.binding_method == BINDING_METHOD_LISTING_ID
+            and not item.ambiguity
+            and not item.candidate_only
+            and item.confidence >= SEND_READY_MIN_CONFIDENCE
         )
 
 
@@ -569,19 +719,41 @@ class FeishuDriveMediaManifestAdapter:
                 items.append(media_item)
                 report.bound_items.append(
                     {
+                        "media_id": media_item.media_id,
                         "listing_id": media_item.listing_id,
                         "kind": media_item.kind,
+                        "media_type": media_item.media_type,
+                        "source_kind": media_item.source_kind,
                         "relative_path": media_item.relative_path,
                         "source_path": source_path,
+                        "source_path_hash": media_item.source_path_hash,
+                        "source_record_id": media_item.source_record_id,
+                        "confidence": media_item.confidence,
+                        "ambiguity": media_item.ambiguity,
+                        "candidate_only": media_item.candidate_only,
+                        "send_ready": True,
+                        "manifest_version": media_item.manifest_version,
                     }
                 )
             return
 
         record = {
             "source_path": source_path,
+            "source_path_hash": _hash_text(source_path),
+            "source_record_id": _source_record_id(item, source_path),
             "kind": kind,
+            "media_type": kind,
+            "source_kind": _source_kind_for_kind(
+                kind,
+                relative_path=_item_name(item) if Path(_item_name(item)).suffix else "",
+                source_url=_first_http_url(item, URL_FIELDS),
+            ),
             "candidate_listing_ids": listing_ids,
             "reason": "multiple_listing_ids" if len(listing_ids) > 1 else "missing_listing_id",
+            "confidence": 0.0,
+            "ambiguity": True,
+            "candidate_only": True,
+            "send_ready": False,
         }
         if len(listing_ids) > 1:
             report.ambiguous_items.append(record)
@@ -600,8 +772,17 @@ class FeishuDriveMediaManifestAdapter:
             report.fuzzy_candidates.append(
                 {
                     "source_path": source_path,
+                    "source_path_hash": record["source_path_hash"],
+                    "source_record_id": record["source_record_id"],
                     "kind": kind,
+                    "media_type": kind,
+                    "source_kind": record["source_kind"],
                     "candidates": fuzzy,
+                    "confidence": fuzzy[0]["confidence"],
+                    "ambiguity": True,
+                    "candidate_only": True,
+                    "send_ready": False,
+                    "binding_method": BINDING_METHOD_FUZZY_FILENAME,
                     "reason": "fuzzy_candidate_only_not_bound",
                 }
             )
@@ -619,6 +800,8 @@ class FeishuDriveMediaManifestAdapter:
         original_url = _first_http_url(item, URL_FIELDS)
         material_page_url = _first_http_url(item, MATERIAL_PAGE_FIELDS)
         source_token_hash = _token_hash(_item_token(item))
+        source_path_hash = _hash_text(source_path)
+        source_record_id = source_token_hash or _source_record_id(item, source_path)
 
         relative_path = ""
         size = 0
@@ -654,14 +837,21 @@ class FeishuDriveMediaManifestAdapter:
             size=size,
             sha256=sha256,
             local_path=relative_path,
+            source_kind=_source_kind_for_kind(kind, relative_path=relative_path, source_url=original_url),
             source_path=source_path,
+            source_path_hash=source_path_hash,
             source_id_hash=source_token_hash,
             source_file_token=source_token_hash,
+            source_record_id=source_record_id,
             source_url=original_url,
             original_url=original_url if kind == MEDIA_KIND_ORIGINAL_VIDEO else "",
             material_page_url=material_page_url,
             modified_at=_item_modified_at(item),
             binding_method=BINDING_METHOD_LISTING_ID,
+            confidence=1.0,
+            ambiguity=False,
+            candidate_only=False,
+            manifest_version=MEDIA_MANIFEST_SCHEMA_VERSION,
             access_verified=bool(sha256 or original_url),
             wecom_sendable=kind == MEDIA_KIND_VIDEO,
         )
@@ -767,7 +957,18 @@ class FeishuDriveMediaManifestAdapter:
             else:
                 score = fuzzy_contains_score(label_text, source_text)
             if score:
-                candidates.append({"listing_id": listing_id, "label": label, "score": score})
+                candidates.append(
+                    {
+                        "listing_id": listing_id,
+                        "label": label,
+                        "score": score,
+                        "confidence": _candidate_confidence(score),
+                        "ambiguity": True,
+                        "candidate_only": True,
+                        "send_ready": False,
+                        "binding_method": BINDING_METHOD_FUZZY_FILENAME,
+                    }
+                )
         candidates.sort(key=lambda item: (-int(item["score"]), item["listing_id"]))
         return candidates[:5]
 
@@ -872,6 +1073,64 @@ def _variant_for_kind(kind: str) -> str:
     }[kind]
 
 
+def _source_kind_for_kind(kind: str, *, relative_path: str = "", source_url: str = "") -> str:
+    if kind == MEDIA_KIND_IMAGE:
+        return MEDIA_SOURCE_KIND_IMAGE_FILE
+    if kind == MEDIA_KIND_VIDEO:
+        return MEDIA_SOURCE_KIND_WECOM_VIDEO_FILE
+    if kind == MEDIA_KIND_ORIGINAL_VIDEO and relative_path:
+        return MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_FILE
+    if kind == MEDIA_KIND_ORIGINAL_VIDEO and source_url:
+        return MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_LINK
+    return MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_FILE
+
+
+def _hash_text(value: str) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _safe_hash_identifier(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if re.fullmatch(r"[0-9a-f]{64}", text):
+        return text
+    return _hash_text(text)
+
+
+def _source_record_id(item: dict[str, Any], source_path: str) -> str:
+    token_hash = _safe_hash_identifier(_item_token(item))
+    if token_hash:
+        return token_hash
+    payload = {
+        "source_path": source_path,
+        "source_url": _first_http_url(item, URL_FIELDS),
+        "material_page_url": _first_http_url(item, MATERIAL_PAGE_FIELDS),
+    }
+    return _hash_text(canonical_json(payload))
+
+
+def _bounded_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return max(0.0, min(1.0, confidence))
+
+
+def _candidate_confidence(score: int) -> float:
+    return min(0.95, round(max(0, int(score)) / 200, 3))
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def _existing_file_matches(path: Path, expected_size: int) -> bool:
     if not path.is_file() or path.stat().st_size <= 0:
         return False
@@ -908,7 +1167,12 @@ __all__ = [
     "MEDIA_VARIANT_IMAGE",
     "MEDIA_VARIANT_WECOM_VIDEO",
     "MEDIA_VARIANT_ORIGINAL_VIDEO",
+    "MEDIA_SOURCE_KIND_IMAGE_FILE",
+    "MEDIA_SOURCE_KIND_WECOM_VIDEO_FILE",
+    "MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_FILE",
+    "MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_LINK",
     "BINDING_METHOD_LISTING_ID",
+    "BINDING_METHOD_FUZZY_FILENAME",
     "MediaBindingReport",
     "MediaManifestEvidence",
     "MediaItem",
