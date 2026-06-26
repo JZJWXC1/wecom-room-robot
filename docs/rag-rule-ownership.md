@@ -166,6 +166,18 @@ M1D2B2 属于“房源读取契约/切换门禁/测试覆盖”和“运维 runb
 
 M1D2B2 的 Cutover Readiness 只表示“本地证据足以进入后续人工切换评估”；没有 `APPROVE_DEPLOY` 时不得把该结果用于服务器配置、生产 pointer 切换或客服读取入口切换。
 
+## RAG V2 D 线 Dual LLM Shadow 归属
+
+D 线新增的 `app/services/kf_dual_llm_shadow.py` 只属于“问题重写/意图分析、Planner、发送准备的结构化契约 shadow 适配层”，不属于生产客服回复链路。它把 legacy rewrite/planner/tool evidence 适配为未来 LLM1/LLM2 的强类型 shadow 数据：
+
+- LLM1 shadow 记录 `task_atoms`、约束、候选绑定摘要、`response_strategy` 和 `tool_plan`。
+- LLM2 shadow 记录候选绑定摘要、`response_strategy`、`claims`、`send_actions` 和 `self_review`。
+- shadow LLM2 只表达 legacy 文本和程序 evidence，不能决定视频、图片、密码或房源表目标；这些动作只能来自工具 evidence/program。
+- 本轮不接入 `app/main.py`，不调用真实 LLM，不访问网络，不连接飞书、企业微信或服务器。
+- 输出 artifact、repr 和测试 JSON 必须通过契约脱敏，不能包含真实密码、手机号、token、raw tool result 或客户原文敏感字段。
+
+本归属不改变客户可见回复、不改变 Planner/Prompt/selfcheck/send 语义，不删除旧 LLM 阶段，也不修改客户回复 golden。
+
 ## M1B 修改归属声明模板
 
 后续提交说明需标明：

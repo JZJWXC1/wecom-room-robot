@@ -1,0 +1,778 @@
+from __future__ import annotations
+
+from hashlib import sha256
+import json
+from typing import Any
+
+from app.services.kf_contracts import (
+    CandidateItem,
+    CandidateSet,
+    Claim,
+    ConstraintOperation,
+    EvidenceItem,
+    PreparedOutboundPackage,
+    ResponseStrategy,
+    SendAction,
+    StructuredTaskPacket,
+    TaskAtom,
+    ToolEvidenceBundle,
+    safe_artifact_payload,
+)
+
+
+DUAL_LLM_SHADOW_SCHEMA_VERSION = "rag_v2_dual_llm_shadow.v1"
+
+ACTION_TO_TASK_TYPE = {
+    "search_inventory": "inventory_search",
+    "compact_listing": "summarize_candidates",
+    "send_inventory_sheet": "send_inventory_sheet",
+    "send_image": "send_image",
+    "send_video": "send_video",
+    "explain_missing_media": "explain_missing_media",
+    "explain_unavailable_viewing": "viewing_guidance",
+    "send_contract_contact": "contract_contact",
+    "send_deposit_policy": "deposit_policy",
+    "clarification": "clarification",
+    "continue_search": "continue_search",
+    "generate_reply": "reply_text",
+}
+
+ACTION_TO_TOOL = {
+    "search_inventory": "inventory.search",
+    "compact_listing": "inventory.compact",
+    "send_inventory_sheet": "inventory.sheet_artifact",
+    "send_image": "media.image",
+    "send_video": "media.video",
+    "explain_missing_media": "media.availability",
+    "explain_unavailable_viewing": "viewing.policy",
+    "send_contract_contact": "contact.contract",
+    "send_deposit_policy": "deposit.policy",
+    "continue_search": "inventory.search",
+    "generate_reply": "reply.compose",
+}
+
+ROW_ALIASES: dict[str, tuple[str, ...]] = {
+    "listing_id": ("listing_id", "listingId", "房源ID", "房源编号"),
+    "community": ("community", "community_name", "小区", "小区名称"),
+    "room_no": ("room_no", "room", "房号", "房间号"),
+    "title": ("title", "标题"),
+    "rent_pay1": ("rent_pay1", "押一付一", "押一付一月租金"),
+    "rent_pay2": ("rent_pay2", "押二付一", "押二付一月租金"),
+    "source_kind": ("source_kind", "inventory_source_kind"),
+    "source_hash": ("source_hash", "inventory_source_hash"),
+    "snapshot_id": ("inventory_snapshot_id", "snapshot_id"),
+}
+
+
+def build_shadow_task_packet(
+    legacy_rewrite: dict[str, Any] | None = None,
+    legacy_planner: dict[str, Any] | None = None,
+    *,
+    content: str = "",
+    conversation_id: str = "",
+    turn_id: str = "",
+    case_id: str = "",
+    prompt_version: str = "dual_llm_shadow.llm1.v1",
+    inventory_snapshot_id: str = "",
+    candidate_set_id: str = "",
+) -> StructuredTaskPacket:
+    """把 legacy rewrite/planner 输出适配成未来 LLM1 的 shadow 任务包。"""
+    rewrite = dict(legacy_rewrite or {})
+    planner = dict(legacy_planner or {})
+    direct_packet = _direct_packet_payload(rewrite, planner)
+    if direct_packet:
+        direct_packet = _normalize_direct_packet_payload(direct_packet)
+        data = {
+            "prompt_version": prompt_version,
+            "conversation_id": conversation_id,
+            "turn_id": turn_id,
+            "case_id": case_id,
+            "inventory_snapshot_id": inventory_snapshot_id,
+            "candidate_set_id": candidate_set_id,
+            **direct_packet,
+        }
+        return StructuredTaskPacket.from_legacy_dict(data)
+
+    actions = _actions_from(rewrite, planner)
+    constraints = _constraints_from(rewrite, planner)
+    candidate_numbers = _candidate_numbers_from(rewrite, planner)
+    if candidate_numbers:
+        constraints.setdefault("candidate_numbers", candidate_numbers)
+    tasks = [
+        _task_from_action(
+            action=action,
+            index=index,
+            content=content,
+            constraints=constraints,
+            candidate_numbers=candidate_numbers,
+        )
+        for index, action in enumerate(actions, start=1)
+    ]
+    if not tasks:
+        tasks = [
+            TaskAtom(
+                task_id="task-1-reply",
+                task_type="reply_text",
+                user_text=content,
+                constraint_operation=ConstraintOperation.INHERIT,
+                constraints=constraints,
+                response_strategy=ResponseStrategy.ANSWER,
+                required_tools=["reply.compose"],
+            )
+        ]
+
+    return StructuredTaskPacket(
+        prompt_version=prompt_version,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        case_id=case_id,
+        inventory_snapshot_id=inventory_snapshot_id,
+        candidate_set_id=candidate_set_id,
+        response_strategy=_strategy_from(actions, rewrite, planner),
+        tasks=tasks,
+        inherited_constraints=_safe_dict(rewrite.get("inherited_constraints") or planner.get("inherited_constraints")),
+        replaced_constraints=_safe_dict(rewrite.get("replaced_constraints") or planner.get("replaced_constraints")),
+        excluded_constraints=_safe_dict(rewrite.get("excluded_constraints") or planner.get("excluded_constraints")),
+        cleared_constraint_keys=_string_list(rewrite.get("cleared_constraint_keys") or planner.get("cleared_constraint_keys")),
+        rewritten_query=str(
+            rewrite.get("rewritten_query")
+            or rewrite.get("rewrite")
+            or rewrite.get("query")
+            or planner.get("rewritten_query")
+            or content
+            or ""
+        ),
+    )
+
+
+def compose_shadow_outbound(
+    task_packet: StructuredTaskPacket,
+    tool_evidence: dict[str, Any] | None = None,
+    legacy_reply_text: str = "",
+    *,
+    legacy_planner: dict[str, Any] | None = None,
+    legacy_reply_result: dict[str, Any] | None = None,
+    prompt_version: str = "dual_llm_shadow.llm2.v1",
+) -> PreparedOutboundPackage:
+    """把工具证据和 legacy 文本适配成未来 LLM2 的 shadow 待发送包。"""
+    evidence = dict(tool_evidence or {})
+    planner = dict(legacy_planner or {})
+    reply_result = dict(legacy_reply_result or {})
+    candidate_set = _candidate_set_from_evidence(task_packet, evidence)
+    evidence_bundle = _evidence_bundle_from(task_packet, evidence, candidate_set)
+    send_actions = _send_actions_from(
+        task_packet=task_packet,
+        evidence=evidence,
+        reply_text=legacy_reply_text,
+    )
+    claims = _claims_from(
+        task_packet=task_packet,
+        evidence=evidence,
+        evidence_bundle=evidence_bundle,
+        legacy_reply_text=legacy_reply_text,
+    )
+
+    return PreparedOutboundPackage(
+        prompt_version=prompt_version,
+        conversation_id=task_packet.conversation_id,
+        turn_id=task_packet.turn_id,
+        case_id=task_packet.case_id,
+        inventory_snapshot_id=task_packet.inventory_snapshot_id,
+        candidate_set_id=task_packet.candidate_set_id,
+        reply_text=str(reply_result.get("reply") or legacy_reply_text or ""),
+        response_strategy=_strategy_from(_actions_from(planner, evidence), planner, evidence, fallback=task_packet.response_strategy),
+        candidate_set=candidate_set,
+        evidence_bundle=evidence_bundle,
+        claims=claims,
+        send_actions=send_actions,
+        reply_source=str(evidence.get("deterministic_reply_source") or reply_result.get("reply_source") or "dual_llm_shadow"),
+    )
+
+
+def build_dual_llm_shadow_record(
+    *,
+    legacy_rewrite: dict[str, Any] | None = None,
+    legacy_planner: dict[str, Any] | None = None,
+    tool_evidence: dict[str, Any] | None = None,
+    legacy_reply_text: str = "",
+    legacy_reply_result: dict[str, Any] | None = None,
+    content: str = "",
+    conversation_id: str = "",
+    turn_id: str = "",
+    case_id: str = "",
+) -> dict[str, Any]:
+    packet = build_shadow_task_packet(
+        legacy_rewrite,
+        legacy_planner,
+        content=content,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        case_id=case_id,
+    )
+    package = compose_shadow_outbound(
+        packet,
+        tool_evidence,
+        legacy_reply_text,
+        legacy_planner=legacy_planner,
+        legacy_reply_result=legacy_reply_result,
+    )
+    evidence = dict(tool_evidence or {})
+    planner = dict(legacy_planner or {})
+    reply_result = dict(legacy_reply_result or {})
+    record = {
+        "schema_version": DUAL_LLM_SHADOW_SCHEMA_VERSION,
+        "mode": "shadow",
+        "llm1": {
+            "task_atoms": [task.to_safe_dict() for task in packet.tasks],
+            "constraints": _packet_constraints(packet),
+            "candidate_binding": _candidate_binding(packet, evidence),
+            "response_strategy": packet.response_strategy,
+            "tool_plan": _tool_plan(packet, planner, evidence),
+        },
+        "llm2": {
+            "response_strategy": package.response_strategy,
+            "candidate_binding": _candidate_binding(packet, evidence),
+            "claims": [claim.to_safe_dict() for claim in package.claims],
+            "send_actions": [action.to_safe_dict() for action in package.send_actions],
+            "self_review": _self_review(package, reply_result),
+        },
+        "legacy_roundtrip": {
+            "reply_hash": _stable_hash(package.reply_text),
+            "task_count": len(packet.tasks),
+            "claim_count": len(package.claims),
+            "send_action_count": len(package.send_actions),
+        },
+    }
+    return safe_artifact_payload(record)
+
+
+def _direct_packet_payload(*payloads: dict[str, Any]) -> dict[str, Any]:
+    for payload in payloads:
+        for key in ("tasks", "task_atoms", "structured_tasks"):
+            if isinstance(payload.get(key), list) and payload.get(key):
+                return dict(payload)
+    return {}
+
+
+def _normalize_direct_packet_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    result = dict(payload)
+    tasks = result.get("tasks") or result.get("task_atoms") or result.get("structured_tasks") or []
+    if isinstance(tasks, list):
+        result["tasks"] = [
+            TaskAtom.from_legacy_dict(task).to_legacy_dict() if isinstance(task, dict) else task
+            for task in tasks
+        ]
+        result.pop("task_atoms", None)
+        result.pop("structured_tasks", None)
+    return result
+
+
+def _task_from_action(
+    *,
+    action: str,
+    index: int,
+    content: str,
+    constraints: dict[str, Any],
+    candidate_numbers: list[int],
+) -> TaskAtom:
+    operation = ConstraintOperation.REPLACE if candidate_numbers and action in {"send_video", "send_image"} else ConstraintOperation.INHERIT
+    return TaskAtom(
+        task_id=f"task-{index}-{_slug(action)}",
+        task_type=ACTION_TO_TASK_TYPE.get(action, action or "reply_text"),
+        user_text=content,
+        constraint_operation=operation,
+        constraints=constraints,
+        response_strategy=_strategy_for_action(action),
+        required_tools=[ACTION_TO_TOOL[action]] if action in ACTION_TO_TOOL else [],
+        depends_on_task_ids=["task-1-search_inventory"] if index > 1 and action in {"send_video", "send_image"} else [],
+    )
+
+
+def _strategy_for_action(action: str) -> ResponseStrategy:
+    if action == "clarification":
+        return ResponseStrategy.ASK_CLARIFICATION
+    if action in {"send_video", "send_image", "send_inventory_sheet"}:
+        return ResponseStrategy.SEND_MEDIA
+    if action in {"search_inventory", "compact_listing", "continue_search"}:
+        return ResponseStrategy.TOOL_FIRST
+    if action in {"send_contract_contact"}:
+        return ResponseStrategy.HANDOFF
+    return ResponseStrategy.ANSWER
+
+
+def _strategy_from(
+    actions: list[str],
+    *payloads: dict[str, Any],
+    fallback: str | ResponseStrategy = ResponseStrategy.ANSWER,
+) -> ResponseStrategy:
+    for payload in payloads:
+        raw = payload.get("response_strategy") or payload.get("strategy")
+        if raw:
+            try:
+                return ResponseStrategy(str(raw))
+            except ValueError:
+                pass
+    action_set = set(actions)
+    if "clarification" in action_set:
+        return ResponseStrategy.ASK_CLARIFICATION
+    if action_set & {"send_video", "send_image", "send_inventory_sheet"}:
+        return ResponseStrategy.SEND_MEDIA
+    if action_set & {"search_inventory", "compact_listing", "continue_search"}:
+        return ResponseStrategy.TOOL_FIRST
+    if action_set & {"send_contract_contact"}:
+        return ResponseStrategy.HANDOFF
+    try:
+        return ResponseStrategy(str(fallback))
+    except ValueError:
+        return ResponseStrategy.ANSWER
+
+
+def _actions_from(*payloads: dict[str, Any]) -> list[str]:
+    for payload in payloads:
+        actions = _string_list(payload.get("actions") or payload.get("tool_actions"))
+        if actions:
+            return _dedupe(actions)
+        plan = payload.get("tool_plan")
+        if isinstance(plan, dict):
+            planned = _string_list(plan.get("actions"))
+            if planned:
+                return _dedupe(planned)
+    return []
+
+
+def _constraints_from(*payloads: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for payload in payloads:
+        for key in ("constraints", "query", "filters", "slots"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                merged.update(value)
+    return safe_artifact_payload(merged)
+
+
+def _candidate_numbers_from(*payloads: dict[str, Any]) -> list[int]:
+    numbers: list[int] = []
+    for payload in payloads:
+        for key in ("candidate_numbers", "candidate_indices", "selected_candidate_numbers"):
+            numbers.extend(_int_list(payload.get(key)))
+        selection = payload.get("candidate_selection")
+        if isinstance(selection, dict):
+            numbers.extend(_int_list(selection.get("candidate_numbers") or selection.get("indices")))
+    return _dedupe_ints([number for number in numbers if number > 0])
+
+
+def _candidate_set_from_evidence(task_packet: StructuredTaskPacket, evidence: dict[str, Any]) -> CandidateSet | None:
+    rows = _rows_from_evidence(evidence)
+    if not rows:
+        return None
+    candidates: list[CandidateItem] = []
+    for index, row in enumerate(rows, start=1):
+        candidates.append(
+            CandidateItem(
+                candidate_number=index,
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=_row_text(row, "snapshot_id") or task_packet.inventory_snapshot_id,
+                candidate_set_id=task_packet.candidate_set_id,
+                listing_id=_row_text(row, "listing_id"),
+                evidence_id=f"evd-candidate-{index}",
+                community=_row_text(row, "community"),
+                room_no=_row_text(row, "room_no"),
+                title=_row_text(row, "title"),
+                rent_pay1=_row_int(row, "rent_pay1"),
+                rent_pay2=_row_int(row, "rent_pay2"),
+                source_kind=_row_text(row, "source_kind"),
+            )
+        )
+    return CandidateSet(
+        conversation_id=task_packet.conversation_id,
+        turn_id=task_packet.turn_id,
+        case_id=task_packet.case_id,
+        inventory_snapshot_id=task_packet.inventory_snapshot_id,
+        candidate_set_id=task_packet.candidate_set_id,
+        candidates=candidates,
+        query_state=safe_artifact_payload(evidence.get("query_state") or {}),
+    )
+
+
+def _evidence_bundle_from(
+    task_packet: StructuredTaskPacket,
+    evidence: dict[str, Any],
+    candidate_set: CandidateSet | None,
+) -> ToolEvidenceBundle:
+    evidence_items: list[EvidenceItem] = []
+    for index, raw in enumerate(evidence.get("inventory_listing_evidence") or [], start=1):
+        if not isinstance(raw, dict):
+            continue
+        evidence_items.append(
+            EvidenceItem(
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=str(raw.get("inventory_snapshot_id") or task_packet.inventory_snapshot_id),
+                listing_id=str(raw.get("listing_id") or ""),
+                evidence_id=str(raw.get("evidence_id") or f"evd-listing-{index}"),
+                evidence_type=str(raw.get("evidence_type") or "inventory_listing"),
+                summary=str(raw.get("summary") or ""),
+                source_kind=str(raw.get("source_kind") or ""),
+                confidence=raw.get("confidence"),
+                metadata=safe_artifact_payload(raw.get("metadata") or {}),
+                sensitive_metadata=raw.get("sensitive_metadata") or {},
+            )
+        )
+    for index, row in enumerate(_rows_from_evidence(evidence), start=1):
+        evidence_items.append(
+            EvidenceItem(
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=_row_text(row, "snapshot_id") or task_packet.inventory_snapshot_id,
+                candidate_set_id=task_packet.candidate_set_id,
+                listing_id=_row_text(row, "listing_id"),
+                evidence_id=f"evd-candidate-{index}",
+                evidence_type="inventory_candidate",
+                summary=_row_summary(row, index),
+                source_kind=_row_text(row, "source_kind"),
+                metadata={
+                    "candidate_number": index,
+                    "source_hash": _row_text(row, "source_hash"),
+                },
+            )
+        )
+    for kind, key in (("video", "video_paths"), ("image", "image_paths"), ("inventory_sheet", "inventory_image_paths")):
+        for index, path in enumerate(_string_list(evidence.get(key)), start=1):
+            evidence_items.append(
+                EvidenceItem(
+                    conversation_id=task_packet.conversation_id,
+                    turn_id=task_packet.turn_id,
+                    case_id=task_packet.case_id,
+                    inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                    candidate_set_id=task_packet.candidate_set_id,
+                    evidence_id=f"evd-{kind}-{index}",
+                    evidence_type=kind,
+                    summary=f"{kind} artifact {index}",
+                    source_kind=str(evidence.get("source_kind") or ""),
+                    metadata={
+                        "media_number": index,
+                        "path_hash": _stable_hash(path),
+                    },
+                )
+            )
+    return ToolEvidenceBundle(
+        conversation_id=task_packet.conversation_id,
+        turn_id=task_packet.turn_id,
+        case_id=task_packet.case_id,
+        inventory_snapshot_id=task_packet.inventory_snapshot_id,
+        candidate_set_id=task_packet.candidate_set_id,
+        tool_name="dual_llm_shadow.evidence_adapter",
+        evidence=evidence_items,
+        candidate_set=candidate_set,
+        raw_tool_result=evidence,
+    )
+
+
+def _claims_from(
+    *,
+    task_packet: StructuredTaskPacket,
+    evidence: dict[str, Any],
+    evidence_bundle: ToolEvidenceBundle,
+    legacy_reply_text: str,
+) -> list[Claim]:
+    explicit_claims = evidence.get("claims")
+    if isinstance(explicit_claims, list) and explicit_claims:
+        claims: list[Claim] = []
+        for index, raw in enumerate(explicit_claims, start=1):
+            if not isinstance(raw, dict):
+                continue
+            claims.append(
+                Claim(
+                    conversation_id=task_packet.conversation_id,
+                    turn_id=task_packet.turn_id,
+                    case_id=task_packet.case_id,
+                    inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                    candidate_set_id=task_packet.candidate_set_id,
+                    listing_id=str(raw.get("listing_id") or ""),
+                    evidence_id=str(raw.get("evidence_id") or ""),
+                    claim_id=str(raw.get("claim_id") or f"claim-{index}"),
+                    text=str(raw.get("text") or ""),
+                    status=str(raw.get("status") or "supported"),
+                    support=_string_list(raw.get("support")),
+                    risk=str(raw.get("risk") or "low"),
+                )
+            )
+        if claims:
+            return claims
+    support_ids = [item.evidence_id for item in evidence_bundle.evidence if item.evidence_id]
+    claims = []
+    for index, row in enumerate(_rows_from_evidence(evidence), start=1):
+        claims.append(
+            Claim(
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                candidate_set_id=task_packet.candidate_set_id,
+                listing_id=_row_text(row, "listing_id"),
+                evidence_id=f"evd-candidate-{index}",
+                claim_id=f"claim-candidate-{index}",
+                text=_row_summary(row, index),
+                support=[f"evd-candidate-{index}"],
+                risk="low",
+            )
+        )
+    if legacy_reply_text and not claims:
+        claims.append(
+            Claim(
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                candidate_set_id=task_packet.candidate_set_id,
+                claim_id="claim-legacy-reply",
+                text=legacy_reply_text,
+                support=support_ids[:5],
+                risk="medium" if not support_ids else "low",
+            )
+        )
+    return claims
+
+
+def _send_actions_from(
+    *,
+    task_packet: StructuredTaskPacket,
+    evidence: dict[str, Any],
+    reply_text: str,
+) -> list[SendAction]:
+    actions = _actions_from(evidence)
+    result: list[SendAction] = []
+    if reply_text and ("generate_reply" in actions or not actions or any(task.task_type == "reply_text" for task in task_packet.tasks)):
+        result.append(
+            SendAction(
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                candidate_set_id=task_packet.candidate_set_id,
+                action_id="send-text-1",
+                action_type="text",
+                payload={"reply_hash": _stable_hash(reply_text)},
+                metadata={"source": "legacy_reply_text"},
+            )
+        )
+    for kind, key, action_type in (
+        ("video", "video_paths", "video"),
+        ("image", "image_paths", "image"),
+        ("inventory_sheet", "inventory_image_paths", "image"),
+    ):
+        for index, path in enumerate(_string_list(evidence.get(key)), start=1):
+            result.append(
+                SendAction(
+                    conversation_id=task_packet.conversation_id,
+                    turn_id=task_packet.turn_id,
+                    case_id=task_packet.case_id,
+                    inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                    candidate_set_id=task_packet.candidate_set_id,
+                    evidence_id=f"evd-{kind}-{index}",
+                    action_id=f"send-{kind}-{index}",
+                    action_type=action_type,
+                    payload={
+                        "media_number": index,
+                        "path_hash": _stable_hash(path),
+                    },
+                    metadata={"source": "program_evidence", "kind": kind},
+                )
+            )
+    return result
+
+
+def _packet_constraints(packet: StructuredTaskPacket) -> dict[str, Any]:
+    task_constraints: dict[str, Any] = {}
+    for task in packet.tasks:
+        if task.constraints:
+            task_constraints[task.task_id] = task.constraints
+    return safe_artifact_payload(
+        {
+            "inherited": packet.inherited_constraints,
+            "replaced": packet.replaced_constraints,
+            "excluded": packet.excluded_constraints,
+            "cleared_keys": packet.cleared_constraint_keys,
+            "task_constraints": task_constraints,
+        }
+    )
+
+
+def _candidate_binding(packet: StructuredTaskPacket, evidence: dict[str, Any]) -> dict[str, Any]:
+    rows = _rows_from_evidence(evidence)
+    selected_numbers: list[int] = []
+    for task in packet.tasks:
+        selected_numbers.extend(_int_list(task.constraints.get("candidate_numbers")))
+    candidates = [
+        {
+            "candidate_number": index,
+            "listing_id": _row_text(row, "listing_id"),
+            "row_hash": _stable_hash(_row_identity(row)),
+            "community": _row_text(row, "community"),
+            "room_no": _row_text(row, "room_no"),
+        }
+        for index, row in enumerate(rows, start=1)
+    ]
+    media = []
+    for kind, key in (("video", "video_paths"), ("image", "image_paths"), ("inventory_sheet", "inventory_image_paths")):
+        for index, path in enumerate(_string_list(evidence.get(key)), start=1):
+            candidate_number = selected_numbers[index - 1] if index <= len(selected_numbers) else (index if index <= len(candidates) else None)
+            media.append(
+                {
+                    "kind": kind,
+                    "media_number": index,
+                    "candidate_number": candidate_number,
+                    "path_hash": _stable_hash(path),
+                    "bound_by": "task_candidate_numbers" if selected_numbers else "evidence_order",
+                }
+            )
+    return safe_artifact_payload(
+        {
+            "selected_candidate_numbers": _dedupe_ints(selected_numbers),
+            "candidates": candidates,
+            "media": media,
+        }
+    )
+
+
+def _tool_plan(packet: StructuredTaskPacket, planner: dict[str, Any], evidence: dict[str, Any]) -> dict[str, Any]:
+    planned = _actions_from(planner)
+    observed = _actions_from(evidence)
+    return safe_artifact_payload(
+        {
+            "actions": observed or planned,
+            "required_tools": _dedupe([tool for task in packet.tasks for tool in task.required_tools]),
+            "continue_search": "continue_search" in set(observed or planned),
+            "source": str(planner.get("source") or planner.get("reply_source") or evidence.get("deterministic_reply_source") or ""),
+        }
+    )
+
+
+def _self_review(package: PreparedOutboundPackage, reply_result: dict[str, Any]) -> dict[str, Any]:
+    selfcheck = reply_result.get("selfcheck") if isinstance(reply_result.get("selfcheck"), dict) else {}
+    return safe_artifact_payload(
+        {
+            "status": str(selfcheck.get("status") or "shadow_only"),
+            "source": str(selfcheck.get("source") or "dual_llm_shadow"),
+            "needs_planner_retry": bool(reply_result.get("needs_planner_retry")),
+            "has_claims": bool(package.claims),
+            "send_action_count": len(package.send_actions),
+            "llm2_decides_media_targets": False,
+        }
+    )
+
+
+def _rows_from_evidence(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("target_rows", "inventory_rows", "candidate_rows"):
+        rows = [dict(row) for row in evidence.get(key) or [] if isinstance(row, dict)]
+        if rows:
+            return rows
+    candidate_set = evidence.get("candidate_set")
+    if isinstance(candidate_set, dict):
+        return [dict(row) for row in candidate_set.get("candidates") or [] if isinstance(row, dict)]
+    return []
+
+
+def _row_summary(row: dict[str, Any], index: int) -> str:
+    community = _row_text(row, "community")
+    room_no = _row_text(row, "room_no")
+    rent = _row_int(row, "rent_pay1") or _row_int(row, "rent_pay2")
+    parts = [f"候选{index}"]
+    if community:
+        parts.append(community)
+    if room_no:
+        parts.append(room_no)
+    if rent:
+        parts.append(f"租金{rent}")
+    return " ".join(parts)
+
+
+def _row_identity(row: dict[str, Any]) -> dict[str, str]:
+    return {
+        "listing_id": _row_text(row, "listing_id"),
+        "community": _row_text(row, "community"),
+        "room_no": _row_text(row, "room_no"),
+    }
+
+
+def _row_text(row: dict[str, Any], field: str) -> str:
+    for name in ROW_ALIASES[field]:
+        value = row.get(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _row_int(row: dict[str, Any], field: str) -> int | None:
+    text = _row_text(row, field)
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if not digits:
+        return None
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    return safe_artifact_payload(dict(value or {})) if isinstance(value, dict) else {}
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _int_list(value: Any) -> list[int]:
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, str):
+        value = value.replace("，", ",")
+        return [int(item) for item in value.split(",") if item.strip().isdigit()]
+    if isinstance(value, (list, tuple, set)):
+        result: list[int] = []
+        for item in value:
+            try:
+                result.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return result
+    return []
+
+
+def _dedupe(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        result.append(value)
+        seen.add(value)
+    return result
+
+
+def _dedupe_ints(values: list[int]) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        if value in seen:
+            continue
+        result.append(value)
+        seen.add(value)
+    return result
+
+
+def _slug(value: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in value.strip().lower()).strip("_") or "action"
+
+
+def _stable_hash(value: Any) -> str:
+    payload = json.dumps(safe_artifact_payload(value), ensure_ascii=False, sort_keys=True, default=str)
+    return sha256(payload.encode("utf-8")).hexdigest()
