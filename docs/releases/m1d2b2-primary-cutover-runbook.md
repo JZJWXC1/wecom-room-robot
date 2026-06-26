@@ -29,6 +29,18 @@
 - primary replay parity case 全部通过。
 - public artifact、replay report、cutover report、prepared outbound package、send action metadata 不含密码、手机号、token、canary 或开发机绝对路径。
 
+## M1D3 Stability Gate Addendum
+
+M1D3 cutover stability gate must not rely on pytest-only fixtures or implicit `tests/conftest.py` environment setup. Local primary replay must construct its own in-memory legacy provider and pass when the process default `INVENTORY_SOURCE` is not `local_cache`.
+
+Before any final cutover evaluation:
+- run full pytest three consecutive times;
+- run local snapshot primary replay three consecutive times;
+- run `stability_replay_cases(..., min_cases=20)` and require 100% legacy/snapshot parity;
+- compare listing id order and rent signatures for every parity case;
+- require `evaluate_cutover_readiness(...).required_parity_cases >= 20`;
+- keep `safe_to_cutover=false` if any alias, pointer, reconciliation, secret scan, candidate ordering, price signature, or parity result is unstable.
+
 ## Secret Scan Boundary
 
 M1D2B2 继续使用 `app/services/inventory_snapshot_shadow.py::scan_public_artifacts_for_sensitive_text` 的结构化扫描语义。

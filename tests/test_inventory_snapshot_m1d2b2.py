@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from app.config import settings
 from app.services.inventory_read_models import (
     FALLBACK_LEGACY_WHOLE_REQUEST,
     FALLBACK_STRICT,
@@ -32,6 +33,7 @@ from app.services.inventory_snapshot_cutover import (
     ready_readiness_state,
     rehearse_rollback,
     run_primary_replay,
+    stability_replay_cases,
     strict_and_fallback_probe,
     synthetic_inventory_rows,
 )
@@ -68,6 +70,47 @@ def test_local_primary_replay_builds_fictional_snapshot_and_readiness_report(tmp
     assert "TOKEN_CANARY" not in payload
     assert "19900009999" not in payload
     assert str(tmp_path) not in payload
+
+
+def test_primary_replay_is_self_contained_without_pytest_inventory_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(settings, "inventory_source", "local_image")
+    report = run_primary_replay(tmp_path / "self-contained")
+    readiness = evaluate_cutover_readiness(
+        tmp_path / "self-contained",
+        replay_report=report,
+        min_parity_cases=len(default_replay_cases()),
+    )
+
+    assert report["ok"] is True
+    assert all(item["parity_passed"] for item in report["cases"])
+    assert readiness["ready"] is True
+
+
+def test_primary_replay_twenty_case_parity_keeps_order_and_prices(tmp_path: Path) -> None:
+    rows = synthetic_inventory_rows()
+    cases = stability_replay_cases(rows)
+    report = run_primary_replay(tmp_path / "twenty-case", rows=rows, cases=cases)
+    readiness = evaluate_cutover_readiness(tmp_path / "twenty-case", replay_report=report)
+
+    assert len(cases) == 20
+    assert report["ok"] is True
+    assert readiness["ready"] is True
+    assert readiness["required_parity_cases"] == 20
+    for item in report["cases"]:
+        legacy = item["legacy"]
+        snapshot = item["snapshot"]
+        assert item["parity_passed"] is True
+        assert [row["listing_id"] for row in legacy] == [row["listing_id"] for row in snapshot]
+        assert [
+            (row["listing_id"], row["rent_pay1"], row["rent_pay2"])
+            for row in legacy
+        ] == [
+            (row["listing_id"], row["rent_pay1"], row["rent_pay2"])
+            for row in snapshot
+        ]
 
 
 def test_two_snapshot_versions_keep_turn_level_context_locked(tmp_path: Path) -> None:

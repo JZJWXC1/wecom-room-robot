@@ -6,6 +6,7 @@ from typing import Any, Callable, Protocol
 from app.services.fuzzy_match import fuzzy_contains_score, normalize_search_text
 from app.services.inventory import InventoryService
 from app.services.inventory_query import (
+    filter_scored_by_hard_constraints,
     parse_inventory_query,
     row_matches_hard_constraints,
 )
@@ -415,22 +416,64 @@ def _score_snapshot_listings(
     snapshot: InventorySnapshot,
     query_text: str,
 ) -> list[tuple[int, int, InventoryListing]]:
-    query = parse_inventory_query(query_text)
-    normalized_query = normalize_search_text(query_text).lower()
-    area_alias_hits = _area_alias_hits(normalized_query)
-    preferred_communities = _mentioned_snapshot_communities(snapshot, normalized_query)
-    scored: list[tuple[int, int, InventoryListing]] = []
+    row_items: list[tuple[dict[str, Any], int, InventoryListing]] = []
     for index, listing in enumerate(snapshot.listings):
-        if preferred_communities and normalize_search_text(listing.community).lower() not in preferred_communities:
-            continue
-        row = _listing_as_query_row(listing)
-        if query.has_hard_constraints and not row_matches_hard_constraints(row, query):
-            continue
-        score = _snapshot_listing_score(listing, normalized_query, query.anchor_terms, area_alias_hits)
-        if score > 0 or query.has_hard_constraints or not normalized_query:
-            scored.append((score, index, listing))
-    scored.sort(key=lambda item: (-item[0], item[1], item[2].listing_id))
-    return scored
+        row_items.append((_listing_as_query_row(listing), index, listing))
+    by_row_id = {id(row): (index, listing) for row, index, listing in row_items}
+    rows = _search_rows_with_legacy_semantics(
+        [row for row, _index, _listing in row_items],
+        query_text,
+        limit=len(row_items),
+    )
+    result: list[tuple[int, int, InventoryListing]] = []
+    for rank, row in enumerate(rows):
+        index, listing = by_row_id[id(row)]
+        result.append((len(rows) - rank, index, listing))
+    return result
+
+
+def _search_rows_with_legacy_semantics(
+    rows: list[dict[str, Any]],
+    query_text: str,
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    scorer = InventoryService()
+    text = scorer._normalize_query(query_text)
+    parsed_query = parse_inventory_query(text)
+    room_refs = list(parsed_query.room_refs)
+    records = list(rows)
+    if room_refs:
+        records = [row for row in records if scorer._row_matches_any_room_ref(row, room_refs)]
+        if not records:
+            return []
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for row in records:
+        merged = " ".join(str(value).lower() for value in row.values())
+        score = scorer._score_row(text, merged, row)
+        if score > 0 or not text.strip():
+            scored.append((score, row))
+    exact_scored = scorer._exact_community_scored_rows(text, scored)
+    if exact_scored:
+        scored = exact_scored
+    area_scored = scorer._area_scored_rows(text, scored)
+    if area_scored:
+        scored = area_scored
+    if parsed_query.has_hard_constraints:
+        scored = filter_scored_by_hard_constraints(scored, parsed_query)
+        if not scored:
+            return []
+    strict_price = None if room_refs or parsed_query.price_range else scorer._requested_strict_price(text)
+    if strict_price is not None:
+        scored = [
+            (score + 10, row)
+            for score, row in scored
+            if strict_price in scorer._row_prices(row)
+        ]
+        if not scored:
+            return []
+    scored = scorer._filter_scored_rows(scored, text=text)
+    return [row for _score, row in scored[:limit]]
 
 
 def _mentioned_snapshot_communities(snapshot: InventorySnapshot, normalized_query: str) -> set[str]:

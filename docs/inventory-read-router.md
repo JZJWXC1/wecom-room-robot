@@ -198,6 +198,14 @@ M1D2B2 不改变：
 
 Secret scan 继续复用 `inventory_snapshot_shadow.scan_public_artifacts_for_sensitive_text`：结构化 `sha256/source_hash/snapshot_id/decision_id/evidence_id` 中的手机号形态数字不会误报；普通业务文本、嵌套 list/dict、manifest 业务字段中的手机号、canary、开发机绝对路径仍会阻断。
 
+M1D3 parity stability gate：
+
+- Snapshot primary search now uses the same legacy search contract for room refs, hard constraints, exact community narrowing, area narrowing, strict price, and score thresholding.
+- Local cutover replay constructs an in-memory legacy fixture service and does not rely on pytest-only `INVENTORY_SOURCE=local_cache` setup.
+- `stability_replay_cases(..., min_cases=20)` is the minimum local final-cutover parity set.
+- `evaluate_cutover_readiness(...).required_parity_cases` defaults to 20, so a 5-case happy-path replay is not sufficient for final cutover readiness.
+- This still does not enable production primary and does not modify `app/main.py`, customer replies, Planner, Prompt, selfcheck, or send semantics.
+
 M1D2B2 Legacy Removal Report：
 
 | 保留项 | 保留原因 | removal_milestone |

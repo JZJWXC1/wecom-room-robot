@@ -21,6 +21,7 @@ from app.services.inventory_read_models import (
 from app.services.inventory_read_provider import (
     LegacyInventoryReadProvider,
     SnapshotInventoryReadProvider,
+    _search_rows_with_legacy_semantics,
 )
 from app.services.inventory_read_router import InventoryReadRouter
 from app.services.inventory_sensitive_access import (
@@ -146,6 +147,40 @@ def default_replay_cases() -> tuple[PrimaryReplayCase, ...]:
         PrimaryReplayCase("media_utility", "云杉苑民水民电视频图片"),
     )
 
+def stability_replay_cases(
+    rows: list[dict[str, Any]] | None = None,
+    *,
+    min_cases: int = 20,
+) -> tuple[PrimaryReplayCase, ...]:
+    fixture_rows = rows or synthetic_inventory_rows()
+    if not fixture_rows:
+        return default_replay_cases()
+    keys = list(fixture_rows[0].keys())
+    if len(keys) < 7:
+        return default_replay_cases()
+    area_key, community_key, room_key, _desc_key, layout_key, rent1_key, rent2_key = keys[:7]
+    cases: list[PrimaryReplayCase] = []
+    for index, row in enumerate(fixture_rows, start=1):
+        area = str(row.get(area_key) or "").strip()
+        community = str(row.get(community_key) or "").strip()
+        room_no = str(row.get(room_key) or "").strip()
+        layout = str(row.get(layout_key) or "").strip()
+        rent_pay1 = str(row.get(rent1_key) or "").strip()
+        rent_pay2 = str(row.get(rent2_key) or "").strip()
+        if community and room_no:
+            cases.append(PrimaryReplayCase(f"row{index}_exact", f"{community}{room_no}"))
+        if community:
+            cases.append(PrimaryReplayCase(f"row{index}_community", community))
+        if room_no:
+            cases.append(PrimaryReplayCase(f"row{index}_room", room_no))
+        if area and layout:
+            cases.append(PrimaryReplayCase(f"row{index}_area_layout", {"area": area, "query": layout}))
+        if area and rent_pay1 and rent_pay2:
+            cases.append(PrimaryReplayCase(f"row{index}_area_budget", {"area": area, "query": f"{rent_pay2}-{rent_pay1}"}))
+    if len(cases) < min_cases:
+        cases.extend(default_replay_cases())
+    return tuple(cases[:min_cases])
+
 
 def build_local_snapshot(
     root: Path,
@@ -266,7 +301,7 @@ def evaluate_cutover_readiness(
     *,
     readiness_state: dict[str, Any] | None = None,
     replay_report: dict[str, Any] | None = None,
-    min_parity_cases: int = 1,
+    min_parity_cases: int = 20,
 ) -> dict[str, Any]:
     reader = SnapshotReader(root)
     pointer = reader.get_current_pointer()
@@ -303,6 +338,7 @@ def evaluate_cutover_readiness(
             "decision": decision.to_dict(),
             "public_artifact_scan": scan,
             "replay_case_count": len(replay_report.get("cases") or []) if replay_report else 0,
+            "required_parity_cases": min_parity_cases,
         }
     )
 
@@ -419,18 +455,35 @@ def legacy_removal_report() -> dict[str, Any]:
 
 
 def _legacy_provider(rows: list[dict[str, Any]]) -> LegacyInventoryReadProvider:
-    service = InventoryService()
-    service._cache = pd.DataFrame(rows)
-    service._cache_file_marker = None
-    service._cache_meta = {
-        "status": "success",
-        "hash": _rows_hash(rows),
-        "row_count": len(rows),
-    }
+    service = _CutoverFixtureInventoryService(rows)
     return LegacyInventoryReadProvider(
         service,
         rewrite_index_loader=lambda: build_rewrite_inventory_index(rows, cache_meta=service.cache_meta()),
     )
+
+
+class _CutoverFixtureInventoryService(InventoryService):
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        super().__init__()
+        self._fixture_rows = [dict(row) for row in rows]
+        self._cache = pd.DataFrame(self._fixture_rows)
+        self._cache_file_marker = None
+        self._cache_meta = {
+            "status": "success",
+            "hash": _rows_hash(self._fixture_rows),
+            "row_count": len(self._fixture_rows),
+        }
+
+    async def search(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        rows = _search_rows_with_legacy_semantics(self._fixture_rows, query, limit=limit)
+        return [self._with_inventory_meta(row) for row in rows]
+
+    async def all_rows(
+        self,
+        limit: int = 500,
+        refresh_if_needed: bool = True,
+    ) -> list[dict[str, Any]]:
+        return [self._with_inventory_meta(row) for row in self._fixture_rows[:limit]]
 
 
 def _evidence_signature(items: list[InventoryListingEvidence]) -> list[dict[str, Any]]:
