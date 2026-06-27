@@ -5,7 +5,7 @@ import hashlib
 import json
 from typing import Any
 
-from app.services.kf_contracts import SendAction, SendReceipt, REDACTED, safe_artifact_payload
+from app.services.kf_contracts import SendAction, SendReceipt, safe_artifact_payload
 
 
 SEND_RECEIPT_SCHEMA_VERSION = "kf_send_receipts.v1"
@@ -15,6 +15,7 @@ SENT_STATUS = "sent"
 FAILED_STATUS = "failed"
 SKIPPED_DUPLICATE_STATUS = "skipped_duplicate"
 _SUCCESS_STATUSES = {SENT_STATUS}
+_LEDGER_INTERNAL_MATCH_KEYS = {"receipt_id", "idempotency_key", "duplicate_of"}
 
 
 def build_send_action(
@@ -190,7 +191,7 @@ def append_receipt(context: dict[str, Any] | None, receipt: SendReceipt) -> dict
     current = context or {}
     ledger = normalize_receipt_ledger(current)
     receipts = list(ledger["receipts"])
-    receipts.append(receipt.to_safe_dict())
+    receipts.append(receipt.to_ledger_dict())
     ledger["receipts"] = receipts[-SEND_RECEIPT_CONTEXT_LIMIT:]
     current[SEND_RECEIPT_CONTEXT_KEY] = ledger
     return current
@@ -201,7 +202,7 @@ def normalize_receipt_ledger(context: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(ledger, dict):
         return {"schema_version": SEND_RECEIPT_SCHEMA_VERSION, "receipts": []}
     receipts = [
-        safe_artifact_payload(item)
+        _safe_ledger_receipt_payload(item)
         for item in ledger.get("receipts") or []
         if isinstance(item, dict)
     ]
@@ -225,6 +226,17 @@ def safe_failure_reason(error: BaseException | str) -> str:
 
 def _receipt_payloads(context: dict[str, Any] | None) -> list[dict[str, Any]]:
     return [item for item in normalize_receipt_ledger(context).get("receipts") or [] if isinstance(item, dict)]
+
+
+def _safe_ledger_receipt_payload(item: dict[str, Any]) -> dict[str, Any]:
+    safe = safe_artifact_payload(item)
+    if not isinstance(safe, dict):
+        return {}
+    for key in _LEDGER_INTERNAL_MATCH_KEYS:
+        value = str(item.get(key) or "").strip()
+        if value:
+            safe[key] = value
+    return safe
 
 
 def _receipt_metadata(action: SendAction, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -255,10 +267,7 @@ def _provider_message_id(result: dict[str, Any]) -> str:
 
 
 def _stable_digest(payload: Any) -> str:
-    safe_payload = safe_artifact_payload(payload)
-    if safe_payload == REDACTED:
-        safe_payload = {"redacted": True}
-    raw = json.dumps(safe_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

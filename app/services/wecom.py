@@ -7,7 +7,19 @@ import httpx
 
 from app.config import settings
 from app.models import IncomingMessage
+from app.services.kf_contracts import redact_sensitive_text, redact_sensitive_value
 from app.services.wx_crypto import WeComCrypto
+
+
+def _raise_for_status_sanitized(response: httpx.Response, label: str) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"{label} HTTP 失败：{redact_sensitive_text(str(exc))}") from None
+
+
+def _safe_api_error(prefix: str, data: dict[str, Any]) -> RuntimeError:
+    return RuntimeError(f"{prefix}：{redact_sensitive_value(data)}")
 
 
 class WeComClient:
@@ -75,10 +87,10 @@ class WeComClient:
         async with httpx.AsyncClient(timeout=60) as client:
             with path.open("rb") as file_obj:
                 response = await client.post(url, files={"media": file_obj})
-            response.raise_for_status()
+            _raise_for_status_sanitized(response, "企业微信素材上传")
             data = response.json()
         if data.get("errcode") != 0:
-            raise RuntimeError(f"企业微信素材上传失败：{data}")
+            raise _safe_api_error("企业微信素材上传失败", data)
         return data["media_id"]
 
     async def _post_message(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -86,10 +98,10 @@ class WeComClient:
         url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(url, json=payload)
-            response.raise_for_status()
+            _raise_for_status_sanitized(response, "企业微信消息发送")
             data = response.json()
         if data.get("errcode") != 0:
-            raise RuntimeError(f"企业微信消息发送失败：{data}")
+            raise _safe_api_error("企业微信消息发送失败", data)
         return data
 
     async def _get_access_token(self) -> str:
@@ -99,10 +111,10 @@ class WeComClient:
         params = {"corpid": settings.wecom_corp_id, "corpsecret": settings.wecom_secret}
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(url, params=params)
-            response.raise_for_status()
+            _raise_for_status_sanitized(response, "企业微信 access_token 获取")
             data = response.json()
         if data.get("errcode") != 0:
-            raise RuntimeError(f"企业微信 access_token 获取失败：{data}")
+            raise _safe_api_error("企业微信 access_token 获取失败", data)
         self._token = data["access_token"]
         self._token_expire_at = time.time() + int(data.get("expires_in", 7200)) - 300
         return self._token

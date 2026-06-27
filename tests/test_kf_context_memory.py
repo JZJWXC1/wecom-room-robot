@@ -1,6 +1,7 @@
+import json
 from pathlib import Path
 
-from app.services import kf_context_memory
+from app.services import kf_context_memory, kf_send_receipts
 
 
 class FakeStore:
@@ -111,6 +112,134 @@ def test_recent_context_loads_from_store_and_deletes_expired_context() -> None:
     assert expired is None
     assert key not in memory
     assert store.deleted == [key]
+
+
+def test_save_context_persists_only_safe_summary_without_customer_id_or_secrets() -> None:
+    raw_customer_id = "wm_CUSTOMER_CANARY_12345678901234567890"
+    synthetic_phone = "19900009999"
+    synthetic_password = "246810#"
+    synthetic_token = "access_token=token_CANARY_abcdefghijklmnopqrstuvwxyz"
+    synthetic_signature = "msg_signature=sig_CANARY_abcdefghijklmnopqrstuvwxyz"
+    source_hash = "a" * 40
+    context = {
+        "recent_messages": [
+            {
+                "role": "user",
+                "content": f"手机{synthetic_phone}，看房密码{synthetic_password}，{synthetic_token}",
+                "created_at": 1,
+            }
+        ],
+        "last_candidate_set": {
+            "query": f"万达 {synthetic_phone}",
+            "intent": "inventory",
+            "candidates": [
+                {
+                    "listing_id": "lst_safe_001",
+                    "小区": "荣润府",
+                    "房号": "15-2-801B",
+                    "押一付一": "1800",
+                    "看房方式密码": synthetic_password,
+                    "手机号": synthetic_phone,
+                    "token": synthetic_token,
+                    "source_hash": source_hash,
+                }
+            ],
+            "shown_count": 1,
+            "total_count": 1,
+            "created_at": 1,
+        },
+        "confirmed_room": {
+            "row": {
+                "listing_id": "lst_safe_001",
+                "小区": "荣润府",
+                "房号": "15-2-801B",
+                "看房方式密码": synthetic_password,
+                "备注": f"联系{synthetic_phone}",
+            },
+            "label": "荣润府15-2-801B",
+            "intent": "viewing",
+            "created_at": 1,
+            "inventory_cache_meta": {
+                "source_hash": source_hash,
+                "msg_signature": synthetic_signature,
+            },
+        },
+        "updated_at": 1,
+    }
+    store = FakeStore()
+    memory: dict[str, dict] = {}
+
+    kf_context_memory.save_context(
+        "kf_CANARY_OPEN_ID_12345678901234567890",
+        raw_customer_id,
+        context,
+        memory=memory,
+        store=store,
+        logger=FakeLogger(),
+        now=lambda: 2,
+    )
+
+    [(saved_key, saved_context)] = store.saved.items()
+    dumped = json.dumps({saved_key: saved_context}, ensure_ascii=False, default=str)
+
+    assert saved_key.startswith("kfctx_")
+    assert raw_customer_id not in dumped
+    assert "kf_CANARY_OPEN_ID" not in dumped
+    assert synthetic_phone not in dumped
+    assert synthetic_password not in dumped
+    assert "token_CANARY" not in dumped
+    assert "sig_CANARY" not in dumped
+    assert "看房方式密码" not in dumped
+    assert saved_context["last_candidate_set"]["candidates"][0]["listing_id"] == "lst_safe_001"
+    assert saved_context["last_candidate_set"]["candidates"][0]["has_password"] is True
+    assert saved_context["confirmed_room"]["row"]["needs_contact"] is False
+
+
+def test_save_context_preserves_send_receipt_ledger_internal_idempotency_key() -> None:
+    context = {
+        "structured_memory": {
+            "current_turn_id": "turn-1",
+            "turn_records": [{"turn_id": "turn-1", "msgids": ["msg-1"]}],
+        },
+        "updated_at": 1,
+    }
+    action = kf_send_receipts.build_send_action(
+        open_kfid="kf",
+        external_userid="wm_CUSTOMER_CANARY_12345678901234567890",
+        context=context,
+        msgids=["msg-1"],
+        action_id="send-text-final",
+        action_type="text",
+        payload={"text_hash": kf_send_receipts.text_hash("这条我已经发送过")},
+    )
+    idempotency_key = kf_send_receipts.build_idempotency_key(action)
+    context = kf_send_receipts.append_receipt(
+        context,
+        kf_send_receipts.build_sent_receipt(
+            action,
+            idempotency_key=idempotency_key,
+            provider_result={"msgid": "msg_PROVIDER_CANARY_12345678901234567890"},
+        ),
+    )
+    store = FakeStore()
+
+    kf_context_memory.save_context(
+        "kf",
+        "wm_CUSTOMER_CANARY_12345678901234567890",
+        context,
+        memory={},
+        store=store,
+        logger=FakeLogger(),
+        now=lambda: 2,
+    )
+
+    [(saved_key, saved_context)] = store.saved.items()
+    dumped = json.dumps({saved_key: saved_context}, ensure_ascii=False, default=str)
+
+    assert "CUSTOMER_CANARY" not in dumped
+    assert "msg_PROVIDER_CANARY" not in dumped
+    assert saved_context["send_receipts"]["receipts"][0]["idempotency_key"] == idempotency_key
+    assert kf_send_receipts.find_successful_receipt(saved_context, idempotency_key) is not None
 
 
 def test_append_and_format_dialog_context() -> None:

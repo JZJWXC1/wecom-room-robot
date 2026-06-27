@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+
 import app.main as main
 from app.models import ReplyPlan
 from app.services import inventory_read_turn, kf_context_memory
@@ -23,6 +25,7 @@ from app.services.wecom_kf import (
     is_kf_message_event,
     kf_callback_payload_event_message,
     should_auto_reply_kf_message,
+    _raise_for_status_sanitized,
 )
 
 
@@ -416,7 +419,7 @@ class InventoryReadRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         main._generate_reply_result = fake_generate_reply_result
         main._send_final_actions = fake_send_final_actions
         inventory_read_turn.InventoryReadRouter = CountingRouter
-        main.kf_turn_generations["kf:wm"] = 0
+        main.kf_turn_generations[main._conversation_key("kf", "wm")] = 0
         try:
             await main._process_text_turn(
                 open_kfid="kf",
@@ -674,7 +677,7 @@ class InventoryReadRouterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         main._generate_reply_result = generate_reply_result or fake_generate_reply_result
         main._send_final_actions = fake_send_final_actions
         main.kf_orchestrator_shadow.build_shadow_artifact = recording_shadow_builder
-        main.kf_turn_generations["kf:wm"] = 0
+        main.kf_turn_generations[main._conversation_key("kf", "wm")] = 0
         try:
             await main._process_text_turn(
                 open_kfid="kf",
@@ -1518,6 +1521,7 @@ class WeComKfStateStoreTests(unittest.TestCase):
             self.assertTrue(reloaded.is_processed("msg-2"))
             self.assertTrue(reloaded.is_processed("msg-3"))
             self.assertEqual(reloaded.last_welcome_sent_at("kf:wm"), 123)
+            self.assertNotIn("kf:wm", path.read_text(encoding="utf-8"))
 
 
 class WeComKfPayloadTests(unittest.TestCase):
@@ -1578,6 +1582,22 @@ class WeComKfPayloadTests(unittest.TestCase):
         self.assertTrue(is_kf_message_event({"Event": "kf_msg_or_event", "Token": "next-token"}))
         self.assertFalse(is_kf_message_event({"msgtype": "text"}))
 
+    def test_http_status_error_is_sanitized_before_logging(self) -> None:
+        request = httpx.Request(
+            "GET",
+            "https://qyapi.weixin.qq.com/cgi-bin/kf/send_msg?access_token=token_CANARY_abcdefghijklmnopqrstuvwxyz&corpsecret=secret_CANARY_abcdefghijklmnopqrstuvwxyz",
+        )
+        response = httpx.Response(500, request=request, text="server error")
+
+        with self.assertRaises(RuntimeError) as raised:
+            _raise_for_status_sanitized(response, "微信客服发送")
+
+        message = str(raised.exception)
+        self.assertNotIn("token_CANARY", message)
+        self.assertNotIn("secret_CANARY", message)
+        self.assertNotIn("access_token=token", message)
+        self.assertIn("[REDACTED]", message)
+
 
 class WeComKfContextStoreTests(unittest.TestCase):
     def test_persists_structured_memory_active_query_and_candidate_metadata(self) -> None:
@@ -1624,6 +1644,65 @@ class WeComKfContextStoreTests(unittest.TestCase):
                 memory["turn_records"][-1]["rewritten_query"],
                 "发送候选第1和第5套视频",
             )
+
+    def test_context_store_writes_redacted_safe_context_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "context.json"
+            store = WeComKfContextStore(path=path)
+            raw_customer_id = "wm_CUSTOMER_CANARY_12345678901234567890"
+            context = kf_context_memory.empty_context(now=lambda: 100.0)
+            context["recent_messages"] = [
+                {
+                    "role": "user",
+                    "content": "手机19900009999，看房密码246810#，token=token_CANARY_abcdefghijklmnopqrstuvwxyz",
+                    "created_at": 100.0,
+                }
+            ]
+            context["last_candidate_set"] = {
+                "intent": "inventory",
+                "query": "荣润府 手机19900009999",
+                "candidates": [
+                    {
+                        "listing_id": "lst_safe_001",
+                        "小区": "荣润府",
+                        "房号": "15-2-801B",
+                        "押一付一": "1800",
+                        "看房方式密码": "246810#",
+                        "手机号": "19900009999",
+                        "token": "token_CANARY_abcdefghijklmnopqrstuvwxyz",
+                    }
+                ],
+                "shown_count": 1,
+                "total_count": 1,
+                "created_at": 100.0,
+            }
+            context["confirmed_room"] = {
+                "row": {
+                    "listing_id": "lst_safe_001",
+                    "小区": "荣润府",
+                    "房号": "15-2-801B",
+                    "看房方式密码": "246810#",
+                    "备注": "电话19900009999",
+                },
+                "label": "荣润府15-2-801B",
+                "created_at": 100.0,
+                "inventory_cache_meta": {"msg_signature": "sig_CANARY_abcdefghijklmnopqrstuvwxyz"},
+            }
+
+            store.save(f"kf:{raw_customer_id}", context)
+            dumped = path.read_text(encoding="utf-8")
+            loaded = json.loads(dumped)
+            saved_context = next(iter(loaded.values()))
+
+            self.assertNotIn(raw_customer_id, dumped)
+            self.assertNotIn("19900009999", dumped)
+            self.assertNotIn("246810#", dumped)
+            self.assertNotIn("token_CANARY", dumped)
+            self.assertNotIn("sig_CANARY", dumped)
+            self.assertNotIn("看房方式密码", dumped)
+            self.assertEqual(saved_context["last_candidate_set"]["candidates"][0]["listing_id"], "lst_safe_001")
+            self.assertEqual(saved_context["last_candidate_set"]["candidates"][0]["小区"], "荣润府")
+            self.assertTrue(saved_context["last_candidate_set"]["candidates"][0]["has_password"])
 
 
 class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -2982,7 +3061,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("不能乱发视频", fake_wecom.texts[-1])
         self.assertIn("小区名+房号", fake_wecom.texts[-1])
-        saved_context = fake_context_store.data["kf:wm"]
+        saved_context = fake_context_store.data[main._conversation_key("kf", "wm")]
         record = saved_context["structured_memory"]["turn_records"][-1]
         self.assertEqual(record["assistant_sent_summary"]["final_reply"], fake_wecom.texts[-1])
         self.assertEqual(record["intent"], "media")
@@ -4196,7 +4275,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_reply_generator.selfcheck_calls, 0)
         self.assertIn("合幢悦府6-1-1204B", fake_wecom.texts[-1])
         self.assertNotIn("免押", fake_wecom.texts[-1])
-        saved_context = fake_context_store.data["kf:wm"]
+        saved_context = fake_context_store.data[main._conversation_key("kf", "wm")]
         record = saved_context["structured_memory"]["turn_records"][-1]
         self.assertNotIn("selfcheck_result", record)
         self.assertEqual(record["assistant_sent_summary"]["final_reply"], fake_wecom.texts[-1])
@@ -11355,7 +11434,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         main.reply_generator = FakeReplyGenerator()
         main.inventory = FakeInventory()
         main._generate_reply_result = fake_generate_reply_result
-        main.kf_turn_generations["kf:wm"] = 0
+        main.kf_turn_generations[main._conversation_key("kf", "wm")] = 0
         try:
             await main._process_text_turn(
                 open_kfid="kf",
@@ -11828,7 +11907,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.event_codes, ["expired-code"])
         self.assertEqual(len(fake.texts), 1)
         self.assertEqual(fake.texts[0][0:2], ("kf-1", "wm-1"))
-        self.assertEqual(fake.state_store.marked, [("kf-1:wm-1", 2000.0)])
+        self.assertEqual(fake.state_store.marked, [(main._conversation_key("kf-1", "wm-1"), 2000.0)])
         self.assertEqual(audits[-1]["status"], "sent")
         self.assertEqual(audits[-1]["method"], "send_text_fallback")
 
