@@ -5365,34 +5365,55 @@ async def _collect_room_media(
     limit: int = KF_VIDEO_SEND_LIMIT,
 ) -> tuple[list[Path], list[dict[str, Any]], list[str], dict[str, Any]]:
     sync_result: dict[str, Any] = {}
+    manifest_evidence: list[dict[str, Any]] = []
+    production_mode = _dual_llm_production_enabled()
+    media_type = "image" if media_kind == "image" else "video"
 
-    def list_manifest_exact(row: dict[str, Any]) -> list[Path]:
+    def evidence_record(item: dict[str, Any], path: Path) -> dict[str, Any]:
+        record = dict(item)
+        record["local_path"] = str(path)
+        return record
+
+    def is_manifest_exact_send_ready(item: dict[str, Any], path: Path, listing_id: str) -> bool:
+        if str(item.get("listing_id") or "").strip() != listing_id:
+            return False
+        if str(item.get("media_type") or item.get("kind") or "").lower() != media_type:
+            return False
+        if str(item.get("binding_method") or "").strip() != "listing_id":
+            return False
+        if not item.get("send_ready") or item.get("candidate_only") or item.get("ambiguity"):
+            return False
+        if not str(item.get("media_id") or "").strip():
+            return False
+        if not re.fullmatch(r"[0-9a-f]{64}", str(item.get("source_hash") or "").strip()):
+            return False
+        sha256 = str(item.get("sha256") or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            return False
+        return _file_sha256_for_send(path) == sha256
+
+    def list_manifest_exact(row: dict[str, Any]) -> list[tuple[Path, dict[str, Any]]]:
         listing_id = _row_listing_id(row)
         if not listing_id:
             return []
-        media_type = "image" if media_kind == "image" else "video"
-        result: list[Path] = []
+        result: list[tuple[Path, dict[str, Any]]] = []
         for item in media_store.media_manifest_evidence_for_listing(listing_id):
             if not isinstance(item, dict):
-                continue
-            if str(item.get("media_type") or item.get("kind") or "").lower() != media_type:
-                continue
-            if not item.get("send_ready") or item.get("candidate_only") or item.get("ambiguity"):
                 continue
             local_path = str(item.get("local_path") or "").strip()
             if not local_path:
                 continue
             path = Path(local_path)
-            if path.exists() and path.is_file():
-                result.append(path)
+            if path.exists() and path.is_file() and is_manifest_exact_send_ready(item, path, listing_id):
+                result.append((path, evidence_record(item, path)))
         return result[:1]
 
-    def list_local(label: str, row: dict[str, Any]) -> list[Path]:
-        if _dual_llm_production_enabled():
+    def list_local(label: str, row: dict[str, Any]) -> list[tuple[Path, dict[str, Any]]]:
+        if production_mode:
             return list_manifest_exact(row)
         if media_kind == "image":
-            return media_store.list_room_database_images(label, limit=1)
-        return media_store.list_room_database_videos(label, limit=1)
+            return [(path, {}) for path in media_store.list_room_database_images(label, limit=1)]
+        return [(path, {}) for path in media_store.list_room_database_videos(label, limit=1)]
 
     paths: list[Path] = []
     matched_rows: list[dict[str, Any]] = []
@@ -5401,12 +5422,25 @@ async def _collect_room_media(
         label = _row_label(row)
         found = list_local(label, row)
         if found:
-            paths.append(found[0])
+            path, item_evidence = found[0]
+            paths.append(path)
             matched_rows.append(row)
+            if item_evidence:
+                manifest_evidence.append(item_evidence)
             if len(paths) >= limit:
                 break
         else:
             missing.append(label)
+
+    if production_mode:
+        sync_result = {
+            "source": "media_manifest",
+            "adapter_mode": "production_read",
+            "on_demand_sync": "skipped_in_production",
+        }
+        if manifest_evidence:
+            sync_result["_media_manifest_evidence"] = manifest_evidence
+        return paths, matched_rows, missing, sync_result
 
     if paths:
         return paths, matched_rows, missing, sync_result
@@ -5459,8 +5493,11 @@ async def _collect_room_media(
                 label = _row_label(row)
                 found = list_local(label, row)
                 if found:
-                    paths.append(found[0])
+                    path, item_evidence = found[0]
+                    paths.append(path)
                     matched_rows.append(row)
+                    if item_evidence:
+                        manifest_evidence.append(item_evidence)
                     if len(paths) >= limit:
                         break
                 else:
@@ -5492,6 +5529,10 @@ async def _execute_tools(
         "inventory_images": [],
         "image_paths": [],
         "video_paths": [],
+        "media_manifest_evidence": [],
+        "image_media_manifest_evidence": [],
+        "video_media_manifest_evidence": [],
+        "original_video_media_manifest_evidence": [],
         "missing_media": [],
         "media_request": {},
         "outbound_package": {},
@@ -6024,6 +6065,17 @@ async def _execute_tools(
                 sync_result = {"failed": [{"source": "collect_room_media", "reason": str(result)}]}
             else:
                 paths, matched_rows, missing, sync_result = result
+            media_manifest_evidence = []
+            if isinstance(sync_result, dict):
+                raw_manifest_evidence = sync_result.pop("_media_manifest_evidence", [])
+                media_manifest_evidence = [
+                    dict(item)
+                    for item in raw_manifest_evidence
+                    if isinstance(item, dict)
+                ]
+            if media_manifest_evidence:
+                evidence.setdefault("media_manifest_evidence", []).extend(media_manifest_evidence)
+                evidence[f"{media_kind}_media_manifest_evidence"] = media_manifest_evidence
 
             if media_kind == "image":
                 evidence["image_paths"] = [str(path) for path in paths]
@@ -6052,10 +6104,26 @@ async def _execute_tools(
                 "sync_status": sync_result,
             }
             if proof.get("wants_original_video"):
-                source_summary = media_store.original_video_sources_for_paths(paths)
+                if _dual_llm_production_enabled():
+                    listing_ids = [
+                        _row_listing_id(row)
+                        for row in _rows_with_listing_ids(matched_rows)
+                        if _row_listing_id(row)
+                    ]
+                    source_summary = media_store.original_video_sources_for_listings(listing_ids)
+                else:
+                    source_summary = media_store.original_video_sources_for_paths(paths)
                 evidence["original_video_paths"] = source_summary.get("original_video_paths") or []
                 evidence["original_video_urls"] = source_summary.get("original_video_urls") or []
                 evidence["material_page_urls"] = source_summary.get("material_page_urls") or []
+                if source_summary.get("media_manifest_evidence"):
+                    original_evidence = [
+                        dict(item)
+                        for item in source_summary.get("media_manifest_evidence") or []
+                        if isinstance(item, dict)
+                    ]
+                    evidence["original_video_media_manifest_evidence"] = original_evidence
+                    evidence.setdefault("media_manifest_evidence", []).extend(original_evidence)
                 if source_summary.get("source_records"):
                     evidence["original_video_source_records"] = source_summary["source_records"]
                 evidence["original_video_request"] = {
@@ -6152,6 +6220,10 @@ def _tool_evidence_summary(tool_evidence: dict[str, Any]) -> dict[str, Any]:
         "missing_media": list(tool_evidence.get("missing_media") or []),
         "media_request": tool_evidence.get("media_request") or {},
         "media_status": tool_evidence.get("media_status") or {},
+        "media_manifest_evidence_count": len(tool_evidence.get("media_manifest_evidence") or []),
+        "image_media_manifest_evidence_count": len(tool_evidence.get("image_media_manifest_evidence") or []),
+        "video_media_manifest_evidence_count": len(tool_evidence.get("video_media_manifest_evidence") or []),
+        "original_video_media_manifest_evidence_count": len(tool_evidence.get("original_video_media_manifest_evidence") or []),
         "original_video_request": tool_evidence.get("original_video_request") or {},
         "original_video_url_count": len(tool_evidence.get("original_video_urls") or []),
         "material_page_url_count": len(tool_evidence.get("material_page_urls") or []),
@@ -6192,6 +6264,10 @@ def _production_audit_tool_evidence_summary(tool_evidence: dict[str, Any]) -> di
         "missing_media",
         "media_request",
         "media_status",
+        "media_manifest_evidence_count",
+        "image_media_manifest_evidence_count",
+        "video_media_manifest_evidence_count",
+        "original_video_media_manifest_evidence_count",
         "original_video_request",
         "original_video_url_count",
         "material_page_url_count",
@@ -9706,6 +9782,150 @@ def _file_sha256_for_send(path: Path) -> str:
         return ""
 
 
+class MediaManifestSendEvidenceError(RuntimeError):
+    pass
+
+
+def _media_evidence_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "是"}
+
+
+def _media_manifest_evidence_candidates(tool_evidence: dict[str, Any], media_kind: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for key in (f"{media_kind}_media_manifest_evidence", "media_manifest_evidence"):
+        for item in tool_evidence.get(key) or []:
+            if isinstance(item, dict):
+                candidates.append(item)
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in candidates:
+        marker = "|".join(
+            str(item.get(field) or "")
+            for field in ("evidence_id", "media_id", "listing_id", "local_path", "sha256")
+        )
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(item)
+    return result
+
+
+def _paths_match_for_send(left: Path, right_value: str) -> bool:
+    right_value = str(right_value or "").strip()
+    if not right_value:
+        return False
+    try:
+        return left.resolve() == Path(right_value).resolve()
+    except OSError:
+        return str(left) == right_value
+
+
+def _media_manifest_evidence_has_exact_send_contract(
+    item: dict[str, Any],
+    *,
+    path: Path,
+    media_kind: str,
+    expected_listing_id: str,
+    path_sha256: str,
+) -> bool:
+    if str(item.get("media_type") or item.get("kind") or "").lower() != media_kind:
+        return False
+    listing_id = str(item.get("listing_id") or "").strip()
+    if not listing_id or (expected_listing_id and listing_id != expected_listing_id):
+        return False
+    if str(item.get("binding_method") or "").strip() != "listing_id":
+        return False
+    if not _media_evidence_bool(item.get("send_ready")):
+        return False
+    if _media_evidence_bool(item.get("candidate_only")) or _media_evidence_bool(item.get("ambiguity")):
+        return False
+    if str(item.get("adapter_mode") or "") != "production_read":
+        return False
+    if str(item.get("evidence_profile") or "") != "media_manifest.production_read.v1":
+        return False
+    if not str(item.get("media_id") or "").strip():
+        return False
+    if not re.fullmatch(r"[0-9a-f]{64}", str(item.get("source_hash") or "").strip()):
+        return False
+    if str(item.get("sha256") or "").strip() != path_sha256:
+        return False
+    return _paths_match_for_send(path, str(item.get("local_path") or ""))
+
+
+def _current_media_manifest_confirms_send(
+    item: dict[str, Any],
+    *,
+    path: Path,
+    media_kind: str,
+    expected_listing_id: str,
+    path_sha256: str,
+) -> bool:
+    listing_id = str(item.get("listing_id") or "").strip()
+    media_id = str(item.get("media_id") or "").strip()
+    source_hash = str(item.get("source_hash") or "").strip()
+    evidence_id = str(item.get("evidence_id") or "").strip()
+    if not listing_id or not media_id or not source_hash:
+        return False
+    try:
+        current_evidence = media_store.media_manifest_evidence_for_listing(listing_id)
+    except Exception as exc:
+        logger.warning("media manifest send verification failed closed: %s", type(exc).__name__)
+        return False
+    for current in current_evidence:
+        if not isinstance(current, dict):
+            continue
+        if str(current.get("media_id") or "").strip() != media_id:
+            continue
+        if str(current.get("source_hash") or "").strip() != source_hash:
+            continue
+        if evidence_id and str(current.get("evidence_id") or "").strip() != evidence_id:
+            continue
+        if _media_manifest_evidence_has_exact_send_contract(
+            current,
+            path=path,
+            media_kind=media_kind,
+            expected_listing_id=expected_listing_id,
+            path_sha256=path_sha256,
+        ):
+            return True
+    return False
+
+
+def _media_manifest_evidence_for_send(
+    tool_evidence: dict[str, Any],
+    *,
+    path: Path,
+    media_kind: str,
+    row: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    expected_listing_id = _row_listing_id(row or {})
+    path_sha256 = _file_sha256_for_send(path)
+    if not path_sha256:
+        return {}
+    for item in _media_manifest_evidence_candidates(tool_evidence, media_kind):
+        if not _media_manifest_evidence_has_exact_send_contract(
+            item,
+            path=path,
+            media_kind=media_kind,
+            expected_listing_id=expected_listing_id,
+            path_sha256=path_sha256,
+        ):
+            continue
+        if not _current_media_manifest_confirms_send(
+            item,
+            path=path,
+            media_kind=media_kind,
+            expected_listing_id=expected_listing_id,
+            path_sha256=path_sha256,
+        ):
+            continue
+        return item
+    return {}
+
+
 def _inventory_evidence_for_listing(tool_evidence: dict[str, Any], listing_id: str) -> dict[str, Any]:
     if not listing_id:
         return {}
@@ -9729,6 +9949,39 @@ def _send_fact_binding_for_row(row: dict[str, Any], tool_evidence: dict[str, Any
     }
 
 
+def _send_media_fact_binding_for_path(
+    row: dict[str, Any],
+    tool_evidence: dict[str, Any],
+    path: Path,
+    *,
+    media_kind: str,
+) -> dict[str, str]:
+    if _dual_llm_production_enabled():
+        media_evidence = _media_manifest_evidence_for_send(
+            tool_evidence,
+            path=path,
+            media_kind=media_kind,
+            row=row,
+        )
+        if not media_evidence:
+            return {}
+        return {
+            "listing_id": str(media_evidence.get("listing_id") or "").strip(),
+            "evidence_id": str(media_evidence.get("evidence_id") or media_evidence.get("media_id") or "").strip(),
+            "inventory_snapshot_id": str(media_evidence.get("snapshot_id") or "").strip(),
+            "source_hash": str(media_evidence.get("source_hash") or "").strip(),
+            "sha256": str(media_evidence.get("sha256") or "").strip(),
+            "media_id": str(media_evidence.get("media_id") or "").strip(),
+            "media_evidence_profile": str(media_evidence.get("evidence_profile") or "").strip(),
+            "media_adapter_mode": str(media_evidence.get("adapter_mode") or "").strip(),
+        }
+    fact_binding = _send_fact_binding_for_row(row, tool_evidence, path)
+    fact_binding["media_id"] = ""
+    fact_binding["media_evidence_profile"] = ""
+    fact_binding["media_adapter_mode"] = ""
+    return fact_binding
+
+
 def _send_action_for_path(
     *,
     open_kfid: str,
@@ -9745,6 +9998,7 @@ def _send_action_for_path(
     inventory_snapshot_id: str = "",
     source_hash: str = "",
     sha256: str = "",
+    media_id: str = "",
 ) -> Any:
     digest = kf_send_receipts.material_hash(path)
     return kf_send_receipts.build_send_action(
@@ -9758,6 +10012,7 @@ def _send_action_for_path(
         evidence_id=evidence_id,
         inventory_snapshot_id=inventory_snapshot_id,
         source_hash=source_hash,
+        media_id=media_id,
         sha256=sha256,
         payload={
             "material_hash": digest,
@@ -9967,12 +10222,60 @@ async def _send_images_with_receipts(
     paths: list[str],
     msgids: list[str] | None = None,
     action_prefix: str = "send-image",
+    rows: list[dict[str, Any]] | None = None,
+    tool_evidence: dict[str, Any] | None = None,
+    require_media_manifest: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     sent: list[dict[str, Any]] = []
+    rows = rows or []
+    tool_evidence = tool_evidence or {}
     for index, raw_path in enumerate(paths, start=1):
         path = Path(raw_path)
         if not path.exists():
             continue
+        row = rows[index - 1] if index <= len(rows) and isinstance(rows[index - 1], dict) else {}
+        fact_binding: dict[str, str] = {}
+        if require_media_manifest:
+            fact_binding = _send_media_fact_binding_for_path(
+                row,
+                tool_evidence,
+                path,
+                media_kind="image",
+            )
+            if not fact_binding:
+                fallback_binding = _send_fact_binding_for_row(row, tool_evidence, path)
+                action = _send_action_for_path(
+                    open_kfid=open_kfid,
+                    external_userid=external_userid,
+                    context=context,
+                    path=path,
+                    action_id=f"{action_prefix}-{index}-{kf_send_receipts.material_hash(path)[:12]}",
+                    action_type="image",
+                    msgids=msgids,
+                    extra_payload={"position": index, "blocked": True, "media_manifest_required": True},
+                    extra_metadata={"position": index, "blocked": True, "media_manifest_required": True},
+                    listing_id=fallback_binding.get("listing_id", ""),
+                    evidence_id=fallback_binding.get("evidence_id", ""),
+                    inventory_snapshot_id=fallback_binding.get("inventory_snapshot_id", ""),
+                    source_hash=fallback_binding.get("source_hash", ""),
+                    sha256=fallback_binding.get("sha256", ""),
+                )
+                idempotency_key = kf_send_receipts.build_idempotency_key(action)
+                receipt = kf_send_receipts.build_failed_receipt(
+                    action,
+                    idempotency_key=idempotency_key,
+                    error=MediaManifestSendEvidenceError("missing exact MediaManifest evidence for production image send"),
+                    metadata={"position": index, "blocked": True, "media_manifest_required": True},
+                )
+                context = kf_send_receipts.append_receipt(context, receipt)
+                sent.append({"type": "image_blocked", "path": str(path), "reason": "missing_media_manifest_evidence"})
+                continue
+        extra_payload = {"position": index}
+        extra_metadata = {"position": index}
+        if fact_binding:
+            extra_payload["media_evidence_profile"] = fact_binding.get("media_evidence_profile", "")
+            extra_metadata["media_evidence_profile"] = fact_binding.get("media_evidence_profile", "")
+            extra_metadata["media_adapter_mode"] = fact_binding.get("media_adapter_mode", "")
         action = _send_action_for_path(
             open_kfid=open_kfid,
             external_userid=external_userid,
@@ -9981,15 +10284,21 @@ async def _send_images_with_receipts(
             action_id=f"{action_prefix}-{index}-{kf_send_receipts.material_hash(path)[:12]}",
             action_type="image",
             msgids=msgids,
-            extra_payload={"position": index},
-            extra_metadata={"position": index},
+            extra_payload=extra_payload,
+            extra_metadata=extra_metadata,
+            listing_id=fact_binding.get("listing_id", ""),
+            evidence_id=fact_binding.get("evidence_id", ""),
+            inventory_snapshot_id=fact_binding.get("inventory_snapshot_id", ""),
+            source_hash=fact_binding.get("source_hash", ""),
+            sha256=fact_binding.get("sha256", ""),
+            media_id=fact_binding.get("media_id", ""),
         )
         try:
             context, did_send, _receipt = await _execute_send_action_once(
                 context=context,
                 action=action,
                 send_call=lambda path=path: wecom_kf.send_image(open_kfid, external_userid, path),
-                receipt_metadata={"position": index},
+                receipt_metadata=extra_metadata,
             )
             if did_send:
                 sent.append({"type": "image", "path": str(path), "count": 1})
@@ -10018,7 +10327,40 @@ async def _send_videos_with_receipts(
         if not path.exists():
             continue
         row = rows[index - 1] if index <= len(rows) and isinstance(rows[index - 1], dict) else {}
-        fact_binding = _send_fact_binding_for_row(row, tool_evidence, path)
+        fact_binding = _send_media_fact_binding_for_path(
+            row,
+            tool_evidence,
+            path,
+            media_kind="video",
+        )
+        if _dual_llm_production_enabled() and not fact_binding:
+            fallback_binding = _send_fact_binding_for_row(row, tool_evidence, path)
+            action = _send_action_for_path(
+                open_kfid=open_kfid,
+                external_userid=external_userid,
+                context=context,
+                path=path,
+                action_id=f"send-video-{index}-{kf_send_receipts.material_hash(path)[:12]}",
+                action_type="video",
+                msgids=msgids,
+                extra_payload={"position": index, "blocked": True, "media_manifest_required": True},
+                extra_metadata={"position": index, "blocked": True, "media_manifest_required": True},
+                listing_id=fallback_binding.get("listing_id", ""),
+                evidence_id=fallback_binding.get("evidence_id", ""),
+                inventory_snapshot_id=fallback_binding.get("inventory_snapshot_id", ""),
+                source_hash=fallback_binding.get("source_hash", ""),
+                sha256=fallback_binding.get("sha256", ""),
+            )
+            idempotency_key = kf_send_receipts.build_idempotency_key(action)
+            receipt = kf_send_receipts.build_failed_receipt(
+                action,
+                idempotency_key=idempotency_key,
+                error=MediaManifestSendEvidenceError("missing exact MediaManifest evidence for production video send"),
+                metadata={"position": index, "blocked": True, "media_manifest_required": True},
+            )
+            context = kf_send_receipts.append_receipt(context, receipt)
+            sent.append({"type": "video_blocked", "path": str(path), "reason": "missing_media_manifest_evidence"})
+            continue
         label = _normalize_customer_visible_reply_text_before_selfcheck(
             _row_label(row) if row else path.stem
         )
@@ -10039,12 +10381,15 @@ async def _send_videos_with_receipts(
                 "position": index,
                 "caption_hash": kf_send_receipts.text_hash(caption),
                 "transaction": "caption_then_video",
+                "media_evidence_profile": fact_binding.get("media_evidence_profile", ""),
+                "media_adapter_mode": fact_binding.get("media_adapter_mode", ""),
             },
             listing_id=fact_binding["listing_id"],
             evidence_id=fact_binding["evidence_id"],
             inventory_snapshot_id=fact_binding["inventory_snapshot_id"],
             source_hash=fact_binding["source_hash"],
             sha256=fact_binding["sha256"],
+            media_id=fact_binding.get("media_id", ""),
         )
         idempotency_key = kf_send_receipts.build_idempotency_key(action)
         existing = kf_send_receipts.find_successful_receipt(context, idempotency_key)
@@ -10077,6 +10422,9 @@ async def _send_videos_with_receipts(
                     "caption_sent": caption_sent,
                     "transcode_retry": transcode_retry,
                     "sent_path_hash": kf_send_receipts.material_hash(sent_path),
+                    "sent_path_sha256": _file_sha256_for_send(sent_path),
+                    "media_evidence_profile": fact_binding.get("media_evidence_profile", ""),
+                    "media_adapter_mode": fact_binding.get("media_adapter_mode", ""),
                 },
             )
             context = kf_send_receipts.append_receipt(context, receipt)
@@ -10090,7 +10438,13 @@ async def _send_videos_with_receipts(
                 action,
                 idempotency_key=idempotency_key,
                 error=exc,
-                metadata={"position": index, "caption_sent": caption_sent, "transcode_retry": transcode_retry},
+                metadata={
+                    "position": index,
+                    "caption_sent": caption_sent,
+                    "transcode_retry": transcode_retry,
+                    "media_evidence_profile": fact_binding.get("media_evidence_profile", ""),
+                    "media_adapter_mode": fact_binding.get("media_adapter_mode", ""),
+                },
             )
             context = kf_send_receipts.append_receipt(context, receipt)
             raise
@@ -10099,7 +10453,13 @@ async def _send_videos_with_receipts(
                 action,
                 idempotency_key=idempotency_key,
                 error=exc,
-                metadata={"position": index, "caption_sent": caption_sent, "transcode_retry": transcode_retry},
+                metadata={
+                    "position": index,
+                    "caption_sent": caption_sent,
+                    "transcode_retry": transcode_retry,
+                    "media_evidence_profile": fact_binding.get("media_evidence_profile", ""),
+                    "media_adapter_mode": fact_binding.get("media_adapter_mode", ""),
+                },
             )
             context = kf_send_receipts.append_receipt(context, receipt)
             logger.warning("send video failed: %s", kf_send_receipts.safe_failure_reason(exc))
@@ -10223,6 +10583,9 @@ async def _send_final_actions(
         paths=list(tool_evidence.get("image_paths") or []),
         msgids=msgids,
         action_prefix="send-room-image",
+        rows=[row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict)],
+        tool_evidence=tool_evidence,
+        require_media_manifest=_dual_llm_production_enabled(),
     )
     sent_actions.extend(image_actions)
 

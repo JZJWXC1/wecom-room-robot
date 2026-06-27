@@ -23,6 +23,7 @@ from app.services.media_manifest import (
     FeishuDriveMediaManifestAdapter,
     MediaItem,
     MediaManifest,
+    MediaManifestIntegrityError,
     MediaManifestProductionAdapter,
     MediaManifestShadowAdapter,
 )
@@ -178,6 +179,87 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(MediaManifest.read_json(manifest_path).source_hash, manifest.source_hash)
             self.assertEqual(second_manifest.source_hash, manifest.source_hash)
 
+    async def test_read_json_rejects_tampered_content_with_stale_source_hash(self) -> None:
+        listing_id = generate_listing_id("测试花园", "1-101A")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "media_manifest.json"
+            manifest = MediaManifest.build(
+                listing_ids=[listing_id],
+                items=[
+                    MediaItem(
+                        listing_id=listing_id,
+                        kind=MEDIA_KIND_VIDEO,
+                        file_name="精确视频.mp4",
+                        relative_path=f"video/{listing_id}/精确视频.mp4",
+                        sha256=hashlib.sha256(b"video").hexdigest(),
+                        binding_method=BINDING_METHOD_LISTING_ID,
+                    )
+                ],
+                generated_at="2026-06-27T08:00:00Z",
+            )
+            manifest.write_json(path)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["items"][0]["sha256"] = hashlib.sha256(b"tampered-video").hexdigest()
+            data["source_hash"] = manifest.source_hash
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            with self.assertRaises(MediaManifestIntegrityError):
+                MediaManifest.read_json(path)
+
+    async def test_read_json_rejects_forged_source_hash_field(self) -> None:
+        listing_id = generate_listing_id("测试花园", "1-101A")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "media_manifest.json"
+            manifest = MediaManifest.build(
+                listing_ids=[listing_id],
+                items=[
+                    MediaItem(
+                        listing_id=listing_id,
+                        kind=MEDIA_KIND_IMAGE,
+                        file_name="客厅.jpg",
+                        relative_path=f"images/{listing_id}/客厅.jpg",
+                        sha256=hashlib.sha256(b"image").hexdigest(),
+                        binding_method=BINDING_METHOD_LISTING_ID,
+                    )
+                ],
+                generated_at="2026-06-27T08:00:00Z",
+            )
+            manifest.write_json(path)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotEqual(data["source_hash"], "0" * 64)
+            data["source_hash"] = "0" * 64
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            with self.assertRaises(MediaManifestIntegrityError):
+                MediaManifest.read_json(path)
+
+    async def test_read_json_rejects_missing_source_hash_field_after_tamper(self) -> None:
+        listing_id = generate_listing_id("测试花园", "1-101A")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "media_manifest.json"
+            manifest = MediaManifest.build(
+                listing_ids=[listing_id],
+                items=[
+                    MediaItem(
+                        listing_id=listing_id,
+                        kind=MEDIA_KIND_IMAGE,
+                        file_name="卧室.jpg",
+                        relative_path=f"images/{listing_id}/卧室.jpg",
+                        sha256=hashlib.sha256(b"image").hexdigest(),
+                        binding_method=BINDING_METHOD_LISTING_ID,
+                    )
+                ],
+                generated_at="2026-06-27T08:00:00Z",
+            )
+            manifest.write_json(path)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["items"][0]["sha256"] = hashlib.sha256(b"tampered-image").hexdigest()
+            data.pop("source_hash", None)
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+            with self.assertRaises(MediaManifestIntegrityError):
+                MediaManifest.read_json(path)
+
     async def test_missing_media_report_lists_listing_and_kind(self) -> None:
         listing_with_video = generate_listing_id("测试花园", "1-101A")
         listing_without_media = generate_listing_id("测试花园", "1-102A")
@@ -328,6 +410,17 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
                 .source_url,
                 "https://media.example.invalid/source-file",
             )
+            production_evidence = MediaManifestProductionAdapter(
+                manifest,
+                local_root=Path(directory),
+            ).evidence_for_listing(listing_with_original)
+            self.assertEqual(len(production_evidence), 1)
+            self.assertEqual(production_evidence[0].listing_id, listing_with_original)
+            self.assertEqual(production_evidence[0].media_type, MEDIA_KIND_ORIGINAL_VIDEO)
+            self.assertEqual(production_evidence[0].source_hash, manifest.source_hash)
+            self.assertTrue(production_evidence[0].evidence_id.startswith("media_manifest:"))
+            self.assertTrue(production_evidence[0].send_ready)
+            self.assertTrue(production_evidence[0].access_verified)
             self.assertEqual(report.downloaded, [])
             self.assertEqual(
                 report.missing,
@@ -519,6 +612,8 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(evidence[0].send_ready)
             self.assertTrue(evidence[0].access_verified)
             self.assertEqual(evidence[0].sha256, exact_sha)
+            self.assertEqual(evidence[0].source_hash, manifest.source_hash)
+            self.assertTrue(evidence[0].evidence_id.startswith("media_manifest:"))
             self.assertEqual(evidence[0].adapter_mode, "production_read")
             self.assertEqual(evidence[0].evidence_profile, "media_manifest.production_read.v1")
             self.assertIsNone(production.evidence_by_media_id(fuzzy_item.media_id))
