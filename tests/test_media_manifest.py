@@ -480,6 +480,89 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(production.evidence_by_media_id(fuzzy_item.media_id))
         self.assertIsNone(production.local_file_for_media_id(fuzzy_item.media_id))
 
+    async def test_production_adapter_exposes_only_exact_listing_id_bound_media(self) -> None:
+        listing_id = generate_listing_id("Unit Garden", "1-101A")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exact_file = root / "video" / listing_id / "exact.mp4"
+            exact_file.parent.mkdir(parents=True)
+            exact_file.write_bytes(b"exact-video")
+            exact_sha = hashlib.sha256(b"exact-video").hexdigest()
+            exact_item = MediaItem(
+                listing_id=listing_id,
+                kind=MEDIA_KIND_VIDEO,
+                file_name=exact_file.name,
+                relative_path=f"video/{listing_id}/{exact_file.name}",
+                sha256=exact_sha,
+                binding_method=BINDING_METHOD_LISTING_ID,
+                confidence=1.0,
+                ambiguity=False,
+                candidate_only=False,
+                access_verified=True,
+            )
+            fuzzy_item = MediaItem(
+                listing_id=listing_id,
+                kind=MEDIA_KIND_VIDEO,
+                file_name="candidate.mp4",
+                relative_path="video/candidate/candidate.mp4",
+                binding_method=BINDING_METHOD_FUZZY_FILENAME,
+                confidence=0.8,
+                ambiguity=True,
+                candidate_only=True,
+            )
+            manifest = MediaManifest.build(listing_ids=[listing_id], items=[exact_item, fuzzy_item])
+            production = MediaManifestProductionAdapter(manifest, local_root=root)
+
+            evidence = production.evidence_for_listing(listing_id)
+
+            self.assertEqual([item.media_id for item in evidence], [exact_item.media_id])
+            self.assertTrue(evidence[0].send_ready)
+            self.assertTrue(evidence[0].access_verified)
+            self.assertEqual(evidence[0].sha256, exact_sha)
+            self.assertEqual(evidence[0].adapter_mode, "production_read")
+            self.assertEqual(evidence[0].evidence_profile, "media_manifest.production_read.v1")
+            self.assertIsNone(production.evidence_by_media_id(fuzzy_item.media_id))
+            self.assertIsNone(production.local_file_for_media_id(fuzzy_item.media_id))
+
+    async def test_production_adapter_rejects_missing_file_and_hash_mismatch(self) -> None:
+        listing_id = generate_listing_id("Unit Garden", "1-101A")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mismatch_file = root / "video" / listing_id / "mismatch.mp4"
+            mismatch_file.parent.mkdir(parents=True)
+            mismatch_file.write_bytes(b"actual-video")
+            mismatch_item = MediaItem(
+                listing_id=listing_id,
+                kind=MEDIA_KIND_VIDEO,
+                file_name=mismatch_file.name,
+                relative_path=f"video/{listing_id}/{mismatch_file.name}",
+                sha256=hashlib.sha256(b"expected-video").hexdigest(),
+                binding_method=BINDING_METHOD_LISTING_ID,
+                confidence=1.0,
+                ambiguity=False,
+                candidate_only=False,
+            )
+            missing_item = MediaItem(
+                listing_id=listing_id,
+                kind=MEDIA_KIND_VIDEO,
+                file_name="missing.mp4",
+                relative_path=f"video/{listing_id}/missing.mp4",
+                sha256=hashlib.sha256(b"missing-video").hexdigest(),
+                binding_method=BINDING_METHOD_LISTING_ID,
+                confidence=1.0,
+                ambiguity=False,
+                candidate_only=False,
+            )
+            manifest = MediaManifest.build(
+                listing_ids=[listing_id],
+                items=[mismatch_item, missing_item],
+            )
+            production = MediaManifestProductionAdapter(manifest, local_root=root)
+
+            self.assertEqual(production.evidence_for_listing(listing_id), [])
+            self.assertIsNone(production.evidence_by_media_id(mismatch_item.media_id))
+            self.assertIsNone(production.local_file_for_media_id(missing_item.media_id))
+
     async def test_manifest_safe_serialization_hashes_source_record_fields(self) -> None:
         listing_id = generate_listing_id("寓你花园", "1-101A")
         raw_token = "raw-file-token-for-test"

@@ -14,6 +14,7 @@ from app.services.inventory_read_models import (
     REASON_INVALID_MODE,
     REASON_FALLBACK_USED,
     REASON_MISSING_SNAPSHOT,
+    REASON_PRIMARY_READINESS_MISSING,
     REASON_RECONCILIATION_BLOCKING,
     REASON_SECRET_SCAN_FAILED,
     REASON_SOURCE_UNAVAILABLE,
@@ -304,7 +305,25 @@ class InventoryReadRouter:
                 "area alias definitions are not ready for primary inventory reads",
                 details=alias_result.to_dict(),
             )
-        readiness_state = dict(self._read_readiness_state())
+        raw_readiness_state = self._read_readiness_state()
+        if not raw_readiness_state:
+            return InventoryReadError(
+                REASON_PRIMARY_READINESS_MISSING,
+                "primary readiness_state is required before primary inventory reads",
+                details={
+                    "required_keys": [
+                        "reconciliation_passed",
+                        "blocking_count",
+                        "public_artifact_secret_scan_passed",
+                        "missing_valid_aliases",
+                        "unresolved_aliases",
+                        "active_alias_conflicts",
+                        "unknown_canonical_areas",
+                        "ambiguous_direct_mappings",
+                    ]
+                },
+            )
+        readiness_state = dict(raw_readiness_state)
         for key, value in alias_result.to_dict().items():
             readiness_state.setdefault(key, value)
         if readiness_state.get("reconciliation_passed") is not True:
