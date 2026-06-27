@@ -12564,6 +12564,190 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         statuses = [item["status"] for item in second["context"]["send_receipts"]["receipts"]]
         self.assertEqual(statuses, ["sent", "skipped_duplicate"])
 
+    async def test_interleaved_customers_do_not_share_candidate_context(self) -> None:
+        class FakeStateStore:
+            def __init__(self) -> None:
+                self.processed: set[str] = set()
+
+            def mark_processed(self, msgid: str) -> None:
+                self.processed.add(msgid)
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
+
+        class FakeContextStore:
+            def __init__(self) -> None:
+                self.data: dict[str, dict] = {}
+
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
+
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        class FakeInventoryReadContext:
+            def __init__(self, turn_id: str) -> None:
+                self.turn_id = turn_id
+
+            def to_log_dict(self) -> dict:
+                return {
+                    "request_id": "test-request",
+                    "turn_id": self.turn_id,
+                    "source_kind": "legacy",
+                    "source_hash": "test-hash",
+                    "decision_id": f"decision-{self.turn_id}",
+                    "selection_mode": "disabled",
+                }
+
+        rows_by_customer = {
+            "wm-a": {"community": "AlphaCourt", "room_no": "A-101", "listing_id": "lst-a"},
+            "wm-b": {"community": "BetaCourt", "room_no": "B-202", "listing_id": "lst-b"},
+        }
+        observed_context: list[tuple[str, str, list[str]]] = []
+        sent_replies: list[tuple[str, str]] = []
+
+        def labels_from_context(context: dict) -> list[str]:
+            return [
+                main._row_label(row)
+                for row in ((context.get("last_candidate_set") or {}).get("candidates") or [])
+            ]
+
+        async def fake_understand_message(**kwargs):
+            content = kwargs["content"]
+            context = kwargs["context"]
+            observed_context.append((kwargs.get("inventory_read_context").turn_id, content, labels_from_context(context)))
+            wants_video = "video" in content.lower()
+            return {
+                "intent": "media" if wants_video else "inventory",
+                "rewritten_query": content,
+                "effective_query": content,
+                "query_state": {"intent": "media" if wants_video else "inventory"},
+                "needs_clarification": False,
+                "constraint_proof": {"wants_video": wants_video},
+                "structured_task": {"tool_requirements": {}},
+            }
+
+        async def fake_plan_actions(**kwargs):
+            content = kwargs["content"]
+            actions = (
+                ["send_video", "generate_reply"]
+                if "video" in content.lower()
+                else ["search_inventory", "compact_listing", "generate_reply"]
+            )
+            return {"actions": actions, "source": "test_interleaved_customers"}
+
+        async def fake_execute_tools(**kwargs):
+            context = kwargs["context"]
+            content = kwargs["content"]
+            if "customer A" in content:
+                row = rows_by_customer["wm-a"]
+                context["last_candidate_set"] = {"candidates": [row], "shown_count": 1}
+                return {"actions": kwargs["actions"], "inventory_rows": [row], "target_rows": [row]}
+            if "customer B" in content:
+                row = rows_by_customer["wm-b"]
+                context["last_candidate_set"] = {"candidates": [row], "shown_count": 1}
+                return {"actions": kwargs["actions"], "inventory_rows": [row], "target_rows": [row]}
+            candidates = (context.get("last_candidate_set") or {}).get("candidates") or []
+            return {
+                "actions": kwargs["actions"],
+                "target_rows": candidates,
+                "video_rows": candidates,
+                "video_paths": [],
+            }
+
+        async def fake_generate_reply_result(**kwargs):
+            labels = labels_from_context(kwargs["context"])
+            reply = f"current candidate: {labels[0]}" if labels else "current candidate: none"
+            return {
+                "reply": reply,
+                "draft_reply": reply,
+                "context": kwargs["context"],
+                "selfcheck": {"status": "pass"},
+                "needs_planner_retry": False,
+                "planner_retry_reason": "",
+            }
+
+        async def fake_send_final_actions(**kwargs):
+            sent_replies.append((kwargs["external_userid"], kwargs["final_reply"]))
+            return {
+                "context": kwargs["context"],
+                "sent_actions": [{"type": "text", "count": 1}],
+            }
+
+        def fake_create_inventory_read_context(**kwargs):
+            return FakeInventoryReadContext(f"{kwargs['external_userid']}-{kwargs['generation']}")
+
+        fake_store = FakeContextStore()
+        originals = {
+            "wecom_kf": main.wecom_kf,
+            "wecom_kf_context_store": main.wecom_kf_context_store,
+            "_create_inventory_read_context": main._create_inventory_read_context,
+            "_understand_message": main._understand_message,
+            "_plan_actions": main._plan_actions,
+            "_execute_tools": main._execute_tools,
+            "_generate_reply_result": main._generate_reply_result,
+            "_send_final_actions": main._send_final_actions,
+            "_build_orchestrator_shadow_artifact": main._build_orchestrator_shadow_artifact,
+            "kf_turn_generations": dict(main.kf_turn_generations),
+            "kf_turn_tasks": dict(main.kf_turn_tasks),
+            "kf_turn_pending_messages": dict(main.kf_turn_pending_messages),
+        }
+        main.wecom_kf = FakeWeComKf()
+        main.wecom_kf_context_store = fake_store
+        main._create_inventory_read_context = fake_create_inventory_read_context
+        main._understand_message = fake_understand_message
+        main._plan_actions = fake_plan_actions
+        main._execute_tools = fake_execute_tools
+        main._generate_reply_result = fake_generate_reply_result
+        main._send_final_actions = fake_send_final_actions
+        main._build_orchestrator_shadow_artifact = lambda **kwargs: None
+        try:
+            sequence = [
+                ("wm-a", "msg-a-1", "customer A wants AlphaCourt one room"),
+                ("wm-b", "msg-b-1", "customer B wants BetaCourt two room"),
+                ("wm-a", "msg-a-2", "send this video"),
+                ("wm-b", "msg-b-2", "send this video"),
+            ]
+            for generation, (external_userid, msgid, content) in enumerate(sequence, start=1):
+                key = main._conversation_key("kf", external_userid)
+                main.kf_turn_generations[key] = generation
+                await main._process_text_turn(
+                    open_kfid="kf",
+                    external_userid=external_userid,
+                    pending_items=[{"msgid": msgid, "content": content}],
+                    generation=generation,
+                )
+        finally:
+            main.wecom_kf = originals["wecom_kf"]
+            main.wecom_kf_context_store = originals["wecom_kf_context_store"]
+            main._create_inventory_read_context = originals["_create_inventory_read_context"]
+            main._understand_message = originals["_understand_message"]
+            main._plan_actions = originals["_plan_actions"]
+            main._execute_tools = originals["_execute_tools"]
+            main._generate_reply_result = originals["_generate_reply_result"]
+            main._send_final_actions = originals["_send_final_actions"]
+            main._build_orchestrator_shadow_artifact = originals["_build_orchestrator_shadow_artifact"]
+            main.kf_turn_generations.clear()
+            main.kf_turn_generations.update(originals["kf_turn_generations"])
+            main.kf_turn_tasks.clear()
+            main.kf_turn_tasks.update(originals["kf_turn_tasks"])
+            main.kf_turn_pending_messages.clear()
+            main.kf_turn_pending_messages.update(originals["kf_turn_pending_messages"])
+
+        key_a = main._conversation_key("kf", "wm-a")
+        key_b = main._conversation_key("kf", "wm-b")
+        self.assertEqual(labels_from_context(fake_store.data[key_a]), ["AlphaCourtA-101"])
+        self.assertEqual(labels_from_context(fake_store.data[key_b]), ["BetaCourtB-202"])
+        a_followup = [item for item in observed_context if item[0] == "wm-a-3"][0]
+        b_followup = [item for item in observed_context if item[0] == "wm-b-4"][0]
+        self.assertEqual(a_followup[2], ["AlphaCourtA-101"])
+        self.assertEqual(b_followup[2], ["BetaCourtB-202"])
+        self.assertIn(("wm-a", "current candidate: AlphaCourtA-101"), sent_replies)
+        self.assertIn(("wm-b", "current candidate: BetaCourtB-202"), sent_replies)
+        self.assertNotIn(("wm-a", "current candidate: BetaCourtB-202"), sent_replies)
+        self.assertNotIn(("wm-b", "current candidate: AlphaCourtA-101"), sent_replies)
+
 
 if __name__ == "__main__":
     unittest.main()

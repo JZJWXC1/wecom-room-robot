@@ -4,7 +4,8 @@ param(
     [string]$Python = "",
     [int]$FullRepeat = 3,
     [int]$ParityCases = 20,
-    [switch]$SkipParity
+    [switch]$SkipParity,
+    [switch]$AllowMissingRealDialogues
 )
 
 $ErrorActionPreference = "Stop"
@@ -216,6 +217,47 @@ function Invoke-Parity20 {
     Write-Host "Parity target satisfied: $ParityCases+ cases via two 10-window runners."
 }
 
+function Invoke-ProductionSmoke {
+    $previousMode = $env:KF_DUAL_LLM_MODE
+    try {
+        $env:KF_DUAL_LLM_MODE = "production"
+        Invoke-External -FilePath $Python -Arguments @("scripts/smoke_dual_llm_production.py")
+    } finally {
+        if ($null -eq $previousMode) {
+            Remove-Item Env:\KF_DUAL_LLM_MODE -ErrorAction SilentlyContinue
+        } else {
+            $env:KF_DUAL_LLM_MODE = $previousMode
+        }
+    }
+}
+
+function Invoke-RealDialogueReplay {
+    $fixture = "tests/fixtures/qa/real_server_dialogues_sanitized.json"
+    if (-not (Test-Path $fixture -PathType Leaf)) {
+        if ($AllowMissingRealDialogues) {
+            Write-Host "AllowMissingRealDialogues enabled; real dialogue replay skipped because fixture is missing." -ForegroundColor Yellow
+            return
+        }
+        throw "L4 requires $fixture. Generate it with scripts/export_real_dialogue_fixture.py or pass -AllowMissingRealDialogues explicitly."
+    }
+
+    Invoke-External -FilePath $Python -Arguments @(
+        "qa_artifacts/run_rag_10windows_10turns_utf8.py",
+        "--fixture",
+        $fixture,
+        "--artifact-prefix",
+        "rag_real_dialogue_replay_utf8",
+        "--min-window-count",
+        "10",
+        "--min-turn-count",
+        "100"
+    )
+}
+
+function Invoke-RandomGuard {
+    Invoke-External -FilePath $Python -Arguments @("qa_artifacts/run_rag_random_guard_utf8.py")
+}
+
 $L1Tests = @(
     "tests/test_kf_contracts.py",
     "tests/test_kf_send_receipts.py",
@@ -282,7 +324,11 @@ if ($Level -eq "L4") {
             Invoke-External -FilePath $Python -Arguments @("-m", "pytest", "-q")
         }
     }
+    Invoke-GateStep "dual LLM production package smoke without send" { Invoke-ProductionSmoke }
     Invoke-GateStep "20+ parity QA" { Invoke-Parity20 }
+    Invoke-GateStep "real dialogue replay QA" { Invoke-RealDialogueReplay }
+    Invoke-GateStep "random 10-question guard QA" { Invoke-RandomGuard }
+    Invoke-GateStep "video upload transcode retry gate" { Invoke-PytestFiles @("tests/test_kf_send_receipt_faults.py") }
     Invoke-GateStep "rollback, cutover and release rehearsal tests" { Invoke-PytestFiles $L4RollbackTests }
     Invoke-GateStep "secret scan" { Invoke-SecretScan }
     Invoke-GateStep "compileall app" { Invoke-External -FilePath $Python -Arguments @("-m", "compileall", "app") }
