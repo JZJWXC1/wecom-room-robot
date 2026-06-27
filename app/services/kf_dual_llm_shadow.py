@@ -170,6 +170,27 @@ def compose_shadow_outbound(
     )
 
 
+def build_program_outbound_contract_inputs(
+    *,
+    task_packet: StructuredTaskPacket,
+    tool_evidence: dict[str, Any] | None = None,
+    planner_result: dict[str, Any] | None = None,
+) -> tuple[ToolEvidenceBundle, ResponseStrategy, list[SendAction]]:
+    """Build production-safe inputs: evidence, strategy and program-owned send actions only."""
+    evidence = dict(tool_evidence or {})
+    planner = dict(planner_result or {})
+    candidate_set = _candidate_set_from_evidence(task_packet, evidence)
+    evidence_bundle = _evidence_bundle_from(task_packet, evidence, candidate_set)
+    response_strategy = _strategy_from(
+        _actions_from(planner, evidence),
+        planner,
+        evidence,
+        fallback=task_packet.response_strategy,
+    )
+    send_actions = _program_send_actions_from(task_packet=task_packet, evidence=evidence)
+    return evidence_bundle, response_strategy, send_actions
+
+
 def build_dual_llm_shadow_record(
     *,
     llm1_shadow_output: dict[str, Any] | None = None,
@@ -624,6 +645,23 @@ def _send_actions_from(
                 )
             )
     return result
+
+
+def _program_send_actions_from(
+    *,
+    task_packet: StructuredTaskPacket,
+    evidence: dict[str, Any],
+) -> list[SendAction]:
+    explicit_actions = evidence.get("send_actions")
+    if isinstance(explicit_actions, list):
+        result: list[SendAction] = []
+        for raw in explicit_actions:
+            if isinstance(raw, SendAction):
+                result.append(raw)
+            elif isinstance(raw, dict):
+                result.append(SendAction.from_legacy_dict(raw))
+        return result
+    return _send_actions_from(task_packet=task_packet, evidence=evidence, reply_text="")
 
 
 def _action_captions_from(

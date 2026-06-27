@@ -107,9 +107,11 @@ class ReplyGenerator:
             structured_memory=structured_memory,
             inventory_index=inventory_index,
             candidate_set=candidate_set,
-            legacy_rewrite=legacy_rewrite,
-            legacy_planner=legacy_planner,
+            legacy_rewrite=None if production_mode else legacy_rewrite,
+            legacy_planner=None if production_mode else legacy_planner,
             prompt_version=prompt_version or "dual_llm_shadow.llm1_task_packet.v1",
+            source="production" if production_mode else "shadow",
+            include_legacy_summary=not production_mode,
         )
         llm1_mode_label = "production" if production_mode else "shadow"
         system_prompt = (
@@ -123,7 +125,7 @@ class ReplyGenerator:
             "只返回 JSON，不要 Markdown。"
         )
         user_prompt = f"""
-脱敏 shadow 输入：
+脱敏 {llm1_mode_label} 输入：
 {json.dumps(prompt_artifact, ensure_ascii=False, default=str)}
 
 Planner 回流证据：
@@ -198,6 +200,7 @@ Planner 回流证据：
             candidate_set_id=candidate_set_id,
             prompt_version=prompt_version or "dual_llm_shadow.llm1_task_packet.v1",
             source_label=source_label,
+            mode=llm1_mode_label,
         ).packet
 
     async def rewrite_kf_message(
@@ -524,6 +527,7 @@ Planner 相关规则卡片：
             "你必须基于 StructuredTaskPacket、ToolEvidenceBundle 和 ResponseStrategy 生成 PreparedOutboundPackage 的文本字段。"
             "不得决定发哪套房、发什么素材、改 candidate_number、改 listing_id、改 send action。"
             "价格、房态、密码、链接、素材目标只能来自 ToolEvidenceBundle；证据没有返回就不能写。"
+            "朝南、有电梯、已空出、可养猫、近地铁等普通事实也必须来自 ToolEvidenceBundle，并写入 claims。"
             "密码和链接属于高风险内容：不要抄写真值，只引用 evidence_id/slot 让受控发送边界处理。"
             "话术要像真实租房客服，短句、自然、直接；不要暴露 listing_id、evidence_id、ToolEvidence、send action 等内部名。"
             "已有媒体 send action 时，用“这是某某房间的视频/图片。”这类当前动作说明，"
@@ -565,9 +569,9 @@ ResponseStrategy：
 
 规则：
 - claims 必须有 evidence_ref，且只能声明该 evidence 里已有的事实。
-- action_captions 只能引用已有 action_id，不能新增 send_actions。
+- action_captions 只能引用已有 action_id，且只能描述该 action 对应 evidence，不能新增 send_actions。
 - 不要输出真实密码、完整手机号、token、URL 真值。
-- 不要把房号数字当价格，不要新增工具证据外的价格或房态。
+- 不要把房号数字当价格，不要新增工具证据外的价格、房态、朝南、有电梯、已空出、可养猫、近地铁等事实。
 - 客户可见话术必须口语化、短句，不出现内部字段名或工具名。
 - 已有媒体 send action 时，reply_text/action_captions 用“这是某某房间的视频/图片。”，不要写稍后、等下、会发你或素材已准备好。
 - 失败时 reply_text 为空，self_review.status=retry，并写 retry_reason。

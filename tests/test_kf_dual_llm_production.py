@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from app.services.kf_dual_llm_production import (
     compose_production_outbound_package,
@@ -68,9 +69,79 @@ def test_llm2_production_ignores_llm_supplied_send_actions() -> None:
 
         assert package_passed(package)
         assert package.reply_text == "我这边按证据给你回复。"
-        assert [action.action_id for action in package.send_actions] == ["send-text-1"]
+        assert package.send_actions == []
         assert package.self_review["llm2_decides_media_targets"] is False
         assert package.self_review["ignored_llm_send_actions"] is True
+
+    asyncio.run(run_case())
+
+
+def test_llm2_production_package_does_not_build_claim_legacy_reply() -> None:
+    async def run_case() -> None:
+        build = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "plain answer",
+                "task_atoms": [{"task_id": "task-1", "task_type": "reply_text"}],
+                "tool_plan": {"actions": ["generate_reply"]},
+            },
+            content="hello",
+            source_label="llm1_production",
+        )
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "我这边按证据给你回复。",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+        package = await compose_production_outbound_package(
+            reply_generator=FakeReplyGenerator(),
+            task_packet=build.packet,
+            tool_evidence={"actions": ["generate_reply"]},
+            draft_reply="legacy shadow baseline reply",
+            planner_result={"actions": ["generate_reply"]},
+            reply_result={"reply": "legacy shadow baseline reply"},
+        )
+        dumped = json.dumps(package.to_legacy_dict(), ensure_ascii=False)
+
+        assert package_passed(package)
+        assert "claim-legacy-reply" not in dumped
+        assert "dual_llm_production.baseline_adapter" not in dumped
+
+    asyncio.run(run_case())
+
+
+def test_llm2_production_gates_retry_required_llm1_packet_without_calling_llm2() -> None:
+    async def run_case() -> None:
+        build = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "第1套视频",
+                "tool_plan": {"actions": ["search_inventory", "send_video", "generate_reply"]},
+            },
+            content="第1套视频",
+            legacy_planner={"actions": ["search_inventory", "send_video", "generate_reply"]},
+            source_label="llm1_production",
+            mode="production",
+        )
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                raise AssertionError("retry-required LLM1 packet must gate before LLM2")
+
+        package = await compose_production_outbound_package(
+            reply_generator=FakeReplyGenerator(),
+            task_packet=build.packet,
+            tool_evidence={"actions": ["generate_reply"]},
+            draft_reply="legacy reply",
+            planner_result={"actions": ["generate_reply"]},
+        )
+
+        assert not package_passed(package)
+        assert "LLM1 production output missing or invalid task_atoms" in package_retry_reason(package)
+        assert package.reply_text == ""
 
     asyncio.run(run_case())
 

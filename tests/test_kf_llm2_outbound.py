@@ -208,3 +208,50 @@ def test_compose_kf_outbound_blocks_high_risk_password_link_and_phone_from_artif
     assert "19900009999" not in dumped
     assert "https://example.invalid" not in dumped
     assert "raw_tool_result" not in dumped
+
+
+def test_compose_kf_outbound_retries_when_llm2_invents_plain_facts() -> None:
+    package = compose_kf_outbound(
+        _task_packet(),
+        _evidence_bundle(),
+        ResponseStrategy.SEND_MEDIA,
+        llm_output={
+            "reply_text": "这套朝南，有电梯，已空出，可以养猫，离地铁近。",
+            "claims": [],
+            "action_captions": [],
+            "self_review": {"status": "pass"},
+        },
+    )
+    reason = package.self_review["retry_reason"]
+
+    assert package.response_strategy == ResponseStrategy.RETRY
+    assert package.reply_text == ""
+    assert "reply_text_unsupported_plain_fact:south_orientation" in reason
+    assert "reply_text_unsupported_plain_fact:elevator" in reason
+    assert "reply_text_unsupported_plain_fact:vacant_now" in reason
+    assert "reply_text_unsupported_plain_fact:cat_allowed" in reason
+    assert "reply_text_unsupported_plain_fact:near_subway" in reason
+
+
+def test_compose_kf_outbound_retries_when_caption_invents_fact_outside_action_evidence() -> None:
+    package = compose_kf_outbound(
+        _task_packet(),
+        _evidence_bundle(),
+        ResponseStrategy.SEND_MEDIA,
+        llm_output={
+            "reply_text": "这是棠润府15-2-801B房间的视频。",
+            "claims": [],
+            "action_captions": [
+                {
+                    "action_id": "send-video-1",
+                    "text": "这是朝南有电梯的房间视频。",
+                }
+            ],
+            "self_review": {"status": "pass"},
+        },
+    )
+
+    assert package.response_strategy == ResponseStrategy.RETRY
+    assert package.action_captions == []
+    assert "caption_1_unsupported_plain_fact:south_orientation" in package.self_review["retry_reason"]
+    assert "caption_1_unsupported_plain_fact:elevator" in package.self_review["retry_reason"]

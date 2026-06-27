@@ -55,6 +55,33 @@ _STATUS_FIELDS = {
     "空出时间",
 }
 _LINK_FIELDS = {"url", "link", "链接", "下载链接", "素材页", "material_page_url", "original_video_url"}
+_PLAIN_FACT_SPECS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        "south_orientation",
+        ("朝南", "南向"),
+        ("朝南", "南向", '"朝向":"南"', '"orientation":"south"', '"orientation":"south-facing"'),
+    ),
+    (
+        "elevator",
+        ("有电梯", "电梯房"),
+        ("有电梯", "电梯房", '"电梯":"有"', '"电梯":true', '"has_elevator":true', '"elevator":true'),
+    ),
+    (
+        "vacant_now",
+        ("已空出", "已经空出", "已空", "现在空", "空着", "随时入住"),
+        ("已空出", "已经空出", "已空", "空置", "空房", "随时入住", '"房态":"已空"', '"状态":"已空"', '"availability":"vacant"'),
+    ),
+    (
+        "cat_allowed",
+        ("可养猫", "可以养猫", "能养猫", "允许养猫"),
+        ("可养猫", "可以养猫", "能养猫", "允许养猫", '"可养猫":true', '"宠物":"可"', '"cat_allowed":true', '"pets_allowed":true'),
+    ),
+    (
+        "near_subway",
+        ("近地铁", "地铁近", "离地铁近", "地铁口", "地铁附近"),
+        ("近地铁", "地铁近", "离地铁近", "地铁口", "地铁附近", '"近地铁":true', '"地铁":"近"', '"near_subway":true'),
+    ),
+)
 
 
 def compose_kf_outbound(
@@ -103,6 +130,7 @@ def compose_kf_outbound(
     caption_result = _action_captions_from_output(packet, trusted_actions, output.get("action_captions"), evidence_by_id)
     guard_reasons.extend(claim_result.errors)
     guard_reasons.extend(caption_result.errors)
+    guard_reasons.extend(_unsupported_plain_facts_in_reply(reply_text, bundle, claim_result.items))
 
     if guard_reasons:
         return _failure_package(
@@ -280,6 +308,35 @@ def _unsupported_high_risk_values(output: dict[str, Any], bundle: ToolEvidenceBu
     return _dedupe(reasons)
 
 
+def _unsupported_plain_facts_in_reply(
+    reply_text: str,
+    bundle: ToolEvidenceBundle,
+    claims: list[Claim],
+) -> list[str]:
+    if not str(reply_text or "").strip():
+        return []
+    support_payload = {
+        "evidence_bundle": bundle.to_safe_dict(),
+        "claims": [claim.to_safe_dict() for claim in claims],
+    }
+    return _unsupported_plain_facts(reply_text, support_payload, prefix="reply_text")
+
+
+def _unsupported_plain_facts(text: str, support_payload: Any, *, prefix: str) -> list[str]:
+    compact_text = _compact_support_text(text)
+    if not compact_text:
+        return []
+    compact_support = _compact_support_text(support_payload)
+    reasons: list[str] = []
+    for fact_key, triggers, support_tokens in _PLAIN_FACT_SPECS:
+        if not any(_compact_support_text(trigger) in compact_text for trigger in triggers):
+            continue
+        if any(_compact_support_text(token) in compact_support for token in support_tokens):
+            continue
+        reasons.append(f"{prefix}_unsupported_plain_fact:{fact_key}")
+    return reasons
+
+
 def _allowed_price_tokens(bundle: ToolEvidenceBundle) -> set[str]:
     text_parts: list[str] = []
     for item in bundle.evidence:
@@ -330,6 +387,9 @@ def _claims_from_output(
         field = str(raw.get("field") or "").strip()
         if _is_high_risk_field(field) and not _value_supported_by_evidence(raw.get("value"), evidence):
             errors.append(f"claim_{index}_unsupported_high_risk_field:{field or 'unknown'}")
+            continue
+        if not _value_supported_by_evidence(raw.get("value"), evidence):
+            errors.append(f"claim_{index}_unsupported_by_evidence:{field or 'unknown'}")
             continue
         task_id = str(raw.get("task_id") or "").strip()
         if task_id and task_id not in valid_tasks:
@@ -393,9 +453,12 @@ def _value_supported_by_evidence(value: Any, evidence: EvidenceItem) -> bool:
     safe_value = safe_artifact_payload(value)
     if safe_value in (None, "", {}, []):
         return True
-    value_text = _normalized_text(safe_value)
-    if not value_text:
-        return True
+    if isinstance(safe_value, dict):
+        leaf_values = [item for item in safe_value.values() if item not in (None, "", {}, [])]
+        return all(_value_supported_by_evidence(item, evidence) for item in leaf_values)
+    if isinstance(safe_value, list):
+        leaf_values = [item for item in safe_value if item not in (None, "", {}, [])]
+        return all(_value_supported_by_evidence(item, evidence) for item in leaf_values)
     evidence_text = _normalized_text(
         {
             "summary": evidence.summary,
@@ -404,7 +467,19 @@ def _value_supported_by_evidence(value: Any, evidence: EvidenceItem) -> bool:
             "source_record_id": evidence.source_record_id,
         }
     )
+    compact_value = _compact_support_text(safe_value)
+    compact_evidence = _compact_support_text(evidence_text)
+    if compact_value and (len(compact_value) >= 2 or compact_value.isdigit()) and compact_value in compact_evidence:
+        return True
+    value_text = _normalized_text(safe_value)
+    if not value_text:
+        return True
     return value_text in evidence_text
+
+
+def _compact_support_text(value: Any) -> str:
+    text = value if isinstance(value, str) else _normalized_text(value)
+    return re.sub(r"\s+", "", str(text)).lower()
 
 
 def _action_captions_from_output(
@@ -427,6 +502,15 @@ def _action_captions_from_output(
             errors.append(f"caption_{index}_unknown_action_id")
             continue
         evidence = evidence_by_id.get(action.evidence_id)
+        caption_text = str(raw.get("text") or (evidence.summary if evidence else action.action_type))
+        caption_errors = _unsupported_plain_facts(
+            caption_text,
+            {"action": action.to_safe_dict(), "evidence": evidence.to_safe_dict() if evidence else {}},
+            prefix=f"caption_{index}",
+        )
+        if caption_errors:
+            errors.extend(caption_errors)
+            continue
         result.append(
             ActionCaption(
                 prompt_version=LLM2_OUTBOUND_PROMPT_VERSION,
@@ -441,7 +525,7 @@ def _action_captions_from_output(
                 caption_id=str(raw.get("caption_id") or f"caption-{action_id}"),
                 action_id=action.action_id,
                 action_type=action.action_type,
-                text=str(raw.get("text") or (evidence.summary if evidence else action.action_type)),
+                text=caption_text,
                 display_order=_int_value(raw.get("display_order"), index),
                 metadata={
                     "source": "llm2_shadow",

@@ -475,6 +475,13 @@ class ToolEvidenceBundle(ContractModel):
 
 
 class Claim(ContractModel):
+    """Evidence-backed factual statement.
+
+    LLM2 may phrase claims, but each claim must reference an existing
+    EvidenceItem. It must not create or change listing binding, material
+    binding, passwords, links or other facts outside the referenced evidence.
+    """
+
     legacy_field_aliases: ClassVar[dict[str, str]] = {
         "evidence": "evidence_ref",
         "evidence_refs": "support",
@@ -558,6 +565,13 @@ class Claim(ContractModel):
 
 
 class SendAction(ContractModel):
+    """Program-owned outbound action.
+
+    SendAction is created by the orchestrator/tools only. LLM2 must not add,
+    remove or retarget actions; it may only reference an existing action_id
+    from ActionCaption wording.
+    """
+
     action_id: str
     action_type: str
     payload: dict[str, Any] = Field(default_factory=dict)
@@ -571,6 +585,13 @@ class SendAction(ContractModel):
 
 
 class ActionCaption(ContractModel):
+    """LLM2 wording for an existing program-owned send action.
+
+    Captions may only describe the referenced SendAction and its EvidenceItem;
+    they cannot decide media targets, listing binding, passwords or delivery
+    payload.
+    """
+
     caption_id: str = ""
     action_id: str
     action_type: str = ""
