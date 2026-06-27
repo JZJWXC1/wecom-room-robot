@@ -5,7 +5,7 @@ import re
 from app.config import settings
 from app.models import RoomMedia
 from app.services.fuzzy_match import fuzzy_contains_score, normalize_search_text
-from app.services.media_manifest import MediaManifestProductionAdapter
+from app.services.media_manifest import MEDIA_KIND_ORIGINAL_VIDEO, MediaManifestProductionAdapter
 
 
 GENERIC_MEDIA_WORDS = (
@@ -118,15 +118,36 @@ class MediaStore:
             return []
         return [item.to_dict() for item in adapter.evidence_for_listing(listing_id)]
 
+    def original_video_sources_for_listings(
+        self,
+        listing_ids: list[str],
+        *,
+        manifest_path: Path | None = None,
+    ) -> dict[str, list]:
+        if not listing_ids:
+            return self._empty_original_video_sources()
+        evidence: list[dict] = []
+        for listing_id in dict.fromkeys(str(item).strip() for item in listing_ids if str(item).strip()):
+            evidence.extend(
+                item
+                for item in self.media_manifest_evidence_for_listing(listing_id, manifest_path=manifest_path)
+                if str(item.get("media_type") or item.get("kind") or "").lower() == MEDIA_KIND_ORIGINAL_VIDEO
+            )
+        if not evidence:
+            return self._empty_original_video_sources()
+        source_records = [self._original_video_source_record(item) for item in evidence]
+        return {
+            "original_video_paths": self._source_record_values(source_records, ("original_path", "source_path")),
+            "original_video_urls": self._source_record_urls(source_records, ("original_url", "source_url", "download_url")),
+            "material_page_urls": self._source_record_urls(source_records, ("material_page_url", "feishu_url", "doc_url")),
+            "source_records": source_records,
+            "media_manifest_evidence": evidence,
+        }
+
     def original_video_sources_for_paths(self, paths: list[Path]) -> dict[str, list]:
         manifest = self._load_media_source_manifest()
         if not manifest or not paths:
-            return {
-                "original_video_paths": [],
-                "original_video_urls": [],
-                "material_page_urls": [],
-                "source_records": [],
-            }
+            return self._empty_original_video_sources()
         by_key = self._media_source_records_by_key(manifest)
         source_records: list[dict] = []
         for path in paths:
@@ -141,6 +162,35 @@ class MediaStore:
             "original_video_urls": self._source_record_urls(source_records, ("original_url", "source_url", "download_url")),
             "material_page_urls": self._source_record_urls(source_records, ("material_page_url", "feishu_url", "doc_url")),
             "source_records": source_records,
+        }
+
+    def _empty_original_video_sources(self) -> dict[str, list]:
+        return {
+            "original_video_paths": [],
+            "original_video_urls": [],
+            "material_page_urls": [],
+            "source_records": [],
+            "media_manifest_evidence": [],
+        }
+
+    def _original_video_source_record(self, evidence: dict) -> dict:
+        return {
+            "listing_id": evidence.get("listing_id") or "",
+            "media_id": evidence.get("media_id") or "",
+            "evidence_id": evidence.get("evidence_id") or "",
+            "source_hash": evidence.get("source_hash") or "",
+            "source_record_id": evidence.get("source_record_id") or "",
+            "source_path_hash": evidence.get("source_path_hash") or "",
+            "source_kind": evidence.get("source_kind") or "",
+            "path": evidence.get("local_path") or "",
+            "original_path": evidence.get("local_path") or "",
+            "original_url": evidence.get("source_url") or evidence.get("original_url") or "",
+            "source_url": evidence.get("source_url") or evidence.get("original_url") or "",
+            "material_page_url": evidence.get("material_page_url") or "",
+            "sha256": evidence.get("sha256") or "",
+            "binding_method": evidence.get("binding_method") or "",
+            "evidence_profile": evidence.get("evidence_profile") or "",
+            "adapter_mode": evidence.get("adapter_mode") or "",
         }
 
     def public_urls(self, media: list[RoomMedia]) -> tuple[list[str], list[str]]:

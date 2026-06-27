@@ -52,7 +52,13 @@ BINDING_METHOD_MANUAL = "manual"
 BINDING_METHOD_FUZZY_FILENAME = "fuzzy_filename"
 SEND_READY_MIN_CONFIDENCE = 0.99
 
+
+class MediaManifestIntegrityError(ValueError):
+    """Raised when a persisted manifest's declared identity no longer matches its content."""
+
+
 LISTING_ID_RE = re.compile(r"lst_[0-9a-f]{16}", re.IGNORECASE)
+SOURCE_HASH_RE = re.compile(r"[0-9a-f]{64}", re.IGNORECASE)
 ORIGINAL_VIDEO_MARKERS = (
     "原视频",
     "原片",
@@ -301,6 +307,7 @@ class MediaManifest:
             if item.listing_id not in indexed_ids:
                 self.listing_ids.append(item.listing_id)
                 indexed_ids.add(item.listing_id)
+        self.source_hash = str(self.source_hash or "").strip().lower()
         if not self.source_hash:
             self.source_hash = self._build_source_hash()
 
@@ -342,6 +349,17 @@ class MediaManifest:
             "items": [item.to_dict() for item in self.items],
         }
         return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+    def refresh_source_hash(self) -> str:
+        self.source_hash = self._build_source_hash()
+        return self.source_hash
+
+    def verify_source_hash(self) -> None:
+        actual = self._build_source_hash()
+        if self.source_hash and self.source_hash != actual:
+            raise MediaManifestIntegrityError("media manifest source_hash does not match content identity")
+        if not self.source_hash:
+            self.source_hash = actual
 
     def items_for_listing(self, listing_id: str, *, kind: str | None = None) -> list[MediaItem]:
         if kind is not None and kind not in MEDIA_KINDS:
@@ -396,7 +414,10 @@ class MediaManifest:
         return grouped
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "MediaManifest":
+    def from_dict(cls, data: dict[str, Any], *, verify_source_hash: bool = True) -> "MediaManifest":
+        declared_source_hash = str(data.get("source_hash") or "").strip()
+        if verify_source_hash and not SOURCE_HASH_RE.fullmatch(declared_source_hash):
+            raise MediaManifestIntegrityError("media manifest source_hash is missing or invalid")
         items = [
             MediaItem.from_dict(item)
             for item in data.get("items") or []
@@ -412,19 +433,23 @@ class MediaManifest:
                         for item in listing.get(key) or []
                         if isinstance(item, dict)
                     )
-        return cls(
+        manifest = cls(
             schema_version=str(data.get("schema_version") or MEDIA_MANIFEST_SCHEMA_VERSION),
             generator_version=str(data.get("generator_version") or MEDIA_MANIFEST_GENERATOR_VERSION),
             manifest_version=str(data.get("manifest_version") or data.get("schema_version") or MEDIA_MANIFEST_SCHEMA_VERSION),
             snapshot_id=str(data.get("snapshot_id") or ""),
             generated_at=str(data.get("generated_at") or now_utc_iso()),
-            source_hash=str(data.get("source_hash") or ""),
+            source_hash=declared_source_hash,
             listing_ids=[str(item) for item in data.get("listing_ids") or []],
             items=items,
         )
+        if verify_source_hash:
+            manifest.verify_source_hash()
+        return manifest
 
     def write_json(self, path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.refresh_source_hash()
         path.write_text(canonical_json(self.to_dict()), encoding="utf-8")
         return path
 
@@ -486,11 +511,13 @@ class MediaBindingReport:
 
 @dataclass(frozen=True)
 class MediaManifestEvidence:
+    evidence_id: str
     media_id: str
     listing_id: str
     variant: str
     media_type: str = ""
     source_kind: str = ""
+    source_hash: str = ""
     source_path_hash: str = ""
     source_record_id: str = ""
     confidence: float = 0.0
@@ -515,11 +542,13 @@ class MediaManifestEvidence:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "evidence_id": self.evidence_id,
             "media_id": self.media_id,
             "listing_id": self.listing_id,
             "variant": self.variant,
             "media_type": self.media_type,
             "source_kind": self.source_kind,
+            "source_hash": self.source_hash,
             "source_path_hash": self.source_path_hash,
             "source_record_id": self.source_record_id,
             "confidence": self.confidence,
@@ -594,13 +623,15 @@ class MediaManifestProductionAdapter:
     def _evidence_for_item(self, item: MediaItem) -> MediaManifestEvidence:
         resolved_local = self._verified_local_path(item)
         local_path = str(resolved_local) if resolved_local else item.local_path
-        access_verified = bool(resolved_local)
+        access_verified = bool(resolved_local) or self._is_verified_original_link(item)
         return MediaManifestEvidence(
+            evidence_id=f"media_manifest:{self.manifest.source_hash[:12]}:{item.media_id}",
             media_id=item.media_id,
             listing_id=item.listing_id,
             variant=item.variant,
             media_type=item.media_type,
             source_kind=item.source_kind,
+            source_hash=self.manifest.source_hash,
             source_path_hash=item.source_path_hash,
             source_record_id=item.source_record_id,
             confidence=item.confidence,
@@ -633,7 +664,18 @@ class MediaManifestProductionAdapter:
             and item.confidence >= SEND_READY_MIN_CONFIDENCE
         ):
             return False
+        if self._is_verified_original_link(item):
+            return True
         return self._verified_local_path(item) is not None
+
+    def _is_verified_original_link(self, item: MediaItem) -> bool:
+        if item.kind != MEDIA_KIND_ORIGINAL_VIDEO:
+            return False
+        if item.source_kind != MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_LINK:
+            return False
+        if not (item.source_url or item.original_url or item.material_page_url):
+            return False
+        return bool(item.source_record_id or item.source_path_hash or item.source_id_hash)
 
     def _verified_local_path(self, item: MediaItem) -> Path | None:
         if not item.sha256 or not re.fullmatch(r"[0-9a-f]{64}", item.sha256):

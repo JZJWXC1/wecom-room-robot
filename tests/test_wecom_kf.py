@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import tempfile
 import unittest
@@ -12,6 +13,13 @@ from app.models import ReplyPlan
 from app.services import inventory_read_turn, kf_context_memory
 from app.services.inventory_snapshot_models import generate_listing_id
 from app.services.kf_llm1_task_packet import build_kf_task_packet_shadow
+from app.services.media_manifest import (
+    MEDIA_KIND_IMAGE,
+    MEDIA_KIND_VIDEO,
+    MediaItem,
+    MediaManifest,
+    MediaManifestProductionAdapter,
+)
 from app.services.rewrite_inventory_index import FIELD_SEMANTICS, build_rewrite_inventory_index
 from app.services.wecom_kf import (
     WeComKfClient,
@@ -27,6 +35,32 @@ from app.services.wecom_kf import (
     should_auto_reply_kf_message,
     _raise_for_status_sanitized,
 )
+
+
+def _write_manifest_evidence_for_send(root: Path, listing_id: str, path: Path, media_kind: str) -> tuple[MediaManifest, dict]:
+    sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest = MediaManifest.build(
+        listing_ids=[listing_id],
+        items=[
+            MediaItem(
+                listing_id=listing_id,
+                kind=media_kind,
+                file_name=path.name,
+                relative_path=path.relative_to(root).as_posix(),
+                sha256=sha256,
+                binding_method="listing_id",
+                confidence=1.0,
+                ambiguity=False,
+                candidate_only=False,
+                access_verified=True,
+            )
+        ],
+        generated_at="2026-06-27T08:00:00Z",
+    )
+    manifest.write_json(root / "media_manifest.json")
+    evidence = MediaManifestProductionAdapter.from_path(root / "media_manifest.json", local_root=root).evidence_for_listing(listing_id)
+    assert len(evidence) == 1
+    return manifest, evidence[0].to_dict()
 
 
 def test_constraint_selfcheck_does_not_force_search_terms_for_contract_followup() -> None:
@@ -366,6 +400,8 @@ def test_collect_room_media_production_uses_manifest_exact_listing(monkeypatch) 
         with tempfile.TemporaryDirectory() as directory:
             video_path = Path(directory) / "exact.mp4"
             video_path.write_bytes(b"video")
+            video_sha = hashlib.sha256(b"video").hexdigest()
+            manifest_source_hash = hashlib.sha256(b"manifest").hexdigest()
             listing_id = generate_listing_id("星河苑", "1-101")
 
             class FakeMediaStore:
@@ -375,9 +411,17 @@ def test_collect_room_media_production_uses_manifest_exact_listing(monkeypatch) 
                         {
                             "listing_id": listing_id,
                             "media_type": "video",
+                            "kind": "video",
+                            "media_id": "med_exact_video",
+                            "evidence_id": "media_manifest:test:med_exact_video",
+                            "source_hash": manifest_source_hash,
+                            "sha256": video_sha,
                             "send_ready": True,
                             "candidate_only": False,
                             "ambiguity": False,
+                            "binding_method": "listing_id",
+                            "adapter_mode": "production_read",
+                            "evidence_profile": "media_manifest.production_read.v1",
                             "local_path": str(video_path),
                         }
                     ]
@@ -402,6 +446,8 @@ def test_collect_room_media_production_uses_manifest_exact_listing(monkeypatch) 
             assert paths == [video_path]
             assert rows[0]["listing_id"] == listing_id
             assert missing == []
+            assert _sync["source"] == "media_manifest"
+            assert _sync["_media_manifest_evidence"][0]["source_hash"] == manifest_source_hash
 
     asyncio.run(run_case())
 
@@ -421,8 +467,13 @@ def test_collect_room_media_production_does_not_fallback_to_fuzzy(monkeypatch) -
             def list_room_database_images(self, *args, **kwargs):
                 raise AssertionError("production media send must not use fuzzy image lookup")
 
+        class FailFeishuClient:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("production media send must not run on-demand Feishu sync")
+
         original_mode = main.settings.kf_dual_llm_mode
         monkeypatch.setattr(main, "media_store", FakeMediaStore())
+        monkeypatch.setattr(main, "FeishuClient", FailFeishuClient)
         main.settings.kf_dual_llm_mode = "production"
         try:
             paths, rows, missing, _sync = await main._collect_room_media(
@@ -435,6 +486,7 @@ def test_collect_room_media_production_does_not_fallback_to_fuzzy(monkeypatch) -
         assert paths == []
         assert rows == []
         assert missing == ["星河苑1-101"]
+        assert _sync["on_demand_sync"] == "skipped_in_production"
 
     asyncio.run(run_case())
 
@@ -480,6 +532,276 @@ def test_execute_tools_production_pending_video_does_not_send_stored_paths(monke
         assert evidence["video_paths"] == []
         assert evidence["media_status"]["video"]["sent_count"] == 0
         assert "stale-fuzzy.mp4" not in json.dumps(evidence, ensure_ascii=False)
+
+    asyncio.run(run_case())
+
+
+def test_send_videos_production_blocks_paths_without_manifest_evidence(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+                self.videos: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+            def send_video(self, open_kfid: str, external_userid: str, path: Path) -> dict:
+                self.videos.append(str(path))
+                return {"errcode": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "wrong.mp4"
+            video_path.write_bytes(b"video")
+            listing_id = generate_listing_id("星河苑", "1-101")
+            fake = FakeWeComKf()
+            original_wecom = main.wecom_kf
+            original_mode = main.settings.kf_dual_llm_mode
+            main.wecom_kf = fake
+            main.settings.kf_dual_llm_mode = "production"
+            try:
+                sent, context = await main._send_videos_with_receipts(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=kf_context_memory.empty_context(),
+                    paths=[str(video_path)],
+                    rows=[{"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}],
+                    tool_evidence={"video_paths": [str(video_path)], "video_rows": []},
+                )
+            finally:
+                main.wecom_kf = original_wecom
+                main.settings.kf_dual_llm_mode = original_mode
+
+            assert fake.texts == []
+            assert fake.videos == []
+            assert sent == [{"type": "video_blocked", "path": str(video_path), "reason": "missing_media_manifest_evidence"}]
+            receipt = context["send_receipts"]["receipts"][-1]
+            assert receipt["status"] == "failed"
+            assert receipt["metadata"]["blocked"] is True
+            assert receipt["metadata"]["media_manifest_required"] is True
+
+    asyncio.run(run_case())
+
+
+def test_send_videos_production_uses_manifest_evidence_in_receipt(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+                self.videos: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+            def send_video(self, open_kfid: str, external_userid: str, path: Path) -> dict:
+                self.videos.append(str(path))
+                return {"errcode": 0, "msgid": "video-1"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "room_database"
+            listing_id = generate_listing_id("星河苑", "1-101")
+            video_path = root / "video" / listing_id / "exact.mp4"
+            video_path.parent.mkdir(parents=True)
+            video_path.write_bytes(b"video")
+            manifest, media_evidence = _write_manifest_evidence_for_send(root, listing_id, video_path, MEDIA_KIND_VIDEO)
+            video_sha = media_evidence["sha256"]
+            manifest_source_hash = manifest.source_hash
+            row = {"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}
+            fake = FakeWeComKf()
+            original_wecom = main.wecom_kf
+            original_mode = main.settings.kf_dual_llm_mode
+            previous_room_database_path = main.settings.room_database_path
+            main.wecom_kf = fake
+            main.settings.kf_dual_llm_mode = "production"
+            main.settings.room_database_path = root
+            try:
+                sent, context = await main._send_videos_with_receipts(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=kf_context_memory.empty_context(),
+                    paths=[str(video_path)],
+                    rows=[row],
+                    tool_evidence={
+                        "video_paths": [str(video_path)],
+                        "video_rows": [row],
+                        "video_media_manifest_evidence": [media_evidence],
+                    },
+                )
+            finally:
+                main.wecom_kf = original_wecom
+                main.settings.kf_dual_llm_mode = original_mode
+                main.settings.room_database_path = previous_room_database_path
+
+            assert fake.texts == ["这是星河苑1-101的视频。"]
+            assert fake.videos == [str(video_path)]
+            assert sent == [{"type": "video", "path": str(video_path), "room": "星河苑1-101", "count": 1}]
+            receipt = context["send_receipts"]["receipts"][-1]
+            assert receipt["status"] == "sent"
+            assert receipt["listing_id"] == listing_id
+            assert receipt["source_hash"] == manifest_source_hash
+            assert receipt["sha256"] == video_sha
+            assert receipt["metadata"]["media_evidence_profile"] == "media_manifest.production_read.v1"
+
+    asyncio.run(run_case())
+
+
+def test_send_images_production_blocks_paths_without_manifest_evidence(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.images: list[str] = []
+
+            def send_image(self, open_kfid: str, external_userid: str, path: Path) -> dict:
+                self.images.append(str(path))
+                return {"errcode": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "wrong.jpg"
+            image_path.write_bytes(b"image")
+            listing_id = generate_listing_id("星河苑", "1-101")
+            row = {"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}
+            fake = FakeWeComKf()
+            original_wecom = main.wecom_kf
+            original_mode = main.settings.kf_dual_llm_mode
+            main.wecom_kf = fake
+            main.settings.kf_dual_llm_mode = "production"
+            try:
+                sent, context = await main._send_images_with_receipts(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=kf_context_memory.empty_context(),
+                    paths=[str(image_path)],
+                    rows=[row],
+                    tool_evidence={"image_paths": [str(image_path)], "image_rows": [row]},
+                    require_media_manifest=True,
+                )
+            finally:
+                main.wecom_kf = original_wecom
+                main.settings.kf_dual_llm_mode = original_mode
+
+            assert fake.images == []
+            assert sent == [{"type": "image_blocked", "path": str(image_path), "reason": "missing_media_manifest_evidence"}]
+            receipt = context["send_receipts"]["receipts"][-1]
+            assert receipt["status"] == "failed"
+            assert receipt["metadata"]["blocked"] is True
+            assert receipt["metadata"]["media_manifest_required"] is True
+
+    asyncio.run(run_case())
+
+
+def test_send_images_production_uses_exact_manifest_evidence_in_receipt(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.images: list[str] = []
+
+            def send_image(self, open_kfid: str, external_userid: str, path: Path) -> dict:
+                self.images.append(str(path))
+                return {"errcode": 0, "msgid": "image-1"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "room_database"
+            listing_id = generate_listing_id("星河苑", "1-101")
+            image_path = root / "images" / listing_id / "exact.jpg"
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(b"image")
+            manifest, media_evidence = _write_manifest_evidence_for_send(root, listing_id, image_path, MEDIA_KIND_IMAGE)
+            row = {"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}
+            fake = FakeWeComKf()
+            original_wecom = main.wecom_kf
+            original_mode = main.settings.kf_dual_llm_mode
+            previous_room_database_path = main.settings.room_database_path
+            main.wecom_kf = fake
+            main.settings.kf_dual_llm_mode = "production"
+            main.settings.room_database_path = root
+            try:
+                sent, context = await main._send_images_with_receipts(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=kf_context_memory.empty_context(),
+                    paths=[str(image_path)],
+                    rows=[row],
+                    tool_evidence={
+                        "image_paths": [str(image_path)],
+                        "image_rows": [row],
+                        "image_media_manifest_evidence": [media_evidence],
+                    },
+                    require_media_manifest=True,
+                )
+            finally:
+                main.wecom_kf = original_wecom
+                main.settings.kf_dual_llm_mode = original_mode
+                main.settings.room_database_path = previous_room_database_path
+
+            assert fake.images == [str(image_path)]
+            assert sent == [{"type": "image", "path": str(image_path), "count": 1}]
+            receipt = context["send_receipts"]["receipts"][-1]
+            assert receipt["status"] == "sent"
+            assert receipt["listing_id"] == listing_id
+            assert receipt["source_hash"] == manifest.source_hash
+            assert receipt["sha256"] == media_evidence["sha256"]
+            assert receipt["media_id"] == media_evidence["media_id"]
+            assert receipt["metadata"]["media_evidence_profile"] == "media_manifest.production_read.v1"
+
+    asyncio.run(run_case())
+
+
+def test_send_images_production_blocks_manifest_source_hash_drift(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.images: list[str] = []
+
+            def send_image(self, open_kfid: str, external_userid: str, path: Path) -> dict:
+                self.images.append(str(path))
+                return {"errcode": 0}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "room_database"
+            listing_id = generate_listing_id("星河苑", "1-101")
+            image_path = root / "images" / listing_id / "exact.jpg"
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(b"image")
+            _manifest, media_evidence = _write_manifest_evidence_for_send(root, listing_id, image_path, MEDIA_KIND_IMAGE)
+            manifest_path = root / "media_manifest.json"
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            data["source_hash"] = "0" * 64
+            manifest_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            row = {"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}
+            fake = FakeWeComKf()
+            original_wecom = main.wecom_kf
+            original_mode = main.settings.kf_dual_llm_mode
+            previous_room_database_path = main.settings.room_database_path
+            main.wecom_kf = fake
+            main.settings.kf_dual_llm_mode = "production"
+            main.settings.room_database_path = root
+            try:
+                sent, context = await main._send_images_with_receipts(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=kf_context_memory.empty_context(),
+                    paths=[str(image_path)],
+                    rows=[row],
+                    tool_evidence={
+                        "image_paths": [str(image_path)],
+                        "image_rows": [row],
+                        "image_media_manifest_evidence": [media_evidence],
+                    },
+                    require_media_manifest=True,
+                )
+            finally:
+                main.wecom_kf = original_wecom
+                main.settings.kf_dual_llm_mode = original_mode
+                main.settings.room_database_path = previous_room_database_path
+
+            assert fake.images == []
+            assert sent == [{"type": "image_blocked", "path": str(image_path), "reason": "missing_media_manifest_evidence"}]
+            receipt = context["send_receipts"]["receipts"][-1]
+            assert receipt["status"] == "failed"
+            assert receipt["metadata"]["blocked"] is True
+            assert receipt["metadata"]["media_manifest_required"] is True
 
     asyncio.run(run_case())
 

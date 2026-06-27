@@ -8,7 +8,9 @@ from app.config import settings
 from app.services.inventory_snapshot_models import generate_listing_id
 from app.services.media_manifest import (
     BINDING_METHOD_FUZZY_FILENAME,
+    MEDIA_KIND_ORIGINAL_VIDEO,
     MEDIA_KIND_VIDEO,
+    MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_LINK,
     MEDIA_SOURCE_KIND_WECOM_VIDEO_FILE,
     MediaItem,
     MediaManifest,
@@ -55,6 +57,8 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
                 self.assertEqual(evidence[0]["listing_id"], listing_id)
                 self.assertEqual(evidence[0]["media_type"], MEDIA_KIND_VIDEO)
                 self.assertEqual(evidence[0]["source_kind"], MEDIA_SOURCE_KIND_WECOM_VIDEO_FILE)
+                self.assertTrue(evidence[0]["source_hash"])
+                self.assertTrue(evidence[0]["evidence_id"].startswith("media_manifest:"))
                 self.assertEqual(evidence[0]["binding_method"], "listing_id")
                 self.assertTrue(evidence[0]["send_ready"])
                 self.assertFalse(evidence[0]["ambiguity"])
@@ -138,6 +142,41 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
                 self.assertEqual([item["listing_id"] for item in evidence], [listing_a])
                 self.assertIn("a.mp4", evidence[0]["local_path"])
                 self.assertNotIn("b.mp4", json.dumps(evidence, ensure_ascii=False))
+            finally:
+                settings.room_database_path = previous_room_database_path
+
+    def test_tampered_media_manifest_is_not_production_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                settings.room_database_path.mkdir(parents=True)
+                listing_id = generate_listing_id("Unit Garden", "1-101A")
+                video = settings.room_database_path / "video" / listing_id / "exact.mp4"
+                video.parent.mkdir(parents=True)
+                video.write_bytes(b"video")
+                manifest_path = settings.room_database_path / "media_manifest.json"
+                MediaManifest.build(
+                    listing_ids=[listing_id],
+                    items=[
+                        MediaItem(
+                            listing_id=listing_id,
+                            kind=MEDIA_KIND_VIDEO,
+                            file_name=video.name,
+                            relative_path=f"video/{listing_id}/{video.name}",
+                            sha256=hashlib.sha256(b"video").hexdigest(),
+                            binding_method="listing_id",
+                            access_verified=True,
+                        )
+                    ],
+                ).write_json(manifest_path)
+                self.assertEqual(len(MediaStore().media_manifest_evidence_for_listing(listing_id)), 1)
+
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                data["items"][0]["file_name"] = "tampered.mp4"
+                manifest_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+                self.assertEqual(MediaStore().media_manifest_evidence_for_listing(listing_id), [])
             finally:
                 settings.room_database_path = previous_room_database_path
 
@@ -365,6 +404,43 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
 
                 self.assertEqual(sources["original_video_urls"], ["https://ccn9urs7d60k.feishu.cn/file/source-video"])
                 self.assertEqual(sources["material_page_urls"], ["https://ccn9urs7d60k.feishu.cn/docx/source-doc"])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
+    def test_reads_original_video_source_manifest_by_exact_listing_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                settings.room_database_path.mkdir(parents=True)
+                listing_id = generate_listing_id("棠润府", "15-2-801B")
+                manifest = MediaManifest.build(
+                    listing_ids=[listing_id],
+                    items=[
+                        MediaItem(
+                            listing_id=listing_id,
+                            kind=MEDIA_KIND_ORIGINAL_VIDEO,
+                            file_name="原视频下载链接",
+                            source_kind=MEDIA_SOURCE_KIND_ORIGINAL_VIDEO_LINK,
+                            source_url="https://ccn9urs7d60k.feishu.cn/file/source-video",
+                            original_url="https://ccn9urs7d60k.feishu.cn/file/source-video",
+                            material_page_url="https://ccn9urs7d60k.feishu.cn/docx/source-doc",
+                            source_record_id=hashlib.sha256(b"source-record").hexdigest(),
+                            source_path_hash=hashlib.sha256(b"source-path").hexdigest(),
+                            binding_method="listing_id",
+                            access_verified=True,
+                        )
+                    ],
+                )
+                manifest.write_json(settings.room_database_path / "media_manifest.json")
+
+                sources = MediaStore().original_video_sources_for_listings([listing_id])
+
+                self.assertEqual(sources["original_video_urls"], ["https://ccn9urs7d60k.feishu.cn/file/source-video"])
+                self.assertEqual(sources["material_page_urls"], ["https://ccn9urs7d60k.feishu.cn/docx/source-doc"])
+                self.assertEqual(sources["media_manifest_evidence"][0]["listing_id"], listing_id)
+                self.assertEqual(sources["media_manifest_evidence"][0]["source_hash"], manifest.source_hash)
+                self.assertEqual(sources["source_records"][0]["media_id"], sources["media_manifest_evidence"][0]["media_id"])
             finally:
                 settings.room_database_path = previous_room_database_path
 
