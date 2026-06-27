@@ -3986,9 +3986,13 @@ def _target_rows_from_understanding(
         for item in proof.get("communities") or []
         if normalize_search_text(str(item))
     }
-    if selected and not candidates:
-        return []
-    if selected and search_rows and proof_communities:
+    current_text_norm = normalize_search_text(current_text)
+    current_mentions_proof_community = bool(
+        proof_communities
+        and current_text_norm
+        and any(community in current_text_norm for community in proof_communities)
+    )
+    if selected and current_mentions_proof_community and search_rows:
         current_search_rows = [
             row
             for row in search_rows
@@ -4004,29 +4008,17 @@ def _target_rows_from_understanding(
         if current_selected_rows:
             return current_selected_rows
 
-    if selected and candidates and any(index > len(candidates) for index in selected):
-        return []
-    selected_rows = [
-        candidates[index - 1]
-        for index in selected
-        if 1 <= index <= len(candidates)
-    ]
-    if selected_rows:
-        return selected_rows
     if selected:
-        return []
-    selected_has_current_scope = bool(
-        proof_communities
-        or proof.get("area")
-        or proof.get("budget_range")
-        or proof.get("layout")
-        or proof.get("features")
-        or explicit_room_refs
-    )
-    if selected and not candidates and not selected_has_current_scope:
-        return []
-    if selected and candidates:
-        return []
+        if not candidates:
+            return []
+        if any(index > len(candidates) for index in selected):
+            return []
+        selected_rows = [
+            candidates[index - 1]
+            for index in selected
+            if 1 <= index <= len(candidates)
+        ]
+        return selected_rows or []
 
     wants_media = bool(
         proof.get("wants_video")
@@ -5632,12 +5624,32 @@ async def _execute_tools(
             search_rows=rows,
         )
     )
+    target_selection_query_text = " ".join(
+        str(part).strip()
+        for part in (
+            content,
+            task.get("original_text"),
+            effective_query,
+            understanding.get("rewritten_query"),
+        )
+        if str(part or "").strip()
+    )
+    target_selection_indices = _selected_indices_from_understanding(
+        understanding,
+        target_selection_query_text,
+    )
+    target_selection_uses_candidates = bool(
+        target_selection_indices
+        and _candidate_rows(context)
+        and not _room_refs_from_text(original_room_text)
+    )
     target_rows = (
         []
         if pending_video_handled or field_followup_requires_specific_room or media_target_error
         else _target_rows_from_understanding(understanding, context, rows)
     )
-    target_rows = _enforce_target_rows_community_constraints(target_rows, rows, proof)
+    if not target_selection_uses_candidates:
+        target_rows = _enforce_target_rows_community_constraints(target_rows, rows, proof)
     if (
         not target_rows
         and not pending_video_handled
@@ -5668,18 +5680,9 @@ async def _execute_tools(
         if confirmed_row and not _has_explicit_candidate_selection(content):
             target_rows = [confirmed_row]
             target_rows = _enforce_target_rows_community_constraints(target_rows, rows, proof)
-    selection_query_text = " ".join(
-        str(part).strip()
-        for part in (
-            content,
-            task.get("original_text"),
-            effective_query,
-            understanding.get("rewritten_query"),
-        )
-        if str(part or "").strip()
-    )
+    selection_query_text = target_selection_query_text
     candidate_rows_for_selection = _candidate_rows(context)
-    selected_indices = _selected_indices_from_understanding(understanding, selection_query_text)
+    selected_indices = target_selection_indices
     current_selection_text = " ".join(
         str(part).strip()
         for part in (content, task.get("original_text"))
@@ -5836,6 +5839,7 @@ async def _execute_tools(
         and not invalid_search_selection
         and not media_target_error
         and not original_video_target_error
+        and not selected_indices
         and any(action in actions for action in ("send_image", "send_video"))
     ):
         target_rows = rows[:KF_VIDEO_SEND_LIMIT]

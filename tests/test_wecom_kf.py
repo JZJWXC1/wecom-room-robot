@@ -1187,6 +1187,47 @@ class MainUnderstandingGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target_rows, rows[:2])
 
+    def test_selected_indices_prefer_candidate_context_over_inherited_search_scope(self) -> None:
+        candidate_rows = [
+            {"\u5c0f\u533a": "\u68e0\u6da6\u5e9c", "\u623f\u53f7": "15-2-801B"},
+            {"\u5c0f\u533a": "\u5408\u5d62\u60a6\u5e9c", "\u623f\u53f7": "6-1-1204B"},
+        ]
+        search_rows = [
+            {"\u5c0f\u533a": "\u534e\u4e30\u6b23\u82d1", "\u623f\u53f7": "14-2-901"},
+            {"\u5c0f\u533a": "\u77f3\u6865\u94ed\u82d1", "\u623f\u53f7": "6-1102"},
+        ]
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "\u4e07\u8fbe2000\u4ee5\u5185\u4e00\u5ba4",
+            "candidates": candidate_rows,
+            "shown_count": 2,
+            "total_count": 2,
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "\u534e\u4e30\u6b23\u82d1\u524d\u4e24\u5957\u56fe\u7247",
+                "rewritten_query": "\u534e\u4e30\u6b23\u82d1\u524d\u4e24\u5957\u56fe\u7247",
+                "context_reference": True,
+                "intent": "media",
+                "selected_indices": [1, 2],
+                "constraint_proof": {
+                    "communities": ["\u534e\u4e30\u6b23\u82d1"],
+                    "selected_indices": [1, 2],
+                    "wants_image": True,
+                },
+                "structured_task": {
+                    "original_text": "\u524d\u4e24\u5957\u56fe\u7247\u53d1\u6211\u3002",
+                    "tool_requirements": {"needs_image": True},
+                },
+            },
+            context,
+            search_rows,
+        )
+
+        self.assertEqual(target_rows, candidate_rows)
+
     def test_selected_indices_do_not_partially_bind_current_search_rows(self) -> None:
         rows = [{"小区": "东新园", "房号": "8-1201"}]
 
@@ -7867,6 +7908,64 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["image_rows"], [])
         self.assertEqual(evidence["selection_error"]["reason"], "missing_current_candidate_set")
         self.assertEqual(evidence["selection_error"]["candidate_count"], 0)
+
+    async def test_selected_indices_with_candidates_do_not_fallback_to_inherited_search_rows(self) -> None:
+        candidate_rows = [
+            {"\u5c0f\u533a": "\u68e0\u6da6\u5e9c", "\u623f\u53f7": "15-2-801B"},
+            {"\u5c0f\u533a": "\u5408\u5d62\u60a6\u5e9c", "\u623f\u53f7": "6-1-1204B"},
+        ]
+        search_rows = [
+            {"\u5c0f\u533a": "\u534e\u4e30\u6b23\u82d1", "\u623f\u53f7": "14-2-901"},
+            {"\u5c0f\u533a": "\u77f3\u6865\u94ed\u82d1", "\u623f\u53f7": "6-1102"},
+        ]
+
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return search_rows
+
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "\u4e07\u8fbe2000\u4ee5\u5185\u4e00\u5ba4",
+            "candidates": candidate_rows,
+            "shown_count": 2,
+            "total_count": 2,
+        }
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_image", "explain_missing_media"],
+                content="\u524d\u4e24\u5957\u56fe\u7247\u53d1\u6211\u3002",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "\u534e\u4e30\u6b23\u82d1\u524d\u4e24\u5957\u56fe\u7247",
+                    "rewritten_query": "\u534e\u4e30\u6b23\u82d1\u524d\u4e24\u5957\u56fe\u7247",
+                    "selected_indices": [1, 2],
+                    "constraint_proof": {
+                        "communities": ["\u534e\u4e30\u6b23\u82d1"],
+                        "selected_indices": [1, 2],
+                        "wants_image": True,
+                    },
+                    "structured_task": {
+                        "original_text": "\u524d\u4e24\u5957\u56fe\u7247\u53d1\u6211\u3002",
+                        "tool_requirements": {"needs_image": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(
+            [main._row_label(row) for row in evidence["target_rows"]],
+            [main._row_label(row) for row in candidate_rows],
+        )
+        self.assertNotIn(
+            main._row_label(search_rows[0]),
+            [main._row_label(row) for row in evidence["target_rows"]],
+        )
+        self.assertNotIn("selection_error", evidence)
 
     async def test_selected_indices_out_of_range_candidate_context_blocks_fallback(self) -> None:
         row = {"小区": "东新园", "房号": "8-1201"}
