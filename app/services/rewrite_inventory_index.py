@@ -10,6 +10,7 @@ from typing import Any
 
 from app.config import settings
 from app.services.fuzzy_match import canonical_community_display, normalize_search_text
+from app.services.inventory_snapshot_models import REDACTED_VALUE, redact_sensitive_text
 from app.services.region_inventory_constants import area_alias_index_entries
 
 
@@ -78,6 +79,77 @@ SENSITIVE_ROOM_INDEX_KEYS = frozenset(
 )
 
 
+PUBLIC_REWRITE_SAFE_KEYS = frozenset(
+    {
+        "has_password",
+        "password_available",
+        "viewing_mode",
+        "viewing_summary",
+        "availability_summary",
+        "availability",
+        "availability_status",
+        "source_hash",
+        "signature",
+        "sha256",
+    }
+)
+PUBLIC_REWRITE_SCHEMA_METADATA_KEYS = frozenset({"field_semantics", "field_aliases"})
+PUBLIC_REWRITE_INTEGRITY_VALUE_KEYS = frozenset(
+    {
+        "hash",
+        "source_hash",
+        "last_source_hash",
+        "last_counted_source_hash",
+        "signature",
+        "sha256",
+        "sha512",
+        "md5",
+        "digest",
+        "checksum",
+        "content_hash",
+        "file_hash",
+        "material_hash",
+        "text_hash",
+        "etag",
+    }
+)
+PUBLIC_REWRITE_SENSITIVE_KEY_TOKENS = (
+    "access_token",
+    "app_secret",
+    "appsecret",
+    "api_key",
+    "apikey",
+    "authorization",
+    "bearer",
+    "credential",
+    "credentials",
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "phone",
+    "mobile",
+    "private",
+    "瀵嗂挜",
+    "瀵嗙爜",
+    "鐪嬫埧瀵嗙爜",
+    "鐪嬫埧鏂瑰紡瀵嗙爜",
+)
+PUBLIC_REWRITE_SECRET_TEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
+    re.compile(r"(?<!\d)\d{3,8}#(?!\d)"),
+    re.compile(r"TEST_SECRET_[A-Za-z0-9_#-]+"),
+    re.compile(
+        r"\b(?:access[_-]?token|app[_-]?secret|api[_-]?key|authorization|bearer|credential|credentials|password|passwd|pwd|secret|token)"
+        r"\s*[:=]\s*[A-Za-z0-9][A-Za-z0-9_#./+=-]{2,}",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+    re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}", re.IGNORECASE),
+)
+
+
 def row_value(row: dict[str, Any], canonical_field: str) -> str:
     for name in FIELD_ALIASES.get(canonical_field, (canonical_field,)):
         value = row.get(name)
@@ -125,7 +197,7 @@ def build_rewrite_inventory_index(
     signature = hashlib.sha256(
         json.dumps(payload_for_signature, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
-    return {
+    index = {
         "source": "latest_inventory_rows",
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "signature": signature,
@@ -150,6 +222,7 @@ def build_rewrite_inventory_index(
             "business_scope": "只服务杭州当前房源表；命中区域别名时按索引归一，不追问城市。",
         },
     }
+    return sanitize_rewrite_inventory_index(index)
 
 
 def write_rewrite_inventory_index(
@@ -563,7 +636,7 @@ def sanitize_rewrite_inventory_index(index: dict[str, Any]) -> dict[str, Any]:
             for item in room_index
             if isinstance(item, dict)
         ]
-    return result
+    return _sanitize_public_rewrite_value(result)
 
 
 def _sanitize_room_index_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -588,7 +661,7 @@ def _sanitize_room_index_item(item: dict[str, Any]) -> dict[str, Any]:
     result.setdefault("viewing_mode", str(summary.get("viewing_mode") or "unknown"))
     if "availability" not in result and raw_viewing:
         result["availability"] = _availability_status(str(raw_viewing))
-    return result
+    return _sanitize_public_rewrite_value(result)
 
 
 def _first_sensitive_viewing_value(item: dict[str, Any]) -> str:
@@ -607,3 +680,52 @@ def _viewing_mode_from_summary(summary: dict[str, Any]) -> str:
     if summary.get("needs_contact"):
         return "contact_required"
     return "viewing_text_only"
+
+
+def _sanitize_public_rewrite_value(value: Any, *, field_name: str = "") -> Any:
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        preserve_schema_keys = _is_public_rewrite_schema_metadata_key(field_name)
+        for key, item in value.items():
+            key_text = str(key)
+            if not preserve_schema_keys and _is_public_rewrite_sensitive_key(key_text):
+                continue
+            child_field_name = field_name if preserve_schema_keys else key_text
+            result[key_text] = _sanitize_public_rewrite_value(item, field_name=child_field_name)
+        return result
+    if isinstance(value, list):
+        return [_sanitize_public_rewrite_value(item, field_name=field_name) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_public_rewrite_value(item, field_name=field_name) for item in value]
+    if isinstance(value, str):
+        if _is_public_rewrite_integrity_value_key(field_name):
+            return value
+        return _redact_public_rewrite_text(value)
+    return value
+
+
+def _is_public_rewrite_sensitive_key(key: str) -> bool:
+    key_text = str(key or "").strip()
+    lowered = key_text.lower()
+    if key_text in PUBLIC_REWRITE_SAFE_KEYS or lowered in PUBLIC_REWRITE_SAFE_KEYS:
+        return False
+    if key_text in SENSITIVE_ROOM_INDEX_KEYS or lowered in SENSITIVE_ROOM_INDEX_KEYS:
+        return True
+    return any(token in lowered for token in PUBLIC_REWRITE_SENSITIVE_KEY_TOKENS)
+
+
+def _is_public_rewrite_integrity_value_key(key: str) -> bool:
+    key_text = str(key or "").strip().lower()
+    return key_text in PUBLIC_REWRITE_INTEGRITY_VALUE_KEYS
+
+
+def _is_public_rewrite_schema_metadata_key(key: str) -> bool:
+    key_text = str(key or "").strip()
+    return key_text in PUBLIC_REWRITE_SCHEMA_METADATA_KEYS
+
+
+def _redact_public_rewrite_text(value: str) -> str:
+    text = redact_sensitive_text(value)
+    for pattern in PUBLIC_REWRITE_SECRET_TEXT_PATTERNS:
+        text = pattern.sub(REDACTED_VALUE, text)
+    return text

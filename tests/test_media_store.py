@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,6 +31,7 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
                 manifest_video = settings.room_database_path / "video" / listing_id / "manifest证据.mp4"
                 manifest_video.parent.mkdir(parents=True)
                 manifest_video.write_bytes(b"manifest-video")
+                manifest_sha = hashlib.sha256(b"manifest-video").hexdigest()
                 MediaManifest.build(
                     listing_ids=[listing_id],
                     items=[
@@ -38,7 +40,7 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
                             kind=MEDIA_KIND_VIDEO,
                             file_name=manifest_video.name,
                             relative_path=f"video/{listing_id}/{manifest_video.name}",
-                            sha256="",
+                            sha256=manifest_sha,
                             binding_method="listing_id",
                             access_verified=True,
                         )
@@ -90,6 +92,52 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
                 evidence = MediaStore().media_manifest_evidence_for_listing(listing_id)
 
                 self.assertEqual(evidence, [])
+            finally:
+                settings.room_database_path = previous_room_database_path
+
+    def test_media_manifest_exact_listing_id_binding_ignores_similar_room_materials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            previous_room_database_path = settings.room_database_path
+            try:
+                settings.room_database_path = Path(directory) / "room_database"
+                settings.room_database_path.mkdir(parents=True)
+                listing_a = generate_listing_id("Unit Garden", "1-101A")
+                listing_b = generate_listing_id("Unit Garden", "1-101B")
+                file_a = settings.room_database_path / "video" / listing_a / "a.mp4"
+                file_b = settings.room_database_path / "video" / listing_b / "b.mp4"
+                file_a.parent.mkdir(parents=True)
+                file_b.parent.mkdir(parents=True)
+                file_a.write_bytes(b"video-a")
+                file_b.write_bytes(b"video-b")
+                MediaManifest.build(
+                    listing_ids=[listing_a, listing_b],
+                    items=[
+                        MediaItem(
+                            listing_id=listing_a,
+                            kind=MEDIA_KIND_VIDEO,
+                            file_name=file_a.name,
+                            relative_path=f"video/{listing_a}/{file_a.name}",
+                            sha256=hashlib.sha256(b"video-a").hexdigest(),
+                            binding_method="listing_id",
+                            access_verified=True,
+                        ),
+                        MediaItem(
+                            listing_id=listing_b,
+                            kind=MEDIA_KIND_VIDEO,
+                            file_name=file_b.name,
+                            relative_path=f"video/{listing_b}/{file_b.name}",
+                            sha256=hashlib.sha256(b"video-b").hexdigest(),
+                            binding_method="listing_id",
+                            access_verified=True,
+                        ),
+                    ],
+                ).write_json(settings.room_database_path / "media_manifest.json")
+
+                evidence = MediaStore().media_manifest_evidence_for_listing(listing_a)
+
+                self.assertEqual([item["listing_id"] for item in evidence], [listing_a])
+                self.assertIn("a.mp4", evidence[0]["local_path"])
+                self.assertNotIn("b.mp4", json.dumps(evidence, ensure_ascii=False))
             finally:
                 settings.room_database_path = previous_room_database_path
 

@@ -5,7 +5,9 @@ import time
 from typing import Any, Callable
 
 from app.services.inventory_read_models import (
+    FALLBACK_STRICT,
     READ_MODE_DISABLED,
+    READ_MODE_PRIMARY,
     READ_MODE_SHADOW,
     REASON_SOURCE_UNAVAILABLE,
     SOURCE_KIND_LEGACY,
@@ -16,7 +18,7 @@ from app.services.inventory_read_models import (
     InventoryReadHealth,
     assert_evidence_consistency,
 )
-from app.services.inventory_read_provider import LegacyInventoryReadProvider
+from app.services.inventory_read_provider import LegacyInventoryReadProvider, SnapshotInventoryReadProvider
 from app.services.inventory_read_router import InventoryReadRouter
 
 
@@ -64,6 +66,8 @@ CUSTOMER_SNAPSHOT_PROVIDER_DISABLED = CustomerSnapshotProviderDisabled()
 
 def customer_inventory_read_mode(mode_value: Any) -> str:
     raw = str(mode_value or "").strip().lower()
+    if raw == READ_MODE_PRIMARY:
+        return READ_MODE_PRIMARY
     if raw == READ_MODE_SHADOW:
         return READ_MODE_SHADOW
     return READ_MODE_DISABLED
@@ -80,15 +84,22 @@ def create_customer_inventory_read_context(
     inventory_snapshot_mode: Any,
     msgids: list[str] | None = None,
     generation: int | str = "",
+    snapshot_provider: Any | None = None,
+    readiness_state: Any | None = None,
+    fallback_strategy: str = FALLBACK_STRICT,
 ) -> InventoryReadContext:
     request_id = f"{prefix}_req_{_safe_hash(open_kfid, external_userid)}"
     msgid_text = "|".join(str(item).strip() for item in (msgids or []) if str(item).strip())
     turn_basis = msgid_text or f"{generation}:{time.time_ns()}"
     turn_id = f"{prefix}_turn_{_safe_hash(request_id, generation, turn_basis, content)}"
+    mode = customer_inventory_read_mode(inventory_snapshot_mode)
     router = _router(
-        mode=customer_inventory_read_mode(inventory_snapshot_mode),
+        mode=mode,
         inventory_service=inventory_service,
         rewrite_index_loader=rewrite_index_loader,
+        snapshot_provider=snapshot_provider,
+        readiness_state=readiness_state,
+        fallback_strategy=fallback_strategy,
     )
     decision = router.select_context(request_id=request_id, turn_id=turn_id)
     if decision.ok and decision.context is not None:
@@ -133,11 +144,13 @@ async def metadata_for_context(
     *,
     inventory_service: Any,
     rewrite_index_loader: RewriteIndexLoader,
+    snapshot_provider: Any | None = None,
 ) -> dict[str, Any]:
     meta = await _provider_for_context(
         inventory_read_context,
         inventory_service=inventory_service,
         rewrite_index_loader=rewrite_index_loader,
+        snapshot_provider=snapshot_provider,
     ).get_inventory_metadata(inventory_read_context)
     return dict(meta or {})
 
@@ -147,11 +160,13 @@ async def rewrite_index_for_context(
     *,
     inventory_service: Any,
     rewrite_index_loader: RewriteIndexLoader,
+    snapshot_provider: Any | None = None,
 ) -> dict[str, Any]:
     index = await _provider_for_context(
         inventory_read_context,
         inventory_service=inventory_service,
         rewrite_index_loader=rewrite_index_loader,
+        snapshot_provider=snapshot_provider,
     ).get_rewrite_index(inventory_read_context)
     return dict(index or {})
 
@@ -162,12 +177,14 @@ async def search_rows_for_context(
     *,
     inventory_service: Any,
     rewrite_index_loader: RewriteIndexLoader,
+    snapshot_provider: Any | None = None,
     limit: int = 8,
 ) -> tuple[list[dict[str, Any]], list[InventoryListingEvidence]]:
     rows, evidence = await _provider_for_context(
         inventory_read_context,
         inventory_service=inventory_service,
         rewrite_index_loader=rewrite_index_loader,
+        snapshot_provider=snapshot_provider,
     ).search_inventory_rows(
         query_state,
         inventory_read_context,
@@ -182,6 +199,7 @@ async def all_rows_for_context(
     *,
     inventory_service: Any,
     rewrite_index_loader: RewriteIndexLoader,
+    snapshot_provider: Any | None = None,
     limit: int = 500,
     refresh_if_needed: bool = True,
 ) -> tuple[list[dict[str, Any]], list[InventoryListingEvidence]]:
@@ -189,6 +207,7 @@ async def all_rows_for_context(
         inventory_read_context,
         inventory_service=inventory_service,
         rewrite_index_loader=rewrite_index_loader,
+        snapshot_provider=snapshot_provider,
     ).all_inventory_rows(
         inventory_read_context,
         limit=limit,
@@ -254,14 +273,19 @@ def _router(
     mode: str,
     inventory_service: Any,
     rewrite_index_loader: RewriteIndexLoader,
+    snapshot_provider: Any | None = None,
+    readiness_state: Any | None = None,
+    fallback_strategy: str = FALLBACK_STRICT,
 ) -> InventoryReadRouter:
     return InventoryReadRouter(
         mode=mode,
+        fallback_strategy=fallback_strategy,
         legacy_provider=LegacyInventoryReadProvider(
             inventory_service,
             rewrite_index_loader=rewrite_index_loader,
         ),
-        snapshot_provider=CUSTOMER_SNAPSHOT_PROVIDER_DISABLED,  # type: ignore[arg-type]
+        snapshot_provider=snapshot_provider or SnapshotInventoryReadProvider(),
+        readiness_state=readiness_state,
         shadow_probe_snapshot_health=False,
     )
 
@@ -271,13 +295,14 @@ def _provider_for_context(
     *,
     inventory_service: Any,
     rewrite_index_loader: RewriteIndexLoader,
+    snapshot_provider: Any | None = None,
 ) -> Any:
     if inventory_read_context.source_kind == SOURCE_KIND_LEGACY:
         return LegacyInventoryReadProvider(
             inventory_service,
             rewrite_index_loader=rewrite_index_loader,
         )
-    raise _snapshot_disabled_error()
+    return snapshot_provider or SnapshotInventoryReadProvider()
 
 
 def _safe_hash(*parts: Any) -> str:

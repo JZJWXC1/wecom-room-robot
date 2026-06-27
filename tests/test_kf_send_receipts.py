@@ -52,6 +52,68 @@ def test_idempotency_key_uses_msgid_scope_and_listing_binding() -> None:
     assert kf_send_receipts.build_idempotency_key(action) != kf_send_receipts.build_idempotency_key(other_listing_action)
 
 
+def test_idempotency_key_changes_when_fact_or_media_evidence_changes() -> None:
+    base = kf_send_receipts.build_send_action(
+        open_kfid="kf",
+        external_userid="wm",
+        context=_context("turn-a", "msg-a"),
+        msgids=["msg-a"],
+        action_id="send-video-1",
+        action_type="video",
+        listing_id="lst_aaaaaaaaaaaaaaaa",
+        evidence_id="evd-1",
+        inventory_snapshot_id="snap-1",
+        source_hash="source-hash-a",
+        candidate_set_id="cand-1",
+        media_id="med-a",
+        sha256="sha-a",
+        payload={"media_id": "med-a", "sha256": "sha-a"},
+    )
+    changed_source = kf_send_receipts.build_send_action(
+        open_kfid="kf",
+        external_userid="wm",
+        context=_context("turn-a", "msg-a"),
+        msgids=["msg-a"],
+        action_id="send-video-1",
+        action_type="video",
+        listing_id="lst_aaaaaaaaaaaaaaaa",
+        evidence_id="evd-1",
+        inventory_snapshot_id="snap-1",
+        source_hash="source-hash-b",
+        candidate_set_id="cand-1",
+        media_id="med-a",
+        sha256="sha-a",
+    )
+    changed_media_hash = kf_send_receipts.build_send_action(
+        open_kfid="kf",
+        external_userid="wm",
+        context=_context("turn-a", "msg-a"),
+        msgids=["msg-a"],
+        action_id="send-video-1",
+        action_type="video",
+        listing_id="lst_aaaaaaaaaaaaaaaa",
+        evidence_id="evd-1",
+        inventory_snapshot_id="snap-1",
+        source_hash="source-hash-a",
+        candidate_set_id="cand-1",
+        media_id="med-a",
+        sha256="sha-b",
+    )
+
+    assert kf_send_receipts.build_idempotency_key(base) != kf_send_receipts.build_idempotency_key(changed_source)
+    assert kf_send_receipts.build_idempotency_key(base) != kf_send_receipts.build_idempotency_key(changed_media_hash)
+
+    receipt = kf_send_receipts.build_sent_receipt(base, provider_result={"msgid": "provider-1"})
+    payload = receipt.to_safe_dict()
+    assert payload["listing_id"] == "lst_aaaaaaaaaaaaaaaa"
+    assert payload["evidence_id"] == "evd-1"
+    assert payload["inventory_snapshot_id"] == "snap-1"
+    assert payload["source_hash"] == "source-hash-a"
+    assert payload["candidate_set_id"] == "cand-1"
+    assert payload["media_id"] == "med-a"
+    assert payload["sha256"] == "sha-a"
+
+
 def test_idempotency_key_separates_customers_and_new_turns_without_msgids() -> None:
     first_customer = kf_send_receipts.build_send_action(
         open_kfid="kf",

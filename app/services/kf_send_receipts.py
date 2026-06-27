@@ -30,15 +30,23 @@ def build_send_action(
     listing_id: str = "",
     evidence_id: str = "",
     inventory_snapshot_id: str = "",
+    source_hash: str = "",
     candidate_set_id: str = "",
+    media_id: str = "",
+    sha256: str = "",
 ) -> SendAction:
     scope = current_turn_scope(context, msgids=msgids)
     conversation_id = _conversation_digest(open_kfid, external_userid)
+    payload = dict(payload or {})
+    metadata = dict(metadata or {})
+    source_hash = _first_text(source_hash, metadata.get("source_hash"), payload.get("source_hash"))
+    media_id = _first_text(media_id, metadata.get("media_id"), payload.get("media_id"))
+    sha256 = _first_text(sha256, metadata.get("sha256"), payload.get("sha256"))
     action_metadata = {
         "idempotency_profile": SEND_RECEIPT_SCHEMA_VERSION,
         "turn_scope_source": scope["source"],
         "turn_scope_id": scope["scope_id"],
-        **dict(metadata or {}),
+        **metadata,
     }
     return SendAction(
         conversation_id=conversation_id,
@@ -46,10 +54,13 @@ def build_send_action(
         listing_id=listing_id,
         evidence_id=evidence_id,
         inventory_snapshot_id=inventory_snapshot_id,
+        source_hash=source_hash,
         candidate_set_id=candidate_set_id,
+        media_id=media_id,
+        sha256=sha256,
         action_id=action_id,
         action_type=action_type,
-        payload=dict(payload or {}),
+        payload=payload,
         metadata=action_metadata,
     )
 
@@ -91,7 +102,10 @@ def build_idempotency_key(action: SendAction, *, channel: str = "wecom_kf") -> s
         "listing_id": action.listing_id,
         "evidence_id": action.evidence_id,
         "inventory_snapshot_id": action.inventory_snapshot_id,
+        "source_hash": _action_fact_value(action, "source_hash"),
         "candidate_set_id": action.candidate_set_id,
+        "media_id": _action_fact_value(action, "media_id"),
+        "sha256": _action_fact_value(action, "sha256"),
         "payload": safe_artifact_payload(action.payload),
         "metadata": {
             "turn_scope_source": action.metadata.get("turn_scope_source"),
@@ -127,7 +141,10 @@ def build_sent_receipt(
         listing_id=action.listing_id,
         evidence_id=action.evidence_id,
         inventory_snapshot_id=action.inventory_snapshot_id,
+        source_hash=action.source_hash,
         candidate_set_id=action.candidate_set_id,
+        media_id=action.media_id,
+        sha256=action.sha256,
         action_id=action.action_id,
         action_type=action.action_type,
         status=SENT_STATUS,
@@ -154,7 +171,10 @@ def build_failed_receipt(
         listing_id=action.listing_id,
         evidence_id=action.evidence_id,
         inventory_snapshot_id=action.inventory_snapshot_id,
+        source_hash=action.source_hash,
         candidate_set_id=action.candidate_set_id,
+        media_id=action.media_id,
+        sha256=action.sha256,
         action_id=action.action_id,
         action_type=action.action_type,
         status=FAILED_STATUS,
@@ -174,7 +194,10 @@ def build_duplicate_receipt(action: SendAction, existing: SendReceipt, *, idempo
         listing_id=action.listing_id,
         evidence_id=action.evidence_id,
         inventory_snapshot_id=action.inventory_snapshot_id,
+        source_hash=action.source_hash,
         candidate_set_id=action.candidate_set_id,
+        media_id=action.media_id,
+        sha256=action.sha256,
         action_id=action.action_id,
         action_type=action.action_type,
         status=SKIPPED_DUPLICATE_STATUS,
@@ -233,6 +256,9 @@ def _receipt_metadata(action: SendAction, metadata: dict[str, Any] | None = None
             "idempotency_profile": SEND_RECEIPT_SCHEMA_VERSION,
             "turn_scope_source": action.metadata.get("turn_scope_source"),
             "turn_scope_id": action.metadata.get("turn_scope_id"),
+            "source_hash": action.source_hash,
+            "media_id": action.media_id,
+            "sha256": action.sha256,
             **dict(metadata or {}),
         }
     )
@@ -260,6 +286,22 @@ def _stable_digest(payload: Any) -> str:
         safe_payload = {"redacted": True}
     raw = json.dumps(safe_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _action_fact_value(action: SendAction, key: str) -> str:
+    return _first_text(
+        getattr(action, key, ""),
+        action.metadata.get(key),
+        action.payload.get(key),
+    )
 
 
 def _utc_now() -> str:

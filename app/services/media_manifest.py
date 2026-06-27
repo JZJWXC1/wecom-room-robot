@@ -10,6 +10,7 @@ from app.services.feishu_base import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 from app.services.fuzzy_match import fuzzy_contains_score, normalize_search_text
 from app.services.inventory_snapshot_models import (
     canonical_json,
+    is_safe_relative_artifact_path,
     is_safe_listing_id,
     now_utc_iso,
 )
@@ -588,19 +589,12 @@ class MediaManifestProductionAdapter:
         item = self._by_media_id.get(media_id)
         if not item or not self._is_send_ready_item(item) or not item.local_path:
             return None
-        path = Path(item.local_path)
-        return path if path.is_absolute() else (self.local_root / path if self.local_root else path)
+        return self._verified_local_path(item)
 
     def _evidence_for_item(self, item: MediaItem) -> MediaManifestEvidence:
-        resolved_local = self.local_file_for_media_id(item.media_id)
+        resolved_local = self._verified_local_path(item)
         local_path = str(resolved_local) if resolved_local else item.local_path
-        access_verified = item.access_verified
-        if resolved_local and item.sha256:
-            access_verified = resolved_local.is_file() and _file_sha256(resolved_local) == item.sha256
-        elif resolved_local:
-            access_verified = resolved_local.is_file()
-        elif item.source_url:
-            access_verified = item.access_verified
+        access_verified = bool(resolved_local)
         return MediaManifestEvidence(
             media_id=item.media_id,
             listing_id=item.listing_id,
@@ -631,6 +625,55 @@ class MediaManifestProductionAdapter:
         )
 
     def _is_send_ready_item(self, item: MediaItem) -> bool:
+        if not (
+            item.listing_id in self.manifest.listing_ids
+            and item.binding_method == BINDING_METHOD_LISTING_ID
+            and not item.ambiguity
+            and not item.candidate_only
+            and item.confidence >= SEND_READY_MIN_CONFIDENCE
+        ):
+            return False
+        return self._verified_local_path(item) is not None
+
+    def _verified_local_path(self, item: MediaItem) -> Path | None:
+        if not item.sha256 or not re.fullmatch(r"[0-9a-f]{64}", item.sha256):
+            return None
+        path = self._safe_local_path(item)
+        if path is None or not path.is_file():
+            return None
+        return path if _file_sha256(path) == item.sha256 else None
+
+    def _safe_local_path(self, item: MediaItem) -> Path | None:
+        raw_path = str(item.local_path or item.relative_path or "").strip()
+        if not raw_path or self.local_root is None:
+            return None
+        path = Path(raw_path)
+        root = self.local_root.resolve()
+        if path.is_absolute():
+            resolved = path.resolve()
+        else:
+            posix_path = PurePosixPath(raw_path.replace("\\", "/")).as_posix()
+            if raw_path != posix_path or not is_safe_relative_artifact_path(posix_path):
+                return None
+            resolved = (root / Path(posix_path)).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return None
+        return resolved
+
+
+class MediaManifestShadowAdapter(MediaManifestProductionAdapter):
+    """Compatibility alias for historical shadow callers.
+
+    Shadow keeps the historical exact-binding surface, including original-video
+    links, while production read requires locally hash-verified send-ready files.
+    """
+
+    evidence_profile = MEDIA_MANIFEST_SHADOW_ADAPTER_PROFILE
+    adapter_mode = "shadow_read"
+
+    def _is_send_ready_item(self, item: MediaItem) -> bool:
         return (
             item.listing_id in self.manifest.listing_ids
             and item.binding_method == BINDING_METHOD_LISTING_ID
@@ -638,18 +681,6 @@ class MediaManifestProductionAdapter:
             and not item.candidate_only
             and item.confidence >= SEND_READY_MIN_CONFIDENCE
         )
-
-
-class MediaManifestShadowAdapter(MediaManifestProductionAdapter):
-    """Compatibility alias for historical shadow callers.
-
-    The filtering rules are intentionally identical to the production read-only
-    adapter; only the evidence profile records that an old shadow entry point
-    was used.
-    """
-
-    evidence_profile = MEDIA_MANIFEST_SHADOW_ADAPTER_PROFILE
-    adapter_mode = "shadow_read"
 
 
 class FeishuDriveMediaManifestAdapter:

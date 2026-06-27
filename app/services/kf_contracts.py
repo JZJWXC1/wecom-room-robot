@@ -560,9 +560,17 @@ class Claim(ContractModel):
 class SendAction(ContractModel):
     action_id: str
     action_type: str
+    source_hash: str = ""
+    media_id: str = ""
+    sha256: str = ""
     payload: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
     sensitive_payload: dict[str, Any] = Field(default_factory=dict, repr=False)
+
+    @field_validator("source_hash", "media_id", "sha256", mode="before")
+    @classmethod
+    def _safe_fact_binding_text(cls, value: Any) -> str:
+        return _redact_text("" if value is None else str(value).strip())
 
     @field_validator("payload", "metadata", mode="before")
     @classmethod
@@ -687,6 +695,9 @@ class SendReceipt(ContractModel):
     action_id: str
     action_type: str
     status: str
+    source_hash: str = ""
+    media_id: str = ""
+    sha256: str = ""
     receipt_id: str = ""
     idempotency_key: str = ""
     duplicate_of: str = ""
@@ -706,6 +717,9 @@ class SendReceipt(ContractModel):
         "receipt_id",
         "idempotency_key",
         "duplicate_of",
+        "source_hash",
+        "media_id",
+        "sha256",
         "provider",
         "sent_at",
         "provider_message_id",
