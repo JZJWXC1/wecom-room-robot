@@ -258,6 +258,17 @@ def test_qa_artifact_filename_is_ascii_and_not_based_on_user_text() -> None:
     assert "新天地" not in path.name
 
 
+def test_qa_artifact_filename_is_unique_for_parallel_gate_runs() -> None:
+    first = run_rag_10windows_10turns_utf8.artifact_path_for("rag_historical_failure_replay_sanitized")
+    second = run_rag_10windows_10turns_utf8.artifact_path_for("rag_historical_failure_replay_sanitized")
+
+    assert first != second
+    assert first.name.startswith("rag_historical_failure_replay_sanitized_")
+    assert first.suffix == ".json"
+    assert all(ord(char) < 128 for char in first.name)
+    assert re.search(r"_p\d+_\d+_\d{4}\.json$", first.name)
+
+
 def test_qa_artifact_atomic_write_supports_chinese_space_path_and_bad_user_text(tmp_path) -> None:
     target = tmp_path / "中文 目录" / "window_004_turn_035.json"
     payload = {
@@ -776,6 +787,53 @@ def test_qa_problem_allows_selected_indices_bound_to_prior_pending_media_targets
     )
 
     assert problem["severity"] == "info"
+
+
+def test_qa_problem_allows_scalar_selected_index_with_prior_candidates() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "第二套也发图片，不要串到别的小区。",
+            "bot": {"texts": ["棠润府10-1004C这套本地暂时没找到图片。"], "image_count": 0},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {"constraint_proof": {"selected_indices": 2, "wants_image": True}},
+            "tool": {"target_rows": ["棠润府10-1004C"], "image_count": 0},
+            "blackbox": {"last_candidate_count_before_turn": 3},
+        }
+    )
+
+    assert problem["severity"] == "info"
+
+
+def test_qa_problem_blocks_scalar_selected_index_without_prior_candidates() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "第二套也发图片，不要串到别的小区。",
+            "bot": {"texts": ["棠润府10-1004C这套本地暂时没找到图片。"], "image_count": 0},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {"constraint_proof": {"selected_indices": 2, "wants_image": True}},
+            "tool": {"target_rows": ["棠润府10-1004C"], "image_count": 0},
+            "blackbox": {"last_candidate_count_before_turn": 0},
+        }
+    )
+
+    assert problem["severity"] == "high"
+    assert problem["likely_link"] == "Planner/工具目标绑定"
+
+
+def test_qa_problem_blocks_multi_selected_indices_when_targets_are_partial() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "第一套和第三套都发图片，不要漏。",
+            "bot": {"texts": ["棠润府10-1004C这套本地暂时没找到图片。"], "image_count": 0},
+            "chain_judgment": {"status": "pass", "likely_link": "人工复核", "reason": ""},
+            "rewrite": {"constraint_proof": {"selected_indices": [1, 3], "wants_image": True}},
+            "tool": {"target_rows": ["棠润府10-1004C"], "image_count": 0},
+            "blackbox": {"last_candidate_count_before_turn": 3},
+        }
+    )
+
+    assert problem["severity"] == "high"
+    assert problem["likely_link"] == "Planner/工具目标绑定"
 
 
 def test_qa_problem_allows_confirmation_question_without_stage_options() -> None:

@@ -9,6 +9,7 @@ import os
 import re
 import time
 from datetime import datetime
+from itertools import count
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ SCRIPT_PATH = Path(__file__)
 ARTIFACT_DIR = Path("qa_artifacts")
 CONVERSATION_PREFIX = "conv_10w_10t"
 _ARTIFACT_SAFE_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+_ARTIFACT_SEQUENCE = count()
 _CANONICAL_SKIP_KEYS = {
     "canonical_result_hash",
     "created_at",
@@ -49,7 +51,10 @@ def _safe_artifact_stem(prefix: str) -> str:
 
 def artifact_path_for(prefix: str, *, now: datetime | None = None) -> Path:
     timestamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
-    return ARTIFACT_DIR / f"{_safe_artifact_stem(prefix)}_{timestamp}.json"
+    suffix = ""
+    if now is None:
+        suffix = f"_p{os.getpid()}_{time.time_ns()}_{next(_ARTIFACT_SEQUENCE):04d}"
+    return ARTIFACT_DIR / f"{_safe_artifact_stem(prefix)}_{timestamp}{suffix}.json"
 
 
 def _canonicalize_for_hash(value: Any) -> Any:
@@ -534,10 +539,18 @@ def _selected_binding_has_prior_context(
     blackbox: dict[str, Any],
 ) -> bool:
     try:
-        max_selected = max(int(index) for index in selected_indices or [])
+        if isinstance(selected_indices, (str, int)):
+            selected_values = [selected_indices]
+        else:
+            selected_values = list(selected_indices or [])
+        selected_numbers = [int(index) for index in selected_values]
+        max_selected = max(selected_numbers)
     except (TypeError, ValueError):
         return False
-    if max_selected <= 0 or len(target_rows) < max_selected:
+    if max_selected <= 0:
+        return False
+    required_target_count = len({index for index in selected_numbers if index > 0})
+    if len(target_rows) < required_target_count:
         return False
     if int(blackbox.get("last_candidate_count_before_turn") or 0) >= max_selected:
         return True

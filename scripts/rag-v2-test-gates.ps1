@@ -201,6 +201,50 @@ function Save-SanitizedQaArtifact {
     Assert-QaTextSanitized -Path $ArtifactPath -GateName $GateName
 }
 
+function ConvertTo-NativeProcessArgument {
+    param([AllowNull()][string]$Argument)
+
+    if ($null -eq $Argument -or $Argument -eq "") {
+        return '""'
+    }
+    if ($Argument -notmatch '[\s"]') {
+        return $Argument
+    }
+    $result = '"'
+    $backslashes = 0
+    foreach ($char in $Argument.ToCharArray()) {
+        if ($char -eq '\') {
+            $backslashes += 1
+            continue
+        }
+        if ($char -eq '"') {
+            $result += ('\' * (($backslashes * 2) + 1))
+            $result += '"'
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            $result += ('\' * $backslashes)
+            $backslashes = 0
+        }
+        $result += $char
+    }
+    if ($backslashes -gt 0) {
+        $result += ('\' * ($backslashes * 2))
+    }
+    $result += '"'
+    return $result
+}
+
+function Split-ProcessOutputLines {
+    param([AllowNull()][string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return @()
+    }
+    return @($Text -split "`r?`n" | Where-Object { $_ -ne "" })
+}
+
 function Invoke-ExternalCapture {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -208,8 +252,35 @@ function Invoke-ExternalCapture {
         [switch]$RedactOutput
     )
 
-    $output = & $FilePath @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
+    $stdoutPath = Join-Path ([System.IO.Path]::GetTempPath()) ("rag-v2-gate-stdout-{0}.log" -f [guid]::NewGuid().ToString("N"))
+    $stderrPath = Join-Path ([System.IO.Path]::GetTempPath()) ("rag-v2-gate-stderr-{0}.log" -f [guid]::NewGuid().ToString("N"))
+    $argumentString = (($Arguments | ForEach-Object { ConvertTo-NativeProcessArgument $_ }) -join " ")
+    try {
+        $process = Start-Process `
+            -FilePath $FilePath `
+            -ArgumentList $argumentString `
+            -WorkingDirectory ([string]$RepoRoot) `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru
+        $stdout = ""
+        $stderr = ""
+        if (Test-Path $stdoutPath -PathType Leaf) {
+            $stdout = Get-Content -Raw -Encoding UTF8 $stdoutPath
+        }
+        if (Test-Path $stderrPath -PathType Leaf) {
+            $stderr = Get-Content -Raw -Encoding UTF8 $stderrPath
+        }
+        $output = @()
+        $output += Split-ProcessOutputLines $stdout
+        $output += Split-ProcessOutputLines $stderr
+        $exitCode = $process.ExitCode
+    } finally {
+        Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    }
     foreach ($line in $output) {
         $lineText = "$line"
         if ($RedactOutput) {

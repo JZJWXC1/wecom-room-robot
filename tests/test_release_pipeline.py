@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,6 +18,10 @@ def _powershell_or_skip() -> str:
 
 def _run_historical_failure_gate(*args: str) -> subprocess.CompletedProcess[str]:
     powershell = _powershell_or_skip()
+    env = dict(os.environ)
+    env["APP_ENV"] = "test"
+    env["KF_DUAL_LLM_MODE"] = "shadow"
+    env["RUN_ONLINE_QA"] = "0"
     return subprocess.run(
         [
             powershell,
@@ -33,6 +38,7 @@ def _run_historical_failure_gate(*args: str) -> subprocess.CompletedProcess[str]
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=env,
         timeout=30,
     )
 
@@ -300,6 +306,153 @@ def test_historical_failure_gate_blocks_bad_artifact_and_sanitizes_hash(tmp_path
     assert fake_token not in sanitized_artifact
     assert fake_phone not in sanitized_artifact
     assert fake_password not in sanitized_artifact
+
+
+def test_historical_failure_gate_surfaces_runner_artifact_with_stderr_logging() -> None:
+    completed = _run_historical_failure_gate(
+        "-HistoricalFailuresFixture",
+        "tests/fixtures/qa/historical_failures_synthetic_sanitized.json",
+    )
+    combined_output = completed.stdout + completed.stderr
+
+    assert completed.returncode == 0, combined_output
+    assert "historical failure replay QA" in combined_output
+    assert "ARTIFACT" in combined_output
+    assert "QA artifact gate passed high=0 medium=0" in combined_output
+    assert "NativeCommandError" not in combined_output
+
+
+def test_external_capture_handles_large_stderr_without_deadlock(tmp_path: Path) -> None:
+    fixture = tmp_path / "historical_failures_synthetic_sanitized.json"
+    fixture.write_text(
+        json.dumps(
+            {
+                "schema": "historical_failures_synthetic_sanitized.v1",
+                "windows": [
+                    {"id": "hist_001", "source": "synthetic_sanitized_fixture", "turns": ["房源表发我"]},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    artifact = tmp_path / "good_historical_artifact.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "full_suite_completed": True,
+                "quality_status": {"passed": True, "high_count": 0, "medium_count": 0, "exit_code": 0},
+                "summary": {"usable_for_release": True},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_python = tmp_path / "fake_python.cmd"
+    fake_python.write_text(
+        "@echo off\n"
+        "for /L %%i in (1,1,2500) do echo stderr-line-%%i 1>&2\n"
+        f"echo ARTIFACT {artifact}\n"
+        "exit /b 0\n",
+        encoding="utf-8",
+    )
+
+    powershell = _powershell_or_skip()
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(Path.cwd() / "scripts" / "rag-v2-test-gates.ps1"),
+            "-RunHistoricalFailureGateOnly",
+            "-HistoricalFailuresFixture",
+            str(fixture),
+            "-Python",
+            str(fake_python),
+        ],
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    combined_output = completed.stdout + completed.stderr
+
+    assert completed.returncode == 0, combined_output
+    assert "stderr-line-2500" in combined_output
+    assert "QA artifact gate passed high=0 medium=0" in combined_output
+    assert "NativeCommandError" not in combined_output
+
+
+def test_external_capture_blocks_nonzero_exit_after_good_artifact(tmp_path: Path) -> None:
+    fixture = tmp_path / "historical_failures_synthetic_sanitized.json"
+    fixture.write_text(
+        json.dumps(
+            {
+                "schema": "historical_failures_synthetic_sanitized.v1",
+                "windows": [
+                    {"id": "hist_001", "source": "synthetic_sanitized_fixture", "turns": ["房源表发我"]},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    artifact = tmp_path / "good_historical_artifact.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "full_suite_completed": True,
+                "quality_status": {"passed": True, "high_count": 0, "medium_count": 0, "exit_code": 0},
+                "summary": {"usable_for_release": True},
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_python = tmp_path / "fake_python_fails_after_artifact.cmd"
+    fake_python.write_text(
+        "@echo off\n"
+        f"echo ARTIFACT {artifact}\n"
+        "exit /b 7\n",
+        encoding="utf-8",
+    )
+
+    powershell = _powershell_or_skip()
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(Path.cwd() / "scripts" / "rag-v2-test-gates.ps1"),
+            "-RunHistoricalFailureGateOnly",
+            "-HistoricalFailuresFixture",
+            str(fixture),
+            "-Python",
+            str(fake_python),
+        ],
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    combined_output = completed.stdout + completed.stderr
+
+    assert completed.returncode != 0, combined_output
+    assert "QA artifact gate passed high=0 medium=0" in combined_output
+    assert "Command failed with exit code 7" in combined_output
+    assert "NativeCommandError" not in combined_output
 
 
 def test_server_ops_propagates_remote_helper_failure(tmp_path: Path) -> None:
