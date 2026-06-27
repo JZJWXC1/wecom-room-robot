@@ -16,6 +16,28 @@ FAILED_STATUS = "failed"
 SKIPPED_DUPLICATE_STATUS = "skipped_duplicate"
 _SUCCESS_STATUSES = {SENT_STATUS}
 _LEDGER_INTERNAL_MATCH_KEYS = {"receipt_id", "idempotency_key", "duplicate_of"}
+_SENSITIVE_ERROR_MARKERS = (
+    "access_token",
+    "authorization",
+    "corpsecret",
+    "credential",
+    "secret",
+    "signature",
+    "token",
+    "鉴权",
+    "凭证",
+    "密钥",
+)
+_AUTH_ERROR_MARKERS = (
+    "auth",
+    "credential",
+    "forbidden",
+    "permission",
+    "unauthorized",
+    "鉴权",
+    "权限",
+    "凭证",
+)
 
 
 def build_send_action(
@@ -182,7 +204,7 @@ def build_failed_receipt(
         receipt_id=_receipt_id(key, action.action_id, FAILED_STATUS),
         idempotency_key=key,
         error_code=error.__class__.__name__,
-        error_message=str(error),
+        error_message=safe_failure_reason(error),
         metadata=_receipt_metadata(action, metadata),
     )
 
@@ -244,7 +266,13 @@ def text_hash(value: str) -> str:
 
 
 def safe_failure_reason(error: BaseException | str) -> str:
-    return str(safe_artifact_payload(str(error)))
+    text = str(error)
+    lowered = text.lower()
+    if any(marker in lowered for marker in _SENSITIVE_ERROR_MARKERS):
+        if any(marker in lowered for marker in _AUTH_ERROR_MARKERS):
+            return "provider_auth_error_redacted"
+        return "provider_sensitive_error_redacted"
+    return str(safe_artifact_payload(text))
 
 
 def _receipt_payloads(context: dict[str, Any] | None) -> list[dict[str, Any]]:
