@@ -636,7 +636,15 @@ class SendAction(ContractModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     sensitive_payload: dict[str, Any] = Field(default_factory=dict, repr=False)
 
-    @field_validator("source_hash", "media_id", "sha256", mode="before")
+    @field_validator("source_hash", "sha256", mode="before")
+    @classmethod
+    def _safe_hash_binding_text(cls, value: Any) -> str:
+        text = "" if value is None else str(value).strip()
+        if re.fullmatch(r"[0-9a-f]{64}", text):
+            return text
+        return _redact_text(text, allow_long_hash=True)
+
+    @field_validator("media_id", mode="before")
     @classmethod
     def _safe_fact_binding_text(cls, value: Any) -> str:
         return _redact_text("" if value is None else str(value).strip())
@@ -792,9 +800,7 @@ class SendReceipt(ContractModel):
         "action_id",
         "action_type",
         "status",
-        "source_hash",
         "media_id",
-        "sha256",
         "provider",
         "sent_at",
         "error_code",
@@ -803,6 +809,14 @@ class SendReceipt(ContractModel):
     @classmethod
     def _safe_receipt_text(cls, value: Any) -> str:
         return _redact_text("" if value is None else str(value).strip())
+
+    @field_validator("source_hash", "sha256", mode="before")
+    @classmethod
+    def _safe_receipt_hash_text(cls, value: Any) -> str:
+        text = "" if value is None else str(value).strip()
+        if re.fullmatch(r"[0-9a-f]{64}", text):
+            return text
+        return _redact_text(text, allow_long_hash=True)
 
     @field_validator("receipt_id", "idempotency_key", "duplicate_of", mode="before")
     @classmethod
@@ -848,7 +862,7 @@ class SendReceipt(ContractModel):
         for key in ("source_hash", "sha256"):
             value = str(raw.get(key) or "").strip()
             if value:
-                payload[key] = _redact_text(value, allow_long_hash=True)
+                payload[key] = value if re.fullmatch(r"[0-9a-f]{64}", value) else _redact_text(value, allow_long_hash=True)
         media_id = str(raw.get("media_id") or "").strip()
         if media_id:
             payload["media_id"] = _redact_text(media_id)

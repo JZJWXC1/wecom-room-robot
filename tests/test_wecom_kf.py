@@ -125,6 +125,365 @@ def test_generate_reply_result_uses_llm2_production_package(monkeypatch) -> None
     asyncio.run(run_case())
 
 
+def test_generate_reply_result_production_llm2_bypasses_legacy_planner_reply_gate(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "plain answer",
+                "task_atoms": [{"task_id": "task-1", "task_type": "reply_text"}],
+                "tool_plan": {"actions": ["generate_reply"]},
+            },
+            content="hello",
+            source_label="llm1_production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_text="")
+
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.llm2_called = False
+
+            async def plan_kf_reply_text(self, **kwargs):
+                raise AssertionError("production LLM2 must not be gated by legacy planner reply text")
+
+            async def compose_kf_outbound_production(self, **kwargs):
+                self.llm2_called = True
+                return {
+                    "reply_text": "我这边按证据给你回复。",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+        fake_reply = FakeReplyGenerator()
+        original_mode = main.settings.kf_dual_llm_mode
+        tool_evidence = {"actions": ["generate_reply"]}
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        monkeypatch.setattr(main, "_needs_llm_final_selfcheck", lambda **kwargs: False)
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._generate_reply_result(
+                content="hello",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "general",
+                    "effective_query": "hello",
+                    "structured_task": {"tool_requirements": {}},
+                    "constraint_proof": {},
+                    "llm1_task_packet": task_packet,
+                },
+                tool_evidence=tool_evidence,
+                planner_result={"actions": ["generate_reply"]},
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert fake_reply.llm2_called is True
+        assert result["reply"] == "我这边按证据给你回复。"
+        assert result["selfcheck"]["status"] == "pass"
+        assert tool_evidence["deterministic_reply_source"] == "kf_llm2_outbound_production"
+
+    asyncio.run(run_case())
+
+
+def test_understand_message_production_skips_legacy_rewrite_and_fallback(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.task_packet_kwargs: dict = {}
+
+            async def rewrite_kf_message(self, **kwargs):
+                raise AssertionError("production LLM1 must not call legacy rewrite")
+
+            async def build_kf_task_packet(self, **kwargs):
+                self.task_packet_kwargs = kwargs
+                return build_kf_task_packet_shadow(
+                    {"rewritten_query": kwargs["content"], "tool_plan": {"actions": ["generate_reply"]}},
+                    content=kwargs["content"],
+                    source_label="llm1_production",
+                    mode="production",
+                ).packet
+
+        async def fake_rows(*args, **kwargs):
+            return []
+
+        async def fake_index(*args, **kwargs):
+            return {}
+
+        async def fake_meta(*args, **kwargs):
+            return {}
+
+        def fail_fallback(*args, **kwargs):
+            raise AssertionError("production LLM1 must not use deterministic fallback understanding")
+
+        fake_reply = FakeReplyGenerator()
+        original_mode = main.settings.kf_dual_llm_mode
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        monkeypatch.setattr(main, "_inventory_rows_for_resolution", fake_rows)
+        monkeypatch.setattr(main, "_inventory_rewrite_index_for_read_context", fake_index)
+        monkeypatch.setattr(main, "_inventory_metadata_for_read_context", fake_meta)
+        monkeypatch.setattr(main, "_fallback_understanding", fail_fallback)
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._understand_message(
+                content="你好",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("你好"),
+                inventory_read_context=main._local_inventory_read_context("prod-llm1"),
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert fake_reply.task_packet_kwargs["content"] == "你好"
+        assert result["tool_plan"]["retry_required"] is True
+        assert result["dual_llm_production"]["llm1"]["status"] == "retry"
+        assert result["structured_task"]["source"] == "llm1_production_minimal_bootstrap"
+
+    asyncio.run(run_case())
+
+
+def test_orchestrator_artifact_uses_production_audit_in_production_mode(monkeypatch) -> None:
+    def fail_shadow_builder(**kwargs):
+        raise AssertionError("production mode must not build mode=shadow artifact")
+
+    original_mode = main.settings.kf_dual_llm_mode
+    monkeypatch.setattr(main.kf_orchestrator_shadow, "build_shadow_artifact", fail_shadow_builder)
+    main.settings.kf_dual_llm_mode = "production"
+    try:
+        artifact = main._build_orchestrator_shadow_artifact(
+            content="你好",
+            open_kfid="kf",
+            external_userid="wm",
+            msgids=["msg-1"],
+            generation=1,
+            inventory_read_context=main._local_inventory_read_context("prod-audit"),
+            understanding={
+                "intent": "production_llm1",
+                "llm1_task_packet": {"tasks": []},
+                "legacy_unknown_fields": {"video_paths": ["C:/room_database/video/secret-room.mp4"]},
+            },
+            planner_result={"actions": [], "debug_paths": ["C:/room_database/video/secret-room.mp4"]},
+            tool_evidence={
+                "actions": ["send_video"],
+                "video_paths": ["C:/room_database/video/secret-room.mp4"],
+                "outbound_package": {"video_paths": ["C:/room_database/video/secret-room.mp4"]},
+                "inventory_source_metadata": {
+                    "row_count": 1,
+                    "hash": "b" * 64,
+                    "cache_path": "C:/room_database/cache/private-inventory.json",
+                },
+            },
+            reply_result={
+                "selfcheck": {"status": "retry"},
+                "context": {"pending_video_sends": {"paths": ["C:/room_database/video/secret-room.mp4"]}},
+            },
+            final_reply="",
+        )
+    finally:
+        main.settings.kf_dual_llm_mode = original_mode
+
+    assert artifact["schema_version"] == "rag_v2_orchestrator_production_audit.v1"
+    assert artifact["mode"] == "production"
+    assert artifact["mode"] != "shadow"
+    dumped = json.dumps(artifact, ensure_ascii=False)
+    assert "secret-room.mp4" not in dumped
+    assert "private-inventory.json" not in dumped
+    assert "debug_paths" not in dumped
+    assert artifact["tool_evidence_summary"]["video_count"] == 1
+    assert artifact["tool_evidence_summary"]["outbound_package_present"] is True
+    assert artifact["tool_evidence_summary"]["inventory_source_metadata"]["row_count"] == 1
+    assert "cache_path" not in artifact["tool_evidence_summary"]["inventory_source_metadata"]
+
+
+def test_plan_actions_production_llm1_retry_blocks_inventory_sheet_fallback(monkeypatch) -> None:
+    async def run_case() -> None:
+        original_mode = main.settings.kf_dual_llm_mode
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            planner = await main._plan_actions(
+                content="房源表发一下",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory_sheet",
+                    "tool_plan": {
+                        "actions": [],
+                        "retry_required": True,
+                        "missing_evidence": "LLM1 needs another pass",
+                        "source": "llm1_production",
+                    },
+                    "dual_llm_production": {"llm1": {"status": "retry", "source": "llm1_production"}},
+                },
+                signals={"wants_inventory_sheet": True},
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert planner["need_rewrite_clarification"] is True
+        assert planner["actions"] == []
+        assert "send_inventory_sheet" not in planner["actions"]
+
+    asyncio.run(run_case())
+
+
+def test_plan_actions_production_llm1_retry_blocks_deposit_fallback(monkeypatch) -> None:
+    async def run_case() -> None:
+        original_mode = main.settings.kf_dual_llm_mode
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            planner = await main._plan_actions(
+                content="免押是什么",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "deposit",
+                    "tool_plan": {
+                        "actions": [],
+                        "need_rewrite_clarification": True,
+                        "missing_evidence": "LLM1 retry gate",
+                        "source": "llm1_production",
+                    },
+                    "dual_llm_production": {"llm1": {"status": "retry", "source": "llm1_production"}},
+                },
+                signals={"wants_deposit": True},
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert planner["need_rewrite_clarification"] is True
+        assert planner["actions"] == []
+        assert "send_deposit_policy" not in planner["actions"]
+
+    asyncio.run(run_case())
+
+
+def test_collect_room_media_production_uses_manifest_exact_listing(monkeypatch) -> None:
+    async def run_case() -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            video_path = Path(directory) / "exact.mp4"
+            video_path.write_bytes(b"video")
+            listing_id = generate_listing_id("星河苑", "1-101")
+
+            class FakeMediaStore:
+                def media_manifest_evidence_for_listing(self, value: str):
+                    assert value == listing_id
+                    return [
+                        {
+                            "listing_id": listing_id,
+                            "media_type": "video",
+                            "send_ready": True,
+                            "candidate_only": False,
+                            "ambiguity": False,
+                            "local_path": str(video_path),
+                        }
+                    ]
+
+                def list_room_database_videos(self, *args, **kwargs):
+                    raise AssertionError("production media send must not use fuzzy video lookup")
+
+                def list_room_database_images(self, *args, **kwargs):
+                    raise AssertionError("production media send must not use fuzzy image lookup")
+
+            original_mode = main.settings.kf_dual_llm_mode
+            monkeypatch.setattr(main, "media_store", FakeMediaStore())
+            main.settings.kf_dual_llm_mode = "production"
+            try:
+                paths, rows, missing, _sync = await main._collect_room_media(
+                    [{"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}],
+                    media_kind="video",
+                )
+            finally:
+                main.settings.kf_dual_llm_mode = original_mode
+
+            assert paths == [video_path]
+            assert rows[0]["listing_id"] == listing_id
+            assert missing == []
+
+    asyncio.run(run_case())
+
+
+def test_collect_room_media_production_does_not_fallback_to_fuzzy(monkeypatch) -> None:
+    async def run_case() -> None:
+        listing_id = generate_listing_id("星河苑", "1-101")
+
+        class FakeMediaStore:
+            def media_manifest_evidence_for_listing(self, value: str):
+                assert value == listing_id
+                return []
+
+            def list_room_database_videos(self, *args, **kwargs):
+                raise AssertionError("production media send must not use fuzzy video lookup")
+
+            def list_room_database_images(self, *args, **kwargs):
+                raise AssertionError("production media send must not use fuzzy image lookup")
+
+        original_mode = main.settings.kf_dual_llm_mode
+        monkeypatch.setattr(main, "media_store", FakeMediaStore())
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            paths, rows, missing, _sync = await main._collect_room_media(
+                [{"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}],
+                media_kind="video",
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert paths == []
+        assert rows == []
+        assert missing == ["星河苑1-101"]
+
+    asyncio.run(run_case())
+
+
+def test_execute_tools_production_pending_video_does_not_send_stored_paths(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeMediaStore:
+            def media_manifest_evidence_for_listing(self, value: str):
+                return []
+
+            def list_room_database_videos(self, *args, **kwargs):
+                raise AssertionError("production pending video must not use fuzzy video lookup")
+
+            def list_room_database_images(self, *args, **kwargs):
+                raise AssertionError("production pending video must not use fuzzy image lookup")
+
+        context = kf_context_memory.remember_pending_video_sends(
+            kf_context_memory.empty_context(),
+            paths=["C:/room_database/video/stale-fuzzy.mp4"],
+            labels=["星河苑1-101"],
+            requested_count=1,
+            sent_count=0,
+        )
+        original_mode = main.settings.kf_dual_llm_mode
+        monkeypatch.setattr(main, "media_store", FakeMediaStore())
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            evidence = await main._execute_tools(
+                actions=["send_video"],
+                content="继续发",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "继续发",
+                    "constraint_proof": {"wants_video": True, "pending_video_action": "continue"},
+                    "query_state": {"pending_video_action": "continue"},
+                    "structured_task": {"intent": "media", "tool_requirements": {"needs_video": True}},
+                },
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert evidence["video_paths"] == []
+        assert evidence["media_status"]["video"]["sent_count"] == 0
+        assert "stale-fuzzy.mp4" not in json.dumps(evidence, ensure_ascii=False)
+
+    asyncio.run(run_case())
+
+
 def test_constraint_selfcheck_passes_when_tool_has_single_matching_inventory_row() -> None:
     result = main._constraint_consistency_selfcheck(
         content="万达1500左右一室有吗？",

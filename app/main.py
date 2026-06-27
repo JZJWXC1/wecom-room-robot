@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -60,6 +61,7 @@ from app.services.rewrite_inventory_index import (
     slice_rewrite_inventory_index,
     write_rewrite_inventory_index,
 )
+from app.services.video_transcoder import prepare_wecom_video
 from app.services.wecom_kf import (
     WeComKfClient,
     WeComKfContextStore,
@@ -669,6 +671,33 @@ def _dual_llm_production_enabled() -> bool:
     return kf_dual_llm_production.production_enabled(getattr(settings, "kf_dual_llm_mode", "shadow"))
 
 
+def _llm1_production_retry_plan(understanding: dict[str, Any]) -> dict[str, Any]:
+    if not _dual_llm_production_enabled():
+        return {}
+    tool_plan = dict(understanding.get("tool_plan") or {})
+    dual_meta = dict(understanding.get("dual_llm_production") or {})
+    llm1_meta = dict(dual_meta.get("llm1") or {})
+    retry_required = (
+        str(llm1_meta.get("status") or "").lower() == "retry"
+        or bool(tool_plan.get("retry_required"))
+        or bool(tool_plan.get("need_rewrite_clarification"))
+    )
+    if not retry_required:
+        return {}
+    missing_evidence = str(
+        tool_plan.get("missing_evidence")
+        or tool_plan.get("reason")
+        or "LLM1 production task packet requires rewrite clarification; deterministic action completion is blocked."
+    )
+    return {
+        "actions": [],
+        "need_rewrite_clarification": True,
+        "missing_evidence": missing_evidence,
+        "source": f"{tool_plan.get('source') or llm1_meta.get('source') or 'llm1_production'}+retry_gate",
+        "reply_text": "",
+    }
+
+
 async def _apply_llm1_production_task_packet(
     *,
     content: str,
@@ -741,9 +770,10 @@ async def _apply_llm1_production_task_packet(
     result["tool_plan"] = tool_plan
     result.setdefault("structured_task", {})["llm1_task_packet"] = packet_payload
     result["structured_task"]["tool_plan"] = tool_plan
+    llm1_status = "retry" if tool_plan.get("retry_required") or tool_plan.get("need_rewrite_clarification") else "pass"
     result["dual_llm_production"] = {
         "llm1": {
-            "status": "pass",
+            "status": llm1_status,
             "source": str(tool_plan.get("source") or "llm1_production_task_packet"),
             "task_count": len(packet_payload.get("tasks") or []),
             "action_count": len(tool_plan.get("actions") or []),
@@ -4907,6 +4937,35 @@ async def _understand_message(
         persisted_index=provider_rewrite_index,
         cache_meta=inventory_cache_meta,
     )
+    if _dual_llm_production_enabled():
+        query_state = {"intent": "production_llm1", **dict(signals or {})}
+        result: dict[str, Any] = {
+            "rewritten_query": content,
+            "effective_query": content,
+            "query_state": query_state,
+            "intent": "production_llm1",
+            "intent_confidence": 0.0,
+            "context_reference": False,
+            "candidate_action": "none",
+            "selected_indices": [],
+            "needs_clarification": False,
+            "clarification_text": "",
+            "structured_task": {
+                "source": "llm1_production_minimal_bootstrap",
+                "query_state": query_state,
+                "clarification": {"needed": False, "text": "", "reason": ""},
+            },
+        }
+        if planner_feedback:
+            result["planner_feedback"] = planner_feedback
+        return await _apply_llm1_production_task_packet(
+            content=content,
+            context=context,
+            result=result,
+            rewrite_view=rewrite_view,
+            inventory_index=inventory_index,
+            inventory_read_context=inventory_read_context,
+        )
     try:
         result = await asyncio.wait_for(
             reply_generator.rewrite_kf_message(
@@ -5283,6 +5342,11 @@ async def _plan_actions(
             "source": "structured_task_deterministic_plan",
             "reason": "Orchestrator 工具前阶段未返回 tool_plan，按结构化任务和确定性信号补齐工具计划。",
         }
+    llm1_retry_plan = _llm1_production_retry_plan(understanding)
+    if llm1_retry_plan:
+        if retry_reason:
+            llm1_retry_plan["planner_retry_reason"] = retry_reason
+        return _ensure_planner_action_contract(llm1_retry_plan, understanding, signals)
     if retry_reason:
         result["planner_retry_reason"] = retry_reason
         result["source"] = f"{result.get('source') or 'orchestrator_pre_tool_plan'}+retry_packet"
@@ -5302,7 +5366,30 @@ async def _collect_room_media(
 ) -> tuple[list[Path], list[dict[str, Any]], list[str], dict[str, Any]]:
     sync_result: dict[str, Any] = {}
 
-    def list_local(label: str) -> list[Path]:
+    def list_manifest_exact(row: dict[str, Any]) -> list[Path]:
+        listing_id = _row_listing_id(row)
+        if not listing_id:
+            return []
+        media_type = "image" if media_kind == "image" else "video"
+        result: list[Path] = []
+        for item in media_store.media_manifest_evidence_for_listing(listing_id):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("media_type") or item.get("kind") or "").lower() != media_type:
+                continue
+            if not item.get("send_ready") or item.get("candidate_only") or item.get("ambiguity"):
+                continue
+            local_path = str(item.get("local_path") or "").strip()
+            if not local_path:
+                continue
+            path = Path(local_path)
+            if path.exists() and path.is_file():
+                result.append(path)
+        return result[:1]
+
+    def list_local(label: str, row: dict[str, Any]) -> list[Path]:
+        if _dual_llm_production_enabled():
+            return list_manifest_exact(row)
         if media_kind == "image":
             return media_store.list_room_database_images(label, limit=1)
         return media_store.list_room_database_videos(label, limit=1)
@@ -5312,7 +5399,7 @@ async def _collect_room_media(
     missing: list[str] = []
     for row in rows:
         label = _row_label(row)
-        found = list_local(label)
+        found = list_local(label, row)
         if found:
             paths.append(found[0])
             matched_rows.append(row)
@@ -5370,7 +5457,7 @@ async def _collect_room_media(
             missing = []
             for row in rows:
                 label = _row_label(row)
-                found = list_local(label)
+                found = list_local(label, row)
                 if found:
                     paths.append(found[0])
                     matched_rows.append(row)
@@ -5428,17 +5515,17 @@ async def _execute_tools(
             for label in pending_video.get("labels") or []
             if str(label).strip()
         ]
-        if pending_paths:
+        if pending_paths and not _dual_llm_production_enabled():
             evidence["video_paths"] = pending_paths[:KF_VIDEO_SEND_LIMIT]
         if pending_labels:
             evidence["missing_media"].extend(f"{label}:视频" for label in pending_labels[:KF_VIDEO_SEND_LIMIT])
         evidence.setdefault("media_status", {})["video"] = {
             "requested_count": int(pending_video.get("requested_count") or len(pending_paths) or len(pending_labels)),
-            "sent_count": len(pending_paths[:KF_VIDEO_SEND_LIMIT]),
+            "sent_count": 0 if _dual_llm_production_enabled() else len(pending_paths[:KF_VIDEO_SEND_LIMIT]),
             "missing_rooms": pending_labels[:KF_VIDEO_SEND_LIMIT],
             "sync_status": {"source": "pending_video_sends"},
         }
-        pending_video_handled = True
+        pending_video_handled = bool(evidence.get("video_paths")) if _dual_llm_production_enabled() else True
 
     if "send_inventory_sheet" in actions:
         try:
@@ -6091,6 +6178,118 @@ def _tool_evidence_summary(tool_evidence: dict[str, Any]) -> dict[str, Any]:
         "image_rows": [_row_brief(row) for row in image_rows[:5]],
         "video_rows": [_row_brief(row) for row in video_rows[:5]],
     }
+
+
+def _production_audit_tool_evidence_summary(tool_evidence: dict[str, Any]) -> dict[str, Any]:
+    summary = _tool_evidence_summary(tool_evidence)
+    safe_keys = (
+        "actions",
+        "inventory_row_count",
+        "target_row_count",
+        "inventory_image_count",
+        "image_count",
+        "video_count",
+        "missing_media",
+        "media_request",
+        "media_status",
+        "original_video_request",
+        "original_video_url_count",
+        "material_page_url_count",
+        "inventory_image_error",
+        "inventory_read_context",
+        "inventory_listing_evidence_count",
+        "viewing_instruction_evidence_count",
+        "inventory_sheet_artifact_evidence_count",
+        "inventory_read_error",
+        "viewing_instruction_error",
+        "inventory_sheet_artifact_error",
+        "selection_error",
+        "field_target_error",
+        "inventory_rows",
+        "target_rows",
+        "image_rows",
+        "video_rows",
+    )
+    payload = {key: summary.get(key) for key in safe_keys if key in summary}
+    payload["inventory_source_metadata"] = _production_audit_inventory_source_metadata(
+        tool_evidence.get("inventory_source_metadata") or {}
+    )
+    payload["dual_llm_production"] = tool_evidence.get("dual_llm_production") or {}
+    payload["outbound_package_present"] = bool(tool_evidence.get("outbound_package"))
+    return safe_artifact_payload(payload)
+
+
+def _production_audit_inventory_source_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    safe_keys = (
+        "source",
+        "source_kind",
+        "source_hash",
+        "hash",
+        "snapshot_id",
+        "schema_version",
+        "row_count",
+        "status",
+        "cache_mtime",
+    )
+    return safe_artifact_payload({key: metadata.get(key) for key in safe_keys if key in metadata})
+
+
+def _production_audit_understanding_summary(understanding: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(understanding, dict):
+        return {}
+    tool_plan = dict(understanding.get("tool_plan") or {})
+    structured_task = dict(understanding.get("structured_task") or {})
+    return safe_artifact_payload(
+        {
+            "intent": understanding.get("intent") or "",
+            "intent_confidence": understanding.get("intent_confidence") or 0,
+            "needs_clarification": bool(understanding.get("needs_clarification")),
+            "context_reference": bool(understanding.get("context_reference")),
+            "tool_plan": {
+                "actions": list(tool_plan.get("actions") or []),
+                "source": tool_plan.get("source") or "",
+                "retry_required": bool(tool_plan.get("retry_required")),
+                "need_rewrite_clarification": bool(tool_plan.get("need_rewrite_clarification")),
+            },
+            "structured_task_source": structured_task.get("source") or "",
+            "has_llm1_task_packet": bool(understanding.get("llm1_task_packet")),
+            "dual_llm_production": understanding.get("dual_llm_production") or {},
+        }
+    )
+
+
+def _production_audit_planner_result_summary(planner_result: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(planner_result, dict):
+        return {}
+    return safe_artifact_payload(
+        {
+            "actions": list(planner_result.get("actions") or []),
+            "source": planner_result.get("source") or "",
+            "need_rewrite_clarification": bool(planner_result.get("need_rewrite_clarification")),
+            "missing_evidence_present": bool(str(planner_result.get("missing_evidence") or "").strip()),
+            "planner_retry_reason_present": bool(str(planner_result.get("planner_retry_reason") or "").strip()),
+            "reply_text_present": bool(str(planner_result.get("reply_text") or "").strip()),
+        }
+    )
+
+
+def _production_audit_reply_result_summary(reply_result: dict[str, Any]) -> dict[str, Any]:
+    selfcheck = reply_result.get("selfcheck") if isinstance(reply_result, dict) else {}
+    if not isinstance(selfcheck, dict):
+        selfcheck = {}
+    return safe_artifact_payload(
+        {
+            "reply_present": bool(str(reply_result.get("reply") or "").strip()) if isinstance(reply_result, dict) else False,
+            "draft_reply_present": bool(str(reply_result.get("draft_reply") or "").strip()) if isinstance(reply_result, dict) else False,
+            "needs_planner_retry": bool(reply_result.get("needs_planner_retry")) if isinstance(reply_result, dict) else False,
+            "planner_retry_reason_present": bool(str(reply_result.get("planner_retry_reason") or "").strip())
+            if isinstance(reply_result, dict)
+            else False,
+            "selfcheck_status": str(selfcheck.get("status") or ""),
+        }
+    )
 
 
 def _assessment_to_dict(assessment: Any) -> dict[str, Any]:
@@ -8673,7 +8872,11 @@ async def _generate_reply_result(
         or (planner_result or {}).get("final_reply")
         or ""
     ).strip()
-    planner_requires_reply = bool(planner_result) and not (planner_result or {}).get("need_rewrite_clarification")
+    planner_requires_reply = (
+        bool(planner_result)
+        and not (planner_result or {}).get("need_rewrite_clarification")
+        and not _dual_llm_production_enabled()
+    )
     if planner_requires_reply and not planner_reply:
         post_tool_reply_result: dict[str, Any] = {}
         planner_reply_func = getattr(reply_generator, "plan_kf_reply_text", None)
@@ -9479,6 +9682,40 @@ def _send_action_for_text(
     )
 
 
+def _file_sha256_for_send(path: Path) -> str:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def _inventory_evidence_for_listing(tool_evidence: dict[str, Any], listing_id: str) -> dict[str, Any]:
+    if not listing_id:
+        return {}
+    for item in tool_evidence.get("inventory_listing_evidence") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("listing_id") or "").strip() == listing_id:
+            return item
+    return {}
+
+
+def _send_fact_binding_for_row(row: dict[str, Any], tool_evidence: dict[str, Any], path: Path) -> dict[str, str]:
+    listing_id = _row_listing_id(row)
+    evidence = _inventory_evidence_for_listing(tool_evidence, listing_id)
+    return {
+        "listing_id": listing_id,
+        "evidence_id": str(evidence.get("evidence_id") or "").strip(),
+        "inventory_snapshot_id": str(evidence.get("snapshot_id") or "").strip(),
+        "source_hash": str(evidence.get("source_hash") or "").strip(),
+        "sha256": _file_sha256_for_send(path),
+    }
+
+
 def _send_action_for_path(
     *,
     open_kfid: str,
@@ -9490,6 +9727,11 @@ def _send_action_for_path(
     msgids: list[str] | None = None,
     extra_payload: dict[str, Any] | None = None,
     extra_metadata: dict[str, Any] | None = None,
+    listing_id: str = "",
+    evidence_id: str = "",
+    inventory_snapshot_id: str = "",
+    source_hash: str = "",
+    sha256: str = "",
 ) -> Any:
     digest = kf_send_receipts.material_hash(path)
     return kf_send_receipts.build_send_action(
@@ -9499,6 +9741,11 @@ def _send_action_for_path(
         msgids=msgids,
         action_id=action_id,
         action_type=action_type,
+        listing_id=listing_id,
+        evidence_id=evidence_id,
+        inventory_snapshot_id=inventory_snapshot_id,
+        source_hash=source_hash,
+        sha256=sha256,
         payload={
             "material_hash": digest,
             "file_name": path.name,
@@ -9556,6 +9803,35 @@ def _build_orchestrator_shadow_artifact(
     reply_result: dict[str, Any] | None = None,
     final_reply: str = "",
 ) -> dict[str, Any]:
+    if _dual_llm_production_enabled():
+        inventory_context_log: dict[str, Any] = {}
+        if inventory_read_context is not None:
+            inventory_context_log = (
+                inventory_read_context.to_log_dict()
+                if hasattr(inventory_read_context, "to_log_dict")
+                else inventory_read_context
+                if isinstance(inventory_read_context, dict)
+                else {}
+            )
+        artifact = safe_artifact_payload(
+            {
+                "schema_version": "rag_v2_orchestrator_production_audit.v1",
+                "mode": "production",
+                "content_present": bool(str(content or "").strip()),
+                "msgid_count": len(msgids or []),
+                "generation": str(generation),
+                "inventory_read_context": inventory_read_turn.context_summary(inventory_context_log)
+                if inventory_context_log
+                else {},
+                "understanding_summary": _production_audit_understanding_summary(understanding or {}),
+                "planner_result_summary": _production_audit_planner_result_summary(planner_result or {}),
+                "tool_evidence_summary": _production_audit_tool_evidence_summary(tool_evidence or {}),
+                "reply_result_summary": _production_audit_reply_result_summary(reply_result or {}),
+                "final_reply_present": bool(str(final_reply or "").strip()),
+            }
+        )
+        logger.info("KF orchestrator production audit artifact: %s", json.dumps(artifact, ensure_ascii=False, default=str))
+        return artifact
     try:
         artifact = kf_orchestrator_shadow.build_shadow_artifact(
             content=content,
@@ -9589,7 +9865,7 @@ async def _send_images(open_kfid: str, external_userid: str, paths: list[str]) -
         except WeComKfSendLimitError:
             raise
         except Exception as exc:
-            logger.exception("send image failed: %s", exc)
+            logger.warning("send image failed: %s", kf_send_receipts.safe_failure_reason(exc))
             sent.append({"type": "image_failed", "path": str(path), "reason": kf_send_receipts.safe_failure_reason(exc)})
     return sent
 
@@ -9615,9 +9891,59 @@ async def _send_videos(
         except WeComKfSendLimitError:
             raise
         except Exception as exc:
-            logger.exception("send video failed: %s", exc)
+            logger.warning("send video failed: %s", kf_send_receipts.safe_failure_reason(exc))
             sent.append({"type": "video_failed", "path": str(path), "room": label, "reason": kf_send_receipts.safe_failure_reason(exc)})
     return sent
+
+
+def _video_error_allows_transcode_retry(error: Exception) -> bool:
+    text = str(error).lower()
+    retry_markers = (
+        "file too large",
+        "too large",
+        "size limit",
+        "max size",
+        "file size exceeded",
+        "media size exceeded",
+        "video size exceeded",
+        "exceeds file size",
+        "exceeds media size",
+        "oversize",
+        "invalid media",
+        "invalid format",
+        "unsupported format",
+        "unsupported video",
+        "codec",
+        "transcode required",
+        "文件过大",
+        "格式",
+        "转码",
+        "编码",
+    )
+    fail_fast_markers = (
+        "429",
+        "access_token",
+        "invalid credential",
+        "credential",
+        "frequency",
+        "quota",
+        "rate limit",
+        "ratelimit",
+        "too many requests",
+        "unauthorized",
+        "forbidden",
+        "permission",
+        "auth",
+        "secret",
+        "token",
+        "频控",
+        "限流",
+        "次数",
+        "鉴权",
+        "权限",
+        "凭证",
+    )
+    return any(marker in text for marker in retry_markers) and not any(marker in text for marker in fail_fast_markers)
 
 
 async def _send_images_with_receipts(
@@ -9657,7 +9983,7 @@ async def _send_images_with_receipts(
         except WeComKfSendLimitError:
             raise
         except Exception as exc:
-            logger.exception("send image failed: %s", exc)
+            logger.warning("send image failed: %s", kf_send_receipts.safe_failure_reason(exc))
             sent.append({"type": "image_failed", "path": str(path), "reason": kf_send_receipts.safe_failure_reason(exc)})
     return sent, context
 
@@ -9669,15 +9995,19 @@ async def _send_videos_with_receipts(
     context: dict[str, Any],
     paths: list[str],
     rows: list[dict[str, Any]],
+    tool_evidence: dict[str, Any] | None = None,
     msgids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     sent: list[dict[str, Any]] = []
+    tool_evidence = tool_evidence or {}
     for index, raw_path in enumerate(paths[:KF_VIDEO_SEND_LIMIT], start=1):
         path = Path(raw_path)
         if not path.exists():
             continue
+        row = rows[index - 1] if index <= len(rows) and isinstance(rows[index - 1], dict) else {}
+        fact_binding = _send_fact_binding_for_row(row, tool_evidence, path)
         label = _normalize_customer_visible_reply_text_before_selfcheck(
-            _row_label(rows[index - 1]) if index <= len(rows) else path.stem
+            _row_label(row) if row else path.stem
         )
         caption = f"这是{label}的视频。"
         action = _send_action_for_path(
@@ -9697,6 +10027,11 @@ async def _send_videos_with_receipts(
                 "caption_hash": kf_send_receipts.text_hash(caption),
                 "transaction": "caption_then_video",
             },
+            listing_id=fact_binding["listing_id"],
+            evidence_id=fact_binding["evidence_id"],
+            inventory_snapshot_id=fact_binding["inventory_snapshot_id"],
+            source_hash=fact_binding["source_hash"],
+            sha256=fact_binding["sha256"],
         )
         idempotency_key = kf_send_receipts.build_idempotency_key(action)
         existing = kf_send_receipts.find_successful_receipt(context, idempotency_key)
@@ -9705,24 +10040,44 @@ async def _send_videos_with_receipts(
             context = kf_send_receipts.append_receipt(context, duplicate)
             continue
         caption_sent = False
+        transcode_retry = False
+        sent_path = path
         try:
             await _send_text(open_kfid, external_userid, caption)
             caption_sent = True
-            provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, path))
+            try:
+                provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, sent_path))
+            except WeComKfSendLimitError:
+                raise
+            except Exception as exc:
+                if not _video_error_allows_transcode_retry(exc):
+                    raise
+                sent_path = await asyncio.to_thread(prepare_wecom_video, path, force=True)
+                transcode_retry = True
+                provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, sent_path))
             receipt = kf_send_receipts.build_sent_receipt(
                 action,
                 idempotency_key=idempotency_key,
                 provider_result=provider_result if isinstance(provider_result, dict) else {},
-                metadata={"position": index, "caption_sent": caption_sent},
+                metadata={
+                    "position": index,
+                    "caption_sent": caption_sent,
+                    "transcode_retry": transcode_retry,
+                    "sent_path_hash": kf_send_receipts.material_hash(sent_path),
+                },
             )
             context = kf_send_receipts.append_receipt(context, receipt)
-            sent.append({"type": "video", "path": str(path), "room": label, "count": 1})
+            sent_action = {"type": "video", "path": str(sent_path), "room": label, "count": 1}
+            if transcode_retry:
+                sent_action["source_path"] = str(path)
+                sent_action["transcode_retry"] = True
+            sent.append(sent_action)
         except WeComKfSendLimitError as exc:
             receipt = kf_send_receipts.build_failed_receipt(
                 action,
                 idempotency_key=idempotency_key,
                 error=exc,
-                metadata={"position": index, "caption_sent": caption_sent},
+                metadata={"position": index, "caption_sent": caption_sent, "transcode_retry": transcode_retry},
             )
             context = kf_send_receipts.append_receipt(context, receipt)
             raise
@@ -9731,10 +10086,10 @@ async def _send_videos_with_receipts(
                 action,
                 idempotency_key=idempotency_key,
                 error=exc,
-                metadata={"position": index, "caption_sent": caption_sent},
+                metadata={"position": index, "caption_sent": caption_sent, "transcode_retry": transcode_retry},
             )
             context = kf_send_receipts.append_receipt(context, receipt)
-            logger.exception("send video failed: %s", exc)
+            logger.warning("send video failed: %s", kf_send_receipts.safe_failure_reason(exc))
             sent.append({"type": "video_failed", "path": str(path), "room": label, "reason": kf_send_receipts.safe_failure_reason(exc)})
     return sent, context
 
@@ -9864,6 +10219,7 @@ async def _send_final_actions(
         context=context,
         paths=list(tool_evidence.get("video_paths") or []),
         rows=[row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)],
+        tool_evidence=tool_evidence,
         msgids=msgids,
     )
     sent_actions.extend(video_actions)

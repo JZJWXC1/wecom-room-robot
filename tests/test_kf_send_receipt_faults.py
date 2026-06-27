@@ -1,5 +1,7 @@
+import hashlib
 import asyncio
 import json
+import logging
 import tempfile
 from pathlib import Path
 
@@ -77,3 +79,260 @@ def test_video_send_failure_records_failed_receipt_and_allows_replay() -> None:
     dumped = json.dumps(second["context"], ensure_ascii=False)
     assert "abc123" not in dumped
     assert "19900009999" not in dumped
+
+
+def test_video_upload_failure_transcodes_with_ffmpeg_and_retries() -> None:
+    class FakeWeComKf:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+            self.video_attempts: list[str] = []
+
+        def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+            self.texts.append(text)
+            return {"errcode": 0}
+
+        def send_video(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+            self.video_attempts.append(str(media_id))
+            if len(self.video_attempts) == 1:
+                raise RuntimeError("video upload failed: file too large")
+            return {"errcode": 0, "msgid": "video-transcoded"}
+
+    async def run_case() -> tuple[dict, FakeWeComKf, list[str], str, str]:
+        fake = FakeWeComKf()
+        transcode_calls: list[str] = []
+        original_wecom = main.wecom_kf
+        original_prepare = main.prepare_wecom_video
+        main.wecom_kf = fake
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                video_path = Path(directory) / "room.mp4"
+                transcoded_path = Path(directory) / "room.wecom.mp4"
+                video_path.write_bytes(b"original-video")
+                transcoded_path.write_bytes(b"transcoded-video")
+                listing_id = "lst_1234567890abcdef"
+                evidence_id = "evd_1234567890abcdef"
+                snapshot_id = "snapshot-test-001"
+                source_hash = "a" * 64
+
+                def fake_prepare(path: Path, *, force: bool = False, **kwargs) -> Path:
+                    assert force is True
+                    transcode_calls.append(str(path))
+                    return transcoded_path
+
+                main.prepare_wecom_video = fake_prepare
+                result = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=_context(),
+                    final_reply="",
+                    tool_evidence={
+                        "video_paths": [str(video_path)],
+                        "video_rows": [{"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}],
+                        "inventory_listing_evidence": [
+                            {
+                                "listing_id": listing_id,
+                                "evidence_id": evidence_id,
+                                "snapshot_id": snapshot_id,
+                                "source_hash": source_hash,
+                            }
+                        ],
+                    },
+                    msgids=["msg-video-transcode"],
+                )
+                return result, fake, transcode_calls, str(video_path), str(transcoded_path)
+        finally:
+            main.wecom_kf = original_wecom
+            main.prepare_wecom_video = original_prepare
+
+    result, fake, transcode_calls, video_path, transcoded_path = asyncio.run(run_case())
+
+    assert transcode_calls == [video_path]
+    assert fake.video_attempts == [video_path, transcoded_path]
+    assert result["sent_actions"] == [
+        {
+            "type": "video",
+            "path": transcoded_path,
+            "room": "星河苑1-101",
+            "count": 1,
+            "source_path": video_path,
+            "transcode_retry": True,
+        }
+    ]
+    receipt = result["context"]["send_receipts"]["receipts"][-1]
+    assert receipt["status"] == "sent"
+    assert receipt["listing_id"] == "lst_1234567890abcdef"
+    assert receipt["evidence_id"] == "evd_1234567890abcdef"
+    assert receipt["inventory_snapshot_id"] == "snapshot-test-001"
+    assert receipt["source_hash"] == "a" * 64
+    assert receipt["sha256"] == hashlib.sha256(b"original-video").hexdigest()
+    assert receipt["metadata"]["transcode_retry"] is True
+
+
+def test_video_auth_failure_does_not_transcode_retry(caplog) -> None:
+    class FakeWeComKf:
+        def __init__(self) -> None:
+            self.video_attempts: list[str] = []
+
+        def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+            return {"errcode": 0}
+
+        def send_video(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+            self.video_attempts.append(str(media_id))
+            raise RuntimeError("video send failed: invalid credential access_token")
+
+    async def run_case() -> tuple[dict, FakeWeComKf, list[str], str]:
+        fake = FakeWeComKf()
+        transcode_calls: list[str] = []
+        original_wecom = main.wecom_kf
+        original_prepare = main.prepare_wecom_video
+        main.wecom_kf = fake
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                video_path = Path(directory) / "room.mp4"
+                video_path.write_bytes(b"original-video")
+
+                def fake_prepare(path: Path, *, force: bool = False, **kwargs) -> Path:
+                    transcode_calls.append(str(path))
+                    return Path(directory) / "room.wecom.mp4"
+
+                main.prepare_wecom_video = fake_prepare
+                result = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=_context(),
+                    final_reply="",
+                    tool_evidence={
+                        "video_paths": [str(video_path)],
+                        "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                    },
+                    msgids=["msg-video-auth-failure"],
+                )
+                return result, fake, transcode_calls, str(video_path)
+        finally:
+            main.wecom_kf = original_wecom
+            main.prepare_wecom_video = original_prepare
+
+    caplog.set_level(logging.WARNING, logger="room-robot")
+    result, fake, transcode_calls, video_path = asyncio.run(run_case())
+
+    assert transcode_calls == []
+    assert fake.video_attempts == [video_path]
+    assert result["sent_actions"][0]["type"] == "video_failed"
+    receipt = result["context"]["send_receipts"]["receipts"][-1]
+    assert receipt["status"] == "failed"
+    assert receipt["metadata"]["transcode_retry"] is False
+    dumped = json.dumps(result["context"], ensure_ascii=False)
+    assert "access_token" not in dumped
+    assert "access_token" not in caplog.text
+
+
+def test_video_rate_limit_upload_failure_does_not_transcode_retry(caplog) -> None:
+    class FakeWeComKf:
+        def __init__(self) -> None:
+            self.video_attempts: list[str] = []
+
+        def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+            return {"errcode": 0}
+
+        def send_video(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+            self.video_attempts.append(str(media_id))
+            raise RuntimeError("temporary media upload failed: 429 rate limit token=token_CANARY_abcdefghijklmnopqrstuvwxyz")
+
+    async def run_case() -> tuple[dict, FakeWeComKf, list[str], str]:
+        fake = FakeWeComKf()
+        transcode_calls: list[str] = []
+        original_wecom = main.wecom_kf
+        original_prepare = main.prepare_wecom_video
+        main.wecom_kf = fake
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                video_path = Path(directory) / "room.mp4"
+                video_path.write_bytes(b"original-video")
+
+                def fake_prepare(path: Path, *, force: bool = False, **kwargs) -> Path:
+                    transcode_calls.append(str(path))
+                    return Path(directory) / "room.wecom.mp4"
+
+                main.prepare_wecom_video = fake_prepare
+                result = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=_context(),
+                    final_reply="",
+                    tool_evidence={
+                        "video_paths": [str(video_path)],
+                        "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                    },
+                    msgids=["msg-video-rate-limit"],
+                )
+                return result, fake, transcode_calls, str(video_path)
+        finally:
+            main.wecom_kf = original_wecom
+            main.prepare_wecom_video = original_prepare
+
+    caplog.set_level(logging.WARNING, logger="room-robot")
+    result, fake, transcode_calls, video_path = asyncio.run(run_case())
+
+    assert transcode_calls == []
+    assert fake.video_attempts == [video_path]
+    assert result["sent_actions"][0]["type"] == "video_failed"
+    receipt = result["context"]["send_receipts"]["receipts"][-1]
+    assert receipt["status"] == "failed"
+    assert receipt["metadata"]["transcode_retry"] is False
+    dumped = json.dumps(result["context"], ensure_ascii=False)
+    assert "token_CANARY" not in dumped
+    assert "token_CANARY" not in caplog.text
+
+
+def test_video_daily_limit_exceeded_does_not_transcode_retry() -> None:
+    class FakeWeComKf:
+        def __init__(self) -> None:
+            self.video_attempts: list[str] = []
+
+        def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+            return {"errcode": 0}
+
+        def send_video(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+            self.video_attempts.append(str(media_id))
+            raise RuntimeError("api call daily limit exceeded")
+
+    async def run_case() -> tuple[dict, FakeWeComKf, list[str], str]:
+        fake = FakeWeComKf()
+        transcode_calls: list[str] = []
+        original_wecom = main.wecom_kf
+        original_prepare = main.prepare_wecom_video
+        main.wecom_kf = fake
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                video_path = Path(directory) / "room.mp4"
+                video_path.write_bytes(b"original-video")
+
+                def fake_prepare(path: Path, *, force: bool = False, **kwargs) -> Path:
+                    transcode_calls.append(str(path))
+                    return Path(directory) / "room.wecom.mp4"
+
+                main.prepare_wecom_video = fake_prepare
+                result = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=_context(),
+                    final_reply="",
+                    tool_evidence={
+                        "video_paths": [str(video_path)],
+                        "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                    },
+                    msgids=["msg-video-daily-limit"],
+                )
+                return result, fake, transcode_calls, str(video_path)
+        finally:
+            main.wecom_kf = original_wecom
+            main.prepare_wecom_video = original_prepare
+
+    result, fake, transcode_calls, video_path = asyncio.run(run_case())
+
+    assert transcode_calls == []
+    assert fake.video_attempts == [video_path]
+    assert result["sent_actions"][0]["type"] == "video_failed"
+    receipt = result["context"]["send_receipts"]["receipts"][-1]
+    assert receipt["status"] == "failed"
+    assert receipt["metadata"]["transcode_retry"] is False
