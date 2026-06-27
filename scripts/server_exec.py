@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import socket
 import sys
 from pathlib import Path
 
@@ -22,6 +23,7 @@ def main() -> int:
     parser.add_argument("--user", required=True)
     parser.add_argument("--command", required=True)
     parser.add_argument("--key")
+    parser.add_argument("--bind-address", default=os.environ.get("ROOM_ROBOT_SSH_BIND_ADDRESS", ""))
     args = parser.parse_args()
 
     password = os.environ.get("ROOM_ROBOT_SSH_PASSWORD")
@@ -48,7 +50,14 @@ def main() -> int:
         print("missing ROOM_ROBOT_SSH_PASSWORD or key", file=sys.stderr)
         return 2
 
+    sock = None
     try:
+        if args.bind_address:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(15)
+            sock.bind((args.bind_address, 0))
+            sock.connect((args.host, 22))
+            connect_kwargs["sock"] = sock
         client.connect(**connect_kwargs)
         stdin, stdout, stderr = client.exec_command(args.command, get_pty=False)
         del stdin
@@ -59,6 +68,10 @@ def main() -> int:
         if err:
             sys.stderr.buffer.write(err)
         return stdout.channel.recv_exit_status()
+    except Exception:
+        if sock is not None:
+            sock.close()
+        raise
     finally:
         client.close()
 

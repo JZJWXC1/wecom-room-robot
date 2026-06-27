@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import posixpath
+import socket
 import sys
 from pathlib import Path
 
@@ -28,6 +29,7 @@ def main() -> int:
     parser.add_argument("--remote-root", required=True)
     parser.add_argument("--local-root", default="tmp/server_snapshot")
     parser.add_argument("--key")
+    parser.add_argument("--bind-address", default=os.environ.get("ROOM_ROBOT_SSH_BIND_ADDRESS", ""))
     parser.add_argument("paths", nargs="+")
     args = parser.parse_args()
 
@@ -56,7 +58,14 @@ def main() -> int:
     local_root = PROJECT_ROOT / args.local_root
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    sock = None
     try:
+        if args.bind_address:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(15)
+            sock.bind((args.bind_address, 0))
+            sock.connect((args.host, 22))
+            connect_kwargs["sock"] = sock
         client.connect(**connect_kwargs)
         with client.open_sftp() as sftp:
             for raw_path in args.paths:
@@ -67,6 +76,10 @@ def main() -> int:
                 sftp.get(remote_path, str(local_path))
                 print(f"downloaded {remote_path} -> {local_path}")
         return 0
+    except Exception:
+        if sock is not None:
+            sock.close()
+        raise
     finally:
         client.close()
 

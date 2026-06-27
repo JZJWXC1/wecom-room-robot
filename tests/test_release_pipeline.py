@@ -108,6 +108,26 @@ def test_server_ops_propagates_remote_helper_failure(tmp_path: Path) -> None:
     assert "server_exec.py failed with exit code 7" in completed.stderr + completed.stdout
 
 
+def test_server_ops_supports_ssh_host_user_and_bind_address_overrides() -> None:
+    project = Path.cwd()
+    server_ops = (project / "scripts" / "server-ops.ps1").read_text(encoding="utf-8")
+    helper_sources = "\n".join(
+        (project / path).read_text(encoding="utf-8")
+        for path in (
+            "scripts/server_exec.py",
+            "scripts/server_upload.py",
+            "scripts/server_download.py",
+        )
+    )
+
+    assert "ROOM_ROBOT_SSH_HOST" in server_ops
+    assert "ROOM_ROBOT_SSH_USER" in server_ops
+    assert "ROOM_ROBOT_SSH_BIND_ADDRESS" in server_ops
+    assert "--bind-address" in server_ops
+    assert "ROOM_ROBOT_SSH_BIND_ADDRESS" in helper_sources
+    assert "sock.bind((args.bind_address, 0))" in helper_sources
+
+
 def test_unattended_health_payload_parser_requires_ok_service() -> None:
     assert check_unattended_runtime._health_payload_status('{"ok": true, "service": "wecom-room-robot-agentic-rag"}') == "ok"
     assert check_unattended_runtime._health_payload_status('{"ok": false, "service": "wecom-room-robot-agentic-rag"}') == "unhealthy:ok_false"

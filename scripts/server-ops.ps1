@@ -6,9 +6,10 @@ param(
     [Parameter(Position = 1)]
     [string]$Command = "",
 
-    [string]$HostName = "114.55.168.97",
-    [string]$User = "root",
+    [string]$HostName = $(if ($env:ROOM_ROBOT_SSH_HOST) { $env:ROOM_ROBOT_SSH_HOST } else { "114.55.168.97" }),
+    [string]$User = $(if ($env:ROOM_ROBOT_SSH_USER) { $env:ROOM_ROBOT_SSH_USER } else { "root" }),
     [string]$ProjectDir = "/opt/wecom-room-robot",
+    [string]$BindAddress = $env:ROOM_ROBOT_SSH_BIND_ADDRESS,
     [string]$ApproveDeploy = $env:ROOM_ROBOT_APPROVE_DEPLOY
 )
 
@@ -33,6 +34,15 @@ if (Test-Path $CredentialFile) {
     }
     if (-not $env:ROOM_ROBOT_PLINK -and $credentialText -match 'ROOM_ROBOT_PLINK\s*=\s*["'']([^"'']+)["'']') {
         $env:ROOM_ROBOT_PLINK = $Matches[1]
+    }
+    if (-not $PSBoundParameters.ContainsKey("HostName") -and $credentialText -match 'ROOM_ROBOT_SSH_HOST\s*=\s*["'']([^"'']+)["'']') {
+        $HostName = $Matches[1]
+    }
+    if (-not $PSBoundParameters.ContainsKey("User") -and $credentialText -match 'ROOM_ROBOT_SSH_USER\s*=\s*["'']([^"'']+)["'']') {
+        $User = $Matches[1]
+    }
+    if (-not $PSBoundParameters.ContainsKey("BindAddress") -and $credentialText -match 'ROOM_ROBOT_SSH_BIND_ADDRESS\s*=\s*["'']([^"'']+)["'']') {
+        $BindAddress = $Matches[1]
     }
 }
 
@@ -79,7 +89,11 @@ function Invoke-RemoteCommand {
         }
         $serverExec = Join-Path (Get-Location) "scripts/server_exec.py"
         if (Test-Path $serverExec) {
-            & $python $serverExec --host $HostName --user $User --command $RemoteCommand
+            $execArgs = @("--host", $HostName, "--user", $User, "--command", $RemoteCommand)
+            if ($BindAddress) {
+                $execArgs += @("--bind-address", $BindAddress)
+            }
+            & $python $serverExec @execArgs
             Assert-NativeCommandSucceeded "server_exec.py"
             return
         }
@@ -87,6 +101,9 @@ function Invoke-RemoteCommand {
     }
 
     $sshArgs = Get-SshBaseArgs
+    if ($BindAddress) {
+        $sshArgs = @("-b", $BindAddress) + $sshArgs
+    }
     & ssh @sshArgs $RemoteCommand
     Assert-NativeCommandSucceeded "ssh"
 }
@@ -122,6 +139,9 @@ function Invoke-UploadFiles {
     if ($env:ROOM_ROBOT_SSH_KEY) {
         $uploadArgs += @("--key", $env:ROOM_ROBOT_SSH_KEY)
     }
+    if ($BindAddress) {
+        $uploadArgs += @("--bind-address", $BindAddress)
+    }
     & $python $serverUpload @uploadArgs @fileArgs
     Assert-NativeCommandSucceeded "server_upload.py"
 }
@@ -152,6 +172,9 @@ function Invoke-DownloadFiles {
     $downloadArgs = @("--host", $HostName, "--user", $User, "--remote-root", $ProjectDir)
     if ($env:ROOM_ROBOT_SSH_KEY) {
         $downloadArgs += @("--key", $env:ROOM_ROBOT_SSH_KEY)
+    }
+    if ($BindAddress) {
+        $downloadArgs += @("--bind-address", $BindAddress)
     }
     & $python $serverDownload @downloadArgs @fileArgs
     Assert-NativeCommandSucceeded "server_download.py"
