@@ -3992,12 +3992,16 @@ def _target_rows_from_understanding(
         and current_text_norm
         and any(community in current_text_norm for community in proof_communities)
     )
-    if selected and current_mentions_proof_community and search_rows:
+    if selected and current_mentions_proof_community:
+        if not search_rows:
+            return []
         current_search_rows = [
             row
             for row in search_rows
             if normalize_search_text(_row_value(row, ("小区", "小区名"))) in proof_communities
         ]
+        if not current_search_rows:
+            return []
         if current_search_rows and any(index > len(current_search_rows) for index in selected):
             return []
         current_selected_rows = [
@@ -4005,8 +4009,7 @@ def _target_rows_from_understanding(
             for index in selected
             if 1 <= index <= len(current_search_rows)
         ]
-        if current_selected_rows:
-            return current_selected_rows
+        return current_selected_rows or []
 
     if selected:
         if not candidates:
@@ -5691,6 +5694,13 @@ async def _execute_tools(
     selection_has_direct_room_ref = bool(
         _room_refs_from_text(current_selection_text)
     )
+    selection_proof_communities = _proof_community_norms(proof)
+    selection_current_text_norm = normalize_search_text(current_selection_text)
+    selection_has_current_community_scope = bool(
+        selection_proof_communities
+        and selection_current_text_norm
+        and any(community in selection_current_text_norm for community in selection_proof_communities)
+    )
     selection_has_prior_context = bool(
         candidate_rows_for_selection or pending_video
     )
@@ -5713,7 +5723,28 @@ async def _execute_tools(
         and rows
         and any(index > len(rows) for index in selected_indices)
     )
-    if invalid_candidate_selection or invalid_search_selection:
+    current_scope_selection_miss = bool(
+        selected_indices
+        and selection_has_current_community_scope
+        and not selection_has_direct_room_ref
+        and not target_rows
+    )
+    if current_scope_selection_miss:
+        candidate_labels = [_row_label(row) for row in rows[:10]]
+        evidence["selection_error"] = {
+            "requested_indices": selected_indices,
+            "candidate_count": len(rows),
+            "candidate_labels": candidate_labels,
+            "reason": "current_scope_selection_not_found",
+        }
+        rows = []
+        target_rows = []
+        evidence["inventory_rows"] = []
+        evidence["image_rows"] = []
+        evidence["video_rows"] = []
+        evidence["image_paths"] = []
+        evidence["video_paths"] = []
+    elif invalid_candidate_selection or invalid_search_selection:
         selection_rows = candidate_rows_for_selection or rows
         candidate_labels = [_row_label(row) for row in selection_rows[:10]]
         evidence["selection_error"] = {
