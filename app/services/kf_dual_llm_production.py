@@ -34,6 +34,10 @@ def tool_plan_from_task_packet(task_packet: StructuredTaskPacket | dict[str, Any
     if not actions and str(packet.response_strategy.mode) == "ask_clarification":
         plan["need_rewrite_clarification"] = True
         plan.setdefault("missing_evidence", "LLM1 production task packet requires clarification.")
+    if str(packet.response_strategy.mode) == "retry" or str(metadata.get("status") or "") == "retry_required":
+        plan["retry_required"] = True
+        plan["need_rewrite_clarification"] = True
+        plan.setdefault("missing_evidence", metadata.get("retry_reason") or "LLM1 production task packet requires retry.")
     plan["actions"] = actions
     plan["source"] = _source_from_llm1_metadata(metadata)
     plan.pop("reply", None)
@@ -53,17 +57,39 @@ async def compose_production_outbound_package(
     retry_reason: str = "",
 ) -> PreparedOutboundPackage:
     packet = _coerce_task_packet(task_packet)
-    baseline = kf_dual_llm_shadow.compose_shadow_outbound(
-        packet,
-        tool_evidence,
-        draft_reply,
-        legacy_planner=planner_result or {},
-        legacy_reply_result=reply_result or {"reply": draft_reply},
-        prompt_version="dual_llm_production.baseline_adapter.v1",
+    llm1_metadata = _llm1_metadata(packet)
+    evidence_bundle, response_strategy, send_actions = kf_dual_llm_shadow.build_program_outbound_contract_inputs(
+        task_packet=packet,
+        tool_evidence=tool_evidence,
+        planner_result=planner_result or {},
     )
+    if str(packet.response_strategy.mode) == "retry" or str(llm1_metadata.get("status") or "") == "retry_required":
+        reason = str(
+            llm1_metadata.get("retry_reason")
+            or llm1_metadata.get("missing_evidence")
+            or "LLM1 production task packet requires retry; LLM2 production is gated."
+        )
+        return compose_kf_outbound(
+            packet,
+            evidence_bundle,
+            response_strategy,
+            llm_output={
+                "reply_text": "",
+                "self_review": {
+                    "status": "retry",
+                    "reason": reason,
+                    "retry_reason": reason,
+                    "rewrite_retry_reason": reason,
+                    "llm2_decides_media_targets": False,
+                },
+                "source": "llm1_production_retry_gate",
+            },
+            send_actions=send_actions,
+            prompt_version=DUAL_LLM_PRODUCTION_LLM2_PROMPT_VERSION,
+            selfcheck_profile=DUAL_LLM_PRODUCTION_SELFCHECK_PROFILE,
+            reply_source=DUAL_LLM_PRODUCTION_REPLY_SOURCE,
+        )
     compose_llm2 = getattr(reply_generator, "compose_kf_outbound_production", None)
-    if not callable(compose_llm2):
-        compose_llm2 = getattr(reply_generator, "compose_kf_outbound_shadow", None)
     if not callable(compose_llm2):
         llm2_output = {
             "reply_text": "",
@@ -77,19 +103,17 @@ async def compose_production_outbound_package(
     else:
         kwargs = {
             "task_packet": packet.to_safe_dict(),
-            "evidence_bundle": baseline.evidence_bundle.to_safe_dict() if baseline.evidence_bundle else {},
-            "response_strategy": baseline.response_strategy.to_safe_dict(),
+            "evidence_bundle": evidence_bundle.to_safe_dict(),
+            "response_strategy": response_strategy.to_safe_dict(),
             "retry_reason": retry_reason,
         }
-        if getattr(compose_llm2, "__name__", "") == "compose_kf_outbound_shadow":
-            kwargs["mode"] = "production"
         llm2_output = await compose_llm2(**kwargs)
     return compose_kf_outbound(
         packet,
-        baseline.evidence_bundle,
-        baseline.response_strategy,
+        evidence_bundle,
+        response_strategy,
         llm_output=llm2_output,
-        send_actions=baseline.send_actions,
+        send_actions=send_actions,
         prompt_version=DUAL_LLM_PRODUCTION_LLM2_PROMPT_VERSION,
         selfcheck_profile=DUAL_LLM_PRODUCTION_SELFCHECK_PROFILE,
         reply_source=DUAL_LLM_PRODUCTION_REPLY_SOURCE,
@@ -133,7 +157,7 @@ def _coerce_task_packet(value: StructuredTaskPacket | dict[str, Any]) -> Structu
 
 def _llm1_metadata(packet: StructuredTaskPacket) -> dict[str, Any]:
     unknown = packet.legacy_unknown_fields if isinstance(packet.legacy_unknown_fields, dict) else {}
-    raw = unknown.get("llm1_shadow") or unknown.get("llm1_production") or {}
+    raw = unknown.get("llm1_production") or unknown.get("llm1_shadow") or {}
     return dict(raw) if isinstance(raw, dict) else {}
 
 

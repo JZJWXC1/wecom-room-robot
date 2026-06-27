@@ -163,28 +163,56 @@ def build_kf_task_packet_shadow(
     inventory_snapshot_id: str = "",
     candidate_set_id: str = "",
     source_label: str = "",
+    mode: str = "shadow",
 ) -> KfTaskPacketShadowBuild:
+    production_mode = _is_production_mode(mode=mode, source_label=source_label, prompt_version=prompt_version)
     raw_output = _sanitize_llm1_output(llm1_output)
     rewrite = _safe_dict(legacy_rewrite)
     planner = _safe_dict(legacy_planner)
-    candidate_context = _candidate_context(candidate_set, rewrite, planner, candidate_set_id=candidate_set_id)
+    decision_rewrite = {} if production_mode else rewrite
+    decision_planner = {} if production_mode else planner
+    context_payloads = () if production_mode else (rewrite, planner)
+    candidate_context = _candidate_context(
+        candidate_set,
+        *context_payloads,
+        candidate_set_id=candidate_set_id,
+    )
     prompt_artifact = build_kf_task_packet_prompt_artifact(
         content=content,
         raw_dialog_context=raw_dialog_context,
         structured_memory=structured_memory,
         inventory_index=inventory_index,
         candidate_context=candidate_context,
-        legacy_rewrite=rewrite,
-        legacy_planner=planner,
+        legacy_rewrite=decision_rewrite,
+        legacy_planner=decision_planner,
         prompt_version=prompt_version,
+        source="production" if production_mode else "shadow",
+        include_legacy_summary=not production_mode,
     )
-    source = source_label or ("llm1_shadow" if raw_output else "legacy_shadow_fallback")
+    source = source_label or ("llm1_production" if production_mode else ("llm1_shadow" if raw_output else "legacy_shadow_fallback"))
+
+    if production_mode and _llm1_production_missing_packet(raw_output):
+        return _production_retry_required_build(
+            content=content,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            case_id=case_id,
+            prompt_version=prompt_version,
+            inventory_snapshot_id=inventory_snapshot_id,
+            candidate_context=candidate_context,
+            prompt_artifact=prompt_artifact,
+            raw_output=raw_output,
+            legacy_rewrite=rewrite,
+            legacy_planner=planner,
+            reason="LLM1 production output missing or invalid task_atoms; retry rewrite before tool planning.",
+            source=source,
+        )
 
     payload, tool_plan, candidate_binding = _packet_payload_from_llm1(
         raw_output,
         content=content,
-        legacy_rewrite=rewrite,
-        legacy_planner=planner,
+        legacy_rewrite=decision_rewrite,
+        legacy_planner=decision_planner,
         candidate_context=candidate_context,
         prompt_version=prompt_version,
         conversation_id=conversation_id,
@@ -195,6 +223,22 @@ def build_kf_task_packet_shadow(
     try:
         packet = StructuredTaskPacket(**payload)
     except (TypeError, ValueError, ValidationError):
+        if production_mode:
+            return _production_retry_required_build(
+                content=content,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                case_id=case_id,
+                prompt_version=prompt_version,
+                inventory_snapshot_id=inventory_snapshot_id,
+                candidate_context=candidate_context,
+                prompt_artifact=prompt_artifact,
+                raw_output=raw_output,
+                legacy_rewrite=rewrite,
+                legacy_planner=planner,
+                reason="LLM1 production output did not satisfy StructuredTaskPacket; retry rewrite before tool planning.",
+                source=source,
+            )
         source = "legacy_shadow_fallback_after_invalid_llm1"
         payload, tool_plan, candidate_binding = _packet_payload_from_llm1(
             {},
@@ -217,10 +261,13 @@ def build_kf_task_packet_shadow(
         legacy_rewrite=rewrite,
         legacy_planner=planner,
     )
+    metadata_key = "llm1_production" if production_mode else "llm1_shadow"
     packet.legacy_unknown_fields = safe_artifact_payload(
         {
-            "llm1_shadow": {
+            metadata_key: {
                 "source": source,
+                "mode": "production" if production_mode else "shadow",
+                "legacy_debug_only": production_mode,
                 "tool_plan": tool_plan,
                 "candidate_binding": candidate_binding,
                 "legacy_diff": legacy_diff,
@@ -250,23 +297,141 @@ def build_kf_task_packet_prompt_artifact(
     legacy_rewrite: dict[str, Any] | None = None,
     legacy_planner: dict[str, Any] | None = None,
     prompt_version: str = LLM1_TASK_PACKET_PROMPT_VERSION,
+    source: str = "shadow",
+    include_legacy_summary: bool = True,
 ) -> dict[str, Any]:
     if candidate_context is None:
         candidate_context = _candidate_context(candidate_set, legacy_rewrite or {}, legacy_planner or {})
+    payload = {
+        "source": source,
+        "prompt_version": prompt_version,
+        "content": _clip(safe_artifact_payload(content), 1000),
+        "raw_dialog_context": _clip_json(safe_artifact_payload(raw_dialog_context or []), 2500),
+        "structured_memory": _clip_json(safe_artifact_payload(structured_memory or {}), 2500),
+        "inventory_index": _clip_json(safe_artifact_payload(inventory_index or {}), 2500),
+        "candidate_set": {
+            "candidate_set_id": str((candidate_context or {}).get("candidate_set_id") or ""),
+            "candidate_count": int((candidate_context or {}).get("candidate_count") or 0),
+            "candidates": (candidate_context or {}).get("candidates", [])[:10],
+        },
+    }
+    if include_legacy_summary:
+        payload["legacy_rewrite_summary"] = _legacy_summary(legacy_rewrite or {})
+        payload["legacy_planner_summary"] = _legacy_summary(legacy_planner or {})
+    return safe_artifact_payload(payload)
+
+
+def _is_production_mode(*, mode: str, source_label: str, prompt_version: str) -> bool:
+    return (
+        str(mode or "").strip().lower() == "production"
+        or str(source_label or "").strip().lower().startswith("llm1_production")
+        or "production" in str(prompt_version or "").strip().lower()
+    )
+
+
+def _llm1_production_missing_packet(raw_output: dict[str, Any]) -> bool:
+    raw_tasks = _raw_tasks(raw_output)
+    if not raw_tasks:
+        return True
+    for task in raw_tasks:
+        if not any(str(task.get(key) or "").strip() for key in ("task_type", "type", "intent", "action")):
+            return True
+    return False
+
+
+def _production_retry_required_build(
+    *,
+    content: str,
+    conversation_id: str,
+    turn_id: str,
+    case_id: str,
+    prompt_version: str,
+    inventory_snapshot_id: str,
+    candidate_context: dict[str, Any],
+    prompt_artifact: dict[str, Any],
+    raw_output: dict[str, Any],
+    legacy_rewrite: dict[str, Any],
+    legacy_planner: dict[str, Any],
+    reason: str,
+    source: str,
+) -> KfTaskPacketShadowBuild:
+    candidate_set_id = str(candidate_context.get("candidate_set_id") or "")
+    candidate_binding = _retry_candidate_binding(candidate_context)
+    tool_plan = safe_artifact_payload(
+        {
+            "actions": [],
+            "required_tools": [],
+            "need_rewrite_clarification": True,
+            "continue_search": False,
+            "status": "retry_required",
+            "missing_evidence": reason,
+            "source": source,
+        }
+    )
+    packet = StructuredTaskPacket(
+        prompt_version=prompt_version,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        case_id=case_id,
+        inventory_snapshot_id=inventory_snapshot_id,
+        candidate_set_id=candidate_set_id,
+        response_strategy=ResponseStrategy.RETRY,
+        tasks=[
+            TaskAtom(
+                task_id="task-llm1-retry-required",
+                task_type="llm1_retry_required",
+                user_text=str(safe_artifact_payload(content) or ""),
+                constraints={"llm1_status": "retry_required"},
+                response_strategy=ResponseStrategy.RETRY,
+                required_tools=[],
+            )
+        ],
+        rewritten_query=str(safe_artifact_payload(content) or ""),
+    )
+    legacy_diff = _legacy_diff(
+        packet=packet,
+        tool_plan=tool_plan,
+        candidate_binding=candidate_binding,
+        legacy_rewrite=legacy_rewrite,
+        legacy_planner=legacy_planner,
+    )
+    packet.legacy_unknown_fields = safe_artifact_payload(
+        {
+            "llm1_production": {
+                "source": source,
+                "mode": "production",
+                "status": "retry_required",
+                "retry_reason": reason,
+                "legacy_debug_only": True,
+                "tool_plan": tool_plan,
+                "candidate_binding": candidate_binding,
+                "legacy_diff": legacy_diff,
+                "prompt_artifact": prompt_artifact,
+            }
+        }
+    )
+    return KfTaskPacketShadowBuild(
+        packet=packet,
+        tool_plan=tool_plan,
+        candidate_binding=candidate_binding,
+        legacy_diff=safe_artifact_payload(legacy_diff),
+        prompt_artifact=prompt_artifact,
+        raw_llm1_output=raw_output,
+        source=source,
+    )
+
+
+def _retry_candidate_binding(candidate_context: dict[str, Any]) -> dict[str, Any]:
+    candidate_count = int(candidate_context.get("candidate_count") or 0)
+    candidate_set_id = str(candidate_context.get("candidate_set_id") or "")
     return safe_artifact_payload(
         {
-            "prompt_version": prompt_version,
-            "content": _clip(safe_artifact_payload(content), 1000),
-            "raw_dialog_context": _clip_json(safe_artifact_payload(raw_dialog_context or []), 2500),
-            "structured_memory": _clip_json(safe_artifact_payload(structured_memory or {}), 2500),
-            "inventory_index": _clip_json(safe_artifact_payload(inventory_index or {}), 2500),
-            "candidate_set": {
-                "candidate_set_id": str((candidate_context or {}).get("candidate_set_id") or ""),
-                "candidate_count": int((candidate_context or {}).get("candidate_count") or 0),
-                "candidates": (candidate_context or {}).get("candidates", [])[:10],
-            },
-            "legacy_rewrite_summary": _legacy_summary(legacy_rewrite or {}),
-            "legacy_planner_summary": _legacy_summary(legacy_planner or {}),
+            "status": "not_requested" if candidate_count else "no_candidate_set",
+            "selected_candidate_numbers": [],
+            "dropped_candidate_numbers": [],
+            "candidate_set_id": candidate_set_id,
+            "candidate_count": candidate_count,
+            "bound_by": "retry_required_without_binding",
         }
     )
 

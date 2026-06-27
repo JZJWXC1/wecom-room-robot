@@ -21,6 +21,51 @@ def test_build_kf_task_packet_production_missing_key_is_hard_gate(monkeypatch) -
         raise AssertionError("production LLM1 must not fall back to legacy packet when rewrite key is missing")
 
 
+def test_build_kf_task_packet_production_prompt_excludes_legacy_summary(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "llm_rewrite_provider", "dashscope")
+    monkeypatch.setattr(settings, "dashscope_api_key", "test-key")
+    monkeypatch.setattr(settings, "dashscope_rewrite_model", "rewrite-model")
+
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=(
+                                '{"rewritten_query":"你好",'
+                                '"task_atoms":[{"task_id":"task-1-reply","task_type":"reply_text"}],'
+                                '"tool_plan":{"actions":["generate_reply"]}}'
+                            )
+                        )
+                    )
+                ]
+            )
+
+    generator = ReplyGenerator(rule_knowledge=SimpleNamespace(retrieve_text=lambda **kwargs: "无"))
+    generator._client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    packet = asyncio.run(
+        generator.build_kf_task_packet(
+            content="你好",
+            legacy_rewrite={"rewritten_query": "LEGACY_ONLY_REWRITE"},
+            legacy_planner={"actions": ["search_inventory", "send_video"], "reason": "LEGACY_ONLY_PLAN"},
+            mode="production",
+        )
+    )
+    prompt = captured["messages"][1]["content"]
+
+    assert packet.legacy_unknown_fields["llm1_production"]["prompt_artifact"]["source"] == "production"
+    assert "脱敏 production 输入" in prompt
+    assert "legacy_rewrite_summary" not in prompt
+    assert "legacy_planner_summary" not in prompt
+    assert "LEGACY_ONLY_REWRITE" not in prompt
+    assert "LEGACY_ONLY_PLAN" not in prompt
+
+
 def test_rewrite_kf_message_returns_orchestrator_tool_plan_contract(monkeypatch) -> None:
     monkeypatch.setattr(settings, "dashscope_api_key", "test-key")
     monkeypatch.setattr(settings, "dashscope_rewrite_model", "rewrite-model")

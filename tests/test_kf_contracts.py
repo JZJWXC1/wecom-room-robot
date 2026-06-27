@@ -239,6 +239,12 @@ def test_evidence_claim_and_send_action_contracts_share_trace_ids() -> None:
     assert payload["selfcheck_profile"] == "contract.selfcheck.v1"
 
 
+def test_llm2_contract_docs_define_program_owned_send_actions() -> None:
+    assert "Evidence-backed" in (Claim.__doc__ or "")
+    assert "Program-owned outbound action" in (SendAction.__doc__ or "")
+    assert "existing program-owned send action" in (ActionCaption.__doc__ or "")
+
+
 def test_sensitive_password_and_phone_are_redacted_from_safe_outputs_and_repr() -> None:
     package = PreparedOutboundPackage(
         conversation_id="conv-secret",

@@ -157,3 +157,51 @@ def test_llm1_shadow_records_legacy_diff_without_changing_packet_output() -> Non
     assert result.tool_plan["actions"] == ["send_inventory_sheet"]
     assert result.legacy_diff["status"] == "diff"
     assert "tool_actions" in result.legacy_diff["changed_fields"]
+
+
+def test_llm1_production_prompt_artifact_excludes_legacy_summary_and_decisions() -> None:
+    result = build_kf_task_packet_shadow(
+        {
+            "rewritten_query": "只做普通回复",
+            "task_atoms": [{"task_id": "task-1-reply", "task_type": "reply_text"}],
+            "tool_plan": {"actions": ["generate_reply"]},
+        },
+        content="你好",
+        legacy_rewrite={"rewritten_query": "legacy 第2套视频", "candidate_numbers": [2]},
+        legacy_planner={"actions": ["search_inventory", "send_video", "generate_reply"]},
+        source_label="llm1_production",
+        mode="production",
+    )
+    metadata = result.packet.legacy_unknown_fields["llm1_production"]
+    prompt_artifact = metadata["prompt_artifact"]
+
+    assert prompt_artifact["source"] == "production"
+    assert "legacy_rewrite_summary" not in prompt_artifact
+    assert "legacy_planner_summary" not in prompt_artifact
+    assert result.tool_plan["actions"] == ["generate_reply"]
+    assert result.candidate_binding["selected_candidate_numbers"] == []
+    assert metadata["legacy_debug_only"] is True
+
+
+def test_llm1_production_invalid_packet_returns_retry_required_not_legacy_fallback() -> None:
+    result = build_kf_task_packet_shadow(
+        {
+            "rewritten_query": "第1套视频",
+            "tool_plan": {"actions": ["search_inventory", "send_video", "generate_reply"]},
+        },
+        content="第1套视频",
+        legacy_rewrite={"candidate_numbers": [1]},
+        legacy_planner={"actions": ["search_inventory", "send_video", "generate_reply"]},
+        source_label="llm1_production",
+        mode="production",
+    )
+    packet = result.packet
+    metadata = packet.legacy_unknown_fields["llm1_production"]
+
+    assert packet.response_strategy == ResponseStrategy.RETRY
+    assert packet.tasks[0].task_type == "llm1_retry_required"
+    assert result.source == "llm1_production"
+    assert result.tool_plan["status"] == "retry_required"
+    assert result.tool_plan["actions"] == []
+    assert metadata["status"] == "retry_required"
+    assert "legacy_shadow_fallback" not in json.dumps(result.to_safe_dict(), ensure_ascii=False)
