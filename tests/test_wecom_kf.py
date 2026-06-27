@@ -7743,6 +7743,49 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["target_rows"], [])
         self.assertEqual(evidence["selection_error"]["reason"], "missing_current_candidate_set")
 
+    async def test_in_range_selected_indices_without_candidates_do_not_bind_current_search_rows(self) -> None:
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return [
+                    {"\u5c0f\u533a": "\u534e\u4e30\u6b23\u82d1", "\u623f\u53f7": "14-2-901"},
+                    {"\u5c0f\u533a": "\u77f3\u6865\u94ed\u82d1", "\u623f\u53f7": "6-1102"},
+                ]
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_image", "compact_listing", "generate_reply", "explain_missing_media"],
+                content="1\u548c2\u7684\u56fe\u7247\u4e5f\u53d1\u6211\u3002",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "1\u548c2\u7684\u56fe\u7247\u4e5f\u53d1\u6211\u3002",
+                    "rewritten_query": "\u53d1\u9001\u524d\u4e24\u5957\u5019\u9009\u623f\u6e90\u7684\u56fe\u7247",
+                    "constraint_proof": {
+                        "area": "\u77f3\u6865\u8857\u9053\n\u534e\u4e30\n\u77f3\u6865\n\u6c38\u4f73\n\u534a\u5c71",
+                        "budget_range": [4500, 5500],
+                        "layout": "\u4e24\u5ba4\u4e00\u5385",
+                        "selected_indices": [1, 2],
+                        "wants_image": True,
+                    },
+                    "structured_task": {
+                        "original_text": "1\u548c2\u7684\u56fe\u7247\u4e5f\u53d1\u6211\u3002",
+                        "tool_requirements": {"needs_image": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(evidence["inventory_rows"], [])
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertEqual(evidence["image_rows"], [])
+        self.assertEqual(evidence["image_paths"], [])
+        self.assertEqual(evidence["selection_error"]["reason"], "missing_current_candidate_set")
+        self.assertEqual(evidence["selection_error"]["requested_indices"], [1])
+        self.assertEqual(evidence["selection_error"]["candidate_count"], 0)
+
     async def test_selected_indices_out_of_range_candidate_context_blocks_fallback(self) -> None:
         row = {"小区": "东新园", "房号": "8-1201"}
 

@@ -3955,6 +3955,10 @@ def _target_rows_from_understanding(
             if candidate_room_ref_rows:
                 return candidate_room_ref_rows
             return []
+    elif explicit_room_refs:
+        matched_by_room_ref = _target_rows_from_room_refs(understanding, search_rows)
+        if matched_by_room_ref:
+            return matched_by_room_ref
 
     confirmed = _confirmed_row(context)
     if (
@@ -3973,6 +3977,8 @@ def _target_rows_from_understanding(
         for item in proof.get("communities") or []
         if normalize_search_text(str(item))
     }
+    if selected and not candidates:
+        return []
     if selected and search_rows and proof_communities:
         current_search_rows = [
             row
@@ -5665,6 +5671,18 @@ async def _execute_tools(
     )
     candidate_rows_for_selection = _candidate_rows(context)
     selected_indices = _selected_indices_from_understanding(understanding, selection_query_text)
+    selection_has_direct_room_ref = bool(
+        proof.get("room_refs") or _room_refs_from_text(selection_query_text)
+    )
+    selection_has_prior_context = bool(
+        candidate_rows_for_selection or pending_video or _confirmed_row(context)
+    )
+    missing_candidate_selection_context = bool(
+        selected_indices
+        and not selection_has_prior_context
+        and not selection_has_direct_room_ref
+        and not original_video_target_error
+    )
     invalid_candidate_selection = bool(
         selected_indices
         and candidate_rows_for_selection
@@ -5673,16 +5691,10 @@ async def _execute_tools(
     )
     invalid_search_selection = bool(
         selected_indices
+        and not missing_candidate_selection_context
         and not candidate_rows_for_selection
         and rows
         and any(index > len(rows) for index in selected_indices)
-    )
-    missing_candidate_selection_context = bool(
-        selected_indices
-        and not candidate_rows_for_selection
-        and not target_rows
-        and not rows
-        and not original_video_target_error
     )
     if invalid_candidate_selection or invalid_search_selection:
         selection_rows = candidate_rows_for_selection or rows
@@ -5696,6 +5708,10 @@ async def _execute_tools(
         rows = []
         target_rows = []
         evidence["inventory_rows"] = []
+        evidence["image_rows"] = []
+        evidence["video_rows"] = []
+        evidence["image_paths"] = []
+        evidence["video_paths"] = []
     elif missing_candidate_selection_context:
         evidence["selection_error"] = {
             "requested_indices": selected_indices,
@@ -5705,6 +5721,10 @@ async def _execute_tools(
         }
         rows = []
         evidence["inventory_rows"] = []
+        evidence["image_rows"] = []
+        evidence["video_rows"] = []
+        evidence["image_paths"] = []
+        evidence["video_paths"] = []
     if (
         not target_rows
         and not evidence.get("selection_error")
