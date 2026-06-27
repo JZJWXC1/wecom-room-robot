@@ -687,15 +687,53 @@ class SendReceipt(ContractModel):
     action_id: str
     action_type: str
     status: str
+    receipt_id: str = ""
+    idempotency_key: str = ""
+    duplicate_of: str = ""
+    provider: str = "wecom_kf"
+    attempt: int = 1
     sent_at: str = ""
     provider_message_id: str = ""
     error_code: str = ""
     error_message: str = ""
+    send_result: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator(
+        "action_id",
+        "action_type",
+        "status",
+        "receipt_id",
+        "idempotency_key",
+        "duplicate_of",
+        "provider",
+        "sent_at",
+        "provider_message_id",
+        "error_code",
+        mode="before",
+    )
+    @classmethod
+    def _safe_receipt_text(cls, value: Any) -> str:
+        return _redact_text("" if value is None else str(value).strip())
+
+    @field_validator("attempt", mode="before")
+    @classmethod
+    def _coerce_attempt(cls, value: Any) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = 1
+        return max(1, number)
 
     @field_validator("error_message", mode="before")
     @classmethod
     def _safe_error_message(cls, value: Any) -> str:
         return _redact_text("" if value is None else str(value))
+
+    @field_validator("send_result", "metadata", mode="before")
+    @classmethod
+    def _safe_receipt_payload(cls, value: Any) -> dict[str, Any]:
+        return _redact_sensitive(dict(value or {}))
 
 
 def _redact_sensitive(value: Any, *, key: str = "") -> Any:

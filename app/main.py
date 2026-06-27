@@ -8,7 +8,7 @@ import re
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
@@ -23,6 +23,7 @@ from app.services import (
     kf_context_memory,
     kf_orchestrator_flow,
     kf_orchestrator_shadow,
+    kf_send_receipts,
     kf_turn_flow,
 )
 from app.services.config_check import get_config_status
@@ -9130,11 +9131,132 @@ async def _await_if_needed(value: Any) -> Any:
     return value
 
 
-async def _send_text(open_kfid: str, external_userid: str, text: str) -> None:
+async def _send_text(open_kfid: str, external_userid: str, text: str) -> Any:
     text = text.strip()
     if not text:
-        return
-    await _await_if_needed(wecom_kf.send_text(open_kfid, external_userid, text))
+        return None
+    return await _await_if_needed(wecom_kf.send_text(open_kfid, external_userid, text))
+
+
+async def _execute_send_action_once(
+    *,
+    context: dict[str, Any],
+    action: Any,
+    send_call: Callable[[], Any],
+    receipt_metadata: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+    idempotency_key = kf_send_receipts.build_idempotency_key(action)
+    existing = kf_send_receipts.find_successful_receipt(context, idempotency_key)
+    if existing:
+        duplicate = kf_send_receipts.build_duplicate_receipt(action, existing, idempotency_key=idempotency_key)
+        context = kf_send_receipts.append_receipt(context, duplicate)
+        return context, False, duplicate.to_safe_dict()
+    try:
+        provider_result = await _await_if_needed(send_call())
+    except Exception as exc:
+        failed = kf_send_receipts.build_failed_receipt(
+            action,
+            idempotency_key=idempotency_key,
+            error=exc,
+            metadata=receipt_metadata,
+        )
+        context = kf_send_receipts.append_receipt(context, failed)
+        raise
+    sent = kf_send_receipts.build_sent_receipt(
+        action,
+        idempotency_key=idempotency_key,
+        provider_result=provider_result if isinstance(provider_result, dict) else {},
+        metadata=receipt_metadata,
+    )
+    context = kf_send_receipts.append_receipt(context, sent)
+    return context, True, sent.to_safe_dict()
+
+
+def _send_action_for_text(
+    *,
+    open_kfid: str,
+    external_userid: str,
+    context: dict[str, Any],
+    text: str,
+    action_id: str,
+    text_role: str,
+    msgids: list[str] | None = None,
+) -> Any:
+    normalized = text.strip()
+    digest = kf_send_receipts.text_hash(normalized)
+    return kf_send_receipts.build_send_action(
+        open_kfid=open_kfid,
+        external_userid=external_userid,
+        context=context,
+        msgids=msgids,
+        action_id=action_id,
+        action_type="text",
+        payload={"text_hash": digest, "text_role": text_role, "text_length": len(normalized)},
+        metadata={"text_hash": digest, "text_role": text_role},
+    )
+
+
+def _send_action_for_path(
+    *,
+    open_kfid: str,
+    external_userid: str,
+    context: dict[str, Any],
+    path: Path,
+    action_id: str,
+    action_type: str,
+    msgids: list[str] | None = None,
+    extra_payload: dict[str, Any] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+) -> Any:
+    digest = kf_send_receipts.material_hash(path)
+    return kf_send_receipts.build_send_action(
+        open_kfid=open_kfid,
+        external_userid=external_userid,
+        context=context,
+        msgids=msgids,
+        action_id=action_id,
+        action_type=action_type,
+        payload={
+            "material_hash": digest,
+            "file_name": path.name,
+            **dict(extra_payload or {}),
+        },
+        metadata={
+            "material_hash": digest,
+            "file_name": path.name,
+            **dict(extra_metadata or {}),
+        },
+    )
+
+
+async def _send_text_with_receipt(
+    *,
+    open_kfid: str,
+    external_userid: str,
+    context: dict[str, Any],
+    text: str,
+    action_id: str,
+    text_role: str,
+    msgids: list[str] | None = None,
+) -> tuple[dict[str, Any], bool, dict[str, Any]]:
+    text = text.strip()
+    if not text:
+        return context, False, {}
+    action = _send_action_for_text(
+        open_kfid=open_kfid,
+        external_userid=external_userid,
+        context=context,
+        text=text,
+        action_id=action_id,
+        text_role=text_role,
+        msgids=msgids,
+    )
+    return await _execute_send_action_once(
+        context=context,
+        action=action,
+        send_call=lambda: _send_text(open_kfid, external_userid, text),
+        receipt_metadata={"text_role": text_role},
+    )
 
 
 def _build_orchestrator_shadow_artifact(
@@ -9215,6 +9337,125 @@ async def _send_videos(
     return sent
 
 
+async def _send_images_with_receipts(
+    *,
+    open_kfid: str,
+    external_userid: str,
+    context: dict[str, Any],
+    paths: list[str],
+    msgids: list[str] | None = None,
+    action_prefix: str = "send-image",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    sent: list[dict[str, Any]] = []
+    for index, raw_path in enumerate(paths, start=1):
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        action = _send_action_for_path(
+            open_kfid=open_kfid,
+            external_userid=external_userid,
+            context=context,
+            path=path,
+            action_id=f"{action_prefix}-{index}-{kf_send_receipts.material_hash(path)[:12]}",
+            action_type="image",
+            msgids=msgids,
+            extra_payload={"position": index},
+            extra_metadata={"position": index},
+        )
+        try:
+            context, did_send, _receipt = await _execute_send_action_once(
+                context=context,
+                action=action,
+                send_call=lambda path=path: wecom_kf.send_image(open_kfid, external_userid, path),
+                receipt_metadata={"position": index},
+            )
+            if did_send:
+                sent.append({"type": "image", "path": str(path), "count": 1})
+        except WeComKfSendLimitError:
+            raise
+        except Exception as exc:
+            logger.exception("send image failed: %s", exc)
+            sent.append({"type": "image_failed", "path": str(path), "reason": str(exc)})
+    return sent, context
+
+
+async def _send_videos_with_receipts(
+    *,
+    open_kfid: str,
+    external_userid: str,
+    context: dict[str, Any],
+    paths: list[str],
+    rows: list[dict[str, Any]],
+    msgids: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    sent: list[dict[str, Any]] = []
+    for index, raw_path in enumerate(paths[:KF_VIDEO_SEND_LIMIT], start=1):
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        label = _normalize_customer_visible_reply_text_before_selfcheck(
+            _row_label(rows[index - 1]) if index <= len(rows) else path.stem
+        )
+        caption = f"这是{label}的视频。"
+        action = _send_action_for_path(
+            open_kfid=open_kfid,
+            external_userid=external_userid,
+            context=context,
+            path=path,
+            action_id=f"send-video-{index}-{kf_send_receipts.material_hash(path)[:12]}",
+            action_type="video",
+            msgids=msgids,
+            extra_payload={
+                "position": index,
+                "caption_hash": kf_send_receipts.text_hash(caption),
+            },
+            extra_metadata={
+                "position": index,
+                "caption_hash": kf_send_receipts.text_hash(caption),
+                "transaction": "caption_then_video",
+            },
+        )
+        idempotency_key = kf_send_receipts.build_idempotency_key(action)
+        existing = kf_send_receipts.find_successful_receipt(context, idempotency_key)
+        if existing:
+            duplicate = kf_send_receipts.build_duplicate_receipt(action, existing, idempotency_key=idempotency_key)
+            context = kf_send_receipts.append_receipt(context, duplicate)
+            continue
+        caption_sent = False
+        try:
+            await _send_text(open_kfid, external_userid, caption)
+            caption_sent = True
+            provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, path))
+            receipt = kf_send_receipts.build_sent_receipt(
+                action,
+                idempotency_key=idempotency_key,
+                provider_result=provider_result if isinstance(provider_result, dict) else {},
+                metadata={"position": index, "caption_sent": caption_sent},
+            )
+            context = kf_send_receipts.append_receipt(context, receipt)
+            sent.append({"type": "video", "path": str(path), "room": label, "count": 1})
+        except WeComKfSendLimitError as exc:
+            receipt = kf_send_receipts.build_failed_receipt(
+                action,
+                idempotency_key=idempotency_key,
+                error=exc,
+                metadata={"position": index, "caption_sent": caption_sent},
+            )
+            context = kf_send_receipts.append_receipt(context, receipt)
+            raise
+        except Exception as exc:
+            receipt = kf_send_receipts.build_failed_receipt(
+                action,
+                idempotency_key=idempotency_key,
+                error=exc,
+                metadata={"position": index, "caption_sent": caption_sent},
+            )
+            context = kf_send_receipts.append_receipt(context, receipt)
+            logger.exception("send video failed: %s", exc)
+            sent.append({"type": "video_failed", "path": str(path), "room": label, "reason": str(exc)})
+    return sent, context
+
+
 def _candidate_state_summary(context: dict[str, Any]) -> dict[str, Any]:
     candidate_set = kf_context_memory.normalize_last_candidate_set(context.get("last_candidate_set"))
     confirmed = kf_context_memory.normalize_confirmed_room_context(context.get("confirmed_room"))
@@ -9250,6 +9491,7 @@ async def _send_final_actions(
     context: dict[str, Any],
     final_reply: str,
     tool_evidence: dict[str, Any],
+    msgids: list[str] | None = None,
 ) -> dict[str, Any]:
     sent_actions: list[dict[str, Any]] = []
     final_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_reply)
@@ -9260,8 +9502,16 @@ async def _send_final_actions(
         final_reply,
         tool_evidence,
     )
-    await _send_text(open_kfid, external_userid, final_reply)
-    if final_reply:
+    context, did_send_text, _receipt = await _send_text_with_receipt(
+        open_kfid=open_kfid,
+        external_userid=external_userid,
+        context=context,
+        text=final_reply,
+        action_id="send-text-final-reply",
+        text_role="final_reply",
+        msgids=msgids,
+    )
+    if final_reply and did_send_text:
         sent_actions.append({"type": "text", "count": 1})
 
     if suppress_actions:
@@ -9281,31 +9531,57 @@ async def _send_final_actions(
         and inventory_explanation not in final_reply
         and "房源表发" not in final_reply
     ):
-        await _send_text(open_kfid, external_userid, inventory_explanation)
-        sent_actions.append({"type": "text", "subtype": "inventory_explanation", "count": 1})
+        context, did_send_inventory_text, _receipt = await _send_text_with_receipt(
+            open_kfid=open_kfid,
+            external_userid=external_userid,
+            context=context,
+            text=inventory_explanation,
+            action_id="send-text-inventory-explanation",
+            text_role="inventory_explanation",
+            msgids=msgids,
+        )
+        if did_send_inventory_text:
+            sent_actions.append({"type": "text", "subtype": "inventory_explanation", "count": 1})
 
-    image_actions = await _send_images(
-        open_kfid,
-        external_userid,
-        list(tool_evidence.get("inventory_images") or []),
+    image_actions, context = await _send_images_with_receipts(
+        open_kfid=open_kfid,
+        external_userid=external_userid,
+        context=context,
+        paths=list(tool_evidence.get("inventory_images") or []),
+        msgids=msgids,
+        action_prefix="send-inventory-image",
     )
     sent_actions.extend(image_actions)
 
-    for explanation in outbound_package.get("image_explanations") or []:
-        await _send_text(open_kfid, external_userid, str(explanation))
-        sent_actions.append({"type": "text", "subtype": "image_explanation", "count": 1})
-    image_actions = await _send_images(
-        open_kfid,
-        external_userid,
-        list(tool_evidence.get("image_paths") or []),
+    for index, explanation in enumerate(outbound_package.get("image_explanations") or [], start=1):
+        context, did_send_image_text, _receipt = await _send_text_with_receipt(
+            open_kfid=open_kfid,
+            external_userid=external_userid,
+            context=context,
+            text=str(explanation),
+            action_id=f"send-text-image-explanation-{index}",
+            text_role="image_explanation",
+            msgids=msgids,
+        )
+        if did_send_image_text:
+            sent_actions.append({"type": "text", "subtype": "image_explanation", "count": 1})
+    image_actions, context = await _send_images_with_receipts(
+        open_kfid=open_kfid,
+        external_userid=external_userid,
+        context=context,
+        paths=list(tool_evidence.get("image_paths") or []),
+        msgids=msgids,
+        action_prefix="send-room-image",
     )
     sent_actions.extend(image_actions)
 
-    video_actions = await _send_videos(
-        open_kfid,
-        external_userid,
-        list(tool_evidence.get("video_paths") or []),
-        [row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)],
+    video_actions, context = await _send_videos_with_receipts(
+        open_kfid=open_kfid,
+        external_userid=external_userid,
+        context=context,
+        paths=list(tool_evidence.get("video_paths") or []),
+        rows=[row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)],
+        msgids=msgids,
     )
     sent_actions.extend(video_actions)
 
@@ -9459,13 +9735,22 @@ async def _process_text_turn(
                 final_reply=reply,
             )
             with timer.stage("send"):
-                await _send_text(open_kfid, external_userid, reply)
-            context = kf_context_memory.append_dialog_message(context, role="assistant", content=reply) or context
+                context, did_send_clarification, _receipt = await _send_text_with_receipt(
+                    open_kfid=open_kfid,
+                    external_userid=external_userid,
+                    context=context,
+                    text=reply,
+                    action_id="send-text-clarification",
+                    text_role="clarification",
+                    msgids=msgids,
+                )
+            if did_send_clarification:
+                context = kf_context_memory.append_dialog_message(context, role="assistant", content=reply) or context
             context = kf_context_memory.record_structured_assistant_output(
                 context,
                 draft_reply=str(clarification_result.get("draft_reply") or reply),
                 final_reply=reply,
-                sent_action={"type": "text", "count": 1},
+                sent_action={"type": "text", "count": 1} if did_send_clarification else None,
                 candidate_state=_candidate_state_summary(context),
             ) or context
             _save_context(open_kfid, external_userid, context)
@@ -9546,13 +9831,22 @@ async def _process_text_turn(
                         final_reply=reply,
                     )
                     with timer.stage("send"):
-                        await _send_text(open_kfid, external_userid, reply)
-                    context = kf_context_memory.append_dialog_message(context, role="assistant", content=reply) or context
+                        context, did_send_clarification, _receipt = await _send_text_with_receipt(
+                            open_kfid=open_kfid,
+                            external_userid=external_userid,
+                            context=context,
+                            text=reply,
+                            action_id="send-text-clarification",
+                            text_role="clarification",
+                            msgids=msgids,
+                        )
+                    if did_send_clarification:
+                        context = kf_context_memory.append_dialog_message(context, role="assistant", content=reply) or context
                     context = kf_context_memory.record_structured_assistant_output(
                         context,
                         draft_reply=str(clarification_result.get("draft_reply") or reply),
                         final_reply=reply,
-                        sent_action={"type": "text", "count": 1},
+                        sent_action={"type": "text", "count": 1} if did_send_clarification else None,
                         candidate_state=_candidate_state_summary(context),
                     ) or context
                     _save_context(open_kfid, external_userid, context)
@@ -9673,6 +9967,7 @@ async def _process_text_turn(
                 context=context,
                 final_reply=final_reply,
                 tool_evidence=tool_evidence,
+                msgids=msgids,
             )
         context = send_result["context"]
         context = kf_context_memory.append_dialog_message(context, role="assistant", content=final_reply) or context

@@ -11629,6 +11629,110 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fake.sent, [("kf", "wm", "你好")])
 
+    async def test_send_final_actions_skips_duplicate_text_for_same_msgid(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0, "msgid": f"provider-{len(self.texts)}"}
+
+        context = {
+            "structured_memory": {
+                "current_turn_id": "turn-1",
+                "turn_records": [{"turn_id": "turn-1", "msgids": ["msg-dup"]}],
+            }
+        }
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        main.wecom_kf = fake
+        try:
+            first = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context=context,
+                final_reply="这条我需要人工再确认一下，避免发错资料。",
+                tool_evidence={"suppress_actions": True},
+                msgids=["msg-dup"],
+            )
+            second = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context=first["context"],
+                final_reply="这条我需要人工再确认一下，避免发错资料。",
+                tool_evidence={"suppress_actions": True},
+                msgids=["msg-dup"],
+            )
+        finally:
+            main.wecom_kf = original_wecom
+
+        self.assertEqual(fake.texts, ["这条我需要人工再确认一下，避免发错资料。"])
+        self.assertEqual(first["sent_actions"], [{"type": "text", "count": 1}])
+        self.assertEqual(second["sent_actions"], [])
+        statuses = [item["status"] for item in second["context"]["send_receipts"]["receipts"]]
+        self.assertEqual(statuses, ["sent", "skipped_duplicate"])
+
+    async def test_send_final_actions_skips_duplicate_video_transaction_for_same_msgid(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+                self.videos: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+            def send_video(self, open_kfid: str, external_userid: str, media_id: str, title: str = "") -> dict:
+                self.videos.append(str(media_id))
+                return {"errcode": 0, "msgid": f"video-{len(self.videos)}"}
+
+        context = {
+            "structured_memory": {
+                "current_turn_id": "turn-1",
+                "turn_records": [{"turn_id": "turn-1", "msgids": ["msg-video"]}],
+            }
+        }
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        main.wecom_kf = fake
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                video_path = str(Path(directory) / "room.mp4")
+                Path(video_path).write_bytes(b"video")
+                first = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=context,
+                    final_reply="",
+                    tool_evidence={
+                        "video_paths": [video_path],
+                        "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                    },
+                    msgids=["msg-video"],
+                )
+                second = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=first["context"],
+                    final_reply="",
+                    tool_evidence={
+                        "video_paths": [video_path],
+                        "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                    },
+                    msgids=["msg-video"],
+                )
+        finally:
+            main.wecom_kf = original_wecom
+
+        self.assertEqual(len(fake.texts), 1)
+        self.assertIn("视频", fake.texts[0])
+        self.assertEqual(fake.videos, [video_path])
+        self.assertEqual(len(first["sent_actions"]), 1)
+        self.assertEqual(second["sent_actions"], [])
+        statuses = [item["status"] for item in second["context"]["send_receipts"]["receipts"]]
+        self.assertEqual(statuses, ["sent", "skipped_duplicate"])
+
 
 if __name__ == "__main__":
     unittest.main()

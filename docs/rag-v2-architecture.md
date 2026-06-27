@@ -10,6 +10,7 @@
 | Planner/工具层 | `ToolEvidenceBundle`、`EvidenceItem`、`CandidateSet` | 读取房源、素材和受控事实，所有房源事实必须带 evidence 与 snapshot 追踪 |
 | LLM2 待发送包 | `PreparedOutboundPackage`、`Claim`、`ActionCaption`、`SendAction` | 只组合 legacy 文本和工具证据；不自行决定视频、图片、密码或房源表目标 |
 | 自检回流 | `self_review`、`selfcheck_profile`、`RetryPacket` | 校验 claims、证据引用、敏感字段和发送动作，失败时生成重试输入 |
+| 发送提交 | `SendReceipt`、`idempotency_key` | 发送前按会话、回调 msgid、动作、素材/文本摘要生成幂等键；成功、失败、重复跳过都写入脱敏回执 |
 
 ## M4A LLM1 Shadow
 
@@ -97,9 +98,19 @@
 
 真实密码和受控 viewing 文本仍只能在专用工具边界内使用，不进入通用 `Claim.value`、`EvidenceItem.field_values`、`PreparedOutboundPackage.reply_text` 的安全输出。
 
-## 本轮不变项
+## M6 SendReceipt 幂等发送
 
-- 不改 `app/main.py`。
+`app/services/kf_send_receipts.py` 定义发送阶段的本地账本：
+
+- `build_send_action()` 从当前结构化 turn、回调 `msgids`、动作类型、文本/素材摘要生成 SendAction。
+- `build_idempotency_key()` 把 `conversation_id`、`turn_id/msgids`、`action_id`、`action_type`、`listing_id`、`evidence_id`、`inventory_snapshot_id`、`candidate_set_id` 和 payload 摘要绑定成稳定键。
+- `SendReceipt` 记录 `sent`、`failed`、`skipped_duplicate`，并通过契约序列化脱敏 provider result、错误信息和 metadata。
+- `app/main.py::_send_final_actions` 已接入文本、房源表图片、房间图片、视频发送回执；视频说明和视频文件共用同一个视频动作幂等键，重复回调命中时两者一起跳过。
+
+当前账本存入客服会话 context，能覆盖同一会话上下文内的重复回调和重复发送。它还不是跨进程持久化发送事务；release 前仍需用历史失败回放和重复回调故障注入验证 context 持久化、进程重启、企微返回不确定时的行为。
+
+## Shadow 阶段不变项
+
 - 不改旧 production LLM 方法语义；`app/services/llm.py` 只新增显式 LLM1/LLM2 shadow methods。
 - 不改变客户可见回复。
 - 不改变素材发送决策。
