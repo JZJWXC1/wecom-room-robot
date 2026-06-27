@@ -518,7 +518,7 @@ def test_same_turn_source_hash_and_decision_id_are_stable_across_reads(tmp_path:
     assert {item.snapshot_id for item in combined} == {session.context.snapshot_id}
 
 
-def test_legacy_rewrite_index_preserves_existing_prompt_payload_for_parity(tmp_path: Path) -> None:
+def test_legacy_rewrite_index_exposes_only_safe_viewing_summary(tmp_path: Path) -> None:
     legacy_rewrite = run(
         router(tmp_path).start_turn(
             request_id="req-legacy-prompt",
@@ -526,7 +526,12 @@ def test_legacy_rewrite_index_preserves_existing_prompt_payload_for_parity(tmp_p
         ).get_rewrite_index()
     )
 
-    assert legacy_rewrite["room_index"][0]["viewing"] == SYNTHETIC_PASSWORD
+    payload = json.dumps(legacy_rewrite, ensure_ascii=False)
+
+    assert SYNTHETIC_PASSWORD not in payload
+    assert "viewing" not in legacy_rewrite["room_index"][0]
+    assert legacy_rewrite["room_index"][0]["has_password"] is True
+    assert legacy_rewrite["room_index"][0]["viewing_mode"] == "password_available"
 
 
 def test_legacy_provider_reuses_inventory_service_search_without_copying_query_engine(tmp_path: Path) -> None:

@@ -240,6 +240,7 @@ def test_legacy_rewrite_index_viewing_is_flagged_but_not_copied(tmp_path: Path) 
     rows = sample_rows(password=canary)
     snapshot, _ = build_snapshot(rows)
     _, legacy_index = write_legacy_index(tmp_path, rows)
+    legacy_index["room_index"][0]["viewing"] = canary
 
     report = reconcile_inventory_snapshot(
         legacy_rows=rows,
@@ -443,6 +444,7 @@ def test_rewrite_sensitive_viewing_warning_does_not_leak_value() -> None:
     rows = sample_rows(password="SECRET_CANARY_246810#")
     snapshot, _ = build_snapshot(rows)
     legacy_index = build_rewrite_inventory_index(rows)
+    legacy_index["room_index"][0]["viewing"] = "SECRET_CANARY_246810#"
 
     report = reconcile_inventory_snapshot(
         legacy_rows=rows,

@@ -183,7 +183,7 @@ def test_reconciliation_compares_blocking_warning_media_and_password_without_sec
     assert any(item["code"] == "field_mismatch.utility_summary" for item in report.field_mismatches)
     assert any(item["code"] == "field_mismatch.has_image" for item in report.field_mismatches)
     assert any(item["code"] == "field_mismatch.has_video" for item in report.field_mismatches)
-    assert any(item["code"] == "rewrite_index_sensitive_field_present" for item in report.rewrite_index_mismatches)
+    assert not any(item["code"] == "rewrite_index_sensitive_field_present" for item in report.rewrite_index_mismatches)
     assert all("source_row_ref" in item["listing"] for item in report.field_mismatches if "listing" in item)
     assert "0007#" not in text
     assert "0012#" not in text

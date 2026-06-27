@@ -6949,7 +6949,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     "户型分类": "两室一厅",
                     "押一付一": "3500",
                     "押二付一": "3200",
-                    "看房方式密码": "6.22空出 看房提前联系",
+                    "看房方式密码": "VIEWING_SECRET_CANARY_246810# 6.22空出 看房提前联系",
                     "备注": "水30/月，电1元/度",
                     "视频数量": "1",
                 }
@@ -6966,7 +6966,14 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(index["media_summary"]["unknown_image_status_count"], 1)
         self.assertEqual(index["viewing_summary"]["needs_contact"], 1)
         self.assertEqual(index["availability_summary"]["has_empty_out_hint"], 1)
+        self.assertNotIn("viewing", index["room_index"][0])
+        self.assertTrue(index["room_index"][0]["has_password"])
+        self.assertEqual(index["room_index"][0]["viewing_mode"], "password_available")
         self.assertTrue(index["room_index"][0]["viewing_summary"]["has_empty_out_hint"])
+        self.assertNotIn(
+            "VIEWING_SECRET_CANARY",
+            json.dumps(index, ensure_ascii=False),
+        )
 
     def test_rewrite_inventory_index_contains_similar_community_groups(self) -> None:
         index = build_rewrite_inventory_index(

@@ -43,7 +43,7 @@ from app.services.inventory_snapshot_models import (
 from app.services.inventory_snapshot_reader import SnapshotReader
 from app.services.inventory_snapshot_store import DEFAULT_SNAPSHOT_ROOT
 from app.services.region_inventory_constants import area_alias_index_entries
-from app.services.rewrite_inventory_index import load_rewrite_inventory_index
+from app.services.rewrite_inventory_index import load_rewrite_inventory_index, sanitize_rewrite_inventory_index
 
 
 class InventoryReadProvider(Protocol):
@@ -191,7 +191,7 @@ class LegacyInventoryReadProvider:
 
     async def get_rewrite_index(self, context: InventoryReadContext) -> dict[str, Any]:
         ensure_provider_context(self.source_kind, context)
-        return dict(self.rewrite_index_loader() or {})
+        return sanitize_rewrite_inventory_index(dict(self.rewrite_index_loader() or {}))
 
     async def get_inventory_metadata(self, context: InventoryReadContext) -> dict[str, Any]:
         ensure_provider_context(self.source_kind, context)

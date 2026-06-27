@@ -1,7 +1,7 @@
 {
   "source": "latest_inventory_rows",
-  "generated_at": "2026-06-27T02:22:31+08:00",
-  "signature": "168a9bfcb5813c3374fcd2b79a53745f848c42b79163184428d03f194d2f31fd",
+  "generated_at": "2026-06-27T13:08:19+08:00",
+  "signature": "52692caf0e05a5369765d95499a7ee3280fbcc39fb6dd7fe34c92e812558602a",
   "cache_meta": {
     "source": "qa_fixture",
     "source_detail": "tests/fixtures/qa/test_inventory_cache.csv",
@@ -672,12 +672,17 @@
       "layout_description": "一室一厅民用水电",
       "price_yayi": "4600",
       "price_yaer": "4300",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "民用水电"
@@ -691,12 +696,17 @@
       "layout_description": "一室一厅民用水电",
       "price_yayi": "4500",
       "price_yaer": "4200",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "民用水电"
@@ -710,12 +720,17 @@
       "layout_description": "两室一厅民用水电",
       "price_yayi": "3900",
       "price_yaer": "3700",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "民用水电"
@@ -729,12 +744,17 @@
       "layout_description": "三室一厅整租",
       "price_yayi": "5300",
       "price_yaer": "5000",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "民用水电"
@@ -748,12 +768,17 @@
       "layout_description": "三室两厅整租",
       "price_yayi": "5600",
       "price_yaer": "5300",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "民用水电"
@@ -767,12 +792,17 @@
       "layout_description": "三室一厅整租",
       "price_yayi": "5200",
       "price_yaer": "4900",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "民用水电"
@@ -786,12 +816,17 @@
       "layout_description": "一室一厅独立厨卫",
       "price_yayi": "1600",
       "price_yaer": "1400",
-      "viewing": "101004# 6.19空出",
+      "has_viewing_text": true,
+      "has_password": true,
+      "needs_contact": false,
+      "has_empty_out_hint": true,
+      "viewing_mode": "password_available",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": true,
         "needs_contact": false,
-        "has_empty_out_hint": true
+        "has_empty_out_hint": true,
+        "viewing_mode": "password_available"
       },
       "availability": "has_empty_out_hint",
       "utilities": "水30/月 电1元/度"
@@ -805,12 +840,17 @@
       "layout_description": "一室一厅独立厨卫",
       "price_yayi": "2600",
       "price_yaer": "2300",
-      "viewing": "101004# 看房提前联系",
+      "has_viewing_text": true,
+      "has_password": true,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "password_available",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": true,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "password_available"
       },
       "availability": "needs_contact",
       "utilities": "水30/月 电1元/度"
@@ -824,12 +864,17 @@
       "layout_description": "两室一厅整租",
       "price_yayi": "4800",
       "price_yaer": "4300",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "民用水电"
@@ -843,12 +888,17 @@
       "layout_description": "两室一厅整租",
       "price_yayi": "4900",
       "price_yaer": "4500",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "民用水电"
@@ -862,12 +912,17 @@
       "layout_description": "两室一厅朝南带阳台",
       "price_yayi": "4300",
       "price_yaer": "4000",
-      "viewing": "6.22空出 看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": true,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": true
+        "has_empty_out_hint": true,
+        "viewing_mode": "contact_required"
       },
       "availability": "has_empty_out_hint",
       "utilities": "水30/月 电1元/度"
@@ -881,12 +936,17 @@
       "layout_description": "两室一厅",
       "price_yayi": "4100",
       "price_yaer": "3900",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "民用水电"
@@ -900,12 +960,17 @@
       "layout_description": "一室一厅独立厨卫",
       "price_yayi": "1500",
       "price_yaer": "1400",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "水30/月 电1元/度"
@@ -919,12 +984,17 @@
       "layout_description": "单间独卫",
       "price_yayi": "1800",
       "price_yaer": "1600",
-      "viewing": "看房提前联系",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
       "utilities": "民用水电"

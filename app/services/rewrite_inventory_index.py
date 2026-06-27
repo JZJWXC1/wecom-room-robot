@@ -63,6 +63,21 @@ VIDEO_FIELD_ALIASES: tuple[str, ...] = (
     "has_video",
 )
 
+SENSITIVE_SIGNATURE_FIELDS = frozenset({"看房方式密码"})
+SENSITIVE_ROOM_INDEX_KEYS = frozenset(
+    {
+        "viewing",
+        "viewing_text",
+        "password",
+        "passcode",
+        "看房方式密码",
+        "看房密码",
+        "密码",
+        "门锁密码",
+    }
+)
+
+
 def row_value(row: dict[str, Any], canonical_field: str) -> str:
     for name in FIELD_ALIASES.get(canonical_field, (canonical_field,)):
         value = row.get(name)
@@ -101,7 +116,7 @@ def build_rewrite_inventory_index(
     canonical_rows = [canonical for _, canonical in row_pairs]
     media_summary = _media_summary(raw_rows, canonical_rows)
     payload_for_signature = {
-        "rows": canonical_rows,
+        "rows": _signature_rows(canonical_rows),
         "area_aliases": alias_entries,
         "field_semantics": FIELD_SEMANTICS,
         "media_summary": media_summary,
@@ -161,7 +176,7 @@ def load_rewrite_inventory_index(path: Path | None = None) -> dict[str, Any]:
         value = json.loads(target.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
-    return value if isinstance(value, dict) else {}
+    return sanitize_rewrite_inventory_index(value) if isinstance(value, dict) else {}
 
 
 def slice_rewrite_inventory_index(
@@ -258,6 +273,7 @@ def _room_index(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
         key = canonical_room_key(row)
         if not key:
             continue
+        viewing_summary = _viewing_room_summary(row)
         result.append(
             {
                 "key": key,
@@ -268,8 +284,12 @@ def _room_index(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
                 "layout_description": row.get("户型描述") or "",
                 "price_yayi": row.get("押一付一") or "",
                 "price_yaer": row.get("押二付一") or "",
-                "viewing": row.get("看房方式密码") or "",
-                "viewing_summary": _viewing_room_summary(row),
+                "has_viewing_text": bool(viewing_summary["has_viewing_text"]),
+                "has_password": bool(viewing_summary["has_password"]),
+                "needs_contact": bool(viewing_summary["needs_contact"]),
+                "has_empty_out_hint": bool(viewing_summary["has_empty_out_hint"]),
+                "viewing_mode": str(viewing_summary["viewing_mode"]),
+                "viewing_summary": viewing_summary,
                 "availability": _availability_status(row.get("看房方式密码") or ""),
                 "utilities": row.get("备注") or "",
             }
@@ -352,13 +372,30 @@ def _viewing_summary(rows: list[dict[str, str]]) -> dict[str, int]:
     return result
 
 
-def _viewing_room_summary(row: dict[str, str]) -> dict[str, bool]:
-    viewing = row.get("看房方式密码") or ""
+def _viewing_room_summary(row: dict[str, str]) -> dict[str, Any]:
+    return _viewing_text_summary(row.get("看房方式密码") or "")
+
+
+def _viewing_text_summary(viewing: Any) -> dict[str, Any]:
+    text = str(viewing or "").strip()
+    has_viewing_text = bool(text)
+    has_password = bool(re.search(r"(?<!\d)\d{3,8}#?(?!\d)", text))
+    needs_contact = any(word in text for word in ("提前联系", "联系", "预约", "看房提前", "密码不对"))
+    has_empty_out_hint = any(word in text for word in ("空出", "未空", "还没空", "转租", "待空"))
+    if not has_viewing_text:
+        viewing_mode = "unknown"
+    elif has_password:
+        viewing_mode = "password_available"
+    elif needs_contact:
+        viewing_mode = "contact_required"
+    else:
+        viewing_mode = "viewing_text_only"
     return {
-        "has_viewing_text": bool(viewing.strip()),
-        "has_password": bool(re.search(r"\d{3,8}#?", viewing)),
-        "needs_contact": any(word in viewing for word in ("提前联系", "联系", "预约", "看房提前", "密码不对")),
-        "has_empty_out_hint": any(word in viewing for word in ("空出", "未空", "还没空", "转租", "待空")),
+        "has_viewing_text": has_viewing_text,
+        "has_password": has_password,
+        "needs_contact": needs_contact,
+        "has_empty_out_hint": has_empty_out_hint,
+        "viewing_mode": viewing_mode,
     }
 
 
@@ -472,11 +509,11 @@ def _room_hits(index: dict[str, Any], query_text: str) -> list[dict[str, Any]]:
     hits: list[dict[str, Any]] = []
     for item in index.get("room_index") or []:
         if normalize_search_text(str(item.get("key") or "")) in query_text:
-            hits.append(item)
+            hits.append(_sanitize_room_index_item(item))
             continue
         room_no = normalize_search_text(str(item.get("room_no") or ""))
         if room_no and room_no in query_text:
-            hits.append(item)
+            hits.append(_sanitize_room_index_item(item))
     return hits
 
 
@@ -499,3 +536,74 @@ def _communities_for_areas(index: dict[str, Any], area_names: set[str]) -> list[
 
 def _limit_list(items: Any, *, limit: int) -> list[Any]:
     return list(items or [])[:limit]
+
+
+def _signature_rows(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        safe = {
+            field: value
+            for field, value in row.items()
+            if field not in SENSITIVE_SIGNATURE_FIELDS
+        }
+        viewing_summary = _viewing_room_summary(row)
+        safe["viewing_summary"] = viewing_summary
+        safe["availability"] = _availability_status(row.get("看房方式密码") or "")
+        safe["viewing_mode"] = str(viewing_summary["viewing_mode"])
+        result.append(safe)
+    return result
+
+
+def sanitize_rewrite_inventory_index(index: dict[str, Any]) -> dict[str, Any]:
+    result = dict(index)
+    room_index = result.get("room_index")
+    if isinstance(room_index, list):
+        result["room_index"] = [
+            _sanitize_room_index_item(item)
+            for item in room_index
+            if isinstance(item, dict)
+        ]
+    return result
+
+
+def _sanitize_room_index_item(item: dict[str, Any]) -> dict[str, Any]:
+    raw_viewing = _first_sensitive_viewing_value(item)
+    result = {
+        key: value
+        for key, value in item.items()
+        if str(key).strip() not in SENSITIVE_ROOM_INDEX_KEYS
+    }
+    summary = result.get("viewing_summary")
+    if not isinstance(summary, dict):
+        summary = _viewing_text_summary(raw_viewing)
+    else:
+        summary = dict(summary)
+        if "viewing_mode" not in summary:
+            summary["viewing_mode"] = _viewing_mode_from_summary(summary)
+    result["viewing_summary"] = summary
+    result.setdefault("has_viewing_text", bool(summary.get("has_viewing_text")))
+    result.setdefault("has_password", bool(summary.get("has_password")))
+    result.setdefault("needs_contact", bool(summary.get("needs_contact")))
+    result.setdefault("has_empty_out_hint", bool(summary.get("has_empty_out_hint")))
+    result.setdefault("viewing_mode", str(summary.get("viewing_mode") or "unknown"))
+    if "availability" not in result and raw_viewing:
+        result["availability"] = _availability_status(str(raw_viewing))
+    return result
+
+
+def _first_sensitive_viewing_value(item: dict[str, Any]) -> str:
+    for key in SENSITIVE_ROOM_INDEX_KEYS:
+        value = item.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _viewing_mode_from_summary(summary: dict[str, Any]) -> str:
+    if not summary.get("has_viewing_text"):
+        return "unknown"
+    if summary.get("has_password"):
+        return "password_available"
+    if summary.get("needs_contact"):
+        return "contact_required"
+    return "viewing_text_only"
