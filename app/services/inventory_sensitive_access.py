@@ -282,7 +282,7 @@ class SnapshotInventoryViewingAccessProvider:
     source_kind = SOURCE_KIND_SNAPSHOT
 
     def __init__(self, reader: SnapshotReader | None = None) -> None:
-        self.reader = reader or SnapshotReader()
+        self.reader = reader or _configured_snapshot_reader()
 
     async def get_viewing_instruction(self, request: ViewingAccessRequest) -> ViewingInstructionEvidence:
         context = request.inventory_read_context
@@ -361,7 +361,7 @@ class SnapshotInventorySheetArtifactProvider:
     source_kind = SOURCE_KIND_SNAPSHOT
 
     def __init__(self, reader: SnapshotReader | None = None) -> None:
-        self.reader = reader or SnapshotReader()
+        self.reader = reader or _configured_snapshot_reader()
 
     async def get_artifacts(self, context: InventoryReadContext) -> InventorySheetArtifactResult:
         _ensure_context_kind(context, self.source_kind)
@@ -718,3 +718,11 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _configured_snapshot_reader() -> SnapshotReader:
+    max_age = int(getattr(settings, "inventory_snapshot_max_age_seconds", 0) or 0)
+    return SnapshotReader(
+        settings.inventory_snapshot_root,
+        max_age_seconds=max_age if max_age > 0 else None,
+    )

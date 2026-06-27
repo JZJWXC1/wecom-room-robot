@@ -1,5 +1,11 @@
 # Inventory Sensitive Access
 
+## V1 Production Primary 补充
+
+Snapshot viewing provider 和 Snapshot sheet artifact provider 的默认 reader 现在统一使用 `INVENTORY_SNAPSHOT_ROOT` 与 `INVENTORY_SNAPSHOT_MAX_AGE_SECONDS`。因此客服 turn 里如果 context 已经选中 snapshot，后续看房工具和房源表 PNG 工具会读取同一个 snapshot root，不会回到默认路径，也不会触发 legacy 房源表刷新。
+
+Snapshot sheet artifact 仍只读取 context 中的 `snapshot_id` 对应 manifest，并校验 PNG 的 hash/size。Snapshot viewing 只在显式看房/密码工具边界读取 `private/viewing_secrets.json`，普通房源 evidence、rewrite index、artifact evidence 和日志都不暴露真实密码、手机号、token 或 secret。
+
 本文记录 M1D2B1 对看房信息和房源表产物的读取收口。目标是让敏感事实也遵守同一个 `InventoryReadContext`，同时不改变客户可见回复、Planner、自检和发送语义。
 
 ## 范围

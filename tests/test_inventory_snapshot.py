@@ -534,6 +534,37 @@ def test_current_pointer_replace_failure_keeps_old_pointer(tmp_path) -> None:
     assert (tmp_path / "snapshots" / second.snapshot_id).exists()
 
 
+def test_post_replace_pointer_verification_failure_restores_old_pointer(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first, first_report = build_snapshot()
+    store = SnapshotStore(tmp_path)
+    store.write_snapshot(first, first_report)
+    old_pointer_bytes = (tmp_path / "current_snapshot.json").read_bytes()
+    rows = base_rows()
+    rows[0]["押一付一"] = "2750"
+    second, second_report = build_snapshot(rows)
+    observed_pointer_ids: list[str] = []
+
+    def fail_after_replace(snapshot) -> None:
+        pointer_data = json.loads((tmp_path / "current_snapshot.json").read_text(encoding="utf-8"))
+        observed_pointer_ids.append(str(pointer_data.get("snapshot_id") or ""))
+        assert pointer_data["snapshot_id"] == snapshot.snapshot_id == second.snapshot_id
+        raise SnapshotStoreError("simulated post-replace verification failure")
+
+    monkeypatch.setattr(store, "_verify_active_pointer", fail_after_replace)
+
+    with pytest.raises(SnapshotStoreError, match="post-replace verification failure"):
+        store.write_snapshot(second, second_report)
+
+    pointer_data = json.loads((tmp_path / "current_snapshot.json").read_text(encoding="utf-8"))
+    assert observed_pointer_ids == [second.snapshot_id]
+    assert (tmp_path / "current_snapshot.json").read_bytes() == old_pointer_bytes
+    assert pointer_data["snapshot_id"] == first.snapshot_id
+    assert (tmp_path / "snapshots" / second.snapshot_id).exists()
+
+
 def test_existing_snapshot_directory_is_not_overwritten(tmp_path) -> None:
     snapshot, report = build_snapshot()
     store = SnapshotStore(tmp_path)
@@ -708,3 +739,31 @@ def test_validator_rejects_secret_fields_in_public_rewrite_index() -> None:
 
     assert not result.ok
     assert any(issue.code in {"public_payload_password_key", "public_payload_contains_password"} for issue in result.errors)
+
+
+def test_validator_rejects_rewrite_index_bound_to_different_snapshot() -> None:
+    snapshot, _ = build_snapshot()
+    snapshot.rewrite_index["source_hash"] = "0" * 64
+
+    result = SnapshotValidator().validate_snapshot(snapshot)
+
+    assert not result.ok
+    assert any(issue.code == "rewrite_index_source_hash_mismatch" for issue in result.errors)
+
+
+def test_rewrite_index_header_failure_keeps_previous_current_pointer(tmp_path) -> None:
+    first, first_report = build_snapshot()
+    store = SnapshotStore(tmp_path)
+    store.write_snapshot(first, first_report)
+    old_pointer = json.loads((tmp_path / "current_snapshot.json").read_text(encoding="utf-8"))
+    second_rows = base_rows()
+    second_rows[0]["押一付一"] = "2600"
+    second, second_report = build_snapshot(second_rows)
+    second.rewrite_index["source_hash"] = "0" * 64
+
+    with pytest.raises(SnapshotStoreError):
+        store.write_snapshot(second, second_report)
+
+    pointer = json.loads((tmp_path / "current_snapshot.json").read_text(encoding="utf-8"))
+    assert pointer["snapshot_id"] == old_pointer["snapshot_id"] == first.snapshot_id
+    assert not (tmp_path / "snapshots" / second.snapshot_id).exists()

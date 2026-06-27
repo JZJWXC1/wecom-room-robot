@@ -23,6 +23,7 @@ from app.services.inventory_read_models import (
     REASON_FALLBACK_NOT_ALLOWED_AFTER_READ,
     REASON_MISSING_SNAPSHOT,
     REASON_MIXED_SOURCE_HASH,
+    REASON_PRIMARY_READINESS_MISMATCH,
     REASON_RECONCILIATION_BLOCKING,
     REASON_SECRET_SCAN_FAILED,
     REASON_SNAPSHOT_POINTER_MISSING,
@@ -128,6 +129,14 @@ def readiness(**overrides: Any) -> dict[str, Any]:
     }
     payload.update(overrides)
     return payload
+
+
+def readiness_for_snapshot(snapshot: Any, **overrides: Any) -> dict[str, Any]:
+    return readiness(
+        snapshot_id=snapshot.snapshot_id,
+        source_hash=snapshot.source_hash,
+        **overrides,
+    )
 
 
 def publish_snapshot(root: Path, rows: list[dict[str, Any]] | None = None, *, version: str = "v1"):
@@ -291,7 +300,7 @@ def test_customer_shadow_context_never_calls_snapshot_primary_reader() -> None:
 
 def test_primary_healthy_selects_snapshot_locally(tmp_path: Path) -> None:
     snapshot = publish_snapshot(tmp_path)
-    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).start_turn(
+    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness_for_snapshot(snapshot)).start_turn(
         request_id="req-primary",
         turn_id="turn-1",
     )
@@ -329,7 +338,7 @@ def test_primary_pointer_to_missing_snapshot_returns_missing_snapshot_reason(tmp
     snapshot = publish_snapshot(tmp_path)
     shutil.rmtree(tmp_path / "snapshots" / snapshot.snapshot_id)
 
-    decision = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).select_context(
+    decision = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness_for_snapshot(snapshot)).select_context(
         request_id="req-missing-snapshot",
         turn_id="turn-1",
     )
@@ -341,13 +350,13 @@ def test_primary_pointer_to_missing_snapshot_returns_missing_snapshot_reason(tmp
 
 
 def test_primary_readiness_gates_return_structured_reason_codes(tmp_path: Path) -> None:
-    publish_snapshot(tmp_path)
+    snapshot = publish_snapshot(tmp_path)
 
     cases = [
-        (readiness(reconciliation_passed=False), REASON_RECONCILIATION_BLOCKING),
-        (readiness(blocking_count=1), REASON_RECONCILIATION_BLOCKING),
-        (readiness(public_artifact_secret_scan_passed=False), REASON_SECRET_SCAN_FAILED),
-        (readiness(missing_valid_aliases=1), REASON_ALIAS_COVERAGE_FAILED),
+        (readiness_for_snapshot(snapshot, reconciliation_passed=False), REASON_RECONCILIATION_BLOCKING),
+        (readiness_for_snapshot(snapshot, blocking_count=1), REASON_RECONCILIATION_BLOCKING),
+        (readiness_for_snapshot(snapshot, public_artifact_secret_scan_passed=False), REASON_SECRET_SCAN_FAILED),
+        (readiness_for_snapshot(snapshot, missing_valid_aliases=1), REASON_ALIAS_COVERAGE_FAILED),
     ]
     for state, expected_code in cases:
         decision = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=state).select_context(
@@ -359,8 +368,50 @@ def test_primary_readiness_gates_return_structured_reason_codes(tmp_path: Path) 
         assert decision.error.code == expected_code
 
 
+def test_primary_readiness_requires_snapshot_and_source_binding(tmp_path: Path) -> None:
+    snapshot = publish_snapshot(tmp_path)
+
+    cases = [
+        (readiness(source_hash=snapshot.source_hash), ["snapshot_id"]),
+        (readiness(snapshot_id=snapshot.snapshot_id), ["source_hash"]),
+    ]
+
+    for state, missing_keys in cases:
+        decision = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=state).select_context(
+            request_id="req-readiness-missing-binding",
+            turn_id="turn-1",
+        )
+
+        assert decision.ok is False
+        assert decision.error is not None
+        assert decision.error.code == REASON_PRIMARY_READINESS_MISMATCH
+        assert decision.error.to_dict()["details"]["missing_keys"] == missing_keys
+
+
+def test_primary_readiness_snapshot_or_source_mismatch_is_blocked(tmp_path: Path) -> None:
+    snapshot = publish_snapshot(tmp_path)
+
+    stale_readiness = readiness(
+        snapshot_id="20260625T000000Z_deadbeef0000",
+        source_hash=snapshot.source_hash,
+    )
+    hash_mismatch = readiness(
+        snapshot_id=snapshot.snapshot_id,
+        source_hash="0" * 64,
+    )
+
+    for state in (stale_readiness, hash_mismatch):
+        decision = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=state).select_context(
+            request_id="req-readiness-mismatch",
+            turn_id="turn-1",
+        )
+        assert decision.ok is False
+        assert decision.error is not None
+        assert decision.error.code == REASON_PRIMARY_READINESS_MISMATCH
+
+
 def test_primary_stale_and_unsupported_schema_are_blocked(tmp_path: Path) -> None:
-    publish_snapshot(tmp_path)
+    snapshot = publish_snapshot(tmp_path)
     pointer_path = tmp_path / "current_snapshot.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
     pointer["activated_at"] = "2020-01-01T00:00:00Z"
@@ -369,13 +420,13 @@ def test_primary_stale_and_unsupported_schema_are_blocked(tmp_path: Path) -> Non
     stale = router(
         tmp_path,
         mode=READ_MODE_PRIMARY,
-        readiness_state=readiness(),
+        readiness_state=readiness_for_snapshot(snapshot),
         max_age_seconds=60,
     ).select_context(request_id="req-stale", turn_id="turn-1")
     unsupported = router(
         tmp_path,
         mode=READ_MODE_PRIMARY,
-        readiness_state=readiness(),
+        readiness_state=readiness_for_snapshot(snapshot),
         supported_schema_versions=("inventory_snapshot.v999",),
     ).select_context(request_id="req-schema", turn_id="turn-1")
 
@@ -453,7 +504,7 @@ def test_evidence_decision_id_must_match_turn_context(tmp_path: Path) -> None:
 
 def test_snapshot_context_locks_snapshot_id_across_pointer_update_and_deleted_old_snapshot_errors(tmp_path: Path) -> None:
     first = publish_snapshot(tmp_path, version="v1")
-    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).start_turn(
+    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness_for_snapshot(first)).start_turn(
         request_id="req-lock",
         turn_id="turn-1",
     )
@@ -473,9 +524,30 @@ def test_snapshot_context_locks_snapshot_id_across_pointer_update_and_deleted_ol
     assert excinfo.value.code == REASON_SNAPSHOT_READ_FAILED
 
 
+def test_same_turn_all_rows_and_rewrite_index_ignore_current_pointer_switch(tmp_path: Path) -> None:
+    first = publish_snapshot(tmp_path, version="v1")
+    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness_for_snapshot(first)).start_turn(
+        request_id="req-lock-all",
+        turn_id="turn-1",
+    )
+    second_rows = inventory_rows()
+    second_rows[0]["押一付一"] = "1900"
+    second = publish_snapshot(tmp_path, second_rows, version="v2")
+
+    all_rows, all_evidence = run(session.provider.all_inventory_rows(session.context, limit=10))
+    rewrite_index = run(session.get_rewrite_index())
+
+    assert first.snapshot_id != second.snapshot_id
+    assert session.context.snapshot_id == first.snapshot_id
+    assert {item.snapshot_id for item in all_evidence} == {first.snapshot_id}
+    assert all_rows[0]["押一付一"] == "1800"
+    assert rewrite_index["snapshot_id"] == first.snapshot_id
+    assert rewrite_index["source_hash"] == first.source_hash
+
+
 def test_fallback_after_any_business_read_is_forbidden(tmp_path: Path) -> None:
-    publish_snapshot(tmp_path)
-    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).start_turn(
+    snapshot = publish_snapshot(tmp_path)
+    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness_for_snapshot(snapshot)).start_turn(
         request_id="req-after-read",
         turn_id="turn-1",
     )
@@ -487,8 +559,8 @@ def test_fallback_after_any_business_read_is_forbidden(tmp_path: Path) -> None:
 
 
 def test_evidence_and_rewrite_index_do_not_expose_password_or_viewing_text(tmp_path: Path) -> None:
-    publish_snapshot(tmp_path)
-    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).start_turn(
+    snapshot = publish_snapshot(tmp_path)
+    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness_for_snapshot(snapshot)).start_turn(
         request_id="req-secret",
         turn_id="turn-1",
     )
@@ -503,8 +575,8 @@ def test_evidence_and_rewrite_index_do_not_expose_password_or_viewing_text(tmp_p
 
 
 def test_same_turn_source_hash_and_decision_id_are_stable_across_reads(tmp_path: Path) -> None:
-    publish_snapshot(tmp_path)
-    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).start_turn(
+    snapshot = publish_snapshot(tmp_path)
+    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness_for_snapshot(snapshot)).start_turn(
         request_id="req-stable",
         turn_id="turn-1",
     )
@@ -561,13 +633,13 @@ def test_legacy_provider_reuses_inventory_service_search_without_copying_query_e
 
 
 def test_legacy_and_snapshot_parity_on_synthetic_queries(tmp_path: Path) -> None:
-    publish_snapshot(tmp_path)
+    snapshot = publish_snapshot(tmp_path)
     legacy_session = InventoryReadRouter(
         mode=READ_MODE_DISABLED,
         legacy_provider=legacy_provider(),
         snapshot_provider=snapshot_provider(tmp_path),
     ).start_turn(request_id="req-parity-legacy", turn_id="turn-1")
-    snapshot_session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).start_turn(
+    snapshot_session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness_for_snapshot(snapshot)).start_turn(
         request_id="req-parity-snapshot",
         turn_id="turn-1",
     )
@@ -619,8 +691,8 @@ def test_router_does_not_access_network_or_production_data_paths(tmp_path: Path,
 
     monkeypatch.setattr(socket, "create_connection", fail_socket)
     before = set(Path("data").glob("*")) if Path("data").exists() else set()
-    publish_snapshot(tmp_path)
-    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness()).start_turn(
+    snapshot = publish_snapshot(tmp_path)
+    session = router(tmp_path, mode=READ_MODE_PRIMARY, readiness_state=readiness_for_snapshot(snapshot)).start_turn(
         request_id="req-local-only",
         turn_id="turn-1",
     )

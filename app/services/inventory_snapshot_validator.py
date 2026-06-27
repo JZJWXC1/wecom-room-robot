@@ -86,6 +86,7 @@ class SnapshotValidator:
         self._validate_manifest(snapshot, result)
         self._validate_listings(snapshot, result)
         self._validate_rewrite_index(snapshot.rewrite_index, result)
+        self._validate_rewrite_index_headers(snapshot, result)
         self._validate_public_payload(snapshot.inventory_payload(redact_sensitive=True), "inventory", result)
         self._validate_utf8_serializable(snapshot.inventory_payload(redact_sensitive=True), "inventory", result)
         self._validate_utf8_serializable(snapshot.rewrite_index, "rewrite_inventory_index", result)
@@ -249,6 +250,20 @@ class SnapshotValidator:
             result.add("error", "rewrite_index_not_object", "rewrite index 必须是对象。", path="rewrite_inventory_index")
             return
         self._validate_public_payload(rewrite_index, "rewrite_inventory_index", result)
+
+    def _validate_rewrite_index_headers(self, snapshot: InventorySnapshot, result: SnapshotValidationResult) -> None:
+        rewrite_index = snapshot.rewrite_index
+        if not isinstance(rewrite_index, dict):
+            return
+        source = str(rewrite_index.get("source") or "")
+        snapshot_id = str(rewrite_index.get("snapshot_id") or "")
+        source_hash = str(rewrite_index.get("source_hash") or "")
+        if source != "inventory_snapshot":
+            result.add("error", "rewrite_index_source_not_snapshot", "snapshot rewrite index 必须声明 inventory_snapshot source。", path="rewrite_inventory_index.source")
+        if snapshot_id != snapshot.snapshot_id:
+            result.add("error", "rewrite_index_snapshot_id_mismatch", "rewrite index snapshot_id 与 inventory 不一致。", path="rewrite_inventory_index.snapshot_id")
+        if source_hash != snapshot.source_hash:
+            result.add("error", "rewrite_index_source_hash_mismatch", "rewrite index source_hash 与 inventory 不一致。", path="rewrite_inventory_index.source_hash")
 
     def _validate_public_payload(self, value: Any, path: str, result: SnapshotValidationResult) -> None:
         if isinstance(value, dict):
