@@ -13,8 +13,10 @@ SEND_RECEIPT_CONTEXT_KEY = "send_receipts"
 SEND_RECEIPT_CONTEXT_LIMIT = 100
 SENT_STATUS = "sent"
 FAILED_STATUS = "failed"
+SEND_UNCERTAIN_STATUS = "send_uncertain"
 SKIPPED_DUPLICATE_STATUS = "skipped_duplicate"
 _SUCCESS_STATUSES = {SENT_STATUS}
+_BLOCKING_STATUSES = {SENT_STATUS, SEND_UNCERTAIN_STATUS}
 _LEDGER_INTERNAL_MATCH_KEYS = {"receipt_id", "idempotency_key", "duplicate_of"}
 _SENSITIVE_ERROR_MARKERS = (
     "access_token",
@@ -115,6 +117,7 @@ def current_turn_scope(context: dict[str, Any] | None, *, msgids: list[str] | No
 
 
 def build_idempotency_key(action: SendAction, *, channel: str = "wecom_kf") -> str:
+    safe_payload_hash = payload_hash(action)
     payload = {
         "profile": SEND_RECEIPT_SCHEMA_VERSION,
         "channel": channel,
@@ -129,7 +132,7 @@ def build_idempotency_key(action: SendAction, *, channel: str = "wecom_kf") -> s
         "candidate_set_id": action.candidate_set_id,
         "media_id": _action_fact_value(action, "media_id"),
         "sha256": _action_fact_value(action, "sha256"),
-        "payload": safe_artifact_payload(action.payload),
+        "payload_hash": safe_payload_hash,
         "metadata": {
             "turn_scope_source": action.metadata.get("turn_scope_source"),
             "turn_scope_id": action.metadata.get("turn_scope_id"),
@@ -145,6 +148,15 @@ def find_successful_receipt(context: dict[str, Any] | None, idempotency_key: str
         if str(item.get("idempotency_key") or "") != idempotency_key:
             continue
         if str(item.get("status") or "") in _SUCCESS_STATUSES:
+            return SendReceipt.from_legacy_dict(item)
+    return None
+
+
+def find_blocking_receipt(context: dict[str, Any] | None, idempotency_key: str) -> SendReceipt | None:
+    for item in reversed(_receipt_payloads(context)):
+        if str(item.get("idempotency_key") or "") != idempotency_key:
+            continue
+        if str(item.get("status") or "") in _BLOCKING_STATUSES:
             return SendReceipt.from_legacy_dict(item)
     return None
 
@@ -209,8 +221,45 @@ def build_failed_receipt(
     )
 
 
-def build_duplicate_receipt(action: SendAction, existing: SendReceipt, *, idempotency_key: str | None = None) -> SendReceipt:
-    key = idempotency_key or existing.idempotency_key or build_idempotency_key(action)
+def build_uncertain_receipt(
+    action: SendAction,
+    *,
+    error: BaseException,
+    idempotency_key: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> SendReceipt:
+    key = idempotency_key or build_idempotency_key(action)
+    return SendReceipt(
+        conversation_id=action.conversation_id,
+        turn_id=action.turn_id,
+        listing_id=action.listing_id,
+        evidence_id=action.evidence_id,
+        inventory_snapshot_id=action.inventory_snapshot_id,
+        source_hash=action.source_hash,
+        candidate_set_id=action.candidate_set_id,
+        media_id=action.media_id,
+        sha256=action.sha256,
+        action_id=action.action_id,
+        action_type=action.action_type,
+        status=SEND_UNCERTAIN_STATUS,
+        receipt_id=_receipt_id(key, action.action_id, SEND_UNCERTAIN_STATUS),
+        idempotency_key=key,
+        error_code=error.__class__.__name__,
+        error_message=safe_failure_reason(error),
+        metadata=_receipt_metadata(action, {"uncertain_result": True, **dict(metadata or {})}),
+    )
+
+
+def build_duplicate_receipt(
+    action: SendAction,
+    existing: SendReceipt | None = None,
+    *,
+    idempotency_key: str | None = None,
+    duplicate_of: str = "",
+    metadata: dict[str, Any] | None = None,
+) -> SendReceipt:
+    key = idempotency_key or (existing.idempotency_key if existing else "") or build_idempotency_key(action)
+    duplicate_target = duplicate_of or (existing.receipt_id if existing else "")
     return SendReceipt(
         conversation_id=action.conversation_id,
         turn_id=action.turn_id,
@@ -226,9 +275,9 @@ def build_duplicate_receipt(action: SendAction, existing: SendReceipt, *, idempo
         status=SKIPPED_DUPLICATE_STATUS,
         receipt_id=_receipt_id(key, action.action_id, SKIPPED_DUPLICATE_STATUS),
         idempotency_key=key,
-        duplicate_of=existing.receipt_id,
+        duplicate_of=duplicate_target,
         sent_at=_utc_now(),
-        metadata=_receipt_metadata(action, {"duplicate_of": existing.receipt_id}),
+        metadata=_receipt_metadata(action, {"duplicate_of": duplicate_target, **dict(metadata or {})}),
     )
 
 
@@ -265,6 +314,10 @@ def text_hash(value: str) -> str:
     return _stable_digest({"text": value or ""})
 
 
+def payload_hash(action: SendAction) -> str:
+    return _stable_digest({"payload": safe_artifact_payload(action.payload)})
+
+
 def safe_failure_reason(error: BaseException | str) -> str:
     text = str(error)
     lowered = text.lower()
@@ -299,6 +352,7 @@ def _receipt_metadata(action: SendAction, metadata: dict[str, Any] | None = None
             "source_hash": action.source_hash,
             "media_id": action.media_id,
             "sha256": action.sha256,
+            "payload_hash": payload_hash(action),
             **dict(metadata or {}),
         }
     )

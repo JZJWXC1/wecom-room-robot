@@ -25,6 +25,7 @@ from app.services import (
     kf_dual_llm_production,
     kf_orchestrator_flow,
     kf_orchestrator_shadow,
+    kf_outbox,
     kf_send_receipts,
     kf_turn_flow,
 )
@@ -97,6 +98,7 @@ agentic_rag = kf_agentic_rag.KfAgenticRagService(
 )
 wecom_kf = WeComKfClient()
 wecom_kf_context_store = WeComKfContextStore()
+kf_send_outbox = kf_outbox.LocalKfOutboxLedger()
 
 inventory_refresh_lock = asyncio.Lock()
 inventory_image_refresh_lock = asyncio.Lock()
@@ -9624,6 +9626,59 @@ async def _send_text(open_kfid: str, external_userid: str, text: str) -> Any:
     return await _await_if_needed(wecom_kf.send_text(open_kfid, external_userid, text))
 
 
+def _record_persistent_send_receipt(
+    receipt: Any,
+    *,
+    action: Any,
+    idempotency_key: str,
+    outbox_id: str = "",
+) -> None:
+    try:
+        kf_send_outbox.record_receipt(
+            receipt,
+            action=action,
+            idempotency_key=idempotency_key,
+            outbox_id=outbox_id,
+        )
+    except Exception as exc:
+        logger.warning("KF send outbox receipt record failed: %s", kf_send_receipts.safe_failure_reason(exc))
+
+
+def _duplicate_receipt_from_outbox_decision(action: Any, decision: Any, *, idempotency_key: str) -> Any:
+    return kf_send_receipts.build_duplicate_receipt(
+        action,
+        decision.existing_receipt,
+        idempotency_key=idempotency_key,
+        duplicate_of=decision.duplicate_of,
+        metadata={
+            "duplicate_reason": decision.reason,
+            **dict(decision.metadata or {}),
+        },
+    )
+
+
+def _build_send_error_receipt(
+    action: Any,
+    *,
+    idempotency_key: str,
+    error: BaseException,
+    metadata: dict[str, Any] | None = None,
+) -> Any:
+    if kf_outbox.send_error_is_uncertain(error):
+        return kf_send_receipts.build_uncertain_receipt(
+            action,
+            idempotency_key=idempotency_key,
+            error=error,
+            metadata=metadata,
+        )
+    return kf_send_receipts.build_failed_receipt(
+        action,
+        idempotency_key=idempotency_key,
+        error=error,
+        metadata=metadata,
+    )
+
+
 async def _execute_send_action_once(
     *,
     context: dict[str, Any],
@@ -9632,21 +9687,42 @@ async def _execute_send_action_once(
     receipt_metadata: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], bool, dict[str, Any]]:
     idempotency_key = kf_send_receipts.build_idempotency_key(action)
-    existing = kf_send_receipts.find_successful_receipt(context, idempotency_key)
+    existing = kf_send_receipts.find_blocking_receipt(context, idempotency_key)
     if existing:
-        duplicate = kf_send_receipts.build_duplicate_receipt(action, existing, idempotency_key=idempotency_key)
+        _record_persistent_send_receipt(existing, action=action, idempotency_key=idempotency_key)
+        duplicate = kf_send_receipts.build_duplicate_receipt(
+            action,
+            existing,
+            idempotency_key=idempotency_key,
+            metadata={"duplicate_reason": "context_receipt_blocks_duplicate"},
+        )
         context = kf_send_receipts.append_receipt(context, duplicate)
+        _record_persistent_send_receipt(duplicate, action=action, idempotency_key=idempotency_key)
         return context, False, duplicate.to_safe_dict()
+
+    outbox_decision = kf_send_outbox.reserve(action, idempotency_key=idempotency_key)
+    if not outbox_decision.should_send:
+        duplicate = _duplicate_receipt_from_outbox_decision(action, outbox_decision, idempotency_key=idempotency_key)
+        context = kf_send_receipts.append_receipt(context, duplicate)
+        _record_persistent_send_receipt(duplicate, action=action, idempotency_key=idempotency_key)
+        return context, False, duplicate.to_safe_dict()
+
     try:
         provider_result = await _await_if_needed(send_call())
     except Exception as exc:
-        failed = kf_send_receipts.build_failed_receipt(
+        failed = _build_send_error_receipt(
             action,
             idempotency_key=idempotency_key,
             error=exc,
             metadata=receipt_metadata,
         )
         context = kf_send_receipts.append_receipt(context, failed)
+        _record_persistent_send_receipt(
+            failed,
+            action=action,
+            idempotency_key=idempotency_key,
+            outbox_id=outbox_decision.outbox_id,
+        )
         raise
     sent = kf_send_receipts.build_sent_receipt(
         action,
@@ -9655,6 +9731,12 @@ async def _execute_send_action_once(
         metadata=receipt_metadata,
     )
     context = kf_send_receipts.append_receipt(context, sent)
+    _record_persistent_send_receipt(
+        sent,
+        action=action,
+        idempotency_key=idempotency_key,
+        outbox_id=outbox_decision.outbox_id,
+    )
     return context, True, sent.to_safe_dict()
 
 
@@ -10034,10 +10116,23 @@ async def _send_videos_with_receipts(
             sha256=fact_binding["sha256"],
         )
         idempotency_key = kf_send_receipts.build_idempotency_key(action)
-        existing = kf_send_receipts.find_successful_receipt(context, idempotency_key)
+        existing = kf_send_receipts.find_blocking_receipt(context, idempotency_key)
         if existing:
-            duplicate = kf_send_receipts.build_duplicate_receipt(action, existing, idempotency_key=idempotency_key)
+            _record_persistent_send_receipt(existing, action=action, idempotency_key=idempotency_key)
+            duplicate = kf_send_receipts.build_duplicate_receipt(
+                action,
+                existing,
+                idempotency_key=idempotency_key,
+                metadata={"duplicate_reason": "context_receipt_blocks_duplicate"},
+            )
             context = kf_send_receipts.append_receipt(context, duplicate)
+            _record_persistent_send_receipt(duplicate, action=action, idempotency_key=idempotency_key)
+            continue
+        outbox_decision = kf_send_outbox.reserve(action, idempotency_key=idempotency_key)
+        if not outbox_decision.should_send:
+            duplicate = _duplicate_receipt_from_outbox_decision(action, outbox_decision, idempotency_key=idempotency_key)
+            context = kf_send_receipts.append_receipt(context, duplicate)
+            _record_persistent_send_receipt(duplicate, action=action, idempotency_key=idempotency_key)
             continue
         caption_sent = False
         transcode_retry = False
@@ -10067,28 +10162,46 @@ async def _send_videos_with_receipts(
                 },
             )
             context = kf_send_receipts.append_receipt(context, receipt)
+            _record_persistent_send_receipt(
+                receipt,
+                action=action,
+                idempotency_key=idempotency_key,
+                outbox_id=outbox_decision.outbox_id,
+            )
             sent_action = {"type": "video", "path": str(sent_path), "room": label, "count": 1}
             if transcode_retry:
                 sent_action["source_path"] = str(path)
                 sent_action["transcode_retry"] = True
             sent.append(sent_action)
         except WeComKfSendLimitError as exc:
-            receipt = kf_send_receipts.build_failed_receipt(
+            receipt = _build_send_error_receipt(
                 action,
                 idempotency_key=idempotency_key,
                 error=exc,
                 metadata={"position": index, "caption_sent": caption_sent, "transcode_retry": transcode_retry},
             )
             context = kf_send_receipts.append_receipt(context, receipt)
+            _record_persistent_send_receipt(
+                receipt,
+                action=action,
+                idempotency_key=idempotency_key,
+                outbox_id=outbox_decision.outbox_id,
+            )
             raise
         except Exception as exc:
-            receipt = kf_send_receipts.build_failed_receipt(
+            receipt = _build_send_error_receipt(
                 action,
                 idempotency_key=idempotency_key,
                 error=exc,
                 metadata={"position": index, "caption_sent": caption_sent, "transcode_retry": transcode_retry},
             )
             context = kf_send_receipts.append_receipt(context, receipt)
+            _record_persistent_send_receipt(
+                receipt,
+                action=action,
+                idempotency_key=idempotency_key,
+                outbox_id=outbox_decision.outbox_id,
+            )
             logger.warning("send video failed: %s", kf_send_receipts.safe_failure_reason(exc))
             sent.append({"type": "video_failed", "path": str(path), "room": label, "reason": kf_send_receipts.safe_failure_reason(exc)})
     return sent, context

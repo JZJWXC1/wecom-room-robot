@@ -11,10 +11,16 @@ activate_offline_test_mode()
 
 
 @pytest.fixture(autouse=True)
-def default_dual_llm_mode_shadow(monkeypatch: pytest.MonkeyPatch) -> None:
+def default_dual_llm_mode_shadow(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     import app.main as main
+    from app.services import kf_outbox
 
     monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "shadow")
+    monkeypatch.setattr(
+        main,
+        "kf_send_outbox",
+        kf_outbox.LocalKfOutboxLedger(tmp_path / "kf_send_outbox.jsonl"),
+    )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

@@ -100,14 +100,16 @@
 
 ## M6 SendReceipt 幂等发送
 
-`app/services/kf_send_receipts.py` 定义发送阶段的本地账本：
+`app/services/kf_send_receipts.py` 和 `app/services/kf_outbox.py` 定义发送阶段的本地幂等事务边界：
 
 - `build_send_action()` 从当前结构化 turn、回调 `msgids`、动作类型、文本/素材摘要生成 SendAction。
-- `build_idempotency_key()` 把 `conversation_id`、`turn_id/msgids`、`action_id`、`action_type`、`listing_id`、`evidence_id`、`inventory_snapshot_id`、`candidate_set_id` 和 payload 摘要绑定成稳定键。
-- `SendReceipt` 记录 `sent`、`failed`、`skipped_duplicate`，并通过契约序列化脱敏 provider result、错误信息和 metadata。
-- `app/main.py::_send_final_actions` 已接入文本、房源表图片、房间图片、视频发送回执；视频说明和视频文件共用同一个视频动作幂等键，重复回调命中时两者一起跳过。
+- `build_idempotency_key()` 把 `conversation_id`、`turn_id/msgids`、`action_id`、`action_type`、`listing_id`、`evidence_id`、`inventory_snapshot_id`、`candidate_set_id`、`media_id` 或 `payload_hash` 绑定成稳定键。
+- `SendReceipt` 记录 `sent`、`failed`、`send_uncertain`、`skipped_duplicate`，并通过契约序列化脱敏 provider result、错误信息和 metadata。
+- `LocalKfOutboxLedger` 默认写入 `data/kf_send_outbox.jsonl`，使用 JSONL append + 本地锁记录 `reserved` 和 `receipt` 事件；写入只保留内部匹配哈希、脱敏后的动作绑定和安全 receipt。
+- `failed` 是可回放终态；下一次同一幂等键会重新 reserve 新 attempt。`sent`、`send_uncertain` 和没有终态 receipt 的 pending reservation 会阻断自动重发，并写入 `skipped_duplicate` receipt。
+- `app/main.py::_send_final_actions` 已接入文本、房源表图片、房间图片、视频发送回执；视频说明和视频文件共用同一个视频动作幂等键，重复回调或进程重启后命中持久账本时两者一起跳过。
 
-当前账本存入客服会话 context，能覆盖同一会话上下文内的重复回调和重复发送。它还不是跨进程持久化发送事务；release 前仍需用历史失败回放和重复回调故障注入验证 context 持久化、进程重启、企微返回不确定时的行为。
+会话 context 中仍保留最近 SendReceipt，供结构化记忆、测试断言和旧存储兼容使用；持久 Outbox 是进程重启后的幂等来源。企微网络超时、连接中断等无法确认 provider 是否已收包的异常记录为 `send_uncertain`，不自动重发，避免在不确定状态下盲目发送错素材。
 
 ## Shadow 阶段不变项
 

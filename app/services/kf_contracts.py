@@ -68,6 +68,7 @@ SAFE_SENSITIVE_SUMMARY_KEYS = {
 }
 SAFE_LONG_HASH_KEYS = {
     "content_hash",
+    "payload_hash",
     "material_hash",
     "source_hash",
     "text_hash",
