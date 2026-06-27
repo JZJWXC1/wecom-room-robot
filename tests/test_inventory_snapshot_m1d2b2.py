@@ -121,7 +121,7 @@ def test_two_snapshot_versions_keep_turn_level_context_locked(tmp_path: Path) ->
         fallback_strategy=FALLBACK_STRICT,
         legacy_provider=legacy_provider(synthetic_inventory_rows(version="v1")),
         snapshot_provider=SnapshotInventoryReadProvider(SnapshotReader(root)),
-        readiness_state=ready_readiness_state(),
+        readiness_state=ready_readiness_state(first.snapshot),
     )
     session = router.start_turn(request_id="lock", turn_id="turn-1")
     second = build_local_snapshot(root, synthetic_inventory_rows(version="v2"), version="v2")
@@ -142,13 +142,13 @@ def test_strict_fallback_and_half_turn_mixing_are_blocked(tmp_path: Path) -> Non
     assert probe["legacy_whole_request"]["context"]["fallback_used"] is True
 
     root = tmp_path / "after-read"
-    build_local_snapshot(root, synthetic_inventory_rows(), version="after-read")
+    build = build_local_snapshot(root, synthetic_inventory_rows(), version="after-read")
     session = InventoryReadRouter(
         mode=READ_MODE_PRIMARY,
         fallback_strategy=FALLBACK_LEGACY_WHOLE_REQUEST,
         legacy_provider=legacy_provider(synthetic_inventory_rows()),
         snapshot_provider=SnapshotInventoryReadProvider(SnapshotReader(root)),
-        readiness_state=ready_readiness_state(),
+        readiness_state=ready_readiness_state(build.snapshot),
     ).start_turn(request_id="half-turn", turn_id="turn-1")
     run(session.search_inventory("晨星花园1-101A", limit=1))
 
@@ -198,7 +198,7 @@ def test_fault_injection_blocks_pointer_manifest_private_and_png(tmp_path: Path)
         fallback_strategy=FALLBACK_STRICT,
         legacy_provider=legacy_provider(synthetic_inventory_rows()),
         snapshot_provider=SnapshotInventoryReadProvider(SnapshotReader(png_root)),
-        readiness_state=ready_readiness_state(),
+        readiness_state=ready_readiness_state(png_build.snapshot),
     ).select_context(request_id="png", turn_id="turn-1")
     assert session.ok is False
 
@@ -211,7 +211,7 @@ def test_snapshot_sheet_png_fault_is_reported_before_send(tmp_path: Path) -> Non
         fallback_strategy=FALLBACK_STRICT,
         legacy_provider=legacy_provider(synthetic_inventory_rows()),
         snapshot_provider=SnapshotInventoryReadProvider(SnapshotReader(root)),
-        readiness_state=ready_readiness_state(),
+        readiness_state=ready_readiness_state(build.snapshot),
     )
     context = router.start_turn(request_id="sheet", turn_id="turn-1").context
     png_path = root / "snapshots" / build.snapshot.snapshot_id / "png" / "inventory.png"
@@ -379,13 +379,13 @@ def test_local_primary_rollback_rehearsal_and_legacy_removal_report(tmp_path: Pa
 
 def test_primary_replay_uses_snapshot_source_only_for_primary_cases(tmp_path: Path) -> None:
     root = tmp_path / "source-kind"
-    build_local_snapshot(root, synthetic_inventory_rows(), version="source-kind")
+    build = build_local_snapshot(root, synthetic_inventory_rows(), version="source-kind")
     primary = InventoryReadRouter(
         mode=READ_MODE_PRIMARY,
         fallback_strategy=FALLBACK_STRICT,
         legacy_provider=legacy_provider(synthetic_inventory_rows()),
         snapshot_provider=SnapshotInventoryReadProvider(SnapshotReader(root)),
-        readiness_state=ready_readiness_state(),
+        readiness_state=ready_readiness_state(build.snapshot),
     ).start_turn(request_id="source-kind", turn_id="turn-1")
     legacy = InventoryReadRouter(
         mode=READ_MODE_DISABLED,

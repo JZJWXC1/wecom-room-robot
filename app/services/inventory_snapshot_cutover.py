@@ -239,7 +239,7 @@ def run_primary_replay(
         fallback_strategy=FALLBACK_STRICT,
         legacy_provider=legacy_provider,
         snapshot_provider=snapshot_provider,
-        readiness_state=ready_readiness_state(),
+        readiness_state=ready_readiness_state(build.snapshot),
     )
     legacy_router = InventoryReadRouter(
         mode=READ_MODE_DISABLED,
@@ -312,12 +312,15 @@ def evaluate_cutover_readiness(
         scan = scan_public_artifacts_for_sensitive_text(root, snapshot_id=pointer.value.snapshot_id)
     else:
         not_ready.append(pointer.code)
+    effective_readiness_state = readiness_state
+    if effective_readiness_state is None and pointer.ok:
+        effective_readiness_state = ready_readiness_state(pointer.value)
     decision = InventoryReadRouter(
         mode=READ_MODE_PRIMARY,
         fallback_strategy=FALLBACK_STRICT,
         legacy_provider=_legacy_provider(synthetic_inventory_rows()),
         snapshot_provider=SnapshotInventoryReadProvider(reader),
-        readiness_state=readiness_state or ready_readiness_state(),
+        readiness_state=effective_readiness_state or ready_readiness_state(),
     ).select_context(request_id="cutover-readiness", turn_id="turn-1")
     if not decision.ok and decision.error is not None:
         not_ready.append(decision.error.code)
@@ -394,7 +397,7 @@ def switch_current_pointer(root: Path, snapshot_id: str) -> dict[str, Any]:
     return {"ok": True, "snapshot_id": snapshot.snapshot_id, "source_hash": snapshot.source_hash}
 
 
-def ready_readiness_state(**overrides: Any) -> dict[str, Any]:
+def ready_readiness_state(snapshot: InventorySnapshot | CurrentSnapshotPointer | None = None, **overrides: Any) -> dict[str, Any]:
     payload = {
         "reconciliation_passed": True,
         "blocking_count": 0,
@@ -405,6 +408,9 @@ def ready_readiness_state(**overrides: Any) -> dict[str, Any]:
         "unknown_canonical_areas": 0,
         "ambiguous_direct_mappings": 0,
     }
+    if snapshot is not None:
+        payload["snapshot_id"] = snapshot.snapshot_id
+        payload["source_hash"] = snapshot.source_hash
     payload.update(overrides)
     return payload
 
