@@ -842,6 +842,18 @@ class SendReceipt(ContractModel):
                 payload[key] = value
         return payload
 
+    def to_safe_dict(self) -> dict[str, Any]:
+        payload = super().to_safe_dict()
+        raw = self.model_dump(mode="json")
+        for key in ("source_hash", "sha256"):
+            value = str(raw.get(key) or "").strip()
+            if value:
+                payload[key] = _redact_text(value, allow_long_hash=True)
+        media_id = str(raw.get("media_id") or "").strip()
+        if media_id:
+            payload["media_id"] = _redact_text(media_id)
+        return payload
+
 
 def _redact_sensitive(value: Any, *, key: str = "") -> Any:
     if _is_sensitive_key(key):
