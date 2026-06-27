@@ -1,0 +1,36 @@
+{
+  "schema": "historical_failures_synthetic_sanitized.v1",
+  "description": "Synthetic sanitized replay windows for L4 historical failure gate mechanism tests. These are not production dialogue exports.",
+  "windows": [
+    {
+      "id": "hist_context_media_binding_001",
+      "source": "synthetic_sanitized_fixture",
+      "turns": [
+        "万达附近一千八以内的一室还有哪些？客户想先看三套。",
+        "第一套视频发我，最好先说明是哪套。",
+        "第二套也发图片，不要串到别的小区。",
+        "刚才两套里哪个现在还能约看？"
+      ]
+    },
+    {
+      "id": "hist_similar_community_clarify_002",
+      "source": "synthetic_sanitized_fixture",
+      "turns": [
+        "杨家府还有房子吗？客户说名字可能没记准。",
+        "如果是杨家新雅苑，价格多少？",
+        "这套视频有吗？",
+        "不要把杨乐府当成这套。"
+      ]
+    },
+    {
+      "id": "hist_inventory_table_media_003",
+      "source": "synthetic_sanitized_fixture",
+      "turns": [
+        "房源表发我一张图片版。",
+        "新天地四千到五千的两室列一下。",
+        "第一个房源的视频发我。",
+        "如果没有素材，就明确说本地暂时没找到。"
+      ]
+    }
+  ]
+}
