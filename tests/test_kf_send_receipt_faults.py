@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 import app.main as main
+from app.services import kf_outbox
 
 
 def _context() -> dict:
@@ -336,3 +337,143 @@ def test_video_daily_limit_exceeded_does_not_transcode_retry() -> None:
     receipt = result["context"]["send_receipts"]["receipts"][-1]
     assert receipt["status"] == "failed"
     assert receipt["metadata"]["transcode_retry"] is False
+
+
+def test_persistent_outbox_blocks_duplicate_text_after_context_loss(tmp_path) -> None:
+    class FakeWeComKf:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+            self.texts.append(text)
+            return {"errcode": 0, "msgid": f"text-{len(self.texts)}"}
+
+    async def run_case() -> tuple[dict, dict, FakeWeComKf, list[dict]]:
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        original_outbox = main.kf_send_outbox
+        main.wecom_kf = fake
+        main.kf_send_outbox = kf_outbox.LocalKfOutboxLedger(tmp_path / "kf_send_outbox.jsonl")
+        try:
+            first = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context={
+                    "structured_memory": {
+                        "current_turn_id": "turn-text-1",
+                        "turn_records": [{"turn_id": "turn-text-1", "msgids": ["msg-text-persist"]}],
+                    }
+                },
+                final_reply="这条我已经发过一次。",
+                tool_evidence={"suppress_actions": True},
+                msgids=["msg-text-persist"],
+            )
+            second = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context={
+                    "structured_memory": {
+                        "current_turn_id": "turn-text-restarted",
+                        "turn_records": [{"turn_id": "turn-text-restarted", "msgids": ["msg-text-persist"]}],
+                    }
+                },
+                final_reply="这条我已经发过一次。",
+                tool_evidence={"suppress_actions": True},
+                msgids=["msg-text-persist"],
+            )
+            return first, second, fake, main.kf_send_outbox.records()
+        finally:
+            main.wecom_kf = original_wecom
+            main.kf_send_outbox = original_outbox
+
+    first, second, fake, records = asyncio.run(run_case())
+
+    assert first["sent_actions"] == [{"type": "text", "count": 1}]
+    assert second["sent_actions"] == []
+    assert fake.texts == ["这条我已经发过一次。"]
+    assert second["context"]["send_receipts"]["receipts"][-1]["status"] == "skipped_duplicate"
+    assert [record["status"] for record in records if record["record_type"] == "receipt"] == [
+        "sent",
+        "skipped_duplicate",
+    ]
+
+
+def test_uncertain_video_result_blocks_automatic_replay_after_context_loss(tmp_path) -> None:
+    class FakeWeComKf:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+            self.video_attempts: list[str] = []
+
+        def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+            self.texts.append(text)
+            return {"errcode": 0}
+
+        def send_video(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+            self.video_attempts.append(str(media_id))
+            raise TimeoutError("send timed out after request body was written")
+
+    async def run_case() -> tuple[dict, dict, FakeWeComKf, list[dict], str]:
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        original_outbox = main.kf_send_outbox
+        main.wecom_kf = fake
+        main.kf_send_outbox = kf_outbox.LocalKfOutboxLedger(tmp_path / "kf_send_outbox.jsonl")
+        try:
+            video_path = tmp_path / "room.mp4"
+            video_path.write_bytes(b"video")
+            first = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context={
+                    "structured_memory": {
+                        "current_turn_id": "turn-video-1",
+                        "turn_records": [{"turn_id": "turn-video-1", "msgids": ["msg-video-timeout"]}],
+                    }
+                },
+                final_reply="",
+                tool_evidence={
+                    "video_paths": [str(video_path)],
+                    "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                },
+                msgids=["msg-video-timeout"],
+            )
+            second = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context={
+                    "structured_memory": {
+                        "current_turn_id": "turn-video-restarted",
+                        "turn_records": [{"turn_id": "turn-video-restarted", "msgids": ["msg-video-timeout"]}],
+                    }
+                },
+                final_reply="",
+                tool_evidence={
+                    "video_paths": [str(video_path)],
+                    "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                },
+                msgids=["msg-video-timeout"],
+            )
+            return first, second, fake, main.kf_send_outbox.records(), str(video_path)
+        finally:
+            main.wecom_kf = original_wecom
+            main.kf_send_outbox = original_outbox
+
+    first, second, fake, records, video_path = asyncio.run(run_case())
+
+    assert first["sent_actions"] == [
+        {
+            "type": "video_failed",
+            "path": video_path,
+            "room": "星河苑1-101",
+            "reason": "send timed out after request body was written",
+        }
+    ]
+    assert second["sent_actions"] == []
+    assert fake.video_attempts == [video_path]
+    assert len(fake.texts) == 1
+    assert first["context"]["send_receipts"]["receipts"][-1]["status"] == "send_uncertain"
+    assert second["context"]["send_receipts"]["receipts"][-1]["status"] == "skipped_duplicate"
+    assert [record["status"] for record in records if record["record_type"] == "receipt"] == [
+        "send_uncertain",
+        "skipped_duplicate",
+    ]

@@ -242,6 +242,55 @@ def test_save_context_preserves_send_receipt_ledger_internal_idempotency_key() -
     assert kf_send_receipts.find_successful_receipt(saved_context, idempotency_key) is not None
 
 
+def test_save_context_preserves_uncertain_send_receipt_as_blocking() -> None:
+    context = {
+        "structured_memory": {
+            "current_turn_id": "turn-uncertain",
+            "turn_records": [{"turn_id": "turn-uncertain", "msgids": ["msg-uncertain"]}],
+        },
+        "updated_at": 1,
+    }
+    action = kf_send_receipts.build_send_action(
+        open_kfid="kf",
+        external_userid="wm_CUSTOMER_CANARY_12345678901234567890",
+        context=context,
+        msgids=["msg-uncertain"],
+        action_id="send-video-1",
+        action_type="video",
+        payload={"material_hash": "video-hash"},
+    )
+    idempotency_key = kf_send_receipts.build_idempotency_key(action)
+    context = kf_send_receipts.append_receipt(
+        context,
+        kf_send_receipts.build_uncertain_receipt(
+            action,
+            idempotency_key=idempotency_key,
+            error=TimeoutError("access_token=abc send timed out"),
+        ),
+    )
+    store = FakeStore()
+
+    kf_context_memory.save_context(
+        "kf",
+        "wm_CUSTOMER_CANARY_12345678901234567890",
+        context,
+        memory={},
+        store=store,
+        logger=FakeLogger(),
+        now=lambda: 2,
+    )
+
+    [(saved_key, saved_context)] = store.saved.items()
+    dumped = json.dumps({saved_key: saved_context}, ensure_ascii=False, default=str)
+
+    assert "CUSTOMER_CANARY" not in dumped
+    assert "access_token" not in dumped
+    receipt = saved_context["send_receipts"]["receipts"][0]
+    assert receipt["status"] == "send_uncertain"
+    assert receipt["idempotency_key"] == idempotency_key
+    assert kf_send_receipts.find_blocking_receipt(saved_context, idempotency_key) is not None
+
+
 def test_append_and_format_dialog_context() -> None:
     context = None
     for index in range(32):
