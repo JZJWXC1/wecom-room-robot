@@ -248,6 +248,8 @@ def _action_type_for_evidence(evidence_type: str) -> str:
         return "video"
     if text in {"image", "inventory_sheet"}:
         return "image"
+    if text in {"contract_contact", "viewing_password", "viewing_contact"}:
+        return text
     return ""
 
 
@@ -605,6 +607,12 @@ def _default_action_captions(
 
 
 def _default_caption_text(action: SendAction, index: int) -> str:
+    if action.action_type == "contract_contact":
+        return "合同、定金和订房联系方式已由受控通道绑定。"
+    if action.action_type == "viewing_password":
+        return "看房密码已由受控通道绑定。"
+    if action.action_type == "viewing_contact":
+        return "看房联系号码已由受控通道绑定。"
     if action.action_type == "video":
         return f"这是第 {index} 个房间的视频。"
     if action.action_type == "image":
@@ -614,6 +622,8 @@ def _default_caption_text(action: SendAction, index: int) -> str:
 
 def _oralized_action_text(action: SendAction, evidence: EvidenceItem | None, index: int, candidate_label: str = "") -> str:
     label = _evidence_room_label(evidence) or _action_room_label(action) or candidate_label
+    if action.action_type in {"contract_contact", "viewing_password", "viewing_contact"}:
+        return evidence.summary if evidence and evidence.summary else _default_caption_text(action, index)
     if action.action_type == "video":
         return f"这是{label}房间的视频。" if label else _default_caption_text(action, index)
     if action.action_type == "image":

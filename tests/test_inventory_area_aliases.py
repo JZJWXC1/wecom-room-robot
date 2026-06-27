@@ -88,7 +88,26 @@ def strip_llm_shadow_only_blocks(lines: list[str]) -> list[str]:
     return result
 
 
-def test_llm_customer_chain_matches_fix1_except_rag_v2_entity_hints() -> None:
+def strip_removed_legacy_plan_reply(lines: list[str]) -> list[str]:
+    result: list[str] = []
+    skip_until: tuple[str, ...] = ()
+    for line in lines:
+        if skip_until:
+            if any(line.startswith(prefix) for prefix in skip_until):
+                skip_until = ()
+                result.append(line)
+            continue
+        if line.startswith("    async def plan_kf_reply_text("):
+            skip_until = (
+                "    async def compose_kf_outbound_shadow(",
+                "    async def assess_kf_final_reply(",
+            )
+            continue
+        result.append(line)
+    return result
+
+
+def test_llm_customer_chain_matches_fix1_except_rag_v2_entity_hints_and_v1_pruned_reply() -> None:
     current_lines = (REPO_ROOT / "app/services/llm.py").read_text(encoding="utf-8").splitlines()
     baseline = subprocess.run(
         ["git", "show", f"{FIX1_SHA}:app/services/llm.py"],
@@ -100,7 +119,8 @@ def test_llm_customer_chain_matches_fix1_except_rag_v2_entity_hints() -> None:
         check=True,
     ).stdout.splitlines()
 
-    current_lines = strip_llm_shadow_only_blocks(current_lines)
+    current_lines = strip_removed_legacy_plan_reply(strip_llm_shadow_only_blocks(current_lines))
+    baseline = strip_removed_legacy_plan_reply(baseline)
     filtered_current = [
         line for line in current_lines
         if not any(hint in line for hint in ALLOWED_LLM_RAG_V2_ENTITY_HINTS)

@@ -21,7 +21,8 @@ existing:
   - `app/main.py::_plan_actions`
   - `app/main.py::_execute_tools`
   - `app/main.py::_generate_reply_result`
-  - `app/services/llm.py::ReplyGenerator.plan_kf_reply_text`
+  - `app/services/llm.py::ReplyGenerator.compose_kf_outbound_production`
+  - `app/services/llm.py::ReplyGenerator.compose_kf_outbound_shadow`
   - `app/services/kf_orchestrator_flow.py`（当前未跟踪）
 - 修改自检前，查询：
   - `app/main.py::_constraint_consistency_selfcheck`

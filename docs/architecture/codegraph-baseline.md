@@ -83,7 +83,7 @@ current worktree:
   - `planner_reply_selfcheck`
   - `planner_reply_selfcheck_status`
 - `app/main.py::_plan_actions` 当前改为优先读取问题重写阶段产出的 `tool_plan`；没有 `tool_plan` 时按结构化任务做确定性补齐。
-- `ReplyGenerator.plan_kf_reply_text` 是工具执行后的 reply_text + selfcheck LLM 阶段，不是工具前 Planner。
+- V1 终态已删除 `ReplyGenerator.plan_kf_reply_text`；工具后客户可见文本由 LLM2 outbound 或 Planner 已提供的文本进入统一自检和发送包。
 
 重要区分：
 
@@ -114,7 +114,7 @@ existing/current:
 
 - 本地硬自检：`_constraint_consistency_selfcheck`、`_outbound_package_selfcheck`、`_local_human_context_selfcheck`
 - LLM 最终自检：`ReplyGenerator.assess_kf_final_reply`
-- 工具后回复生成：`ReplyGenerator.plan_kf_reply_text`
+- 工具后回复生成：LLM2 outbound production/shadow，或 Planner 已提供的 `reply_text` 进入统一自检。
 - RAG 质量规则：`KfAgenticRagService.assess_reply`、`assess_action`
 - 安全兜底：`_safe_fallback_for_intent`、`_final_inventory_evidence_fallback` 等。
 
@@ -294,11 +294,11 @@ proposed:
 
 ### `app/services/llm.py`
 
-- 公开入口：`ReplyGenerator.rewrite_kf_message`、`plan_kf_reply_text`、`assess_kf_final_reply`。
+- 公开入口：`ReplyGenerator.rewrite_kf_message`、`build_kf_task_packet`、`compose_kf_outbound_shadow`、`compose_kf_outbound_production`、`assess_kf_final_reply`。
 - 主要调用方：`app/main.py`。
 - 主要被调用方：OpenAI-compatible client、`RuleKnowledgeService`。
 - 输入：prompt payload、规则卡片、结构化任务、工具证据、自检上下文。
-- 输出：重写结果、工具后 reply_text、自检结果。
+- 输出：重写结果、LLM1 task packet、LLM2 outbound package、自检结果。
 - 状态读写：不应写客服上下文。
 - 外部依赖：LLM API；M0.6 未联网调用。
 - composition root：否。

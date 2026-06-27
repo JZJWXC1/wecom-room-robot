@@ -232,7 +232,9 @@ def test_agentic_rag_assessment_retries_bad_deposit_reply(tmp_path: Path) -> Non
         retry_attempted=True,
     )
     assert fallback.action == "fallback"
-    assert "免押不是免费" in fallback.fallback_text
+    assert fallback.fallback_text == ""
+    assert fallback.report is not None
+    assert "免押不是免费" in fallback.report.retry_instruction
 
 
 def test_agentic_rag_skips_plain_video_send_request(tmp_path: Path) -> None:
@@ -296,7 +298,9 @@ def test_agentic_rag_assessment_blocks_misleading_video_sent_reply_when_pending(
         retry_attempted=True,
     )
     assert fallback.action == "fallback"
-    assert "微信限制没发完" in fallback.fallback_text
+    assert fallback.fallback_text == ""
+    assert fallback.report is not None
+    assert "微信限制没发完" in fallback.report.retry_instruction
 
 
 def test_agentic_rag_includes_dynamic_inventory_media_and_password_when_requested(tmp_path: Path) -> None:
@@ -608,8 +612,10 @@ def test_agentic_rag_assessment_fixes_wrong_canonical_room_name(tmp_path: Path) 
 
     assert assessment.action == "fallback"
     assert assessment.reason == "canonical_room_name_mismatch"
-    assert "棠润府15-2-801B" in assessment.fallback_text
-    assert "荣润府" not in assessment.fallback_text
+    assert assessment.fallback_text == ""
+    assert assessment.report is not None
+    assert "棠润府15-2-801B" in assessment.report.retry_instruction
+    assert "荣润府" not in assessment.report.retry_instruction
 
 
 def test_agentic_rag_assessment_blocks_sequence_without_numbered_list(tmp_path: Path) -> None:
@@ -632,7 +638,9 @@ def test_agentic_rag_assessment_blocks_sequence_without_numbered_list(tmp_path: 
 
     assert assessment.action == "fallback"
     assert assessment.reason == "orphan_sequence_instruction"
-    assert "序号" not in assessment.fallback_text
+    assert assessment.fallback_text == ""
+    assert assessment.report is not None
+    assert "序号" not in assessment.report.retry_instruction
 
 
 def test_agentic_rag_assessment_requires_direct_availability_answer(tmp_path: Path) -> None:
