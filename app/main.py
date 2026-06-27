@@ -3931,6 +3931,15 @@ def _target_rows_from_understanding(
         )
             if str(part or "").strip()
     )
+    current_text = " ".join(
+        str(part).strip()
+        for part in (
+            task.get("original_text"),
+            understanding.get("original_query"),
+        )
+        if str(part or "").strip()
+    )
+    current_turn_has_room_refs = bool(_room_refs_from_text(current_text))
     explicit_room_refs = bool(
         proof.get("room_refs")
         or _room_refs_from_text(query_text)
@@ -3955,8 +3964,8 @@ def _target_rows_from_understanding(
             if candidate_room_ref_rows:
                 return candidate_room_ref_rows
             return []
-    elif explicit_room_refs:
-        matched_by_room_ref = _target_rows_from_room_refs(understanding, search_rows)
+    elif current_turn_has_room_refs:
+        matched_by_room_ref = _rows_matching_original_room_refs(current_text, search_rows)
         if matched_by_room_ref:
             return matched_by_room_ref
 
@@ -5671,11 +5680,16 @@ async def _execute_tools(
     )
     candidate_rows_for_selection = _candidate_rows(context)
     selected_indices = _selected_indices_from_understanding(understanding, selection_query_text)
+    current_selection_text = " ".join(
+        str(part).strip()
+        for part in (content, task.get("original_text"))
+        if str(part or "").strip()
+    )
     selection_has_direct_room_ref = bool(
-        proof.get("room_refs") or _room_refs_from_text(selection_query_text)
+        _room_refs_from_text(current_selection_text)
     )
     selection_has_prior_context = bool(
-        candidate_rows_for_selection or pending_video or _confirmed_row(context)
+        candidate_rows_for_selection or pending_video
     )
     missing_candidate_selection_context = bool(
         selected_indices
@@ -5720,6 +5734,7 @@ async def _execute_tools(
             "reason": "missing_current_candidate_set",
         }
         rows = []
+        target_rows = []
         evidence["inventory_rows"] = []
         evidence["image_rows"] = []
         evidence["video_rows"] = []

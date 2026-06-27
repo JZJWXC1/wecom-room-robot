@@ -1149,6 +1149,44 @@ class MainUnderstandingGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target_rows, [rows[0], rows[4]])
 
+    def test_selected_indices_ignore_inherited_room_refs_for_candidate_binding(self) -> None:
+        rows = [
+            {"\u5c0f\u533a": "\u68e0\u6da6\u5e9c", "\u623f\u53f7": "15-2-801B"},
+            {"\u5c0f\u533a": "\u5408\u5d62\u60a6\u5e9c", "\u623f\u53f7": "6-1-1204B"},
+            {"\u5c0f\u533a": "\u8363\u6da6\u5e9c", "\u623f\u53f7": "10-1004C"},
+        ]
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "\u4e07\u8fbe2000\u4ee5\u5185\u4e00\u5ba4",
+            "candidates": rows,
+            "shown_count": 3,
+            "total_count": 3,
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "\u53d1\u9001\u68e0\u6da6\u5e9c15-2-801B\u7684\u524d\u4e24\u5957\u89c6\u9891",
+                "rewritten_query": "\u53d1\u9001\u68e0\u6da6\u5e9c15-2-801B\u7684\u524d\u4e24\u5957\u89c6\u9891",
+                "context_reference": True,
+                "intent": "media",
+                "selected_indices": [1, 2],
+                "constraint_proof": {
+                    "room_refs": ["15-2-801b"],
+                    "selected_indices": [1, 2],
+                    "wants_video": True,
+                },
+                "structured_task": {
+                    "original_text": "\u524d\u4e24\u5957\u89c6\u9891\u53d1\u6211\u3002",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            [rows[0]],
+        )
+
+        self.assertEqual(target_rows, rows[:2])
+
     def test_selected_indices_do_not_partially_bind_current_search_rows(self) -> None:
         rows = [{"小区": "东新园", "房号": "8-1201"}]
 
@@ -7784,6 +7822,50 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["image_paths"], [])
         self.assertEqual(evidence["selection_error"]["reason"], "missing_current_candidate_set")
         self.assertEqual(evidence["selection_error"]["requested_indices"], [1])
+        self.assertEqual(evidence["selection_error"]["candidate_count"], 0)
+
+    async def test_selected_indices_without_candidates_ignore_inherited_room_refs(self) -> None:
+        row = {"\u5c0f\u533a": "\u77f3\u6865\u94ed\u82d1", "\u623f\u53f7": "6-1102"}
+
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return [row]
+
+        context = kf_context_memory.empty_context()
+        context["confirmed_room"] = {
+            "row": row,
+            "label": "\u77f3\u6865\u94ed\u82d16-1102",
+        }
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_image", "explain_missing_media"],
+                content="\u524d\u4e24\u5957\u56fe\u7247\u4e5f\u53d1\u6211\u3002",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "\u77f3\u6865\u94ed\u82d16-1102\u7684\u524d\u4e24\u5957\u56fe\u7247",
+                    "rewritten_query": "\u77f3\u6865\u94ed\u82d16-1102\u7684\u524d\u4e24\u5957\u56fe\u7247",
+                    "selected_indices": [1, 2],
+                    "constraint_proof": {
+                        "room_refs": ["6-1102"],
+                        "selected_indices": [1, 2],
+                        "wants_image": True,
+                    },
+                    "structured_task": {
+                        "original_text": "\u524d\u4e24\u5957\u56fe\u7247\u4e5f\u53d1\u6211\u3002",
+                        "tool_requirements": {"needs_image": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(evidence["inventory_rows"], [])
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertEqual(evidence["image_rows"], [])
+        self.assertEqual(evidence["selection_error"]["reason"], "missing_current_candidate_set")
         self.assertEqual(evidence["selection_error"]["candidate_count"], 0)
 
     async def test_selected_indices_out_of_range_candidate_context_blocks_fallback(self) -> None:
