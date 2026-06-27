@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import app.main as main
 from app.models import ReplyPlan
 from app.services import inventory_read_turn, kf_context_memory
+from app.services.inventory_snapshot_models import generate_listing_id
 from app.services.kf_llm1_task_packet import build_kf_task_packet_shadow
 from app.services.rewrite_inventory_index import FIELD_SEMANTICS, build_rewrite_inventory_index
 from app.services.wecom_kf import (
@@ -49,6 +50,17 @@ def test_constraint_selfcheck_does_not_force_search_terms_for_contract_followup(
     )
 
     assert result["status"] == "pass"
+
+
+def test_tool_evidence_rows_can_enrich_legacy_rows_with_stable_listing_id() -> None:
+    community = "\u68e0\u6da6\u5e9c"
+    room_no = "15-2-801B"
+    row = {"\u5c0f\u533a": community, "\u623f\u53f7": room_no}
+
+    enriched = main._rows_with_listing_ids([row])
+
+    assert enriched[0]["listing_id"] == generate_listing_id(community, room_no)
+    assert "listing_id" not in row
 
 
 def test_generate_reply_result_uses_llm2_production_package(monkeypatch) -> None:
@@ -4587,7 +4599,11 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([row["房号"] for row in first_evidence["inventory_rows"]], ["9-402B"])
         self.assertEqual(context["last_candidate_set"]["candidates"][0]["房号"], "9-402B")
-        self.assertEqual(second_evidence["target_rows"], [single_row])
+        target_rows_without_listing_id = [dict(row) for row in second_evidence["target_rows"]]
+        for row in target_rows_without_listing_id:
+            row.pop("listing_id", None)
+        self.assertEqual(target_rows_without_listing_id, [single_row])
+        self.assertEqual(second_evidence["target_rows"][0]["listing_id"], main._row_listing_id(single_row))
 
     async def test_vague_send_media_followup_binds_previous_candidate_set(self) -> None:
         previous_candidates = [

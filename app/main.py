@@ -44,6 +44,7 @@ from app.services.inventory_read_models import (
     InventoryReadError,
     assert_evidence_consistency,
 )
+from app.services.inventory_snapshot_models import is_safe_listing_id
 from app.services.inventory_query import (
     parse_inventory_query,
     row_matches_hard_constraints,
@@ -1386,6 +1387,30 @@ def _row_label(row: dict[str, Any]) -> str:
     community = _row_value(row, ("小区", "小区名", "community"))
     room_no = _row_value(row, ("房号", "房间号", "room", "room_no"))
     return f"{community}{room_no}".strip() or "这套房源"
+
+
+def _row_listing_id(row: dict[str, Any]) -> str:
+    for key in ("listing_id", "listingId", "房源ID", "房源编号"):
+        value = str(row.get(key) or "").strip()
+        if value and is_safe_listing_id(value):
+            return value
+    listing_id = inventory_sensitive_access.legacy_listing_id_for_row(row)
+    return listing_id if is_safe_listing_id(listing_id) else ""
+
+
+def _row_with_listing_id(row: dict[str, Any]) -> dict[str, Any]:
+    listing_id = _row_listing_id(row)
+    if not listing_id:
+        return row
+    if str(row.get("listing_id") or "").strip() == listing_id:
+        return row
+    enriched = dict(row)
+    enriched["listing_id"] = listing_id
+    return enriched
+
+
+def _rows_with_listing_ids(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [_row_with_listing_id(row) for row in rows if isinstance(row, dict)]
 
 
 def _normalized_room_label(row: dict[str, Any]) -> str:
@@ -5779,6 +5804,9 @@ async def _execute_tools(
         and any(action in actions for action in ("send_image", "send_video"))
     ):
         target_rows = rows[:KF_VIDEO_SEND_LIMIT]
+    rows = _rows_with_listing_ids(rows)
+    target_rows = _rows_with_listing_ids(target_rows)
+    evidence["inventory_rows"] = _rows_with_listing_ids(evidence.get("inventory_rows") or rows)
     evidence["target_rows"] = target_rows
     if target_rows and selected_indices:
         rows = target_rows
@@ -5842,7 +5870,7 @@ async def _execute_tools(
 
             if media_kind == "image":
                 evidence["image_paths"] = [str(path) for path in paths]
-                evidence["image_rows"] = matched_rows
+                evidence["image_rows"] = _rows_with_listing_ids(matched_rows)
                 if sync_result:
                     evidence.setdefault("media_sync", {})["image"] = sync_result
                 evidence["missing_media"].extend(f"{label}:图片" for label in missing)
@@ -5855,7 +5883,7 @@ async def _execute_tools(
                 continue
 
             evidence["video_paths"] = [str(path) for path in paths]
-            evidence["video_rows"] = matched_rows
+            evidence["video_rows"] = _rows_with_listing_ids(matched_rows)
             if sync_result:
                 evidence.setdefault("media_sync", {})["video"] = sync_result
             evidence["missing_media"].extend(f"{label}:视频" for label in missing)
