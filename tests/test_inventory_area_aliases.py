@@ -64,6 +64,8 @@ def strip_llm_shadow_only_blocks(lines: list[str]) -> list[str]:
 
         if line == "from app.services.kf_contracts import safe_artifact_payload":
             continue
+        if line == "from app.services.kf_dual_llm_production import DUAL_LLM_PRODUCTION_LLM1_PROMPT_VERSION":
+            continue
         if line == "from app.services.kf_llm1_task_packet import (":
             skip_import_block = True
             continue

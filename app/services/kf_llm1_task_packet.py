@@ -162,6 +162,7 @@ def build_kf_task_packet_shadow(
     prompt_version: str = LLM1_TASK_PACKET_PROMPT_VERSION,
     inventory_snapshot_id: str = "",
     candidate_set_id: str = "",
+    source_label: str = "",
 ) -> KfTaskPacketShadowBuild:
     raw_output = _sanitize_llm1_output(llm1_output)
     rewrite = _safe_dict(legacy_rewrite)
@@ -177,7 +178,7 @@ def build_kf_task_packet_shadow(
         legacy_planner=planner,
         prompt_version=prompt_version,
     )
-    source = "llm1_shadow" if raw_output else "legacy_shadow_fallback"
+    source = source_label or ("llm1_shadow" if raw_output else "legacy_shadow_fallback")
 
     payload, tool_plan, candidate_binding = _packet_payload_from_llm1(
         raw_output,

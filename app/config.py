@@ -125,6 +125,10 @@ class Settings(BaseSettings):
         default=5,
         alias="KF_AGENTIC_RAG_MAX_EVIDENCE",
     )
+    kf_dual_llm_mode: str = Field(
+        default="shadow",
+        alias="KF_DUAL_LLM_MODE",
+    )
 
     dashscope_api_key: str = Field(default="", alias="DASHSCOPE_API_KEY")
     dashscope_base_url: str = Field(

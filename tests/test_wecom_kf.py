@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import app.main as main
 from app.models import ReplyPlan
 from app.services import inventory_read_turn, kf_context_memory
+from app.services.kf_llm1_task_packet import build_kf_task_packet_shadow
 from app.services.rewrite_inventory_index import FIELD_SEMANTICS, build_rewrite_inventory_index
 from app.services.wecom_kf import (
     WeComKfClient,
@@ -48,6 +49,65 @@ def test_constraint_selfcheck_does_not_force_search_terms_for_contract_followup(
     )
 
     assert result["status"] == "pass"
+
+
+def test_generate_reply_result_uses_llm2_production_package(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "plain answer",
+                "task_atoms": [{"task_id": "task-1", "task_type": "reply_text"}],
+                "tool_plan": {"actions": ["generate_reply"]},
+            },
+            content="hello",
+            source_label="llm1_production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_text="")
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "我这边按证据给你回复。",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+        original_mode = main.settings.kf_dual_llm_mode
+        tool_evidence = {"actions": ["generate_reply"]}
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+        monkeypatch.setattr(main, "_needs_llm_final_selfcheck", lambda **kwargs: False)
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._generate_reply_result(
+                content="hello",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "general",
+                    "effective_query": "hello",
+                    "structured_task": {"tool_requirements": {}},
+                    "constraint_proof": {},
+                    "llm1_task_packet": task_packet,
+                },
+                tool_evidence=tool_evidence,
+                planner_result={"actions": ["generate_reply"], "reply_text": "旧话术"},
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert result["reply"] == "我这边按证据给你回复。"
+        assert result["selfcheck"]["status"] == "pass"
+        assert tool_evidence["deterministic_reply_source"] == "kf_llm2_outbound_production"
+        assert tool_evidence["dual_llm_production"]["llm2"]["reply_source"] == "kf_llm2_outbound_production"
+
+    asyncio.run(run_case())
 
 
 def test_constraint_selfcheck_passes_when_tool_has_single_matching_inventory_row() -> None:

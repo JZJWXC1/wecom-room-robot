@@ -7,6 +7,7 @@ from openai import AsyncOpenAI
 from app.config import settings
 from app.services.config_check import is_missing_or_placeholder
 from app.services.kf_contracts import safe_artifact_payload
+from app.services.kf_dual_llm_production import DUAL_LLM_PRODUCTION_LLM1_PROMPT_VERSION
 from app.services.kf_llm1_task_packet import (
     build_kf_task_packet_prompt_artifact,
     build_kf_task_packet_shadow,
@@ -64,9 +65,17 @@ class ReplyGenerator:
         conversation_id: str = "",
         turn_id: str = "",
         case_id: str = "",
+        inventory_snapshot_id: str = "",
+        candidate_set_id: str = "",
+        mode: str = "shadow",
     ):
         """LLM1 shadow：只输出 StructuredTaskPacket，不生成客户可见回复。"""
+        production_mode = str(mode or "").strip().lower() == "production"
+        prompt_version = DUAL_LLM_PRODUCTION_LLM1_PROMPT_VERSION if production_mode else ""
+        source_label = "llm1_production" if production_mode else ""
         if self._stage_api_key_missing("rewrite"):
+            if production_mode:
+                raise RuntimeError("LLM1 production rewrite API key is missing")
             return build_kf_task_packet_shadow(
                 None,
                 content=content,
@@ -79,6 +88,9 @@ class ReplyGenerator:
                 conversation_id=conversation_id,
                 turn_id=turn_id,
                 case_id=case_id,
+                inventory_snapshot_id=inventory_snapshot_id,
+                candidate_set_id=candidate_set_id,
+                prompt_version=prompt_version or "dual_llm_shadow.llm1_task_packet.v1",
             ).packet
         safe_planner_feedback = safe_artifact_payload(planner_feedback or {})
         rule_cards = self.rule_knowledge.retrieve_text(
@@ -97,9 +109,11 @@ class ReplyGenerator:
             candidate_set=candidate_set,
             legacy_rewrite=legacy_rewrite,
             legacy_planner=legacy_planner,
+            prompt_version=prompt_version or "dual_llm_shadow.llm1_task_packet.v1",
         )
+        llm1_mode_label = "production" if production_mode else "shadow"
         system_prompt = (
-            "你是长租公寓客服 Agentic RAG 的 LLM1 shadow。"
+            f"你是长租公寓客服 Agentic RAG 的 LLM1 {llm1_mode_label}。"
             "你只做问题理解、意图分析、上下文继承、实体绑定和工具计划，不生成客户可见回复。"
             "输出必须能转换为 StructuredTaskPacket：task_atoms 支持多任务，constraint_operation 只能是 inherit/replace/exclude/clear。"
             "constraints 要表达继承、替换、排除、清空；本轮明确修改的条件用 replace，明确不要的条件用 exclude，清空条件用 clear。"
@@ -180,6 +194,10 @@ Planner 回流证据：
             conversation_id=conversation_id,
             turn_id=turn_id,
             case_id=case_id,
+            inventory_snapshot_id=inventory_snapshot_id,
+            candidate_set_id=candidate_set_id,
+            prompt_version=prompt_version or "dual_llm_shadow.llm1_task_packet.v1",
+            source_label=source_label,
         ).packet
 
     async def rewrite_kf_message(
@@ -478,7 +496,11 @@ Planner 相关规则卡片：
         evidence_bundle: dict[str, Any],
         response_strategy: dict[str, Any] | str | None = None,
         retry_reason: str = "",
+        mode: str = "shadow",
     ) -> dict[str, Any]:
+        production_mode = str(mode or "").strip().lower() == "production"
+        mode_label = "production" if production_mode else "shadow"
+        source = f"llm2_outbound_{mode_label}"
         if self._stage_api_key_missing("reply"):
             return {
                 "reply_text": "",
@@ -488,8 +510,8 @@ Planner 相关规则卡片：
                 "self_review": {
                     "status": "retry",
                     "source": "missing_llm_key",
-                    "retry_reason": "LLM2 outbound shadow 缺少 reply 阶段 API key，未生成客户可见文本。",
-                    "rewrite_retry_reason": "LLM2 outbound shadow missing reply API key",
+                    "retry_reason": f"LLM2 outbound {mode_label} 缺少 reply 阶段 API key，未生成客户可见文本。",
+                    "rewrite_retry_reason": f"LLM2 outbound {mode_label} missing reply API key",
                     "llm2_decides_media_targets": False,
                 },
                 "source": "missing_llm_key",
@@ -498,7 +520,7 @@ Planner 相关规则卡片：
         safe_evidence = safe_artifact_payload(evidence_bundle or {})
         safe_strategy = safe_artifact_payload(response_strategy or {})
         system_prompt = (
-            "你是租房客服 Agentic RAG 的 LLM2 outbound shadow，只负责怎么说。"
+            f"你是租房客服 Agentic RAG 的 LLM2 outbound {mode_label}，只负责怎么说。"
             "你必须基于 StructuredTaskPacket、ToolEvidenceBundle 和 ResponseStrategy 生成 PreparedOutboundPackage 的文本字段。"
             "不得决定发哪套房、发什么素材、改 candidate_number、改 listing_id、改 send action。"
             "价格、房态、密码、链接、素材目标只能来自 ToolEvidenceBundle；证据没有返回就不能写。"
@@ -562,16 +584,32 @@ ResponseStrategy：
         data = self._parse_json_object(text)
         review = data.get("self_review")
         if not isinstance(review, dict):
-            review = {"status": "retry", "reason": "LLM2 shadow 未返回 self_review"}
+            review = {"status": "retry", "reason": f"LLM2 {mode_label} 未返回 self_review"}
         status = str(review.get("status") or "retry").strip().lower()
         if status not in {"pass", "retry"}:
             status = "retry"
         review["status"] = status
-        review["source"] = "llm2_outbound_shadow"
+        review["source"] = source
         review["llm2_decides_media_targets"] = False
         data["self_review"] = review
-        data["source"] = "llm2_outbound_shadow"
+        data["source"] = source
         return data
+
+    async def compose_kf_outbound_production(
+        self,
+        *,
+        task_packet: dict[str, Any],
+        evidence_bundle: dict[str, Any],
+        response_strategy: dict[str, Any] | str | None = None,
+        retry_reason: str = "",
+    ) -> dict[str, Any]:
+        return await self.compose_kf_outbound_shadow(
+            task_packet=task_packet,
+            evidence_bundle=evidence_bundle,
+            response_strategy=response_strategy,
+            retry_reason=retry_reason,
+            mode="production",
+        )
 
     async def assess_kf_final_reply(
         self,

@@ -21,6 +21,7 @@ from app.services import (
     inventory_sensitive_access,
     kf_agentic_rag,
     kf_context_memory,
+    kf_dual_llm_production,
     kf_orchestrator_flow,
     kf_orchestrator_shadow,
     kf_send_receipts,
@@ -48,6 +49,7 @@ from app.services.inventory_query import (
     row_matches_hard_constraints,
     row_matches_price_range,
 )
+from app.services.kf_contracts import safe_artifact_payload
 from app.services.llm import ReplyGenerator
 from app.services.media_store import MediaStore
 from app.services.region_inventory_sync import RegionInventorySyncService
@@ -660,6 +662,93 @@ def _safe_action_list(planner_result: dict[str, Any]) -> list[str]:
 
 def _orchestrator_tool_plan_from_understanding(understanding: dict[str, Any]) -> dict[str, Any]:
     return kf_orchestrator_flow.tool_plan_from_understanding(understanding)
+
+
+def _dual_llm_production_enabled() -> bool:
+    return kf_dual_llm_production.production_enabled(getattr(settings, "kf_dual_llm_mode", "shadow"))
+
+
+async def _apply_llm1_production_task_packet(
+    *,
+    content: str,
+    context: dict[str, Any],
+    result: dict[str, Any],
+    rewrite_view: dict[str, Any],
+    inventory_index: dict[str, Any],
+    inventory_read_context: InventoryReadContext,
+) -> dict[str, Any]:
+    if not _dual_llm_production_enabled():
+        return result
+    build_packet = getattr(reply_generator, "build_kf_task_packet", None)
+    if not callable(build_packet):
+        failure_plan = {
+            "actions": [],
+            "need_rewrite_clarification": True,
+            "missing_evidence": "LLM1 production task packet builder is unavailable.",
+            "source": "llm1_production_unavailable_gate",
+            "reply_text": "",
+        }
+        result["tool_plan"] = failure_plan
+        result.setdefault("structured_task", {})["tool_plan"] = failure_plan
+        result["dual_llm_production"] = {
+            "llm1": {"status": "retry", "source": "missing_llm1_builder"}
+        }
+        return result
+    conversation_id = str(context.get("conversation_id") or inventory_read_context.request_id or "")
+    turn_id = str(inventory_read_context.turn_id or "")
+    candidate_set = rewrite_view.get("last_candidate_set") if isinstance(rewrite_view, dict) else {}
+    candidate_set_id = str(candidate_set.get("candidate_set_id") or "") if isinstance(candidate_set, dict) else ""
+    try:
+        packet = await asyncio.wait_for(
+            build_packet(
+                content=content,
+                raw_dialog_context=list(rewrite_view.get("raw_dialog_context") or []),
+                structured_memory=rewrite_view,
+                inventory_index=inventory_index,
+                candidate_set=candidate_set if isinstance(candidate_set, dict) else {},
+                legacy_rewrite=result,
+                planner_feedback=result.get("planner_feedback") or {},
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                case_id=str(inventory_read_context.decision_id or ""),
+                inventory_snapshot_id=str(inventory_read_context.snapshot_id or ""),
+                candidate_set_id=candidate_set_id,
+                mode="production",
+            ),
+            timeout=8,
+        )
+        packet_payload = packet.to_safe_dict() if hasattr(packet, "to_safe_dict") else safe_artifact_payload(packet)
+        if not isinstance(packet_payload, dict):
+            packet_payload = {}
+        tool_plan = kf_dual_llm_production.tool_plan_from_task_packet(packet)
+    except Exception as exc:
+        logger.exception("KF LLM1 production task packet failed: %s", exc)
+        failure_plan = {
+            "actions": [],
+            "need_rewrite_clarification": True,
+            "missing_evidence": "LLM1 production task packet failed; do not continue with customer-visible facts.",
+            "source": "llm1_production_error_gate",
+            "reply_text": "",
+        }
+        result["tool_plan"] = failure_plan
+        result.setdefault("structured_task", {})["tool_plan"] = failure_plan
+        result["dual_llm_production"] = {
+            "llm1": {"status": "retry", "source": "llm1_production_error_gate", "error_type": type(exc).__name__}
+        }
+        return result
+    result["llm1_task_packet"] = packet_payload
+    result["tool_plan"] = tool_plan
+    result.setdefault("structured_task", {})["llm1_task_packet"] = packet_payload
+    result["structured_task"]["tool_plan"] = tool_plan
+    result["dual_llm_production"] = {
+        "llm1": {
+            "status": "pass",
+            "source": str(tool_plan.get("source") or "llm1_production_task_packet"),
+            "task_count": len(packet_payload.get("tasks") or []),
+            "action_count": len(tool_plan.get("actions") or []),
+        }
+    }
+    return result
 
 
 def _wants_continue_pending_video(content: str, understanding: dict[str, Any]) -> bool:
@@ -5130,6 +5219,14 @@ async def _understand_message(
         }
     if planner_feedback:
         result["planner_feedback"] = planner_feedback
+    result = await _apply_llm1_production_task_packet(
+        content=content,
+        context=context,
+        result=result,
+        rewrite_view=rewrite_view,
+        inventory_index=inventory_index,
+        inventory_read_context=inventory_read_context,
+    )
     return result
 
 
@@ -8843,6 +8940,94 @@ async def _generate_reply_result(
         draft_reply = normalized_reply
     if deterministic_reply_source:
         tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+    if _dual_llm_production_enabled():
+        llm2_retry_reason = ""
+        task_packet = understanding.get("llm1_task_packet")
+        production_package_payload: dict[str, Any] = {}
+        if not isinstance(task_packet, dict) or not task_packet:
+            llm2_retry_reason = "LLM1 production task packet is missing; LLM2 production cannot compose customer reply."
+            production_package_payload = {
+                "self_review": {"status": "retry", "reason": llm2_retry_reason},
+                "reply_text_present": False,
+            }
+        else:
+            try:
+                production_package = await asyncio.wait_for(
+                    kf_dual_llm_production.compose_production_outbound_package(
+                        reply_generator=reply_generator,
+                        task_packet=task_packet,
+                        tool_evidence=tool_evidence,
+                        draft_reply=draft_reply,
+                        planner_result=planner_result or {},
+                        reply_result={"reply": draft_reply, "reply_source": deterministic_reply_source},
+                        retry_reason=retry_reason,
+                    ),
+                    timeout=8,
+                )
+                production_package_payload = kf_dual_llm_production.package_log_payload(production_package)
+                if (
+                    kf_dual_llm_production.package_passed(production_package)
+                    and str(production_package.reply_text or "").strip()
+                ):
+                    draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
+                        str(production_package.reply_text or "")
+                    )
+                    deterministic_reply_source = "kf_llm2_outbound_production"
+                    tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+                    outbound_dict = production_package.to_legacy_dict()
+                    tool_evidence["llm2_production_outbound_package"] = outbound_dict
+                else:
+                    llm2_retry_reason = kf_dual_llm_production.package_retry_reason(production_package)
+            except Exception as exc:
+                logger.exception("KF LLM2 production outbound failed: %s", exc)
+                llm2_retry_reason = "LLM2 production outbound failed; do not continue with customer-visible facts."
+                production_package_payload = {
+                    "self_review": {
+                        "status": "retry",
+                        "source": "llm2_production_error_gate",
+                        "error_type": type(exc).__name__,
+                    },
+                    "reply_text_present": False,
+                }
+        dual_meta = dict(tool_evidence.get("dual_llm_production") or understanding.get("dual_llm_production") or {})
+        dual_meta["llm2"] = production_package_payload
+        tool_evidence["dual_llm_production"] = safe_artifact_payload(dual_meta)
+        if llm2_retry_reason and not retry_reason:
+            gate_selfcheck = {
+                "status": "retry",
+                "source": "llm2_production_output_gate",
+                "reason": llm2_retry_reason,
+            }
+            retry_payload = _planner_retry_reason_payload(
+                content=content,
+                understanding=understanding,
+                planner_result=planner_result or {},
+                tool_evidence=tool_evidence,
+                draft_reply=draft_reply,
+                rule_selfcheck=gate_selfcheck,
+                llm_selfcheck=production_package_payload.get("self_review") or gate_selfcheck,
+                reason=llm2_retry_reason,
+            )
+            return {
+                "reply": "",
+                "draft_reply": draft_reply,
+                "planner_reply_result": planner_reply_result,
+                "context": context,
+                "selfcheck": {
+                    "status": "retry",
+                    "rule": gate_selfcheck,
+                    "llm": production_package_payload.get("self_review") or gate_selfcheck,
+                },
+                "needs_planner_retry": True,
+                "planner_retry_reason": retry_payload,
+            }
+        if llm2_retry_reason:
+            draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
+                _safe_fallback_for_intent(understanding, settings.default_fallback_reply)
+            )
+            deterministic_reply_source = "llm2_production_safe_fallback"
+            tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+            tool_evidence["suppress_actions"] = True
     outbound_package = _build_outbound_package(draft_reply, tool_evidence)
     tool_evidence["outbound_package"] = outbound_package
     selfcheck_stage = timer.stage("final_selfcheck") if timer else nullcontext()

@@ -7,6 +7,20 @@ from app.config import settings
 from app.services.llm import ReplyGenerator
 
 
+def test_build_kf_task_packet_production_missing_key_is_hard_gate(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "llm_rewrite_provider", "dashscope")
+    monkeypatch.setattr(settings, "dashscope_api_key", "")
+
+    generator = ReplyGenerator()
+
+    try:
+        asyncio.run(generator.build_kf_task_packet(content="你好", mode="production"))
+    except RuntimeError as exc:
+        assert "LLM1 production rewrite API key is missing" in str(exc)
+    else:
+        raise AssertionError("production LLM1 must not fall back to legacy packet when rewrite key is missing")
+
+
 def test_rewrite_kf_message_returns_orchestrator_tool_plan_contract(monkeypatch) -> None:
     monkeypatch.setattr(settings, "dashscope_api_key", "test-key")
     monkeypatch.setattr(settings, "dashscope_rewrite_model", "rewrite-model")
