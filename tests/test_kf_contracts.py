@@ -395,12 +395,35 @@ def test_orchestrator_shadow_artifact_schema_and_redaction() -> None:
 
     assert payload["schema_version"] == ORCHESTRATOR_SHADOW_SCHEMA_VERSION
     assert payload["mode"] == "shadow"
+    assert payload["baseline_commit"] == "693a9c899d1cb1a4565ad67e4e600fc9559da4dd"
     assert tuple(payload.keys()) == ORCHESTRATOR_SHADOW_TOP_LEVEL_KEYS
     assert "raw_customer_content" not in payload["turn"]
     assert "raw_tool_result" not in payload["legacy_pipeline"]
     assert "19900009999" not in dumped
     assert FAKE_VIEWING_PASSWORD not in dumped
     assert "abc123" not in dumped
+
+
+def test_safe_artifact_payload_preserves_explicit_git_commit_fields_only() -> None:
+    commit = "693a9c899d1cb1a4565ad67e4e600fc9559da4dd"
+    long_hash = "a" * 64
+
+    payload = safe_artifact_payload(
+        {
+            "baseline_commit": commit,
+            "commit": commit,
+            "commit_hash": commit,
+            "note": f"free text commit {commit} and hash {long_hash}",
+            "other_hash": long_hash,
+        }
+    )
+
+    assert payload["baseline_commit"] == commit
+    assert payload["commit"] == commit
+    assert payload["commit_hash"] == commit
+    assert commit not in payload["note"]
+    assert long_hash not in payload["note"]
+    assert payload["other_hash"] != long_hash
 
 
 def test_safe_artifact_payload_omits_raw_customer_content_and_tool_results() -> None:
@@ -423,3 +446,41 @@ def test_safe_artifact_payload_omits_raw_customer_content_and_tool_results() -> 
     assert "19900009999" not in dumped
     assert "abc123" not in dumped
     assert "secret" not in dumped
+
+
+def test_safe_artifact_payload_redacts_boundary_ids_signatures_and_long_runtime_values() -> None:
+    source_hash = "b" * 40
+    long_runtime_id = "wm_CUSTOMER_CANARY_1234567890abcdefghijklmnop"
+    payload = safe_artifact_payload(
+        {
+            "source_hash": source_hash,
+            "msg_signature": "sig_CANARY_abcdefghijklmnopqrstuvwxyz",
+            "signature": "sha1_CANARY_abcdefghijklmnopqrstuvwxyz",
+            "external_userid": long_runtime_id,
+            "openid": "open_CANARY_1234567890abcdefghijklmnop",
+            "unionid": "union_CANARY_1234567890abcdefghijklmnop",
+            "cursor": "cursor_CANARY_1234567890abcdefghijklmnop",
+            "welcome_code": "welcome_CANARY_1234567890abcdefghijklmnop",
+            "media_id": "media_CANARY_1234567890abcdefghijklmnop",
+            "note": (
+                "手机 19900009999，看房密码 246810#，"
+                "token=token_CANARY_abcdefghijklmnopqrstuvwxyz，"
+                f"runtime={long_runtime_id}，hash={'a' * 64}"
+            ),
+        }
+    )
+    dumped = json.dumps(payload, ensure_ascii=False)
+
+    assert payload["source_hash"] == source_hash
+    assert "sig_CANARY" not in dumped
+    assert "sha1_CANARY" not in dumped
+    assert "CUSTOMER_CANARY" not in dumped
+    assert "open_CANARY" not in dumped
+    assert "union_CANARY" not in dumped
+    assert "cursor_CANARY" not in dumped
+    assert "welcome_CANARY" not in dumped
+    assert "media_CANARY" not in dumped
+    assert "19900009999" not in dumped
+    assert "246810#" not in dumped
+    assert "token_CANARY" not in dumped
+    assert "a" * 64 not in dumped

@@ -1,8 +1,12 @@
 ﻿from __future__ import annotations
 
+import hashlib
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+from app.services.kf_contracts import redact_sensitive_text, redact_sensitive_value
 
 
 DEFAULT_MESSAGE_LIMIT = 30
@@ -10,6 +14,7 @@ DEFAULT_CANDIDATE_LIMIT = 10
 DEFAULT_TURN_TRACE_LIMIT = 10
 MAX_STRUCTURED_TEXT_CHARS = 500
 MAX_STRUCTURED_ACTION_ITEMS = 10
+SAFE_CONTEXT_SCHEMA_VERSION = "wecom_kf_context.safe.v1"
 
 
 def _bounded_int(value: Any, *, default: int = 0, minimum: int = 0) -> int:
@@ -29,7 +34,17 @@ def _bounded_float(value: Any, *, default: float = 0.0, minimum: float = 0.0, ma
 
 
 def conversation_key(open_kfid: str, external_userid: str) -> str:
-    return f"{open_kfid}:{external_userid}"
+    raw = f"{str(open_kfid or '').strip()}:{str(external_userid or '').strip()}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return f"kfctx_{digest}"
+
+
+def safe_context_storage_key(key: str) -> str:
+    text = str(key or "").strip()
+    if re.fullmatch(r"kfctx_[0-9a-f]{32}", text):
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+    return f"kfctx_{digest}"
 
 
 def empty_context(*, now: Callable[[], float] = time.time) -> dict[str, Any]:
@@ -259,21 +274,64 @@ def room_key_from_row(row: dict[str, Any] | None) -> str:
     return f"{community}{room_no}".strip()
 
 
+def _listing_id_from_row(row: dict[str, Any]) -> str:
+    for key in ("listing_id", "listingId", "房源ID", "房源编号"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return redact_sensitive_text(value)
+    return ""
+
+
+def _has_viewing_password(viewing_text: str) -> bool:
+    return bool(re.search(r"(?<!\d)\d{3,8}#?(?!\d)", viewing_text))
+
+
+def _viewing_needs_contact(viewing_text: str) -> bool:
+    if not viewing_text:
+        return False
+    return (
+        not _has_viewing_password(viewing_text)
+        or any(word in viewing_text for word in ("提前联系", "预约", "转租", "联系", "密码不对", "打不开", "空出", "未空"))
+    )
+
+
 def summarize_row(row: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(row, dict):
         return {}
+    viewing = str(row.get("看房方式密码") or row.get("看房方式") or row.get("密码") or row.get("看房密码") or "").strip()
+    has_password = _has_viewing_password(viewing)
+    needs_contact = _viewing_needs_contact(viewing)
     summary = {
+        "listing_id": _listing_id_from_row(row),
         "key": room_key_from_row(row),
         "community": str(row.get("小区") or row.get("社区") or row.get("楼盘") or "").strip(),
+        "小区": str(row.get("小区") or row.get("社区") or row.get("楼盘") or "").strip(),
         "room_no": str(row.get("房号") or row.get("房间号") or row.get("门牌号") or "").strip(),
+        "房号": str(row.get("房号") or row.get("房间号") or row.get("门牌号") or "").strip(),
         "layout": str(row.get("户型") or row.get("户型描述") or "").strip(),
+        "户型": str(row.get("户型") or row.get("户型描述") or "").strip(),
         "layout_type": str(row.get("户型分类") or "").strip(),
         "rent_one": str(row.get("押一付一") or row.get("押一") or "").strip(),
+        "押一付一": str(row.get("押一付一") or row.get("押一") or "").strip(),
         "rent_two": str(row.get("押二付一") or row.get("押二") or "").strip(),
-        "viewing": str(row.get("看房方式密码") or row.get("看房方式") or "").strip(),
+        "押二付一": str(row.get("押二付一") or row.get("押二") or "").strip(),
+        "has_password": has_password,
+        "needs_contact": needs_contact,
+        "viewing_mode": (
+            "contact_required"
+            if needs_contact
+            else "password_available"
+            if has_password
+            else ""
+        ),
         "remark": str(row.get("备注") or "").strip(),
+        "备注": str(row.get("备注") or "").strip(),
     }
-    return {key: value for key, value in summary.items() if value}
+    return {
+        key: redact_sensitive_value(value)
+        for key, value in summary.items()
+        if value not in ("", None, [], {})
+    }
 
 
 def summarize_rows(
@@ -542,6 +600,63 @@ def normalize_media_context(
     return normalized
 
 
+def _normalize_send_receipts_for_storage(context: dict[str, Any]) -> dict[str, Any]:
+    from app.services import kf_send_receipts
+
+    ledger = kf_send_receipts.normalize_receipt_ledger(context)
+    if ledger.get("receipts"):
+        return ledger
+    return {}
+
+
+def sanitize_context_for_storage(
+    context: dict[str, Any],
+    *,
+    now: Callable[[], float] = time.time,
+    message_limit: int = DEFAULT_MESSAGE_LIMIT,
+    candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
+) -> dict[str, Any]:
+    normalized = normalize_media_context(
+        context,
+        message_limit=message_limit,
+        candidate_limit=candidate_limit,
+        now=now,
+    )
+    normalized["schema_version"] = SAFE_CONTEXT_SCHEMA_VERSION
+    send_receipts = _normalize_send_receipts_for_storage(context)
+
+    if "last_candidate_set" in normalized:
+        candidate_set = dict(normalized["last_candidate_set"])
+        candidate_set["query"] = redact_sensitive_text(candidate_set.get("query", ""))
+        candidate_set["candidates"] = summarize_rows(candidate_set.get("candidates") or [], limit=candidate_limit)
+        candidate_set["inventory_cache_meta"] = redact_sensitive_value(candidate_set.get("inventory_cache_meta") or {})
+        normalized["last_candidate_set"] = {
+            key: value for key, value in candidate_set.items() if value not in ("", None, [], {})
+        }
+
+    if "confirmed_room" in normalized:
+        confirmed = dict(normalized["confirmed_room"])
+        confirmed["label"] = redact_sensitive_text(confirmed.get("label", ""))
+        confirmed["row"] = summarize_row(confirmed.get("row"))
+        confirmed["inventory_cache_meta"] = redact_sensitive_value(confirmed.get("inventory_cache_meta") or {})
+        normalized["confirmed_room"] = {
+            key: value for key, value in confirmed.items() if value not in ("", None, [], {})
+        }
+
+    if "active_context_binding" in normalized:
+        binding = dict(normalized["active_context_binding"])
+        binding["content"] = redact_sensitive_text(binding.get("content", ""))
+        binding["rows"] = summarize_rows(binding.get("rows") or [], limit=candidate_limit)
+        normalized["active_context_binding"] = {
+            key: value for key, value in binding.items() if value not in ("", None, [], {})
+        }
+
+    safe_context = redact_sensitive_value(_jsonable_structured_value(normalized))
+    if send_receipts:
+        safe_context["send_receipts"] = send_receipts
+    return safe_context
+
+
 def context_is_expired(
     context: dict[str, Any],
     *,
@@ -604,7 +719,7 @@ def save_context(
     context["updated_at"] = now()
     memory[key] = context
     try:
-        store.save(key, context)
+        store.save(key, sanitize_context_for_storage(context, now=now))
     except Exception:
         logger.exception("WeCom KF context save failed")
 

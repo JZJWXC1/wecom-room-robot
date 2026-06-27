@@ -10,6 +10,7 @@ import httpx
 from app.config import settings
 from app.services import kf_context_memory
 from app.services.fuzzy_match import COMMUNITY_DISPLAY_ALIASES
+from app.services.kf_contracts import redact_sensitive_text, redact_sensitive_value
 from app.services.wx_crypto import WeComCrypto
 
 
@@ -40,7 +41,7 @@ class WeComKfStateStore:
             if not key:
                 continue
             try:
-                welcome_sent_at[str(key)] = float(value)
+                welcome_sent_at[kf_context_memory.safe_context_storage_key(str(key))] = float(value)
             except (TypeError, ValueError):
                 continue
         return {
@@ -71,14 +72,15 @@ class WeComKfStateStore:
     def last_welcome_sent_at(self, conversation_key: str) -> float:
         if not conversation_key:
             return 0.0
-        return float(self.load().get("welcome_sent_at", {}).get(conversation_key) or 0.0)
+        safe_key = kf_context_memory.safe_context_storage_key(conversation_key)
+        return float(self.load().get("welcome_sent_at", {}).get(safe_key) or 0.0)
 
     def mark_welcome_sent(self, conversation_key: str, sent_at: float | None = None) -> None:
         if not conversation_key:
             return
         state = self.load()
         welcome_sent_at = dict(state.get("welcome_sent_at") or {})
-        welcome_sent_at[conversation_key] = float(sent_at or time.time())
+        welcome_sent_at[kf_context_memory.safe_context_storage_key(conversation_key)] = float(sent_at or time.time())
         state["welcome_sent_at"] = dict(
             sorted(
                 welcome_sent_at.items(),
@@ -112,17 +114,17 @@ class WeComKfContextStore:
         if not isinstance(data, dict):
             return {}
         return {
-            str(key): self._normalize_context(value)
+            kf_context_memory.safe_context_storage_key(str(key)): self._normalize_context(value)
             for key, value in data.items()
             if isinstance(value, dict)
         }
 
     def get(self, key: str) -> dict[str, Any] | None:
-        return self.load().get(key)
+        return self.load().get(kf_context_memory.safe_context_storage_key(key))
 
     def save(self, key: str, context: dict[str, Any]) -> None:
         contexts = self.load()
-        contexts[key] = self._normalize_context(context)
+        contexts[kf_context_memory.safe_context_storage_key(key)] = self._normalize_context(context)
         items = sorted(
             contexts.items(),
             key=lambda item: float(item[1].get("updated_at", 0)),
@@ -131,77 +133,14 @@ class WeComKfContextStore:
 
     def delete(self, key: str) -> None:
         contexts = self.load()
-        if key not in contexts:
+        safe_key = kf_context_memory.safe_context_storage_key(key)
+        if safe_key not in contexts:
             return
-        contexts.pop(key, None)
+        contexts.pop(safe_key, None)
         self._write(contexts)
 
     def _normalize_context(self, context: dict[str, Any]) -> dict[str, Any]:
-        recent_messages = []
-        for item in context.get("recent_messages") or []:
-            if not isinstance(item, dict):
-                continue
-            role = str(item.get("role") or "").strip()
-            content = str(item.get("content") or "").strip()
-            if not role or not content:
-                continue
-            recent_messages.append(
-                {
-                    "role": role,
-                    "content": content,
-                    "created_at": float(item.get("created_at") or time.time()),
-                }
-            )
-        normalized = {
-            "image_paths": [str(item) for item in context.get("image_paths") or [] if item],
-            "video_paths": [str(item) for item in context.get("video_paths") or [] if item],
-            "video_urls": [str(item) for item in context.get("video_urls") or [] if item],
-            "recent_messages": recent_messages[-10:],
-            "updated_at": float(context.get("updated_at") or time.time()),
-        }
-        last_candidate_set = kf_context_memory.normalize_last_candidate_set(
-            context.get("last_candidate_set")
-        )
-        if last_candidate_set:
-            normalized["last_candidate_set"] = last_candidate_set
-        confirmed = self._normalize_confirmed_room(context.get("confirmed_room"))
-        if confirmed:
-            normalized["confirmed_room"] = confirmed
-        pending_reference = self._normalize_reference_confirmation(
-            context.get("pending_reference_confirmation")
-        )
-        if pending_reference:
-            normalized["pending_reference_confirmation"] = pending_reference
-        last_understanding = self._normalize_last_message_understanding(
-            context.get("last_message_understanding")
-        )
-        if last_understanding:
-            normalized["last_message_understanding"] = last_understanding
-        active_binding = self._normalize_active_context_binding(
-            context.get("active_context_binding")
-        )
-        if active_binding:
-            normalized["active_context_binding"] = active_binding
-        active_query_state = kf_context_memory.normalize_active_query_state(
-            context.get("active_query_state")
-        )
-        if active_query_state:
-            normalized["active_query_state"] = active_query_state
-        pending_video_sends = self._normalize_pending_video_sends(
-            context.get("pending_video_sends")
-        )
-        if pending_video_sends:
-            normalized["pending_video_sends"] = pending_video_sends
-        structured_memory = kf_context_memory.normalize_structured_memory(
-            context.get("structured_memory")
-        )
-        if (
-            structured_memory.get("raw_dialog_context")
-            or structured_memory.get("turn_records")
-            or structured_memory.get("current_turn_id")
-        ):
-            normalized["structured_memory"] = structured_memory
-        return normalized
+        return kf_context_memory.sanitize_context_for_storage(context)
 
     def _normalize_confirmed_room(self, value: Any) -> dict[str, Any]:
         if not isinstance(value, dict):
@@ -287,6 +226,17 @@ class WeComKfContextStore:
         tmp_path.replace(self.path)
 
 
+def _raise_for_status_sanitized(response: httpx.Response, label: str) -> None:
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"{label} HTTP 失败：{redact_sensitive_text(str(exc))}") from None
+
+
+def _safe_api_error(prefix: str, data: dict[str, Any]) -> RuntimeError:
+    return RuntimeError(f"{prefix}：{redact_sensitive_value(data)}")
+
+
 class WeComKfClient:
     def __init__(self, state_store: WeComKfStateStore | None = None) -> None:
         self._token: str = ""
@@ -356,10 +306,10 @@ class WeComKfClient:
                     payload["cursor"] = cursor
 
                 response = await client.post(url, json=payload)
-                response.raise_for_status()
+                _raise_for_status_sanitized(response, "微信客服消息拉取")
                 data = response.json()
                 if data.get("errcode") != 0:
-                    raise RuntimeError(f"微信客服消息拉取失败：{data}")
+                    raise _safe_api_error("微信客服消息拉取失败", data)
 
                 messages.extend(data.get("msg_list") or [])
                 next_cursor = str(data.get("next_cursor") or next_cursor)
@@ -380,12 +330,12 @@ class WeComKfClient:
         payload = self.build_text_payload(open_kfid, external_userid, content)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(url, json=payload)
-            response.raise_for_status()
+            _raise_for_status_sanitized(response, "微信客服消息发送")
             data = response.json()
         if data.get("errcode") != 0:
             if data.get("errcode") == SEND_MSG_COUNT_LIMIT_ERRCODE:
-                raise WeComKfSendLimitError(f"微信客服消息发送次数受限：{data}")
-            raise RuntimeError(f"微信客服消息发送失败：{data}")
+                raise WeComKfSendLimitError(f"微信客服消息发送次数受限：{redact_sensitive_value(data)}")
+            raise _safe_api_error("微信客服消息发送失败", data)
         return data
 
     async def send_welcome_text_on_event(
@@ -398,12 +348,12 @@ class WeComKfClient:
         payload = self.build_event_text_payload(welcome_code, content)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(url, json=payload)
-            response.raise_for_status()
+            _raise_for_status_sanitized(response, "微信客服欢迎语发送")
             data = response.json()
         if data.get("errcode") != 0:
             if data.get("errcode") == SEND_MSG_COUNT_LIMIT_ERRCODE:
-                raise WeComKfSendLimitError(f"微信客服欢迎语发送次数受限：{data}")
-            raise RuntimeError(f"微信客服欢迎语发送失败：{data}")
+                raise WeComKfSendLimitError(f"微信客服欢迎语发送次数受限：{redact_sensitive_value(data)}")
+            raise _safe_api_error("微信客服欢迎语发送失败", data)
         return data
 
     async def upload_media(self, path: Path, media_type: str = "image") -> str:
@@ -415,13 +365,13 @@ class WeComKfClient:
             files = {"media": (path.name, file, content_type)}
             async with httpx.AsyncClient(timeout=60) as client:
                 response = await client.post(url, params=params, files=files)
-                response.raise_for_status()
+                _raise_for_status_sanitized(response, "企业微信临时素材上传")
                 data = response.json()
         if data.get("errcode", 0) != 0:
-            raise RuntimeError(f"企业微信临时素材上传失败：{data}")
+            raise _safe_api_error("企业微信临时素材上传失败", data)
         media_id = str(data.get("media_id") or "")
         if not media_id:
-            raise RuntimeError(f"企业微信临时素材上传未返回 media_id：{data}")
+            raise _safe_api_error("企业微信临时素材上传未返回 media_id", data)
         return media_id
 
     async def send_image(
@@ -436,12 +386,12 @@ class WeComKfClient:
         payload = self.build_image_payload(open_kfid, external_userid, media_id)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(url, json=payload)
-            response.raise_for_status()
+            _raise_for_status_sanitized(response, "微信客服图片发送")
             data = response.json()
         if data.get("errcode") != 0:
             if data.get("errcode") == SEND_MSG_COUNT_LIMIT_ERRCODE:
-                raise WeComKfSendLimitError(f"微信客服图片发送次数受限：{data}")
-            raise RuntimeError(f"微信客服图片发送失败：{data}")
+                raise WeComKfSendLimitError(f"微信客服图片发送次数受限：{redact_sensitive_value(data)}")
+            raise _safe_api_error("微信客服图片发送失败", data)
         return data
 
     async def send_video(
@@ -464,12 +414,12 @@ class WeComKfClient:
         payload = self.build_video_payload(open_kfid, external_userid, media_id)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(url, json=payload)
-            response.raise_for_status()
+            _raise_for_status_sanitized(response, "微信客服视频发送")
             data = response.json()
         if data.get("errcode") != 0:
             if data.get("errcode") == SEND_MSG_COUNT_LIMIT_ERRCODE:
-                raise WeComKfSendLimitError(f"微信客服视频发送次数受限：{data}")
-            raise RuntimeError(f"微信客服视频发送失败：{data}")
+                raise WeComKfSendLimitError(f"微信客服视频发送次数受限：{redact_sensitive_value(data)}")
+            raise _safe_api_error("微信客服视频发送失败", data)
         return data
 
     def build_text_payload(
@@ -537,10 +487,10 @@ class WeComKfClient:
         params = {"corpid": settings.wecom_corp_id, "corpsecret": secret}
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(url, params=params)
-            response.raise_for_status()
+            _raise_for_status_sanitized(response, "企业微信 access_token 获取")
             data = response.json()
         if data.get("errcode") != 0:
-            raise RuntimeError(f"企业微信 access_token 获取失败：{data}")
+            raise _safe_api_error("企业微信 access_token 获取失败", data)
         self._token = data["access_token"]
         self._token_expire_at = time.time() + int(data.get("expires_in", 7200)) - 300
         return self._token

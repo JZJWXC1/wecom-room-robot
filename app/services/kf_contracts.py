@@ -16,12 +16,24 @@ SENSITIVE_KEY_MARKERS = (
     "appsecret",
     "authorization",
     "bearer",
+    "corpsecret",
+    "cursor",
     "feishu",
+    "external_userid",
+    "external_user_id",
+    "media_id",
+    "msg_signature",
+    "openid",
+    "open_id",
     "password",
     "refresh_token",
     "secret",
+    "signature",
     "tenant_access_token",
     "token",
+    "unionid",
+    "union_id",
+    "welcome_code",
     "phone",
     "mobile",
     "电话",
@@ -40,6 +52,34 @@ SENSITIVE_KEY_MARKERS = (
     "密码",
     "手机号",
 )
+SAFE_SENSITIVE_SUMMARY_KEYS = {
+    "has_password",
+    "password_available",
+    "password_match",
+    "password_policy",
+    "has_viewing_text",
+    "viewing_mode",
+    "viewing_summary",
+    "availability_summary",
+    "availability_status",
+    "needs_contact",
+    "contact_required",
+    "source_hash",
+}
+SAFE_LONG_HASH_KEYS = {
+    "content_hash",
+    "material_hash",
+    "source_hash",
+    "text_hash",
+    "turn_scope_id",
+}
+SAFE_GIT_COMMIT_KEYS = {
+    "baseline_commit",
+    "commit",
+    "commit_hash",
+    "git_commit",
+    "git_commit_hash",
+}
 SAFE_OUTPUT_OMIT_KEYS = {"raw_tool_result", "sensitive_metadata", "sensitive_payload"}
 SAFE_ARTIFACT_OMIT_KEYS = SAFE_OUTPUT_OMIT_KEYS | {
     "raw_customer_content",
@@ -61,12 +101,27 @@ ORCHESTRATOR_SHADOW_TOP_LEVEL_KEYS = (
     "integration_notes",
 )
 PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
+FLEX_PHONE_PATTERN = re.compile(r"(?<!\d)1[3-9](?:[\s-]?\d){9}(?!\d)")
 PASSWORD_CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])\d{3,8}#(?![A-Za-z0-9])")
-TOKEN_CONTEXT_PATTERN = re.compile(r"\b(token|secret|password)\s*[:=]\s*[^\s,;]+", re.IGNORECASE)
-SECRET_CONTEXT_PATTERN = re.compile(
-    r"((?:飞书)?密钥|app[_ -]?secret|tenant[_ -]?access[_ -]?token|access[_ -]?token|refresh[_ -]?token|authorization)\s*[:=：]?\s*[^\s,;，。]+",
+PASSWORD_CONTEXT_PATTERN = re.compile(
+    r"((?:看房方式|看房|门锁|门禁|房门|密码)[^0-9A-Za-z#]{0,12})([A-Za-z0-9][A-Za-z0-9_#-]{2,31})"
+)
+TOKEN_CONTEXT_PATTERN = re.compile(
+    r"\b(access[_-]?token|tenant[_-]?access[_-]?token|refresh[_-]?token|api[_-]?key|app[_-]?secret|corpsecret|secret|token|password|passwd|pwd|authorization|bearer|msg[_-]?signature|signature|welcome[_-]?code|media[_-]?id|cursor|external[_-]?userid|openid|unionid)"
+    r"\s*[:=]\s*[^\s,;，。\"'<>]+",
     re.IGNORECASE,
 )
+SECRET_CONTEXT_PATTERN = re.compile(
+    r"((?:飞书)?密钥|app[_ -]?secret|corpsecret|tenant[_ -]?access[_ -]?token|access[_ -]?token|refresh[_ -]?token|authorization|msg[_ -]?signature|signature|welcome[_ -]?code|media[_ -]?id|external[_ -]?userid|openid|unionid|cursor)\s*[:=：]?\s*[^\s,;，。\"'<>]+",
+    re.IGNORECASE,
+)
+LONG_HEX_PATTERN = re.compile(r"\b[0-9a-f]{32,128}\b", re.IGNORECASE)
+GIT_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}", re.IGNORECASE)
+LONG_RUNTIME_ID_PATTERN = re.compile(
+    r"\b(?:wm|wo|open|union|media|msg|cursor|welcome)[A-Za-z0-9_-]{12,}\b",
+    re.IGNORECASE,
+)
+GENERIC_LONG_ID_PATTERN = re.compile(r"\b(?=[A-Za-z0-9_-]{40,}\b)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_-]{40,}\b")
 
 
 class ConstraintOperation(str, Enum):
@@ -720,21 +775,29 @@ class SendReceipt(ContractModel):
     send_result: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    _INTERNAL_MATCH_FIELDS: ClassVar[set[str]] = {"receipt_id", "idempotency_key", "duplicate_of"}
+
     @field_validator(
         "action_id",
         "action_type",
         "status",
-        "receipt_id",
-        "idempotency_key",
-        "duplicate_of",
         "provider",
         "sent_at",
-        "provider_message_id",
         "error_code",
         mode="before",
     )
     @classmethod
     def _safe_receipt_text(cls, value: Any) -> str:
+        return _redact_text("" if value is None else str(value).strip())
+
+    @field_validator("receipt_id", "idempotency_key", "duplicate_of", mode="before")
+    @classmethod
+    def _preserve_internal_match_text(cls, value: Any) -> str:
+        return "" if value is None else str(value).strip()
+
+    @field_validator("provider_message_id", mode="before")
+    @classmethod
+    def _safe_provider_message_id(cls, value: Any) -> str:
         return _redact_text("" if value is None else str(value).strip())
 
     @field_validator("attempt", mode="before")
@@ -756,6 +819,15 @@ class SendReceipt(ContractModel):
     def _safe_receipt_payload(cls, value: Any) -> dict[str, Any]:
         return _redact_sensitive(dict(value or {}))
 
+    def to_ledger_dict(self) -> dict[str, Any]:
+        payload = self.to_safe_dict()
+        raw = self.model_dump(mode="json")
+        for key in self._INTERNAL_MATCH_FIELDS:
+            value = str(raw.get(key) or "").strip()
+            if value:
+                payload[key] = value
+        return payload
+
 
 def _redact_sensitive(value: Any, *, key: str = "") -> Any:
     if _is_sensitive_key(key):
@@ -769,7 +841,9 @@ def _redact_sensitive(value: Any, *, key: str = "") -> Any:
     if isinstance(value, tuple):
         return [_redact_sensitive(item) for item in value]
     if isinstance(value, str):
-        return _redact_text(value)
+        if _is_safe_git_commit_key(key) and _is_git_commit_hash(value.strip()):
+            return value.strip()
+        return _redact_text(value, allow_long_hash=_is_safe_long_hash_key(key))
     return value
 
 
@@ -789,17 +863,45 @@ def _omit_non_loggable(value: Any) -> Any:
     return value
 
 
-def _redact_text(text: str) -> str:
-    result = PHONE_PATTERN.sub("[REDACTED_PHONE]", text)
+def _redact_text(text: str, *, allow_long_hash: bool = False) -> str:
+    result = FLEX_PHONE_PATTERN.sub("[REDACTED_PHONE]", text)
+    result = PHONE_PATTERN.sub("[REDACTED_PHONE]", result)
     result = PASSWORD_CODE_PATTERN.sub(REDACTED, result)
+    result = PASSWORD_CONTEXT_PATTERN.sub(lambda match: f"{match.group(1)}{REDACTED}", result)
     result = TOKEN_CONTEXT_PATTERN.sub(lambda match: f"{match.group(1)}={REDACTED}", result)
     result = SECRET_CONTEXT_PATTERN.sub(lambda match: f"{match.group(1)}={REDACTED}", result)
+    result = LONG_RUNTIME_ID_PATTERN.sub("[REDACTED_ID]", result)
+    result = GENERIC_LONG_ID_PATTERN.sub("[REDACTED_ID]", result)
+    if not allow_long_hash:
+        result = LONG_HEX_PATTERN.sub("[REDACTED_HASH]", result)
     return result
 
 
 def _is_sensitive_key(key: str) -> bool:
     lowered = key.lower()
+    if lowered in SAFE_SENSITIVE_SUMMARY_KEYS:
+        return False
     return any(marker in lowered for marker in SENSITIVE_KEY_MARKERS)
+
+
+def _is_safe_long_hash_key(key: str) -> bool:
+    return key.lower() in SAFE_LONG_HASH_KEYS
+
+
+def _is_safe_git_commit_key(key: str) -> bool:
+    return key.lower() in SAFE_GIT_COMMIT_KEYS
+
+
+def _is_git_commit_hash(value: str) -> bool:
+    return bool(GIT_COMMIT_PATTERN.fullmatch(value))
+
+
+def redact_sensitive_text(value: Any) -> str:
+    return _redact_text("" if value is None else str(value))
+
+
+def redact_sensitive_value(value: Any) -> Any:
+    return _redact_sensitive(value)
 
 
 def safe_artifact_payload(value: Any) -> Any:
@@ -865,12 +967,22 @@ class OrchestratorShadowArtifact(ContractModel):
             raise ValueError("orchestrator shadow artifact mode must be shadow")
         return mode
 
-    @field_validator("artifact_id", "created_at", "baseline_commit", mode="before")
+    @field_validator("artifact_id", "created_at", mode="before")
     @classmethod
     def _require_artifact_text(cls, value: Any) -> str:
         text = "" if value is None else str(value).strip()
         if not text:
             raise ValueError("field must not be empty")
+        return _redact_text(text)
+
+    @field_validator("baseline_commit", mode="before")
+    @classmethod
+    def _require_baseline_commit(cls, value: Any) -> str:
+        text = "" if value is None else str(value).strip()
+        if not text:
+            raise ValueError("field must not be empty")
+        if _is_git_commit_hash(text):
+            return text
         return _redact_text(text)
 
     @field_validator("turn", "inventory_read", "legacy_pipeline", "shadow_a", mode="before")
