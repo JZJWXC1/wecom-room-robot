@@ -465,6 +465,24 @@ def test_staging_write_failure_keeps_previous_pointer(tmp_path) -> None:
     assert not (tmp_path / "tmp" / f"{second.snapshot_id}.tmp").exists()
 
 
+def test_stale_tmp_snapshot_dirs_are_cleaned_on_next_publish(tmp_path) -> None:
+    stale_tmp = tmp_path / "tmp" / "20260601T000000Z_deadbeef0000.tmp"
+    fresh_tmp = tmp_path / "tmp" / "20260624T000000Z_feedface0000.tmp"
+    stale_tmp.mkdir(parents=True)
+    fresh_tmp.mkdir(parents=True)
+    old_timestamp = datetime(2026, 6, 1, tzinfo=UTC).timestamp()
+    os.utime(stale_tmp, (old_timestamp, old_timestamp))
+
+    snapshot, report = build_snapshot()
+    pointer = SnapshotStore(tmp_path, stale_tmp_seconds=60).write_snapshot(snapshot, report)
+
+    pointer_data = json.loads((tmp_path / "current_snapshot.json").read_text(encoding="utf-8"))
+    assert pointer is not None
+    assert pointer_data["snapshot_id"] == snapshot.snapshot_id
+    assert not stale_tmp.exists()
+    assert fresh_tmp.exists()
+
+
 def test_manifest_write_failure_keeps_previous_pointer(tmp_path) -> None:
     first, first_report = build_snapshot()
     store = SnapshotStore(tmp_path)

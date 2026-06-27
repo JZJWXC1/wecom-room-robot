@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import time
 from typing import Any
 
 from app.services.inventory_snapshot_models import (
@@ -36,9 +37,11 @@ class SnapshotStore:
         root: Path | str = DEFAULT_SNAPSHOT_ROOT,
         *,
         validator: SnapshotValidator | None = None,
+        stale_tmp_seconds: int | None = 24 * 60 * 60,
     ) -> None:
         self.root = Path(root)
         self.validator = validator or SnapshotValidator()
+        self.stale_tmp_seconds = stale_tmp_seconds
 
     @property
     def snapshots_dir(self) -> Path:
@@ -68,6 +71,7 @@ class SnapshotStore:
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         with _SnapshotPublishLock(self.root / "locks" / "sync.lock"):
+            self._cleanup_stale_tmp_dirs()
             staging = self.tmp_dir / f"{snapshot.snapshot_id}.tmp"
             final_path = self.snapshots_dir / snapshot.snapshot_id
             if final_path.exists():
@@ -243,6 +247,21 @@ class SnapshotStore:
     def _maybe_fail(self, simulate_write_failure_after: str | None, logical_name: str) -> None:
         if simulate_write_failure_after == logical_name:
             raise SnapshotStoreError(f"simulated write failure after {logical_name}")
+
+    def _cleanup_stale_tmp_dirs(self) -> None:
+        if self.stale_tmp_seconds is None:
+            return
+        now = time.time()
+        for path in self.tmp_dir.glob("*.tmp"):
+            if not path.is_dir():
+                continue
+            age_seconds = now - path.stat().st_mtime
+            if age_seconds < self.stale_tmp_seconds:
+                continue
+            try:
+                _remove_tree(path)
+            except OSError as exc:
+                raise SnapshotStoreError(f"failed to cleanup stale tmp snapshot dir: {path.name}") from exc
 
 
 def _write_json(path: Path, data: Any, *, private: bool = False) -> None:
