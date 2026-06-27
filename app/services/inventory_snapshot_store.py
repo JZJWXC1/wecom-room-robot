@@ -241,8 +241,65 @@ class SnapshotStore:
         if simulate_pointer_failure:
             pointer_tmp.unlink(missing_ok=True)
             raise SnapshotStoreError("simulated current pointer replace failure")
+        previous_pointer_bytes = self._read_valid_current_pointer_backup()
         pointer_tmp.replace(self.current_pointer_path)
+        try:
+            self._verify_active_pointer(snapshot)
+        except Exception:
+            try:
+                self._restore_previous_current_pointer(previous_pointer_bytes)
+            except OSError as rollback_exc:
+                raise SnapshotStoreError(
+                    "current pointer activation verification failed and previous pointer rollback failed"
+                ) from rollback_exc
+            raise
         return pointer
+
+    def _read_valid_current_pointer_backup(self) -> bytes | None:
+        if not self.current_pointer_path.exists():
+            return None
+        try:
+            pointer_bytes = self.current_pointer_path.read_bytes()
+            pointer_data = json.loads(pointer_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
+            return None
+        validation_result = self.validator.validate_pointer(pointer_data, self.root)
+        if not validation_result.ok:
+            return None
+        return pointer_bytes
+
+    def _restore_previous_current_pointer(self, previous_pointer_bytes: bytes | None) -> None:
+        rollback_tmp = self.current_pointer_path.with_name(
+            f".{self.current_pointer_path.name}.{os.getpid()}.rollback.tmp"
+        )
+        rollback_tmp.unlink(missing_ok=True)
+        if previous_pointer_bytes is None:
+            self.current_pointer_path.unlink(missing_ok=True)
+            return
+        try:
+            with rollback_tmp.open("xb") as file:
+                file.write(previous_pointer_bytes)
+            rollback_tmp.replace(self.current_pointer_path)
+        except Exception:
+            rollback_tmp.unlink(missing_ok=True)
+            raise
+
+    def _verify_active_pointer(self, snapshot: InventorySnapshot) -> None:
+        try:
+            pointer_data = json.loads(self.current_pointer_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            raise SnapshotStoreError("current pointer activation verification failed") from exc
+        validation_result = self.validator.validate_pointer(pointer_data, self.root)
+        if not validation_result.ok:
+            raise SnapshotStoreError(
+                "current pointer activation verification failed: "
+                + "; ".join(issue.code for issue in validation_result.errors)
+            )
+        if (
+            str(pointer_data.get("snapshot_id") or "") != snapshot.snapshot_id
+            or str(pointer_data.get("source_hash") or "") != snapshot.source_hash
+        ):
+            raise SnapshotStoreError("current pointer activation verification mismatch")
 
     def _maybe_fail(self, simulate_write_failure_after: str | None, logical_name: str) -> None:
         if simulate_write_failure_after == logical_name:

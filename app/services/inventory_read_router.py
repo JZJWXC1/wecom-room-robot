@@ -15,6 +15,7 @@ from app.services.inventory_read_models import (
     REASON_FALLBACK_USED,
     REASON_MISSING_SNAPSHOT,
     REASON_PRIMARY_READINESS_MISSING,
+    REASON_PRIMARY_READINESS_MISMATCH,
     REASON_RECONCILIATION_BLOCKING,
     REASON_SECRET_SCAN_FAILED,
     REASON_SOURCE_UNAVAILABLE,
@@ -320,12 +321,52 @@ class InventoryReadRouter:
                         "active_alias_conflicts",
                         "unknown_canonical_areas",
                         "ambiguous_direct_mappings",
+                        "snapshot_id",
+                        "source_hash",
                     ]
                 },
             )
         readiness_state = dict(raw_readiness_state)
         for key, value in alias_result.to_dict().items():
             readiness_state.setdefault(key, value)
+        readiness_snapshot_id = str(readiness_state.get("snapshot_id") or "").strip()
+        readiness_source_hash = str(readiness_state.get("source_hash") or "").strip()
+        missing_binding_keys = [
+            key
+            for key, value in (
+                ("snapshot_id", readiness_snapshot_id),
+                ("source_hash", readiness_source_hash),
+            )
+            if not value
+        ]
+        if missing_binding_keys:
+            return InventoryReadError(
+                REASON_PRIMARY_READINESS_MISMATCH,
+                "primary readiness must bind snapshot_id and source_hash to the current snapshot",
+                details={
+                    "missing_keys": missing_binding_keys,
+                    "current_snapshot_id": snapshot.snapshot_id,
+                    "current_source_hash": snapshot.source_hash,
+                },
+            )
+        if readiness_snapshot_id != snapshot.snapshot_id:
+            return InventoryReadError(
+                REASON_PRIMARY_READINESS_MISMATCH,
+                "primary readiness snapshot_id does not match current snapshot",
+                details={
+                    "readiness_snapshot_id": readiness_snapshot_id,
+                    "current_snapshot_id": snapshot.snapshot_id,
+                },
+            )
+        if readiness_source_hash != snapshot.source_hash:
+            return InventoryReadError(
+                REASON_PRIMARY_READINESS_MISMATCH,
+                "primary readiness source_hash does not match current snapshot",
+                details={
+                    "readiness_source_hash": readiness_source_hash,
+                    "current_source_hash": snapshot.source_hash,
+                },
+            )
         if readiness_state.get("reconciliation_passed") is not True:
             return InventoryReadError(
                 REASON_RECONCILIATION_BLOCKING,

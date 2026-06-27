@@ -1,5 +1,22 @@
 # Inventory Read Router
 
+## V1 Production Primary Snapshot 契约
+
+V1 production primary 继续使用本地演练时的 `InventoryReadContext` 契约，但默认 reader 现在由这些配置决定：
+
+- `INVENTORY_SNAPSHOT_ROOT`
+- `INVENTORY_SNAPSHOT_MAX_AGE_SECONDS`
+- `INVENTORY_SNAPSHOT_PRIMARY_READINESS_PATH`
+- `INVENTORY_READ_FALLBACK_STRATEGY`
+
+当客服模式为 `primary` 且没有注入测试用 provider 时，`inventory_read_turn` 会基于 `INVENTORY_SNAPSHOT_ROOT` 创建 `SnapshotReader`。它优先读取显式本地 readiness/audit JSON；如果文件不存在，则只从当前 `current_snapshot.json`、当前 snapshot 的 `sync_report.json` 和公开 artifact 敏感扫描推导 readiness。这个路径不允许触发飞书刷新、legacy CSV 重建或聊天路径临时全量同步。
+
+Readiness 必须强绑定当前 pointer。只要存在 readiness/audit 状态，就必须同时声明 `snapshot_id` 和 `source_hash`，且两者必须与 pointer 选中的 snapshot 一致；缺任一字段或值不一致时，router 以 `primary_readiness_mismatch` 阻断。缺少 readiness/audit 来源仍以 `primary_readiness_missing` 失败关闭；pointer 异常、snapshot stale、artifact hash/size 校验失败、公开敏感扫描失败、schema 不支持或 alias coverage 失败都会返回各自结构化原因。
+
+整轮请求只能使用一个选定源。默认仍是 `strict`。如果显式配置 `legacy_whole_request`，fallback 只能发生在任何业务事实读取之前，并且 context 会记录 `fallback_used=true` 和 `fallback_reason`。一旦 snapshot 业务读取开始，半轮 fallback 会被阻断。
+
+Snapshot 内部的 rewrite index 也必须绑定事实源。`rewrite_inventory_index.json` 必须声明 `source="inventory_snapshot"`，并带有与 `inventory.json` 一致的 `snapshot_id/source_hash`；否则目录校验和 provider 读取都会在产生客服可见事实前失败。
+
 本文记录 M1D1 本地读取路由底座，以及 M1D2A 将同一读取 Context 接入客服 RAG turn 的本地门禁。本轮不部署服务器，不启用服务器 primary，不改变客户回复。
 
 ## 范围

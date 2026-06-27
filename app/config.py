@@ -1,11 +1,15 @@
+import os
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+_ENV_FILE = None if os.environ.get("APP_ENV", "").strip().lower() == "test" else ".env"
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, env_file_encoding="utf-8")
 
     app_env: str = "development"
     public_base_url: str = "http://localhost:8000"
@@ -258,6 +262,22 @@ class Settings(BaseSettings):
     inventory_snapshot_mode: str = Field(
         default="disabled",
         alias="INVENTORY_SNAPSHOT_MODE",
+    )
+    inventory_snapshot_root: Path = Field(
+        default=Path("data/inventory_snapshots"),
+        alias="INVENTORY_SNAPSHOT_ROOT",
+    )
+    inventory_snapshot_max_age_seconds: int = Field(
+        default=24 * 60 * 60,
+        alias="INVENTORY_SNAPSHOT_MAX_AGE_SECONDS",
+    )
+    inventory_snapshot_primary_readiness_path: Path = Field(
+        default=Path("data/inventory_snapshots/primary_readiness.json"),
+        alias="INVENTORY_SNAPSHOT_PRIMARY_READINESS_PATH",
+    )
+    inventory_read_fallback_strategy: str = Field(
+        default="strict",
+        alias="INVENTORY_READ_FALLBACK_STRATEGY",
     )
     inventory_snapshot_shadow_root: Path = Field(
         default=Path("data/inventory_snapshots_shadow"),

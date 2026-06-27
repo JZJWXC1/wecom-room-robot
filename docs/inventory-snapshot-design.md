@@ -273,3 +273,10 @@ M1B Store 的安全边界：
 - artifact 内保存 POSIX 风格相对路径，运行时解析为本机 Path。
 - 不把 Windows 盘符路径写入可迁移 artifact。
 - systemd 工作目录保持 `/opt/wecom-room-robot`，本地测试保持当前 worktree 根目录。
+## V1 Production Primary 补充
+
+生产 primary 的当前指针是 `INVENTORY_SNAPSHOT_ROOT/current_snapshot.json`。Snapshot 发布仍按 staging 目录生成、目录校验、原子移动、pointer 临时文件校验、`Path.replace` 激活的顺序执行；激活后会立即重读 pointer，确认 `snapshot_id/source_hash` 与刚发布的 snapshot 一致。任何目录校验、rewrite index 头部校验、private manifest 校验或 pointer 写入失败都不得切换 current，读路径继续沿用上一成功 current 的本地证据。
+
+Snapshot 内的 `rewrite_inventory_index.json` 必须声明 `source="inventory_snapshot"`，并与 `inventory.json` 使用相同 `snapshot_id/source_hash`。`search_inventory`、`all_rows`、rewrite index、房源表 PNG artifact 和 viewing tool 都只接受 turn 起点锁定的 `InventoryReadContext`，不跟随中途切换的 current pointer。
+
+公开 artifact 包括 `manifest.json`、`inventory.json`、`inventory.csv`、`rewrite_inventory_index.json`、`sync_report.json` 和 `png/`。这些文件不得包含真实看房密码、完整 viewing 原文、手机号、token、secret 或测试 canary。`private/viewing_secrets.json` 只允许 viewing tool 在显式看房/密码边界按 `snapshot_id + listing_id` 读取。

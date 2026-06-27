@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Protocol
 
+from app.config import settings
 from app.services.fuzzy_match import fuzzy_contains_score, normalize_search_text
 from app.services.inventory import InventoryService
 from app.services.inventory_query import (
@@ -41,7 +42,6 @@ from app.services.inventory_snapshot_models import (
     sanitize_for_log,
 )
 from app.services.inventory_snapshot_reader import SnapshotReader
-from app.services.inventory_snapshot_store import DEFAULT_SNAPSHOT_ROOT
 from app.services.region_inventory_constants import area_alias_index_entries
 from app.services.rewrite_inventory_index import load_rewrite_inventory_index, sanitize_rewrite_inventory_index
 
@@ -219,7 +219,7 @@ class SnapshotInventoryReadProvider:
     source_kind = SOURCE_KIND_SNAPSHOT
 
     def __init__(self, reader: SnapshotReader | None = None) -> None:
-        self.reader = reader or SnapshotReader(DEFAULT_SNAPSHOT_ROOT)
+        self.reader = reader or _configured_snapshot_reader()
 
     async def search_inventory(
         self,
@@ -295,7 +295,9 @@ class SnapshotInventoryReadProvider:
     async def get_rewrite_index(self, context: InventoryReadContext) -> dict[str, Any]:
         ensure_provider_context(self.source_kind, context)
         snapshot = self._snapshot_for_context(context)
-        return _strip_sensitive_payload(snapshot.rewrite_index)
+        index = _strip_sensitive_payload(snapshot.rewrite_index)
+        _assert_snapshot_rewrite_index_headers(index, context)
+        return index
 
     async def get_inventory_metadata(self, context: InventoryReadContext) -> dict[str, Any]:
         ensure_provider_context(self.source_kind, context)
@@ -638,3 +640,35 @@ def _strip_sensitive_payload(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_strip_sensitive_payload(item) for item in value]
     return sanitize_for_log(value)
+
+
+def _configured_snapshot_reader() -> SnapshotReader:
+    max_age = int(getattr(settings, "inventory_snapshot_max_age_seconds", 0) or 0)
+    return SnapshotReader(
+        settings.inventory_snapshot_root,
+        max_age_seconds=max_age if max_age > 0 else None,
+    )
+
+
+def _assert_snapshot_rewrite_index_headers(index: dict[str, Any], context: InventoryReadContext) -> None:
+    snapshot_id = str(index.get("snapshot_id") or "")
+    source_hash = str(index.get("source_hash") or "")
+    source = str(index.get("source") or "")
+    if source != "inventory_snapshot":
+        raise InventoryReadError(
+            REASON_CONTEXT_SNAPSHOT_MISMATCH,
+            "snapshot rewrite index must declare inventory_snapshot source headers",
+            details={"source": source},
+        )
+    if snapshot_id != context.snapshot_id:
+        raise InventoryReadError(
+            REASON_CONTEXT_SNAPSHOT_MISMATCH,
+            "snapshot rewrite index snapshot_id does not match context",
+            details={"index_snapshot_id": snapshot_id, "context_snapshot_id": context.snapshot_id},
+        )
+    if source_hash != context.source_hash:
+        raise InventoryReadError(
+            REASON_CONTEXT_SNAPSHOT_MISMATCH,
+            "snapshot rewrite index source_hash does not match context",
+            details={"index_source_hash": source_hash, "context_source_hash": context.source_hash},
+        )

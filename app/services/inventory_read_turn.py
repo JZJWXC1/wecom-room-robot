@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from hashlib import sha256
+import json
+from pathlib import Path
 import time
 from typing import Any, Callable
 
+from app.config import settings
 from app.services.inventory_read_models import (
     FALLBACK_STRICT,
     READ_MODE_DISABLED,
@@ -20,6 +23,8 @@ from app.services.inventory_read_models import (
 )
 from app.services.inventory_read_provider import LegacyInventoryReadProvider, SnapshotInventoryReadProvider
 from app.services.inventory_read_router import InventoryReadRouter
+from app.services.inventory_snapshot_reader import SnapshotReader
+from app.services.inventory_snapshot_shadow import scan_public_artifacts_for_sensitive_text
 
 
 RewriteIndexLoader = Callable[[], dict[str, Any]]
@@ -86,7 +91,7 @@ def create_customer_inventory_read_context(
     generation: int | str = "",
     snapshot_provider: Any | None = None,
     readiness_state: Any | None = None,
-    fallback_strategy: str = FALLBACK_STRICT,
+    fallback_strategy: str | None = None,
 ) -> InventoryReadContext:
     request_id = f"{prefix}_req_{_safe_hash(open_kfid, external_userid)}"
     msgid_text = "|".join(str(item).strip() for item in (msgids or []) if str(item).strip())
@@ -99,7 +104,7 @@ def create_customer_inventory_read_context(
         rewrite_index_loader=rewrite_index_loader,
         snapshot_provider=snapshot_provider,
         readiness_state=readiness_state,
-        fallback_strategy=fallback_strategy,
+        fallback_strategy=fallback_strategy or settings.inventory_read_fallback_strategy,
     )
     decision = router.select_context(request_id=request_id, turn_id=turn_id)
     if decision.ok and decision.context is not None:
@@ -277,6 +282,16 @@ def _router(
     readiness_state: Any | None = None,
     fallback_strategy: str = FALLBACK_STRICT,
 ) -> InventoryReadRouter:
+    resolved_snapshot_provider = snapshot_provider or _configured_snapshot_provider()
+    resolved_readiness_state = (
+        readiness_state
+        if readiness_state is not None or mode != READ_MODE_PRIMARY
+        else (
+            _primary_readiness_state_provider(resolved_snapshot_provider)
+            if snapshot_provider is None
+            else None
+        )
+    )
     return InventoryReadRouter(
         mode=mode,
         fallback_strategy=fallback_strategy,
@@ -284,8 +299,8 @@ def _router(
             inventory_service,
             rewrite_index_loader=rewrite_index_loader,
         ),
-        snapshot_provider=snapshot_provider or SnapshotInventoryReadProvider(),
-        readiness_state=readiness_state,
+        snapshot_provider=resolved_snapshot_provider,
+        readiness_state=resolved_readiness_state,
         shadow_probe_snapshot_health=False,
     )
 
@@ -302,7 +317,7 @@ def _provider_for_context(
             inventory_service,
             rewrite_index_loader=rewrite_index_loader,
         )
-    return snapshot_provider or SnapshotInventoryReadProvider()
+    return snapshot_provider or _configured_snapshot_provider()
 
 
 def _safe_hash(*parts: Any) -> str:
@@ -315,3 +330,71 @@ def _snapshot_disabled_error() -> InventoryReadError:
         REASON_SOURCE_UNAVAILABLE,
         "customer inventory read path must not query snapshot in this milestone",
     )
+
+
+def _configured_snapshot_provider() -> SnapshotInventoryReadProvider:
+    return SnapshotInventoryReadProvider(_configured_snapshot_reader())
+
+
+def _configured_snapshot_reader() -> SnapshotReader:
+    max_age = int(getattr(settings, "inventory_snapshot_max_age_seconds", 0) or 0)
+    return SnapshotReader(
+        settings.inventory_snapshot_root,
+        max_age_seconds=max_age if max_age > 0 else None,
+    )
+
+
+def _primary_readiness_state_provider(snapshot_provider: Any) -> Callable[[], dict[str, Any]]:
+    def load() -> dict[str, Any]:
+        explicit = _load_primary_readiness_file()
+        if explicit:
+            return explicit
+        reader = getattr(snapshot_provider, "reader", None)
+        if not isinstance(reader, SnapshotReader):
+            return {}
+        return _derive_primary_readiness_from_current_snapshot(reader)
+
+    return load
+
+
+def _load_primary_readiness_file() -> dict[str, Any]:
+    path = Path(settings.inventory_snapshot_primary_readiness_path)
+    if not path.exists() or path.name in {".env", ""}:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return dict(payload)
+
+
+def _derive_primary_readiness_from_current_snapshot(reader: SnapshotReader) -> dict[str, Any]:
+    pointer = reader.get_current_pointer()
+    if not pointer.ok:
+        return {}
+    snapshot_id = str(pointer.value.snapshot_id)
+    snapshot_dir = reader.root / "snapshots" / snapshot_id
+    report_path = snapshot_dir / "sync_report.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(report, dict):
+        return {}
+    validation = report.get("validation_result") if isinstance(report.get("validation_result"), dict) else {}
+    error_count = int(validation.get("error_count") or 0) if isinstance(validation, dict) else 0
+    report_ok = bool(report.get("ok")) and error_count == 0
+    scan = scan_public_artifacts_for_sensitive_text(reader.root, snapshot_id=snapshot_id)
+    return {
+        "schema_version": "inventory_snapshot_primary_readiness.v1",
+        "readiness_source": "current_snapshot_sync_report",
+        "snapshot_id": snapshot_id,
+        "source_hash": str(pointer.value.source_hash),
+        "reconciliation_passed": report_ok,
+        "blocking_count": error_count,
+        "public_artifact_secret_scan_passed": bool(scan.get("passed")),
+        "public_artifact_secret_scan_files": int(scan.get("files_scanned") or 0),
+        "audit_reason": "current pointer, sync_report validation, and public artifact scan",
+    }

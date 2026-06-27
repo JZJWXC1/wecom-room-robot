@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from app.config import settings
 from app.services import inventory_read_turn
 from app.services.inventory_read_models import (
     READ_MODE_PRIMARY,
@@ -103,8 +104,10 @@ def _publish_snapshot(root: Path):
     return snapshot
 
 
-def _ready_primary_readiness(**overrides: Any) -> dict[str, Any]:
+def _ready_primary_readiness(snapshot: Any, **overrides: Any) -> dict[str, Any]:
     payload = {
+        "snapshot_id": snapshot.snapshot_id,
+        "source_hash": snapshot.source_hash,
         "reconciliation_passed": True,
         "blocking_count": 0,
         "public_artifact_secret_scan_passed": True,
@@ -132,7 +135,7 @@ def test_customer_context_primary_value_uses_snapshot_when_readiness_is_ready(tm
         msgids=["msg-1"],
         generation=1,
         snapshot_provider=snapshot_provider,
-        readiness_state=_ready_primary_readiness(),
+        readiness_state=_ready_primary_readiness(snapshot),
     )
 
     assert context.source_kind == SOURCE_KIND_SNAPSHOT
@@ -153,6 +156,51 @@ def test_customer_context_primary_value_uses_snapshot_when_readiness_is_ready(tm
     assert rows
     assert evidence[0].listing_id == generate_listing_id("Unit Garden", "1-101A")
     assert evidence[0].snapshot_id == snapshot.snapshot_id
+
+
+def test_customer_primary_uses_configured_snapshot_root_and_local_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = _publish_snapshot(tmp_path)
+    monkeypatch.setattr(settings, "inventory_snapshot_root", tmp_path)
+    monkeypatch.setattr(settings, "inventory_snapshot_max_age_seconds", 0)
+    monkeypatch.setattr(settings, "inventory_snapshot_primary_readiness_path", tmp_path / "missing_readiness.json")
+
+    context = inventory_read_turn.create_customer_inventory_read_context(
+        prefix="kf",
+        open_kfid="open-kf",
+        external_userid="external-user",
+        content="Unit Garden 1-101A video",
+        inventory_service=FakeInventory(),
+        rewrite_index_loader=rewrite_index,
+        inventory_snapshot_mode=READ_MODE_PRIMARY,
+        msgids=["msg-1"],
+        generation=1,
+    )
+    rows, evidence = run(
+        inventory_read_turn.search_rows_for_context(
+            context,
+            "Unit Garden 1-101A",
+            inventory_service=FakeInventory(),
+            rewrite_index_loader=rewrite_index,
+            limit=1,
+        )
+    )
+    rewrite = run(
+        inventory_read_turn.rewrite_index_for_context(
+            context,
+            inventory_service=FakeInventory(),
+            rewrite_index_loader=rewrite_index,
+        )
+    )
+
+    assert context.source_kind == SOURCE_KIND_SNAPSHOT
+    assert context.snapshot_id == snapshot.snapshot_id
+    assert rows
+    assert evidence[0].snapshot_id == snapshot.snapshot_id
+    assert rewrite["snapshot_id"] == snapshot.snapshot_id
+    assert rewrite["source_hash"] == snapshot.source_hash
 
 
 def test_customer_context_primary_without_readiness_state_fails_closed(tmp_path: Path) -> None:

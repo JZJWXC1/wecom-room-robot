@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from app.config import settings
 from app.services.inventory_read_models import (
     READ_MODE_PRIMARY,
     SOURCE_KIND_LEGACY,
@@ -201,6 +202,42 @@ def test_snapshot_viewing_access_reads_context_snapshot_private_file(tmp_path: P
     assert evidence[0].snapshot_id == snapshot.snapshot_id
     assert rule["rooms"][0]["viewing"] == SECRET_CANARY
     assert SECRET_CANARY not in json.dumps(evidence[0].to_log_dict(), ensure_ascii=False)
+
+
+def test_snapshot_viewing_and_sheet_defaults_use_configured_snapshot_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = publish_snapshot(tmp_path)
+    png = add_snapshot_png(tmp_path, snapshot)
+    monkeypatch.setattr(settings, "inventory_snapshot_root", tmp_path)
+    monkeypatch.setattr(settings, "inventory_snapshot_max_age_seconds", 0)
+
+    async def refresh():
+        raise AssertionError("snapshot sheet must not refresh legacy PNG")
+
+    evidence, rule = run(
+        viewing_evidence_for_rows(
+            context=snapshot_context(snapshot),
+            rows=[{"小区": "合幢悦府", "房号": "6-1-1204B"}],
+            content="这套密码多少？",
+            row_labeler=label,
+            viewing_text_getter=viewing_text,
+            contact_numbers=(),
+        )
+    )
+    sheet = run(
+        sheet_artifacts_for_context(
+            context=snapshot_context(snapshot),
+            refresh_func=refresh,
+            list_paths_func=lambda: [],
+        )
+    )
+
+    assert rule["rooms"][0]["viewing"] == SECRET_CANARY
+    assert evidence[0].snapshot_id == snapshot.snapshot_id
+    assert sheet.paths == (png.resolve(),)
+    assert sheet.evidence[0].snapshot_id == snapshot.snapshot_id
 
 
 def test_legacy_sheet_artifact_keeps_existing_paths(tmp_path: Path) -> None:
