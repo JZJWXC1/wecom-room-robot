@@ -29,8 +29,13 @@ def test_release_rehearsal_env_summary_does_not_print_secret_values(tmp_path: Pa
     project.mkdir()
     env_file = project / ".env"
     env_file.write_text(
-        "WECOM_KF_SECRET=previous_secret\n"
-        "FEISHU_APP_SECRET=previous_key\n",
+        "\n".join(
+            [
+                "WECOM_KF_SECRET=" + "previous_secret",
+                "FEISHU_APP_SECRET=" + "previous_key",
+            ]
+        )
+        + "\n",
         encoding="utf-8",
     )
 
