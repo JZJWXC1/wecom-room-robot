@@ -36,6 +36,14 @@ if (Test-Path $CredentialFile) {
     }
 }
 
+function Assert-NativeCommandSucceeded {
+    param([Parameter(Mandatory = $true)][string]$Label)
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Label failed with exit code $LASTEXITCODE."
+    }
+}
+
 function Get-SshBaseArgs {
     $key = $env:ROOM_ROBOT_SSH_KEY
     $args = @("-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=12")
@@ -60,6 +68,7 @@ function Invoke-RemoteCommand {
         }
         $plinkArgs += @("$User@$HostName", $RemoteCommand)
         & $plink @plinkArgs
+        Assert-NativeCommandSucceeded "plink"
         return
     }
 
@@ -71,6 +80,7 @@ function Invoke-RemoteCommand {
         $serverExec = Join-Path (Get-Location) "scripts/server_exec.py"
         if (Test-Path $serverExec) {
             & $python $serverExec --host $HostName --user $User --command $RemoteCommand
+            Assert-NativeCommandSucceeded "server_exec.py"
             return
         }
         throw "ROOM_ROBOT_SSH_PASSWORD is set, but neither plink nor scripts/server_exec.py is available."
@@ -78,6 +88,7 @@ function Invoke-RemoteCommand {
 
     $sshArgs = Get-SshBaseArgs
     & ssh @sshArgs $RemoteCommand
+    Assert-NativeCommandSucceeded "ssh"
 }
 
 function Invoke-UploadFiles {
@@ -112,6 +123,7 @@ function Invoke-UploadFiles {
         $uploadArgs += @("--key", $env:ROOM_ROBOT_SSH_KEY)
     }
     & $python $serverUpload @uploadArgs @fileArgs
+    Assert-NativeCommandSucceeded "server_upload.py"
 }
 
 function Invoke-DownloadFiles {
@@ -142,6 +154,7 @@ function Invoke-DownloadFiles {
         $downloadArgs += @("--key", $env:ROOM_ROBOT_SSH_KEY)
     }
     & $python $serverDownload @downloadArgs @fileArgs
+    Assert-NativeCommandSucceeded "server_download.py"
 }
 
 switch ($Action) {
