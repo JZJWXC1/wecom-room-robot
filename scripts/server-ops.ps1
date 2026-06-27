@@ -8,10 +8,19 @@ param(
 
     [string]$HostName = "114.55.168.97",
     [string]$User = "root",
-    [string]$ProjectDir = "/opt/wecom-room-robot"
+    [string]$ProjectDir = "/opt/wecom-room-robot",
+    [string]$ApproveDeploy = $env:ROOM_ROBOT_APPROVE_DEPLOY
 )
 
 $ErrorActionPreference = "Stop"
+
+function Require-DeployApproval {
+    if ($ApproveDeploy -ne "APPROVE_DEPLOY") {
+        throw "Remote server operations require explicit APPROVE_DEPLOY. Set -ApproveDeploy APPROVE_DEPLOY or ROOM_ROBOT_APPROVE_DEPLOY=APPROVE_DEPLOY after user authorization."
+    }
+}
+
+Require-DeployApproval
 
 $CredentialFile = Join-Path (Get-Location) ".local/server-credentials.ps1"
 if (Test-Path $CredentialFile) {

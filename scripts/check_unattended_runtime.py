@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -79,8 +80,23 @@ def _health_check(url: str) -> str:
     except Exception as exc:
         return f"error:{exc}"
     if completed.returncode == 0:
-        return "ok"
+        return _health_payload_status(completed.stdout)
     return (completed.stderr or completed.stdout or f"exit:{completed.returncode}").strip()
+
+
+def _health_payload_status(payload_text: str) -> str:
+    try:
+        payload = json.loads(payload_text)
+    except Exception as exc:
+        return f"invalid_json:{exc.__class__.__name__}"
+    if not isinstance(payload, dict):
+        return "invalid_json:not_object"
+    if payload.get("ok") is not True:
+        return "unhealthy:ok_false"
+    service = str(payload.get("service") or "")
+    if service != "wecom-room-robot-agentic-rag":
+        return "unhealthy:service_mismatch"
+    return "ok"
 
 
 def main() -> int:

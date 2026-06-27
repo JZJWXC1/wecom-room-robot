@@ -34,6 +34,12 @@
 .\scripts\server-ops.ps1 UnattendedCheck
 ```
 
+远程命令会读取服务器凭证并连接服务器，必须先获得用户明确写出的 `APPROVE_DEPLOY`。获得授权后再传入：
+
+```powershell
+.\scripts\server-ops.ps1 UnattendedCheck -ApproveDeploy APPROVE_DEPLOY
+```
+
 检查内容包括：
 
 - 本地是否有免交互 SSH 凭证
@@ -45,10 +51,10 @@
 常用运维命令：
 
 ```powershell
-.\scripts\server-ops.ps1 Status
-.\scripts\server-ops.ps1 Health
-.\scripts\server-ops.ps1 Timers
-.\scripts\server-ops.ps1 Restart
-.\scripts\server-ops.ps1 SyncDryRun
-.\scripts\server-ops.ps1 RagCacheSync
+.\scripts\server-ops.ps1 Status -ApproveDeploy APPROVE_DEPLOY
+.\scripts\server-ops.ps1 Health -ApproveDeploy APPROVE_DEPLOY
+.\scripts\server-ops.ps1 Timers -ApproveDeploy APPROVE_DEPLOY
+.\scripts\server-ops.ps1 Restart -ApproveDeploy APPROVE_DEPLOY
+.\scripts\server-ops.ps1 SyncDryRun -ApproveDeploy APPROVE_DEPLOY
+.\scripts\server-ops.ps1 RagCacheSync -ApproveDeploy APPROVE_DEPLOY
 ```

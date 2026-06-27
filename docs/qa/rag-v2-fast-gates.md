@@ -99,7 +99,7 @@ L3 只把全量 pytest 跑一次，用于开发效率；它不替代发布前的
 
 - 连续 3 次全量 `pytest -q`。
 - 20+ parity QA：默认运行两个 10-window UTF-8 RAG parity runner。
-- rollback/cutover safety：`tests/test_inventory_snapshot.py` 与 `tests/test_inventory_snapshot_m1d2b2.py`。
+- rollback/cutover/release safety：`tests/test_inventory_snapshot.py`、`tests/test_inventory_snapshot_m1d2b2.py` 与 `tests/test_release_pipeline.py`。
 - secret scan：扫描已跟踪文件中的私钥、OpenAI/GitHub/AWS 样式密钥和运行时凭证赋值；仅允许 `.env.example` 或测试 fixture 中显然是 `your_`、`missing_`、`dummy_`、`fake_`、`test_`、`example_`、`placeholder_` 这类占位值。
 - `python -m compileall app`。
 - `git diff --check`。

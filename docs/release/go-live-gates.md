@@ -27,8 +27,9 @@
 3. 使用无真实凭证 fixture 或临时测试目录运行测试。
 4. 运行 `pytest -q`。
 5. 运行仓库现有 QA，并确认输入为 UTF-8。
-6. 将测试日志保存到 `qa_artifacts/` 下的脱敏目录。
-7. 明确区分失败类型：
+6. 运行本地 release/current rehearsal，确认 current 指针、release manifest、rollback rehearsal、health payload 解析和服务器操作审批门禁都通过。
+7. 将测试日志保存到 `qa_artifacts/` 下的脱敏目录。
+8. 明确区分失败类型：
    - 业务断言失败。
    - 环境或依赖失败。
    - 外部服务依赖失败。

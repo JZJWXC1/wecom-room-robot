@@ -238,7 +238,8 @@ $L2Tests = @(
 
 $L4RollbackTests = @(
     "tests/test_inventory_snapshot.py",
-    "tests/test_inventory_snapshot_m1d2b2.py"
+    "tests/test_inventory_snapshot_m1d2b2.py",
+    "tests/test_release_pipeline.py"
 )
 
 Write-Host "RAG V2 QA Fast Gates"
@@ -281,7 +282,7 @@ if ($Level -eq "L4") {
         }
     }
     Invoke-GateStep "20+ parity QA" { Invoke-Parity20 }
-    Invoke-GateStep "rollback and cutover safety tests" { Invoke-PytestFiles $L4RollbackTests }
+    Invoke-GateStep "rollback, cutover and release rehearsal tests" { Invoke-PytestFiles $L4RollbackTests }
     Invoke-GateStep "secret scan" { Invoke-SecretScan }
     Invoke-GateStep "compileall app" { Invoke-External -FilePath $Python -Arguments @("-m", "compileall", "app") }
     Invoke-GateStep "git diff --check" { Invoke-External -FilePath "git" -Arguments @("diff", "--check") }
