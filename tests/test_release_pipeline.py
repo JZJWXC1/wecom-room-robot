@@ -29,8 +29,8 @@ def test_release_rehearsal_env_summary_does_not_print_secret_values(tmp_path: Pa
     project.mkdir()
     env_file = project / ".env"
     env_file.write_text(
-        "WECOM_KF_SECRET=super-secret-value\n"
-        "FEISHU_APP_SECRET=another-secret-value\n",
+        "WECOM_KF_SECRET=previous_secret\n"
+        "FEISHU_APP_SECRET=previous_key\n",
         encoding="utf-8",
     )
 
@@ -39,8 +39,8 @@ def test_release_rehearsal_env_summary_does_not_print_secret_values(tmp_path: Pa
 
     assert summary["env_file_exists"] is True
     assert summary["secret_values_printed"] is False
-    assert "super-secret-value" not in dumped
-    assert "another-secret-value" not in dumped
+    assert "previous_secret" not in dumped
+    assert "previous_key" not in dumped
 
 
 def test_server_ops_requires_approve_deploy_before_credential_load() -> None:
