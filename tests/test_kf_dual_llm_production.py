@@ -8,8 +8,10 @@ from app.services.kf_dual_llm_production import (
     package_passed,
     package_retry_reason,
     tool_plan_from_task_packet,
+    validate_production_outbound_package,
 )
 from app.services.kf_llm1_task_packet import build_kf_task_packet_shadow
+from app.services.kf_outbound_validation import ValidationStatus
 
 
 def test_llm1_production_tool_plan_strips_customer_visible_reply_fields() -> None:
@@ -177,5 +179,48 @@ def test_llm2_production_rejects_unsupported_price() -> None:
 
         assert not package_passed(package)
         assert "unsupported_price_or_budget:9999" in package_retry_reason(package)
+
+    asyncio.run(run_case())
+
+
+def test_llm2_production_package_must_pass_outbound_validation_after_self_review_pass() -> None:
+    async def run_case() -> None:
+        build = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "第1套视频",
+                "task_atoms": [{"task_id": "task-video", "task_type": "send_video", "user_text": "第1套视频"}],
+                "tool_plan": {"actions": ["generate_reply"]},
+            },
+            content="第1套视频",
+            source_label="llm1_production",
+            mode="production",
+        )
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "我这边按证据给你回复。",
+                    "answered_task_ids": ["task-video"],
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+        package = await compose_production_outbound_package(
+            reply_generator=FakeReplyGenerator(),
+            task_packet=build.packet,
+            tool_evidence={"actions": ["generate_reply"]},
+            draft_reply="legacy reply",
+            planner_result={"actions": ["generate_reply"]},
+        )
+        validation = validate_production_outbound_package(
+            package,
+            task_packet=build.packet,
+            user_asked_password=False,
+        )
+
+        assert package_passed(package)
+        assert validation.status == ValidationStatus.BLOCKED
+        assert any(issue.code == "l2.task_not_answered" for issue in validation.blocking_issues)
 
     asyncio.run(run_case())

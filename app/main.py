@@ -7822,11 +7822,12 @@ def _reply_for_original_video_request(understanding: dict[str, Any], tool_eviden
 
 
 def _build_outbound_package(reply_text: str, tool_evidence: dict[str, Any]) -> dict[str, Any]:
-    inventory_images = [str(path) for path in tool_evidence.get("inventory_images") or []]
-    image_paths = [str(path) for path in tool_evidence.get("image_paths") or []]
-    video_paths = [str(path) for path in tool_evidence.get("video_paths") or []]
-    image_rows = [row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict)]
-    video_rows = [row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)]
+    suppress_actions = bool(tool_evidence.get("suppress_actions"))
+    inventory_images = [] if suppress_actions else [str(path) for path in tool_evidence.get("inventory_images") or []]
+    image_paths = [] if suppress_actions else [str(path) for path in tool_evidence.get("image_paths") or []]
+    video_paths = [] if suppress_actions else [str(path) for path in tool_evidence.get("video_paths") or []]
+    image_rows = [] if suppress_actions else [row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict)]
+    video_rows = [] if suppress_actions else [row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)]
     return {
         "text": reply_text,
         "inventory_images": inventory_images,
@@ -9266,9 +9267,18 @@ async def _generate_reply_result(
                     timeout=8,
                 )
                 production_package_payload = kf_dual_llm_production.package_log_payload(production_package)
+                outbound_validation = kf_dual_llm_production.validate_production_outbound_package(
+                    production_package,
+                    task_packet=task_packet,
+                    user_asked_password=_content_wants_password(content),
+                    known_constraints=dict(understanding.get("constraint_proof") or {}),
+                )
+                validation_payload = outbound_validation.to_dict()
+                production_package_payload["outbound_validation"] = validation_payload
                 if (
                     kf_dual_llm_production.package_passed(production_package)
                     and str(production_package.reply_text or "").strip()
+                    and outbound_validation.passed
                 ):
                     draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
                         str(production_package.reply_text or "")
@@ -9278,7 +9288,10 @@ async def _generate_reply_result(
                     outbound_dict = production_package.to_legacy_dict()
                     tool_evidence["llm2_production_outbound_package"] = outbound_dict
                 else:
-                    llm2_retry_reason = kf_dual_llm_production.package_retry_reason(production_package)
+                    llm2_retry_reason = (
+                        kf_dual_llm_production.outbound_validation_retry_reason(outbound_validation)
+                        or kf_dual_llm_production.package_retry_reason(production_package)
+                    )
             except Exception as exc:
                 logger.exception("KF LLM2 production outbound failed: %s", exc)
                 llm2_retry_reason = "LLM2 production outbound failed; do not continue with customer-visible facts."

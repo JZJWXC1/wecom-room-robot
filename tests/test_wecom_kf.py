@@ -192,6 +192,136 @@ def test_generate_reply_result_production_llm2_bypasses_legacy_planner_reply_gat
     asyncio.run(run_case())
 
 
+def test_generate_reply_result_production_blocks_l2_validation_failure(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "第1套视频",
+                "task_atoms": [{"task_id": "task-video", "task_type": "send_video", "user_text": "第1套视频"}],
+                "tool_plan": {"actions": ["generate_reply"]},
+            },
+            content="第1套视频",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                raise AssertionError("L0-L2 validation failure must gate before final selfcheck")
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "我这边按证据给你回复。",
+                    "answered_task_ids": ["task-video"],
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+        original_mode = main.settings.kf_dual_llm_mode
+        tool_evidence = {"actions": ["generate_reply"]}
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._generate_reply_result(
+                content="第1套视频",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "第1套视频",
+                    "structured_task": {"tool_requirements": {"needs_video": True}},
+                    "constraint_proof": {"wants_video": True},
+                    "llm1_task_packet": task_packet,
+                },
+                tool_evidence=tool_evidence,
+                planner_result={"actions": ["generate_reply"]},
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert result["reply"] == ""
+        assert result["needs_planner_retry"] is True
+        assert result["selfcheck"]["rule"]["source"] == "llm2_production_output_gate"
+        assert "kf_outbound_validation L0-L2 blocked" in result["planner_retry_reason"]
+        assert tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]["status"] == "blocked"
+        assert any(
+            issue["code"] == "l2.task_not_answered"
+            for issue in tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]["issues"]
+        )
+        assert "llm2_production_outbound_package" not in tool_evidence
+
+    asyncio.run(run_case())
+
+
+def test_generate_reply_result_production_blocks_l3_validation_rewrite(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "普通回复",
+                "task_atoms": [{"task_id": "task-reply", "task_type": "reply_text", "user_text": "普通回复"}],
+                "tool_plan": {"actions": ["generate_reply"]},
+            },
+            content="普通回复",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                raise AssertionError("L3 rewrite gate must run before final selfcheck")
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "listing_id=lst-1，我这边按证据给你回复。",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+        original_mode = main.settings.kf_dual_llm_mode
+        tool_evidence = {"actions": ["generate_reply"]}
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._generate_reply_result(
+                content="普通回复",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "general",
+                    "effective_query": "普通回复",
+                    "structured_task": {"tool_requirements": {}},
+                    "constraint_proof": {},
+                    "llm1_task_packet": task_packet,
+                },
+                tool_evidence=tool_evidence,
+                planner_result={"actions": ["generate_reply"]},
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert result["reply"] == ""
+        assert result["needs_planner_retry"] is True
+        assert "kf_outbound_validation L3 rewrite required" in result["planner_retry_reason"]
+        validation = tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]
+        assert validation["status"] == "rewrite_required"
+        assert validation["facts_passed"] is True
+        assert validation["send_allowed"] is False
+        assert any(issue["code"] == "l3.internal_name_leak" for issue in validation["issues"])
+        assert "llm2_production_outbound_package" not in tool_evidence
+
+    asyncio.run(run_case())
+
+
 def test_understand_message_production_skips_legacy_rewrite_and_fallback(monkeypatch) -> None:
     async def run_case() -> None:
         class FakeReplyGenerator:
