@@ -20,6 +20,11 @@ They do not contain real tokens, secrets, server addresses, phone numbers, or vi
   - Must be generated with `scripts/export_real_dialogue_fixture.py` so raw customer ids, phone numbers, viewing passwords, tokens, and long runtime identifiers are removed before the file enters tests.
   - The raw server log must not be committed.
 
+- `historical_failures_synthetic_sanitized.json`
+  - Source: synthetic sanitized replay cases for the L4 historical failure gate.
+  - These cases are mechanism fixtures, not real server evidence.
+  - They must not contain phone numbers, viewing passwords, tokens, long hashes, raw signatures, server ids, or raw customer identifiers.
+
 ## Generation command
 
 Run from the repository root with UTF-8 enabled:

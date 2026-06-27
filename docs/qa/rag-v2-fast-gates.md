@@ -98,13 +98,21 @@ L3 只把全量 pytest 跑一次，用于开发效率；它不替代发布前的
 包含：
 
 - 连续 3 次全量 `pytest -q`。
+- dual LLM production package smoke：只验证 contract，不触发真实发送。
 - 20+ parity QA：默认运行两个 10-window UTF-8 RAG parity runner。
+- 真实对话回放 QA：读取脱敏后的 `tests/fixtures/qa/real_server_dialogues_sanitized.json`，最少 10 个窗口、100 轮。
+- 随机 10 问保底 QA：每次从 fixture 房源索引生成不同问题组合，覆盖上下文、候选编号、素材、密码、免押、定房等高风险链路。
+- QA artifact release gate：所有 release QA artifact 必须 `passed=true`、`high_count=0`、`medium_count=0`，完整回放必须 `summary.usable_for_release=true`。
+- 视频上传转码重试 gate：覆盖上传失败、认证失败、限流和日限额故障注入。
 - rollback/cutover/release safety：`tests/test_inventory_snapshot.py`、`tests/test_inventory_snapshot_m1d2b2.py` 与 `tests/test_release_pipeline.py`。
+- release/current 本地 rehearsal：生成本地 release report，验证 current pointer、manifest、rollback、health contract 和 server-ops 审批门禁；本地 rehearsal 不读取真实 `.env` 内容。
 - secret scan：扫描已跟踪文件中的私钥、OpenAI/GitHub/AWS 样式密钥和运行时凭证赋值；仅允许 `.env.example` 或测试 fixture 中显然是 `your_`、`missing_`、`dummy_`、`fake_`、`test_`、`example_`、`placeholder_` 这类占位值。
 - `python -m compileall app`。
 - `git diff --check`。
 
-L4 的重点不是“多跑几遍显得放心”，而是验证全量结果稳定、parity 覆盖足够、回滚演练存在、敏感信息扫描没有退化。
+L4 的重点不是“多跑几遍显得放心”，而是验证全量结果稳定、parity 和真实回放覆盖足够、回滚演练存在、敏感信息扫描没有退化。
+
+`-AllowMissingRealDialogues` 和 `-SkipParity` 只用于本地诊断时继续跑后续步骤；它们都会记录红色 release blocker，最终 L4 不能作为上线证据。
 
 ## 何时选择
 

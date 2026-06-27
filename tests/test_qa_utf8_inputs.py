@@ -4,6 +4,7 @@ import asyncio
 import ast
 import csv
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -211,6 +212,27 @@ def test_real_dialogue_release_integrity_requires_minimum_scope(tmp_path: Path) 
     assert integrity["turn_count"] == 3
     assert integrity["min_window_count"] == 10
     assert integrity["min_turn_count"] == 100
+
+
+def test_historical_failure_fixture_is_synthetic_and_sanitized() -> None:
+    fixture_path = Path("tests/fixtures/qa/historical_failures_synthetic_sanitized.json")
+    text = fixture_path.read_text(encoding="utf-8")
+    payload = json.loads(text)
+    joined_turns = "\n".join(turn for window in payload["windows"] for turn in window["turns"])
+
+    assert payload["schema"] == "historical_failures_synthetic_sanitized.v1"
+    assert "real server" not in payload["description"].lower()
+    assert "synthetic_sanitized_fixture" in {window["source"] for window in payload["windows"]}
+    assert len(payload["windows"]) >= 3
+    assert sum(len(window["turns"]) for window in payload["windows"]) >= 12
+    assert not any(token in text for token in BAD_MOJIBAKE_PHRASES)
+    assert "房源表" in joined_turns
+    assert "视频" in joined_turns
+    assert "图片" in joined_turns
+    assert "密码" not in text
+    assert not re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", text)
+    assert not re.search(r"\b[a-fA-F0-9]{32,}\b", text)
+    assert not re.search(r"(?i)\b(sk-(proj-)?|gh[pousr]_|AKIA)[A-Za-z0-9_-]{12,}\b", text)
 
 
 def test_random_guard_qa_generation_is_utf8_clean_and_covers_required_categories() -> None:
@@ -839,6 +861,98 @@ def test_qa_quality_status_marks_high_risk_as_business_failure() -> None:
     assert quality["business_failures"][0]["severity"] == "high"
 
 
+def test_qa_quality_status_marks_any_medium_as_release_blocker() -> None:
+    quality = run_rag_10windows_10turns_utf8.build_quality_status(
+        [
+            {
+                "window_id": "sample",
+                "turns": [
+                    {
+                        "turn": 1,
+                        "user": "杨家府还有房子吗？客户说名字可能没记准。",
+                        "bot": {"texts": ["最新房源表里暂时没查到杨家府这个小区。"]},
+                        "problem": {
+                            "severity": "medium",
+                            "likely_link": "问题重写/意图分析",
+                            "reason": "需要人工复核的小区确认。",
+                        },
+                    }
+                ],
+            }
+        ],
+        completed=True,
+    )
+
+    assert quality["passed"] is False
+    assert quality["business_failure"] is True
+    assert quality["high_count"] == 0
+    assert quality["medium_count"] == 1
+    assert quality["medium_threshold"] == 0
+    assert quality["exit_code"] == 4
+
+
+def test_qa_problem_marks_llm_timeout_and_bad_packages_as_high() -> None:
+    timeout_problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "这套视频发我。",
+            "bot": {"texts": []},
+            "error": "TimeoutError: LLM planner timed out",
+        }
+    )
+    llm1_bad_packet = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "第1套视频发我。",
+            "bot": {"texts": ["我再确认一下。"]},
+            "chain_judgment": {
+                "status": "retry_needed",
+                "likely_link": "LLM1结构化任务包",
+                "reason": "LLM1 production output missing or invalid task_atoms",
+            },
+        }
+    )
+    llm2_bad_packet = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "房源表发我。",
+            "bot": {"texts": []},
+            "chain_judgment": {
+                "status": "no_output",
+                "likely_link": "LLM2出站包",
+                "reason": "LLM2 returned malformed outbound package",
+            },
+        }
+    )
+
+    assert timeout_problem["severity"] == "high"
+    assert llm1_bad_packet["severity"] == "high"
+    assert llm1_bad_packet["likely_link"] == "LLM1结构化任务包"
+    assert llm2_bad_packet["severity"] == "high"
+    assert llm2_bad_packet["likely_link"] == "LLM2出站包"
+
+
+def test_qa_quality_status_records_feishu_sync_failure_as_infrastructure_error() -> None:
+    quality = run_rag_10windows_10turns_utf8.build_quality_status(
+        [
+            {
+                "window_id": "feishu_fault",
+                "turns": [
+                    {
+                        "turn": 1,
+                        "user": "这套视频发我。",
+                        "error": "Feishu sync failed in offline replay stub",
+                        "problem": {"severity": "high", "likely_link": "房源/素材同步"},
+                    }
+                ],
+            }
+        ],
+        completed=False,
+    )
+
+    assert quality["passed"] is False
+    assert quality["infrastructure_error"] is True
+    assert quality["exit_code"] == 2
+    assert quality["infrastructure_errors"][0]["reason"] == "Feishu sync failed in offline replay stub"
+
+
 def test_fast_gate_secret_scan_allows_only_obvious_fixture_placeholders() -> None:
     script = Path("scripts/rag-v2-test-gates.ps1").read_text(encoding="utf-8")
 
@@ -850,6 +964,10 @@ def test_fast_gate_secret_scan_allows_only_obvious_fixture_placeholders() -> Non
 
 def test_fast_gate_includes_send_receipt_and_fault_replay_tests() -> None:
     script = Path("scripts/rag-v2-test-gates.ps1").read_text(encoding="utf-8")
+    production_smoke_body = script.split("function Invoke-ProductionSmoke", 1)[1].split(
+        "function Invoke-RealDialogueReplay",
+        1,
+    )[0]
 
     assert '"tests/test_kf_send_receipts.py"' in script
     assert '"tests/test_kf_send_receipt_faults.py"' in script
@@ -857,17 +975,38 @@ def test_fast_gate_includes_send_receipt_and_fault_replay_tests() -> None:
     assert "smoke_dual_llm_production.py" in script
     assert "real_server_dialogues_sanitized.json" in script
     assert "AllowMissingRealDialogues" in script
+    assert "historical_failures_synthetic_sanitized.json" in script
+    assert "AllowMissingHistoricalFailures" in script
+    assert "Invoke-HistoricalFailureReplay" in script
+    assert "historical failure replay QA" in script
+    assert "Save-SanitizedQaArtifact" in script
     assert "--min-window-count" in script
     assert "--min-turn-count" in script
     assert "run_rag_random_guard_utf8.py" in script
     assert "video upload transcode retry gate" in script
+    assert "Assert-QaArtifactReleaseGate" in script
+    assert "high=0 medium=0" in script
+    assert "ReleaseBlockers" in script
+    assert "production cutover is blocked" in script
+    assert "release/current rehearsal local artifact" in script
+    assert "Invoke-ReleaseRehearsal" in script
+    assert "release blocker audit" in script
+    assert '$env:APP_ENV = "test"' in production_smoke_body
+    assert '"scripts/smoke_dual_llm_production.py"' in production_smoke_body
+    assert "--allow-live-llm" not in production_smoke_body
 
 
 def test_production_smoke_is_contract_only_and_send_guarded() -> None:
     script = Path("scripts/smoke_dual_llm_production.py").read_text(encoding="utf-8")
+    offline_source = script.split("async def _run_live_smoke", 1)[0]
 
     assert '"contract_only": True' in script
     assert '"send_transport_invoked": False' in script
+    assert '"llm_transport_invoked": False' in script
+    assert '"env_file_read": False' in script
+    assert "FakeReplyGenerator" in script
+    assert "from app.config import settings" not in offline_source
+    assert "from app.services.llm import ReplyGenerator" not in offline_source
     assert "send_action_count == 0" in script
     assert "send_text(" not in script
     assert "send_image(" not in script

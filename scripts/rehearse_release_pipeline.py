@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -13,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.check_unattended_runtime import REQUIRED_ENV_KEYS, _is_placeholder, _parse_env_file
+from scripts.check_unattended_runtime import REQUIRED_ENV_KEYS
 
 
 RELEASE_REHEARSAL_SCHEMA_VERSION = "rag_v2_release_rehearsal.v1"
@@ -72,12 +73,12 @@ def rehearse_release_pipeline(project_dir: Path, rehearsal_root: Path, *, versio
 
     env_summary = build_unattended_env_summary(project_dir)
     approval_guard = inspect_server_ops_approval_guard(project_dir)
-    health_contract = validate_health_payload({"ok": True, "service": "wecom-room-robot-agentic-rag"})
+    health_contract = validate_health_contract()
     release_ready = (
         all(candidate["required_paths"].values())
         and candidate["excluded_runtime_paths_present_in_manifest"] == []
         and rollback["ok"]
-        and approval_guard["requires_approve_deploy"]
+        and approval_guard["ok"]
         and health_contract["ok"]
     )
     result = {
@@ -133,13 +134,14 @@ def rehearse_rollback(release_root: Path, *, to_version: str) -> dict[str, Any]:
 
 def build_unattended_env_summary(project_dir: Path) -> dict[str, Any]:
     env_file = project_dir / ".env"
-    values = _parse_env_file(env_file)
-    missing = [key for key in REQUIRED_ENV_KEYS if _is_placeholder(values.get(key, ""))]
     local_credential_file = project_dir / ".local" / "server-credentials.ps1"
     return {
         "env_file_exists": env_file.exists(),
+        "env_file_read": False,
+        "env_file_read_policy": "skipped_in_local_rehearsal_to_avoid_reading_secrets",
         "required_env_count": len(REQUIRED_ENV_KEYS),
-        "missing_or_placeholder_keys": missing,
+        "missing_or_placeholder_keys": [],
+        "required_env_completeness_checked": False,
         "local_ssh_credential_file_exists": local_credential_file.exists(),
         "secret_values_printed": False,
     }
@@ -147,19 +149,93 @@ def build_unattended_env_summary(project_dir: Path) -> dict[str, Any]:
 
 def inspect_server_ops_approval_guard(project_dir: Path) -> dict[str, Any]:
     script = (project_dir / "scripts" / "server-ops.ps1").read_text(encoding="utf-8")
-    credential_index = script.find("$CredentialFile")
-    guard_index = script.find("Require-DeployApproval")
+    approval_call_lines: list[int] = []
+    credential_load_lines: list[int] = []
+    function_definition_lines: list[int] = []
+    for line_no, line in enumerate(script.splitlines(), start=1):
+        if _is_require_deploy_approval_definition(line):
+            function_definition_lines.append(line_no)
+            continue
+        if _is_require_deploy_approval_call(line):
+            approval_call_lines.append(line_no)
+        if _is_credential_file_read(line):
+            credential_load_lines.append(line_no)
+    approval_call_line = approval_call_lines[0] if approval_call_lines else None
+    credential_load_line = credential_load_lines[0] if credential_load_lines else None
+    requires_approve_deploy = "APPROVE_DEPLOY" in script and approval_call_line is not None
+    approval_guard_before_credential_load = (
+        approval_call_line is not None
+        and credential_load_line is not None
+        and approval_call_line < credential_load_line
+    )
     return {
-        "requires_approve_deploy": "APPROVE_DEPLOY" in script and "Require-DeployApproval" in script,
-        "approval_guard_before_credential_load": guard_index >= 0 and credential_index >= 0 and guard_index < credential_index,
+        "ok": requires_approve_deploy and approval_guard_before_credential_load,
+        "requires_approve_deploy": requires_approve_deploy,
+        "approval_guard_before_credential_load": approval_guard_before_credential_load,
+        "approval_guard_line": approval_call_line,
+        "credential_load_line": credential_load_line,
+        "function_definition_lines": function_definition_lines,
     }
+
+
+def _is_require_deploy_approval_definition(line: str) -> bool:
+    return re.match(r"^\s*function\s+Require-DeployApproval\b", line, flags=re.IGNORECASE) is not None
+
+
+def _is_require_deploy_approval_call(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    if _is_require_deploy_approval_definition(stripped):
+        return False
+    return re.match(r"^(?:[&.]\s*)?Require-DeployApproval\b", stripped, flags=re.IGNORECASE) is not None
+
+
+def _is_credential_file_read(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    return (
+        re.search(r"\bGet-Content\b", stripped, flags=re.IGNORECASE) is not None
+        and re.search(r"(^|\s)-Path\b\s+\$CredentialFile\b", stripped, flags=re.IGNORECASE) is not None
+    )
 
 
 def validate_health_payload(payload: dict[str, Any]) -> dict[str, Any]:
     service = str(payload.get("service") or "")
+    ok = bool(payload.get("ok")) and service == "wecom-room-robot-agentic-rag"
+    if payload.get("ok") is not True:
+        reason = "ok_false"
+    elif service != "wecom-room-robot-agentic-rag":
+        reason = "service_mismatch"
+    else:
+        reason = ""
     return {
-        "ok": bool(payload.get("ok")) and service == "wecom-room-robot-agentic-rag",
+        "ok": ok,
         "service": service,
+        "reason": reason,
+    }
+
+
+def validate_health_contract() -> dict[str, Any]:
+    samples = {
+        "healthy": validate_health_payload({"ok": True, "service": "wecom-room-robot-agentic-rag"}),
+        "ok_false": validate_health_payload({"ok": False, "service": "wecom-room-robot-agentic-rag"}),
+        "service_mismatch": validate_health_payload({"ok": True, "service": "legacy-room-robot"}),
+        "missing_service": validate_health_payload({"ok": True}),
+    }
+    return {
+        "schema": "rag_v2_health_contract.v1",
+        "ok": (
+            samples["healthy"]["ok"] is True
+            and samples["ok_false"]["ok"] is False
+            and samples["ok_false"]["reason"] == "ok_false"
+            and samples["service_mismatch"]["ok"] is False
+            and samples["service_mismatch"]["reason"] == "service_mismatch"
+            and samples["missing_service"]["ok"] is False
+        ),
+        "required_service": "wecom-room-robot-agentic-rag",
+        "samples": samples,
     }
 
 

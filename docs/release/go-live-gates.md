@@ -35,6 +35,24 @@
    - 外部服务依赖失败。
    - 测试自身读取线上配置的问题。
 
+## V1 Production Cutover 本地 L4
+
+`scripts/rag-v2-test-gates.ps1 -Level L4` 是 V1 cutover 前的本地 release gate。它只允许离线、本地、脱敏验证，不允许 SSH、部署、连接飞书或企业微信线上服务。
+
+L4 必须同时满足：
+
+- 全量 pytest 重复执行通过。
+- 20+ parity QA、真实对话回放 QA、历史失败回放 QA、随机 10 问保底 QA 都生成 QA artifact。
+- 每个 release QA artifact 的 `quality_status.passed=true`、`high_count=0`、`medium_count=0`，且完整回放 artifact 必须是 `summary.usable_for_release=true`。
+- `tests/fixtures/qa/real_server_dialogues_sanitized.json` 必须存在并满足最小 10 个窗口、100 轮回放；显式传入 `-AllowMissingRealDialogues` 只允许继续跑后续本地检查，但最终仍记录红色 release blocker，不能上线。
+- `tests/fixtures/qa/historical_failures_synthetic_sanitized.json` 必须存在并满足历史失败回放最小范围；显式传入 `-AllowMissingHistoricalFailures` 只允许继续跑后续本地检查，但最终仍记录红色 release blocker，不能上线。
+- 历史失败回放 runner 输出和落盘 artifact 必须脱敏，不得包含手机号、查看凭据、token、长 hash 或原始签名。
+- 显式传入 `-SkipParity` 会记录 release blocker，不能上线。
+- 本地 release/current rehearsal 必须生成报告，并验证 current 指针、rollback、health contract、server-ops 审批门禁。
+- secret scan 必须对 git 跟踪文件通过；`.env`、`.local`、运行时目录和素材目录不得进入扫描输出或 release manifest。
+
+本地 release rehearsal 不读取真实 `.env` 内容，只报告 `.env` 是否存在、必需键数量和“未读取密钥文件内容”的策略状态；真实无人值守凭证完整性只允许在获得 `APPROVE_DEPLOY` 后通过服务器侧检查确认。
+
 ## CI 门禁
 
 GitHub Actions 只能执行：
