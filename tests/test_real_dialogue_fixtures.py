@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -103,7 +104,15 @@ def test_sanitize_text_masks_common_runtime_sensitive_shapes() -> None:
 
 def test_real_server_dialogue_fixture_is_safe_when_present() -> None:
     if not REAL_DIALOGUE_FIXTURE.exists():
-        pytest.skip("尚未导入脱敏服务器真实对话 fixture")
+        if os.environ.get("REQUIRE_REAL_DIALOGUE_FIXTURE") == "1":
+            pytest.fail(
+                "上线级真实对话 fixture 缺失；L4 必须提供 tests/fixtures/qa/real_server_dialogues_sanitized.json，"
+                "或显式使用 -AllowMissingRealDialogues。"
+            )
+        pytest.skip(
+            "本地离线单测允许缺少真实对话 fixture；上线级 L4 由 scripts/rag-v2-test-gates.ps1 "
+            "强制要求该 fixture，除非显式 -AllowMissingRealDialogues。"
+        )
 
     payload = json.loads(REAL_DIALOGUE_FIXTURE.read_text(encoding="utf-8"))
     errors = validate_fixture_payload(payload)

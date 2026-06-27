@@ -123,6 +123,7 @@ def _artifact_write_failure_payload(
             "quality_status": quality,
         }
     )
+    failure["summary"] = build_machine_summary(failure)
     failure["canonical_result_hash"] = canonical_result_hash(failure)
     return failure
 
@@ -329,7 +330,10 @@ FAILED_MARKERS = ("发送失败", "上传失败", "发不出去", "没发出去"
 def chinese_integrity_report(
     windows: list[dict[str, Any]] | None = None,
     *,
-    required_tokens: tuple[str, ...] | None = REQUIRED_TOKENS,
+    required_tokens: tuple[str, ...] | list[str] | None = REQUIRED_TOKENS,
+    expected_window_count: int | None = 10,
+    min_window_count: int = 1,
+    min_turn_count: int = 100,
 ) -> dict[str, Any]:
     source_windows = windows if windows is not None else WINDOWS
     turns = [turn for window in source_windows for turn in window["turns"]]
@@ -339,15 +343,23 @@ def chinese_integrity_report(
     required = required_tokens or ()
     missing = [token for token in required if token not in joined]
     bad = [token for token in BAD_TOKENS if token in joined]
+    window_count_ok = (
+        len(source_windows) >= min_window_count
+        and (expected_window_count is None or len(source_windows) == expected_window_count)
+    )
+    turn_count_ok = len(turns) >= min_turn_count
     return {
         "script_path": _display_path(SCRIPT_PATH),
         "encoding": "utf-8",
         "window_count": len(source_windows),
         "turn_count": len(turns),
+        "expected_window_count": expected_window_count,
+        "min_window_count": min_window_count,
+        "min_turn_count": min_turn_count,
         "chinese_ratio": round(chinese_count / total_count, 4),
         "missing_required_tokens": missing,
         "bad_tokens": bad,
-        "passed": len(source_windows) == 10 and len(turns) >= 100 and not missing and not bad and chinese_count / total_count > 0.35,
+        "passed": window_count_ok and turn_count_ok and not missing and not bad and chinese_count / total_count > 0.35,
     }
 
 
@@ -750,8 +762,41 @@ def build_completion_status(
         "selected_window_count": selected_window_count,
         "expected_full_window_count": expected_full_window_count,
         "expected_selected_turn_count": expected_selected_turn_count,
+        "expected_case_count": expected_selected_turn_count,
         "actual_window_count": actual_window_count,
         "actual_turn_count": actual_turn_count,
+        "actual_case_count": actual_turn_count,
+    }
+
+
+def build_machine_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    quality = payload.get("quality_status") or {}
+    passed = bool(quality.get("passed"))
+    artifact_role = "pass_transcript" if passed else "failure_log"
+    actual_case_count = int(payload.get("actual_case_count") or payload.get("actual_turn_count") or 0)
+    expected_case_count = int(payload.get("expected_case_count") or payload.get("expected_selected_turn_count") or 0)
+    full_suite_completed = bool(payload.get("full_suite_completed"))
+    usable_for_release = (
+        passed
+        and full_suite_completed
+        and expected_case_count > 0
+        and actual_case_count == expected_case_count
+    )
+    return {
+        "schema": "rag_qa_artifact_summary.v1",
+        "artifact_role": artifact_role,
+        "contains_pass_transcript": artifact_role == "pass_transcript",
+        "contains_failure_log": artifact_role == "failure_log",
+        "usable_for_release": usable_for_release,
+        "passed": passed,
+        "exit_code": int(quality.get("exit_code") or (0 if passed else 2)),
+        "actual_case_count": actual_case_count,
+        "expected_case_count": expected_case_count,
+        "actual_window_count": int(payload.get("actual_window_count") or 0),
+        "selected_window_count": int(payload.get("selected_window_count") or payload.get("window_count") or 0),
+        "full_suite_completed": full_suite_completed,
+        "business_failure": bool(quality.get("business_failure")),
+        "infrastructure_error": bool(quality.get("infrastructure_error")),
     }
 
 
@@ -1012,6 +1057,28 @@ def _timing_summary(windows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def load_fixture_windows(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_windows = payload.get("windows") if isinstance(payload, dict) else None
+    if not isinstance(raw_windows, list) or not raw_windows:
+        raise RuntimeError(f"fixture has no replay windows: {path}")
+    windows: list[dict[str, Any]] = []
+    for index, window in enumerate(raw_windows, start=1):
+        if not isinstance(window, dict):
+            raise RuntimeError(f"fixture window #{index} must be an object: {path}")
+        turns = [str(turn).strip() for turn in window.get("turns") or [] if str(turn).strip()]
+        if not turns:
+            raise RuntimeError(f"fixture window #{index} has no turns: {path}")
+        windows.append(
+            {
+                "id": str(window.get("id") or f"fixture_window_{index:03d}"),
+                "source": str(window.get("source") or payload.get("schema") or "fixture"),
+                "turns": turns,
+            }
+        )
+    return windows
+
+
 async def run_all(
     *,
     turn_timeout: float = 90,
@@ -1021,9 +1088,18 @@ async def run_all(
     artifact_prefix: str = "rag_10windows_10turns_utf8",
     conversation_prefix: str = CONVERSATION_PREFIX,
     required_tokens: tuple[str, ...] | list[str] | None = None,
+    expected_window_count: int | None = 10,
+    min_window_count: int = 1,
+    min_turn_count: int = 100,
 ) -> Path:
     source_windows = windows if windows is not None else WINDOWS
-    integrity = chinese_integrity_report(source_windows, required_tokens=required_tokens)
+    integrity = chinese_integrity_report(
+        source_windows,
+        required_tokens=required_tokens,
+        expected_window_count=expected_window_count,
+        min_window_count=min_window_count,
+        min_turn_count=min_turn_count,
+    )
     if not integrity["passed"]:
         raise RuntimeError("10窗口QA输入编码或覆盖异常：" + json.dumps(integrity, ensure_ascii=False))
     ARTIFACT_DIR.mkdir(exist_ok=True)
@@ -1069,6 +1145,7 @@ async def run_all(
             "offline_guard": offline_guard_status(),
             "windows": all_results,
         }
+        payload["summary"] = build_machine_summary(payload)
         payload["canonical_result_hash"] = canonical_result_hash(payload)
         try:
             _write_json_atomic(artifact, payload)
@@ -1133,19 +1210,21 @@ async def run_all(
         main.kf_turn_pending_messages.update(originals["kf_turn_pending_messages"])
         base.restore_offline_service_stubs(originals["offline_service_stubs"])
 
-    completed = (
-        len(all_results) == len(selected_windows)
-        and all(
-            len(window["turns"]) == 10 and not any(turn.get("error") for turn in window["turns"])
-            for window in all_results
-        )
-    )
+    completed = len(all_results) == len(selected_windows)
+    if completed:
+        for result, source in zip(all_results, selected_windows):
+            result_turns = result.get("turns") or []
+            source_turns = source.get("turns") or []
+            if len(result_turns) != len(source_turns) or any(turn.get("error") for turn in result_turns):
+                completed = False
+                break
     write_artifact(completed)
     return artifact
 
 
 def print_summary(artifact: Path) -> None:
     data = json.loads(artifact.read_text(encoding="utf-8"))
+    print("SUMMARY_JSON " + json.dumps(data.get("summary") or {}, ensure_ascii=False, sort_keys=True))
     print(f"ARTIFACT {artifact}")
     print(
         "INPUT_INTEGRITY "
@@ -1195,17 +1274,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turn-timeout", type=float, default=90)
     parser.add_argument("--window-limit", type=int, default=0)
     parser.add_argument("--window-id", default="")
+    parser.add_argument("--fixture", type=Path)
+    parser.add_argument("--artifact-prefix", default="")
+    parser.add_argument("--min-window-count", type=int, default=0)
+    parser.add_argument("--min-turn-count", type=int, default=0)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    fixture_windows = load_fixture_windows(args.fixture) if args.fixture else None
+    artifact_prefix = args.artifact_prefix or (
+        f"rag_fixture_{args.fixture.stem}" if args.fixture else "rag_10windows_10turns_utf8"
+    )
+    min_window_count = args.min_window_count or 1
+    min_turn_count = args.min_turn_count or (1 if args.fixture else 100)
     try:
         artifact_path = asyncio.run(
             run_all(
                 turn_timeout=args.turn_timeout,
                 window_limit=args.window_limit or None,
                 window_id=args.window_id,
+                windows=fixture_windows,
+                artifact_prefix=artifact_prefix,
+                conversation_prefix="conv_fixture_replay" if args.fixture else CONVERSATION_PREFIX,
+                required_tokens=() if args.fixture else None,
+                expected_window_count=None if args.fixture else 10,
+                min_window_count=min_window_count,
+                min_turn_count=min_turn_count,
             )
         )
     except ArtifactWriteError as error:

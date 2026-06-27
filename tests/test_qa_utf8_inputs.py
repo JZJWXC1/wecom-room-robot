@@ -34,6 +34,16 @@ def test_all_qa_scripts_are_utf8_clean() -> None:
         assert not any(token in text for token in BAD_MOJIBAKE_PHRASES), path
 
 
+def test_send_receipt_fault_tests_are_utf8_clean() -> None:
+    text = Path("tests/test_kf_send_receipt_faults.py").read_text(encoding="utf-8")
+    mojibake_tokens = BAD_MOJIBAKE_PHRASES + ("灏忓尯", "鏄熸渤", "鎴垮彿")
+
+    assert "星河苑" in text
+    assert "小区" in text
+    assert "房号" in text
+    assert not any(token in text for token in mojibake_tokens)
+
+
 def test_three_question_qa_inputs_pass_chinese_integrity() -> None:
     report = run_rag_3questions_10turns_utf8.chinese_integrity_report(
         run_rag_3questions_10turns_utf8.TURNS
@@ -139,6 +149,68 @@ def test_full_10window_qa_completion_requires_all_windows_and_turns() -> None:
 
     assert status["completed"] is True
     assert status["full_suite_completed"] is True
+    assert status["actual_case_count"] == 100
+    assert status["expected_case_count"] == 100
+
+
+def test_real_dialogue_fixture_loader_accepts_variable_window_counts(tmp_path: Path) -> None:
+    fixture = tmp_path / "real_server_dialogues_sanitized.json"
+    fixture.write_text(
+        json.dumps(
+            {
+                "schema": "real_server_dialogues_sanitized.v1",
+                "windows": [
+                    {"id": "real_001", "source": "server_log_sanitized", "turns": ["你好", "房源表发我"]},
+                    {"turns": ["这套视频发我"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    windows = run_rag_10windows_10turns_utf8.load_fixture_windows(fixture)
+    integrity = run_rag_10windows_10turns_utf8.chinese_integrity_report(
+        windows,
+        required_tokens=(),
+        expected_window_count=None,
+        min_turn_count=1,
+    )
+
+    assert [window["id"] for window in windows] == ["real_001", "fixture_window_002"]
+    assert integrity["passed"], integrity
+
+
+def test_real_dialogue_release_integrity_requires_minimum_scope(tmp_path: Path) -> None:
+    fixture = tmp_path / "real_server_dialogues_sanitized.json"
+    fixture.write_text(
+        json.dumps(
+            {
+                "schema": "real_server_dialogues_sanitized.v1",
+                "windows": [
+                    {"id": "real_001", "turns": ["你好", "房源表发我"]},
+                    {"id": "real_002", "turns": ["这套视频发我"]},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    windows = run_rag_10windows_10turns_utf8.load_fixture_windows(fixture)
+
+    integrity = run_rag_10windows_10turns_utf8.chinese_integrity_report(
+        windows,
+        required_tokens=(),
+        expected_window_count=None,
+        min_window_count=10,
+        min_turn_count=100,
+    )
+
+    assert integrity["passed"] is False
+    assert integrity["window_count"] == 2
+    assert integrity["turn_count"] == 3
+    assert integrity["min_window_count"] == 10
+    assert integrity["min_turn_count"] == 100
 
 
 def test_random_guard_qa_generation_is_utf8_clean_and_covers_required_categories() -> None:
@@ -209,6 +281,56 @@ def test_qa_artifact_failure_payload_is_infrastructure_error_not_completed() -> 
     assert failure["quality_status"]["infrastructure_error"] is True
     assert failure["quality_status"]["exit_code"] == 2
     assert failure["quality_status"]["infrastructure_errors"][0]["target_path"] == "bad:name.json"
+    assert failure["summary"]["artifact_role"] == "failure_log"
+    assert failure["summary"]["contains_pass_transcript"] is False
+
+
+def test_qa_artifact_machine_summary_separates_pass_transcript_from_failure_log() -> None:
+    passed = run_rag_10windows_10turns_utf8.build_machine_summary(
+        {
+            "actual_case_count": 100,
+            "expected_case_count": 100,
+            "actual_window_count": 10,
+            "selected_window_count": 10,
+            "full_suite_completed": True,
+            "quality_status": {"passed": True, "exit_code": 0},
+        }
+    )
+    failed = run_rag_10windows_10turns_utf8.build_machine_summary(
+        {
+            "actual_case_count": 37,
+            "expected_case_count": 100,
+            "actual_window_count": 4,
+            "selected_window_count": 10,
+            "full_suite_completed": False,
+            "quality_status": {"passed": False, "exit_code": 3, "business_failure": True},
+        }
+    )
+    partial = run_rag_10windows_10turns_utf8.build_machine_summary(
+        {
+            "actual_case_count": 10,
+            "expected_case_count": 10,
+            "actual_window_count": 1,
+            "selected_window_count": 1,
+            "full_suite_completed": False,
+            "quality_status": {"passed": True, "exit_code": 0},
+        }
+    )
+
+    assert passed["artifact_role"] == "pass_transcript"
+    assert passed["contains_pass_transcript"] is True
+    assert passed["contains_failure_log"] is False
+    assert passed["usable_for_release"] is True
+    assert passed["actual_case_count"] == 100
+    assert failed["artifact_role"] == "failure_log"
+    assert failed["contains_pass_transcript"] is False
+    assert failed["contains_failure_log"] is True
+    assert failed["usable_for_release"] is False
+    assert failed["actual_case_count"] == 37
+    assert partial["artifact_role"] == "pass_transcript"
+    assert partial["passed"] is True
+    assert partial["usable_for_release"] is False
+    assert partial["full_suite_completed"] is False
 
 
 def test_qa_canonical_hash_ignores_dynamic_fields_but_keeps_result_content() -> None:
@@ -732,3 +854,21 @@ def test_fast_gate_includes_send_receipt_and_fault_replay_tests() -> None:
     assert '"tests/test_kf_send_receipts.py"' in script
     assert '"tests/test_kf_send_receipt_faults.py"' in script
     assert '"tests/test_qa_utf8_inputs.py"' in script
+    assert "smoke_dual_llm_production.py" in script
+    assert "real_server_dialogues_sanitized.json" in script
+    assert "AllowMissingRealDialogues" in script
+    assert "--min-window-count" in script
+    assert "--min-turn-count" in script
+    assert "run_rag_random_guard_utf8.py" in script
+    assert "video upload transcode retry gate" in script
+
+
+def test_production_smoke_is_contract_only_and_send_guarded() -> None:
+    script = Path("scripts/smoke_dual_llm_production.py").read_text(encoding="utf-8")
+
+    assert '"contract_only": True' in script
+    assert '"send_transport_invoked": False' in script
+    assert "send_action_count == 0" in script
+    assert "send_text(" not in script
+    assert "send_image(" not in script
+    assert "send_video(" not in script

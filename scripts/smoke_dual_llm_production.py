@@ -88,18 +88,23 @@ async def _run_smoke() -> int:
         return 5
 
     log_payload = package_log_payload(package)
+    send_action_count = len(package.send_actions)
     result = {
-        "ok": bool(package_passed(package) and str(package.reply_text or "").strip()),
+        "ok": bool(package_passed(package) and str(package.reply_text or "").strip() and send_action_count == 0),
         "stage": "llm2",
         "mode": mode,
+        "contract_only": True,
+        "send_transport_invoked": False,
         "llm1_task_count": len(packet_payload.get("tasks") or []),
         "reply_source": package.reply_source,
         "reply_text_present": bool(str(package.reply_text or "").strip()),
-        "send_action_count": len(package.send_actions),
+        "send_action_count": send_action_count,
         "self_review": log_payload.get("self_review"),
     }
     if not result["ok"]:
         result["retry_reason"] = package_retry_reason(package)
+        if send_action_count:
+            result["send_guard_reason"] = "production smoke is contract-only and must not produce send actions"
     _print(result)
     return 0 if result["ok"] else 6
 
