@@ -118,7 +118,7 @@ def compose_kf_outbound(
         )
 
     claims = claim_result.items or _default_claims(packet, bundle)
-    action_captions = caption_result.items or _default_action_captions(packet, trusted_actions, evidence_by_id)
+    action_captions = caption_result.items or _default_action_captions(packet, trusted_actions, evidence_by_id, _candidate_labels_by_listing(bundle))
     answered_task_ids = _answered_task_ids(packet, output.get("answered_task_ids"), claims, trusted_actions, bool(reply_text))
     self_review = _success_review(
         output_review,
@@ -228,7 +228,7 @@ def _deterministic_llm2_shadow_output(
     bundle: ToolEvidenceBundle,
     send_actions: list[SendAction],
 ) -> dict[str, Any]:
-    captions = _default_action_captions(packet, send_actions, _evidence_by_id(bundle))
+    captions = _default_action_captions(packet, send_actions, _evidence_by_id(bundle), _candidate_labels_by_listing(bundle))
     claims = _default_claims(packet, bundle)
     return {
         "reply_text": _default_reply_text(bundle, send_actions),
@@ -245,13 +245,19 @@ def _deterministic_llm2_shadow_output(
 
 def _default_reply_text(bundle: ToolEvidenceBundle, send_actions: list[SendAction]) -> str:
     if send_actions:
+        evidence_by_id = _evidence_by_id(bundle)
+        candidate_labels = _candidate_labels_by_listing(bundle)
         video_count = sum(1 for action in send_actions if action.action_type == "video")
         image_count = sum(1 for action in send_actions if action.action_type == "image")
+        if len(send_actions) == 1:
+            action = send_actions[0]
+            evidence = evidence_by_id.get(action.evidence_id)
+            return _oralized_action_text(action, evidence, 1, _candidate_label_for_action(action, evidence, candidate_labels))
         if video_count and not image_count:
-            return "视频素材已准备好。"
+            return f"这是这{_listing_count_label(video_count)}对应的视频。"
         if image_count and not video_count:
-            return "图片素材已准备好。"
-        return "素材已准备好。"
+            return f"这是这{_listing_count_label(image_count)}对应的图片。"
+        return "这是这批对应的素材。"
     for item in bundle.evidence:
         if item.summary:
             return item.summary
@@ -481,12 +487,14 @@ def _default_action_captions(
     packet: StructuredTaskPacket,
     send_actions: list[SendAction],
     evidence_by_id: dict[str, EvidenceItem],
+    candidate_labels: dict[str, str],
 ) -> list[ActionCaption]:
     captions: list[ActionCaption] = []
     for index, action in enumerate(send_actions, start=1):
         evidence = evidence_by_id.get(action.evidence_id)
         if action.action_type == "text":
             continue
+        label = _candidate_label_for_action(action, evidence, candidate_labels)
         captions.append(
             ActionCaption(
                 prompt_version=LLM2_OUTBOUND_PROMPT_VERSION,
@@ -501,7 +509,7 @@ def _default_action_captions(
                 caption_id=f"caption-{action.action_id}",
                 action_id=action.action_id,
                 action_type=action.action_type,
-                text=evidence.summary if evidence and evidence.summary else _default_caption_text(action, index),
+                text=_oralized_action_text(action, evidence, index, label),
                 display_order=index,
                 metadata={
                     "source": "tool_evidence",
@@ -514,10 +522,91 @@ def _default_action_captions(
 
 def _default_caption_text(action: SendAction, index: int) -> str:
     if action.action_type == "video":
-        return f"视频素材 {index}"
+        return f"这是第 {index} 个房间的视频。"
     if action.action_type == "image":
-        return f"图片素材 {index}"
+        return f"这是第 {index} 个房间的图片。"
     return f"发送动作 {index}"
+
+
+def _oralized_action_text(action: SendAction, evidence: EvidenceItem | None, index: int, candidate_label: str = "") -> str:
+    label = _evidence_room_label(evidence) or _action_room_label(action) or candidate_label
+    if action.action_type == "video":
+        return f"这是{label}房间的视频。" if label else _default_caption_text(action, index)
+    if action.action_type == "image":
+        if evidence and evidence.evidence_type == "inventory_sheet":
+            return "这是房源表。"
+        return f"这是{label}房间的图片。" if label else _default_caption_text(action, index)
+    return _default_caption_text(action, index)
+
+
+def _evidence_room_label(evidence: EvidenceItem | None) -> str:
+    if not evidence:
+        return ""
+    field_values = dict(evidence.field_values or {})
+    metadata = dict(evidence.metadata or {})
+    community = _first_text(field_values, metadata, keys=("community", "小区", "community_name"))
+    room_no = _first_text(field_values, metadata, keys=("room_no", "房号", "room"))
+    if community and room_no:
+        return f"{community}{room_no}"
+    if community:
+        return community
+    if room_no:
+        return room_no
+    return ""
+
+
+def _action_room_label(action: SendAction) -> str:
+    payload = dict(action.payload or {})
+    metadata = dict(action.metadata or {})
+    community = _first_text(payload, metadata, keys=("community", "小区", "community_name"))
+    room_no = _first_text(payload, metadata, keys=("room_no", "房号", "room"))
+    if community and room_no:
+        return f"{community}{room_no}"
+    return community or room_no
+
+
+def _candidate_labels_by_listing(bundle: ToolEvidenceBundle) -> dict[str, str]:
+    if not bundle.candidate_set:
+        return {}
+    result: dict[str, str] = {}
+    for candidate in bundle.candidate_set.candidates:
+        listing_id = str(candidate.listing_id or "").strip()
+        if not listing_id:
+            continue
+        label = _candidate_room_label(candidate)
+        if label:
+            result[listing_id] = label
+    return result
+
+
+def _candidate_label_for_action(
+    action: SendAction,
+    evidence: EvidenceItem | None,
+    candidate_labels: dict[str, str],
+) -> str:
+    listing_id = str(action.listing_id or (evidence.listing_id if evidence else "") or "").strip()
+    return candidate_labels.get(listing_id, "")
+
+
+def _candidate_room_label(candidate: Any) -> str:
+    community = str(getattr(candidate, "community", "") or "").strip()
+    room_no = str(getattr(candidate, "room_no", "") or "").strip()
+    if community and room_no:
+        return f"{community}{room_no}"
+    return community or room_no
+
+
+def _first_text(*payloads: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for payload in payloads:
+        for key in keys:
+            value = payload.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+    return ""
+
+
+def _listing_count_label(count: int) -> str:
+    return "几套" if count >= 2 else "套"
 
 
 def _answered_task_ids(

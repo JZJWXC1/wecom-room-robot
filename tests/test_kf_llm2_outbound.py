@@ -12,6 +12,7 @@ from app.services.kf_contracts import (
     ToolEvidenceBundle,
 )
 from app.services.kf_llm2_outbound import compose_kf_outbound
+from app.services.kf_outbound_validation import ValidationStatus, validate_prepared_outbound_package
 
 
 def _task_packet() -> StructuredTaskPacket:
@@ -123,6 +124,21 @@ def test_compose_kf_outbound_accepts_supported_llm2_text_and_preserves_bindings(
     assert package.claims[0].listing_id == "lst-801b"
     assert package.action_captions[0].action_id == "send-video-1"
     assert package.self_review["llm2_decides_media_targets"] is False
+
+
+def test_deterministic_llm2_shadow_fallback_is_oralized_and_l3_clean() -> None:
+    package = compose_kf_outbound(
+        _task_packet(),
+        _evidence_bundle(),
+        ResponseStrategy.SEND_MEDIA,
+    )
+    validation = validate_prepared_outbound_package(package, task_packet=_task_packet())
+
+    assert package.reply_text == "这是棠润府15-2-801B房间的视频。"
+    assert package.action_captions[0].text == "这是棠润府15-2-801B房间的视频。"
+    assert "准备好" not in package.reply_text
+    assert validation.status == ValidationStatus.PASS
+    assert not validation.l3_rewrite_reasons
 
 
 def test_compose_kf_outbound_retries_when_llm2_invents_price() -> None:

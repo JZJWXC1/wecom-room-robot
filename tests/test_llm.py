@@ -218,6 +218,49 @@ def test_reply_generator_routes_each_rag_stage_to_configured_model(monkeypatch) 
     ]
 
 
+def test_compose_kf_outbound_shadow_prompt_requires_oralized_media_tense(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "dashscope_api_key", "test-key")
+    monkeypatch.setattr(settings, "dashscope_reply_model", "reply-model")
+
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content='{"reply_text":"这是棠润府15-2-801B房间的视频。","self_review":{"status":"pass"}}'
+                        )
+                    )
+                ]
+            )
+
+    generator = ReplyGenerator()
+    generator._client = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    )
+
+    result = asyncio.run(
+        generator.compose_kf_outbound_shadow(
+            task_packet={"tasks": [{"task_id": "task-video", "task_type": "send_video"}]},
+            evidence_bundle={"evidence": [{"evidence_id": "evd-video", "summary": "棠润府15-2-801B 视频"}]},
+            response_strategy={"mode": "send_media"},
+        )
+    )
+
+    system_prompt = captured["messages"][0]["content"]
+    user_prompt = captured["messages"][1]["content"]
+
+    assert result["reply_text"].startswith("这是棠润府")
+    assert captured["model"] == "reply-model"
+    assert "话术要像真实租房客服" in system_prompt
+    assert "不要说“稍后发、等下发、会发你、素材已准备好”" in system_prompt
+    assert "客户可见话术必须口语化" in user_prompt
+    assert "已有媒体 send action" in user_prompt
+
+
 def test_settings_support_deepseek_provider_without_changing_stage_contract(monkeypatch) -> None:
     monkeypatch.setattr(settings, "llm_planner_provider", "deepseek")
     monkeypatch.setattr(settings, "llm_retry_provider", "deepseek")
