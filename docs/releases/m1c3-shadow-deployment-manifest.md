@@ -42,7 +42,7 @@
 | `docs/releases/m1c3-server-runtime-audit.md` | 服务器运行方式审计。 |
 | `docs/releases/m1c3-shadow-runbook.md` | 发布和回滚 runbook。 |
 | `docs/releases/m1c3-shadow-observation-template.md` | 三次 Shadow 观察记录模板。 |
-| `docs/legacy-rule-inventory.md` | Legacy Removal Gate 更新。 |
+| `docs/release/v1-legacy-rule-prune-report.md` | V1 终态旧规则清理报告；原 `docs/legacy-rule-inventory.md` 已删除。 |
 | `docs/rag-rule-ownership.md` | 记录 Shadow health 不属于客服事实源。 |
 | `docs/inventory-snapshot-test-plan.md` | M1C3 测试覆盖说明。 |
 | `docs/inventory-snapshot-migration.md` | M1C3 状态说明。 |

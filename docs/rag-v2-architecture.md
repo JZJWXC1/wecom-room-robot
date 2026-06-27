@@ -84,7 +84,7 @@
 - 价格、房态、密码、链接和素材目标必须由 evidence 支撑；发现模型新增未证实高风险事实时，输出 retry 包，保留既有动作但清空客户文本、claims 和 captions。
 - 密码、链接、完整手机号、token 和 raw tool result 不进入 shadow artifact。
 
-`app/services/llm.py` 仅新增 `compose_kf_outbound_shadow` prompt/method，用于未来 shadow 调用 LLM2 生成候选话术；旧 `rewrite_kf_message`、`plan_kf_reply_text`、`assess_kf_final_reply` 语义不变。
+`app/services/llm.py` 提供 LLM1 task packet、LLM2 outbound 和最终 selfcheck 入口；V1 终态已删除旧工具后单 LLM `plan_kf_reply_text`，客户可见文本不再走该 legacy 方法。
 
 ## 敏感信息边界
 

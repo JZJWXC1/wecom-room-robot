@@ -6235,7 +6235,7 @@ def _tool_evidence_summary(tool_evidence: dict[str, Any]) -> dict[str, Any]:
         ),
         "media_sync": tool_evidence.get("media_sync") or {},
         "planner_reply_result": tool_evidence.get("planner_reply_result") or {},
-        "outbound_package": tool_evidence.get("outbound_package") or {},
+        "outbound_package": safe_artifact_payload(tool_evidence.get("outbound_package") or {}),
         "inventory_read_context": tool_evidence.get("inventory_read_context") or {},
         "inventory_source_metadata": tool_evidence.get("inventory_source_metadata") or {},
         "inventory_listing_evidence_count": len(tool_evidence.get("inventory_listing_evidence") or []),
@@ -6373,13 +6373,18 @@ def _production_audit_reply_result_summary(reply_result: dict[str, Any]) -> dict
 def _assessment_to_dict(assessment: Any) -> dict[str, Any]:
     status = str(getattr(assessment, "status", "") or getattr(assessment, "action", "") or "pass")
     fallback = str(getattr(assessment, "fallback_text", "") or getattr(assessment, "fallback_reply", "") or "")
-    return {
+    report = getattr(assessment, "report", None)
+    retry_instruction = str(getattr(report, "retry_instruction", "") or "")
+    result = {
         "action": str(getattr(assessment, "action", "") or status),
         "status": status,
         "reason": str(getattr(assessment, "reason", "") or ""),
         "fallback_text": fallback,
         "fallback_reply": fallback,
     }
+    if retry_instruction:
+        result["retry_instruction"] = retry_instruction
+    return result
 
 
 def _planner_retry_reason_payload(
@@ -7161,7 +7166,7 @@ def _safe_fallback_for_intent(understanding: dict[str, Any], fallback: str) -> s
             or dict(understanding.get("constraint_proof") or {}).get("wants_utilities")
             or dict(understanding.get("query_state") or {}).get("wants_utilities")
         )
-        if needs_utilities and not _content_wants_deposit(original_text):
+        if needs_utilities and original_text and not _content_wants_deposit(original_text):
             return fallback or "水电要按具体房源备注查，你把小区+房号发我，我马上按那套核对。"
         required = ("芝麻", "服务费")
         fee_tokens = ("5.5", "7%", "8%", "5.5%-8%")
@@ -7270,6 +7275,254 @@ def _viewing_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {"rooms": result, "contact_numbers": list(CONTACT_NUMBERS)}
 
 
+def _controlled_hash(value: Any) -> str:
+    payload = json.dumps(safe_artifact_payload(value), ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _append_unique_evidence(evidence_items: list[dict[str, Any]], item: dict[str, Any]) -> None:
+    evidence_id = str(item.get("evidence_id") or "").strip()
+    if evidence_id and any(str(existing.get("evidence_id") or "") == evidence_id for existing in evidence_items if isinstance(existing, dict)):
+        return
+    evidence_items.append(item)
+
+
+def _append_unique_send_action(send_actions: list[dict[str, Any]], action: dict[str, Any]) -> None:
+    action_id = str(action.get("action_id") or "").strip()
+    if action_id and any(str(existing.get("action_id") or "") == action_id for existing in send_actions if isinstance(existing, dict)):
+        return
+    send_actions.append(action)
+
+
+def _media_send_actions_for_controlled_channels(tool_evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for kind, key, action_type in (
+        ("video", "video_paths", "video"),
+        ("image", "image_paths", "image"),
+        ("inventory_sheet", "inventory_images", "image"),
+    ):
+        for index, path in enumerate([str(item) for item in tool_evidence.get(key) or [] if str(item).strip()], start=1):
+            _append_unique_send_action(
+                result,
+                {
+                    "evidence_id": f"evd-{kind}-{index}",
+                    "action_id": f"send-{kind}-{index}",
+                    "action_type": action_type,
+                    "payload": {
+                        "media_number": index,
+                        "path_hash": _controlled_hash(path),
+                    },
+                    "metadata": {"source": "program_evidence", "kind": kind},
+                },
+            )
+    return result
+
+
+def _user_explicitly_asked_password_for_controlled_channel(content: str, understanding: dict[str, Any]) -> bool:
+    if _content_wants_password(content):
+        return True
+    task = dict(understanding.get("structured_task") or {})
+    texts = [
+        str(task.get("original_text") or ""),
+        str(understanding.get("effective_query") or ""),
+        str(understanding.get("rewritten_query") or ""),
+    ]
+    return any(_content_wants_password(text) for text in texts if text)
+
+
+def _attach_controlled_outbound_channels(
+    tool_evidence: dict[str, Any],
+    *,
+    content: str,
+    understanding: dict[str, Any],
+) -> None:
+    rule_evidence = dict(tool_evidence.get("rule_evidence") or {})
+    actions = [str(action) for action in tool_evidence.get("actions") or []]
+    if not rule_evidence and not any(action in actions for action in ("send_contract_contact", "explain_unavailable_viewing")):
+        return
+
+    evidence_items = [item for item in tool_evidence.get("inventory_listing_evidence") or [] if isinstance(item, dict)]
+    controlled_actions = [item for item in tool_evidence.get("send_actions") or [] if isinstance(item, dict)]
+    had_controlled_action = bool(controlled_actions)
+
+    if "send_contract_contact" in actions or rule_evidence.get("contract_contact"):
+        evidence_id = "evd-controlled-contract-contact-1"
+        contacts = [str(number) for number in rule_evidence.get("contract_contact") or CONTACT_NUMBERS if str(number).strip()]
+        _append_unique_evidence(
+            evidence_items,
+            {
+                "evidence_id": evidence_id,
+                "evidence_type": "contract_contact",
+                "summary": "合同、定金和订房联系电话由受控通道提供。",
+                "source_kind": "rule_evidence",
+                "source_record_id": _controlled_hash({"contract_contact": contacts}),
+                "field_values": {
+                    "contact_count": len(contacts),
+                    "contact_purpose": "contract_deposit_booking",
+                    "requires_customer_room_ref": True,
+                },
+                "sensitivity": "controlled_contact",
+                "metadata": {
+                    "controlled_channel": "contract_contact",
+                    "evidence_bound": True,
+                },
+            },
+        )
+        _append_unique_send_action(
+            controlled_actions,
+            {
+                "evidence_id": evidence_id,
+                "action_id": "send-controlled-contract-contact-1",
+                "action_type": "contract_contact",
+                "payload": {"evidence_ref": evidence_id, "contact_count": len(contacts)},
+                "metadata": {
+                    "source": "controlled_rule_evidence",
+                    "controlled_channel": "contract_contact",
+                    "evidence_bound": True,
+                },
+                "sensitive_payload": {"contact_numbers": contacts},
+            },
+        )
+
+    viewing_rule = rule_evidence.get("viewing") if isinstance(rule_evidence.get("viewing"), dict) else {}
+    viewing_rooms = [room for room in viewing_rule.get("rooms") or [] if isinstance(room, dict)]
+    user_asked_password = _user_explicitly_asked_password_for_controlled_channel(content, understanding)
+    for index, room in enumerate(viewing_rooms, start=1):
+        room_label = str(room.get("room") or "").strip()
+        listing_id = str(room.get("listing_id") or "").strip()
+        source_evidence_id = str(room.get("evidence_id") or "").strip()
+        viewing_text = str(room.get("viewing") or "").strip()
+        has_password = bool(room.get("has_password"))
+        needs_contact = bool(room.get("needs_contact"))
+        safe_room = room_label or f"房源{index}"
+        if has_password and viewing_text and user_asked_password:
+            evidence_id = f"evd-controlled-viewing-password-{index}"
+            _append_unique_evidence(
+                evidence_items,
+                {
+                    "evidence_id": evidence_id,
+                    "listing_id": listing_id,
+                    "evidence_type": "viewing_password",
+                    "summary": f"{safe_room} 的看房密码已由受控通道绑定。",
+                    "source_kind": "viewing_rule_evidence",
+                    "source_record_id": source_evidence_id or _controlled_hash({"room": safe_room, "viewing": viewing_text}),
+                    "field_values": {
+                        "room": safe_room,
+                        "has_password": True,
+                        "needs_contact": needs_contact,
+                    },
+                    "sensitivity": "private",
+                    "metadata": {
+                        "controlled_channel": "viewing_password",
+                        "evidence_bound": True,
+                        "user_asked_password": True,
+                    },
+                },
+            )
+            _append_unique_send_action(
+                controlled_actions,
+                {
+                    "evidence_id": evidence_id,
+                    "listing_id": listing_id,
+                    "action_id": f"send-controlled-viewing-password-{index}",
+                    "action_type": "viewing_password",
+                    "payload": {"evidence_ref": evidence_id, "room": safe_room},
+                    "metadata": {
+                        "source": "controlled_rule_evidence",
+                        "controlled_channel": "viewing_password",
+                        "evidence_bound": True,
+                        "user_asked_password": True,
+                    },
+                    "sensitive_payload": {
+                        "room": safe_room,
+                        "viewing_password": viewing_text,
+                        "contact_numbers": list(CONTACT_NUMBERS),
+                        "needs_contact": needs_contact,
+                    },
+                },
+            )
+            continue
+        if needs_contact:
+            evidence_id = f"evd-controlled-viewing-contact-{index}"
+            _append_unique_evidence(
+                evidence_items,
+                {
+                    "evidence_id": evidence_id,
+                    "listing_id": listing_id,
+                    "evidence_type": "viewing_contact",
+                    "summary": f"{safe_room} 看房需要联系确认。",
+                    "source_kind": "viewing_rule_evidence",
+                    "source_record_id": source_evidence_id or _controlled_hash({"room": safe_room, "needs_contact": True}),
+                    "field_values": {
+                        "room": safe_room,
+                        "needs_contact": True,
+                        "future_or_unavailable": bool(room.get("future_or_unavailable")),
+                    },
+                    "sensitivity": "controlled_contact",
+                    "metadata": {
+                        "controlled_channel": "viewing_contact",
+                        "evidence_bound": True,
+                    },
+                },
+            )
+            _append_unique_send_action(
+                controlled_actions,
+                {
+                    "evidence_id": evidence_id,
+                    "listing_id": listing_id,
+                    "action_id": f"send-controlled-viewing-contact-{index}",
+                    "action_type": "viewing_contact",
+                    "payload": {"evidence_ref": evidence_id, "room": safe_room},
+                    "metadata": {
+                        "source": "controlled_rule_evidence",
+                        "controlled_channel": "viewing_contact",
+                        "evidence_bound": True,
+                    },
+                    "sensitive_payload": {
+                        "room": safe_room,
+                        "contact_numbers": list(CONTACT_NUMBERS),
+                    },
+                },
+            )
+
+    if controlled_actions:
+        media_actions = _media_send_actions_for_controlled_channels(tool_evidence) if not had_controlled_action else []
+        tool_evidence["send_actions"] = [*media_actions, *controlled_actions]
+    if evidence_items:
+        tool_evidence["inventory_listing_evidence"] = evidence_items
+
+
+def _controlled_reply_from_outbound_package(package: Any) -> str:
+    lines: list[str] = []
+    for action in getattr(package, "send_actions", []) or []:
+        action_type = str(getattr(action, "action_type", "") or "")
+        sensitive_payload = getattr(action, "sensitive_payload", {}) or {}
+        if not isinstance(sensitive_payload, dict):
+            continue
+        if action_type == "contract_contact":
+            contacts = [str(number) for number in sensitive_payload.get("contact_numbers") or [] if str(number).strip()]
+            if contacts:
+                lines.append(
+                    f"客户看中了可以联系 {' / '.join(contacts)} 定房和签电子合同。"
+                    "联系时带上小区+房号，方便确认房态和定金。"
+                )
+        elif action_type == "viewing_password":
+            room = str(sensitive_payload.get("room") or "这套房").strip()
+            viewing_text = str(sensitive_payload.get("viewing_password") or "").strip()
+            contacts = [str(number) for number in sensitive_payload.get("contact_numbers") or [] if str(number).strip()]
+            if viewing_text:
+                sentence = f"{room}的看房方式/密码是 {viewing_text}。"
+                if contacts:
+                    sentence += f"密码不对、打不开门或者还没空出，就联系 {' / '.join(contacts)} 确认。"
+                lines.append(sentence)
+        elif action_type == "viewing_contact":
+            room = str(sensitive_payload.get("room") or "这套房").strip()
+            contacts = [str(number) for number in sensitive_payload.get("contact_numbers") or [] if str(number).strip()]
+            if contacts:
+                lines.append(f"{room}看房需要提前联系 {' / '.join(contacts)} 确认时间。")
+    return "\n".join(dict.fromkeys(line for line in lines if line)).strip()
+
+
 def _reply_for_missing_media(understanding: dict[str, Any], tool_evidence: dict[str, Any]) -> str:
     proof = dict(understanding.get("constraint_proof") or {})
     missing = [str(item) for item in tool_evidence.get("missing_media") or [] if str(item).strip()]
@@ -7346,138 +7599,6 @@ def _reply_for_missing_media(understanding: dict[str, Any], tool_evidence: dict[
     return f"房源我查到了，但本地暂时没找到{media_name}。{suffix}"
 
 
-def _reply_for_deposit_and_utilities(
-    understanding: dict[str, Any],
-    tool_evidence: dict[str, Any],
-    *,
-    content: str = "",
-) -> str:
-    if not _understanding_wants_utilities(understanding, content=content):
-        return ""
-    rule_evidence = dict(tool_evidence.get("rule_evidence") or {})
-    wants_deposit = bool(rule_evidence.get("deposit_policy")) and (
-        not str(content or "").strip()
-        or _content_wants_deposit(content)
-    )
-    wants_price = _understanding_wants_price(understanding, content=content)
-    source_rows = tool_evidence.get("target_rows") or tool_evidence.get("inventory_rows") or []
-    if any(word in content for word in ("这几套", "这几间", "这些", "上面", "刚才")):
-        source_rows = tool_evidence.get("inventory_rows") or source_rows
-    rows = [row for row in source_rows if isinstance(row, dict)]
-    utility_lines: list[str] = []
-    utility_price_lines: list[str] = []
-    for row in rows[:5]:
-        utilities = _row_value(row, ("备注", "水电", "水电费", "水电备注"))
-        if utilities:
-            utility_lines.append(f"{_row_label(row)}：{utilities}")
-        if wants_price:
-            price_parts = []
-            pay_one = _row_value(row, ("押一付一", "押1付1", "押一", "押一付"))
-            pay_two = _row_value(row, ("押二付一", "押2付1", "押二", "押二付"))
-            if pay_one:
-                price_parts.append(f"押一付一{pay_one}")
-            if pay_two:
-                price_parts.append(f"押二付一{pay_two}")
-            detail_parts = []
-            if price_parts:
-                detail_parts.append("，".join(price_parts))
-            if utilities:
-                detail_parts.append(f"水电{utilities}")
-            if detail_parts:
-                utility_price_lines.append(f"{_row_label(row)}：" + "；".join(detail_parts))
-
-    deposit_text = (
-        "免押走支付宝无忧住，通常芝麻信用要符合风控（一般芝麻分550以上），需要签电子合同；"
-        "服务费按租期大概是免押金额的5.5%-8%。"
-    )
-    if wants_price and utility_price_lines:
-        prefix = "这几套价格和水电我按房源表给你对比一下："
-        if len(utility_price_lines) == 1:
-            reply = f"{utility_price_lines[0]}。"
-        else:
-            reply = prefix + "\n" + "\n".join(f"{index}. {line}" for index, line in enumerate(utility_price_lines, 1))
-        if wants_deposit:
-            return f"{deposit_text}\n\n{reply}"
-        return reply
-    if not utility_lines:
-        if wants_deposit:
-            return (
-                f"{deposit_text}\n"
-                "水电要按具体房源备注查，你把小区+房号发我，我马上按那套核对。"
-            )
-        return "水电要按具体房源备注查，你把小区+房号发我，我马上按那套核对。"
-    if not wants_deposit:
-        if len(utility_lines) == 1:
-            return f"{utility_lines[0]}。"
-        return "这几套水电我按房源备注给你列一下：\n" + "\n".join(
-            f"{index}. {line}" for index, line in enumerate(utility_lines, 1)
-        )
-    return (
-        f"{deposit_text}\n\n"
-        "这几套水电我按房源备注给你列一下：\n"
-        + "\n".join(f"{index}. {line}" for index, line in enumerate(utility_lines, 1))
-    )
-
-
-def _customer_visible_viewing_text(viewing_text: str, *, allow_password: bool = False) -> str:
-    text = str(viewing_text or "").strip()
-    if not text:
-        return ""
-    if allow_password:
-        return text
-    text = re.sub(r"\b\d{3,8}#?\b", "", text)
-    text = re.sub(r"(?:密码|门锁码|开门码|门禁码)(?:不对|错误|失效)?[、，,；; ]*", "", text)
-    text = text.replace("看房方式/密码", "看房方式")
-    text = text.strip(" #，,；;。")
-    return text
-
-
-def _reply_for_utilities_and_viewing(
-    understanding: dict[str, Any],
-    tool_evidence: dict[str, Any],
-    *,
-    content: str = "",
-) -> str:
-    if not (
-        _understanding_wants_utilities(understanding, content=content)
-        and _content_wants_viewing(content)
-    ):
-        return ""
-    source_rows = tool_evidence.get("target_rows") or tool_evidence.get("inventory_rows") or []
-    rows = [row for row in source_rows if isinstance(row, dict)]
-    if not rows:
-        return "水电和看房方式都要按具体房源查。你把小区+房号发我，我马上按那套核对。"
-
-    viewing_evidence = _viewing_evidence(rows)
-    viewing_by_label = {
-        str(item.get("room") or "").strip(): item
-        for item in viewing_evidence.get("rooms") or []
-        if isinstance(item, dict)
-    }
-    lines: list[str] = []
-    contact_needed = False
-    allow_password = _content_wants_password(content)
-    for row in rows[:5]:
-        label = _row_label(row)
-        utilities = _row_value(row, ("备注", "水电", "水电费", "水电备注")) or "水电备注暂时没写"
-        viewing_item = viewing_by_label.get(label) or {}
-        raw_viewing_text = str(viewing_item.get("viewing") or _row_viewing_summary(row, allow_password=allow_password)).strip()
-        viewing_text = _customer_visible_viewing_text(raw_viewing_text, allow_password=allow_password)
-        if not viewing_text:
-            viewing_text = "看房方式需要联系确认"
-        if bool(viewing_item.get("needs_contact")):
-            contact_needed = True
-        viewing_label = "看房方式/密码" if allow_password else "看房方式"
-        lines.append(f"{label}：水电是{utilities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".join(lines)
-    if contact_needed:
-        if allow_password:
-            reply += "\n如果密码不对、打不开门，或者还没空出，直接联系 18758141785 / 13282125992 / 19941091943 预约或核对。"
-        else:
-            reply += "\n如果打不开门、现场情况不一致，或者还没空出，直接联系 18758141785 / 13282125992 / 19941091943 预约或核对。"
-    return reply
-
-
 def _understanding_wants_contract_contact(understanding: dict[str, Any], *, content: str = "") -> bool:
     task = dict(understanding.get("structured_task") or {})
     requirements = dict(task.get("tool_requirements") or {})
@@ -7488,54 +7609,6 @@ def _understanding_wants_contract_contact(understanding: dict[str, Any], *, cont
         or requirements.get("needs_contract_contact")
         or query_state.get("wants_contract_contact")
     )
-
-
-def _reply_for_contract_contact(
-    understanding: dict[str, Any],
-    tool_evidence: dict[str, Any],
-    *,
-    content: str = "",
-) -> str:
-    if not _understanding_wants_contract_contact(understanding, content=content):
-        return ""
-    rule_evidence = dict(tool_evidence.get("rule_evidence") or {})
-    if not rule_evidence.get("contract_contact"):
-        return ""
-    return (
-        "客户看中了就让他联系 18758141785 / 13282125992 / 19941091943 定房，"
-        "定金、签电子合同和具体入住时间都让这几个号码确认。"
-        "如果是从房源表里挑的，最好同时带上小区+房号，避免定错房。"
-    )
-
-
-def _reply_for_viewing(tool_evidence: dict[str, Any], *, allow_password: bool = False) -> str:
-    rule_evidence = dict(tool_evidence.get("rule_evidence") or {})
-    viewing = rule_evidence.get("viewing")
-    if not isinstance(viewing, dict):
-        return ""
-    rooms = [room for room in viewing.get("rooms") or [] if isinstance(room, dict)]
-    if not rooms:
-        return ""
-    lines: list[str] = []
-    for item in rooms[:5]:
-        room = str(item.get("room") or "这套房源").strip()
-        viewing_text = _customer_visible_viewing_text(str(item.get("viewing") or ""), allow_password=allow_password)
-        has_password = bool(item.get("has_password"))
-        needs_contact = bool(item.get("needs_contact"))
-        if has_password and allow_password and viewing_text:
-            lines.append(f"{room}：看房方式是 {viewing_text}。")
-        elif viewing_text:
-            lines.append(f"{room}：{viewing_text}。")
-        else:
-            lines.append(f"{room}：看房方式需要联系确认。")
-        if needs_contact:
-            if allow_password:
-                lines.append("如果密码不对、打不开门，或者还没空出，直接联系 18758141785 / 13282125992 / 19941091943 预约或核对。")
-            else:
-                lines.append("如果打不开门、现场情况不一致，或者还没空出，直接联系 18758141785 / 13282125992 / 19941091943 预约或核对。")
-    return "\n".join(lines)
-
-
 def _is_generic_waiting_reply(text: str) -> bool:
     normalized = str(text or "").strip()
     return any(
@@ -7907,7 +7980,7 @@ def _build_outbound_package(reply_text: str, tool_evidence: dict[str, Any]) -> d
     image_rows = [] if suppress_actions else [row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict)]
     video_rows = [] if suppress_actions else [row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)]
     return {
-        "text": reply_text,
+        "text": safe_artifact_payload(reply_text),
         "inventory_images": inventory_images,
         "inventory_explanation": "房源表发你了，你可以让客户先整体看一下。" if inventory_images else "",
         "image_paths": image_paths,
@@ -7920,7 +7993,9 @@ def _build_outbound_package(reply_text: str, tool_evidence: dict[str, Any]) -> d
         "original_video_request": tool_evidence.get("original_video_request") or {},
         "original_video_urls": list(tool_evidence.get("original_video_urls") or []),
         "material_page_urls": list(tool_evidence.get("material_page_urls") or []),
-        "rule_evidence": tool_evidence.get("rule_evidence") or {},
+        "rule_evidence": inventory_sensitive_access.safe_rule_evidence_for_summary(
+            tool_evidence.get("rule_evidence") or {}
+        ),
         "reply_source": str(tool_evidence.get("deterministic_reply_source") or ""),
         "target_rooms": [_row_brief(row) for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)],
     }
@@ -8708,6 +8783,8 @@ def _needs_llm_final_selfcheck(
         return False
     if retry_reason:
         return False
+    if deterministic_reply_source == "kf_llm2_outbound_production_controlled":
+        return False
     proof = dict(understanding.get("constraint_proof") or {})
     actions = [str(action) for action in tool_evidence.get("actions") or []]
     text = str(draft_reply or "")
@@ -8942,6 +9019,11 @@ async def _generate_reply_result(
         rule_evidence = dict(tool_evidence.get("rule_evidence") or {})
         rule_evidence.setdefault("contract_contact", CONTACT_NUMBERS)
         tool_evidence["rule_evidence"] = rule_evidence
+    _attach_controlled_outbound_channels(
+        tool_evidence,
+        content=content,
+        understanding=understanding,
+    )
     rows = [row for row in tool_evidence.get("inventory_rows") or [] if isinstance(row, dict)]
     target_rows = [row for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)]
     evidence_rows = target_rows or rows
@@ -8957,49 +9039,15 @@ async def _generate_reply_result(
         and not _dual_llm_production_enabled()
     )
     if planner_requires_reply and not planner_reply:
-        post_tool_reply_result: dict[str, Any] = {}
-        planner_reply_func = getattr(reply_generator, "plan_kf_reply_text", None)
-        if callable(planner_reply_func):
-            try:
-                stage = timer.stage("planner_reply_text") if timer else nullcontext()
-                with stage:
-                    post_tool_reply_result = await asyncio.wait_for(
-                        planner_reply_func(
-                            content=effective_query,
-                            structured_task=understanding.get("structured_task") or {},
-                            entity_resolution=understanding.get("entity_resolution") or {},
-                            constraint_proof=understanding.get("constraint_proof") or {},
-                            planner_result=planner_result or {},
-                            tool_evidence=_tool_evidence_summary(tool_evidence),
-                            planner_retry_reason=retry_reason,
-                        ),
-                        timeout=8,
-                    )
-            except TimeoutError as exc:
-                logger.warning("KF planner post-tool reply generation timed out: %s", exc)
-                post_tool_reply_result = {"reply_text": "", "source": "planner_reply_timeout", "error": "timeout"}
-            except Exception as exc:
-                logger.exception("KF planner reply generation failed: %s", exc)
-                post_tool_reply_result = {"reply_text": "", "source": "planner_reply_exception", "error": str(exc)}
+        post_tool_reply_result: dict[str, Any] = {
+            "reply_text": "",
+            "source": "legacy_planner_reply_text_removed",
+            "reason": "V1 终态删除旧工具后单 LLM 文本生成；缺 reply_text 必须回 Planner/LLM2，不走旧直出。",
+        }
         planner_result = dict(planner_result or {})
         planner_result["post_tool_reply_result"] = post_tool_reply_result
-        if post_tool_reply_result.get("need_rewrite_clarification"):
-            planner_result["need_rewrite_clarification"] = True
-            planner_result["missing_evidence"] = str(
-                post_tool_reply_result.get("missing_evidence")
-                or post_tool_reply_result.get("reason")
-                or "工具结果不足，Planner 第二阶段无法生成回复。"
-            )
-        planner_reply = str(
-            post_tool_reply_result.get("reply")
-            or post_tool_reply_result.get("reply_text")
-            or post_tool_reply_result.get("final_reply")
-            or ""
-        ).strip()
-        if planner_reply:
-            planner_result["reply_text"] = planner_reply
-            planner_result["reply_source"] = "post_tool_planner"
-            tool_evidence["planner_reply_result"] = post_tool_reply_result
+        planner_result["missing_evidence"] = str(post_tool_reply_result["reason"])
+        tool_evidence["planner_reply_result"] = post_tool_reply_result
     planner_reply_result = (planner_result or {}).get("post_tool_reply_result") or {}
     inventory_search_reply = _reply_for_inventory_search(understanding, tool_evidence)
     planner_missing_reply = planner_requires_reply and not planner_reply
@@ -9239,24 +9287,6 @@ async def _generate_reply_result(
     field_target_error_reply = _reply_for_field_target_error(tool_evidence)
     prepared_media_reply = _reply_for_prepared_media(understanding, tool_evidence)
     missing_media_reply = _reply_for_missing_media(understanding, tool_evidence)
-    utilities_viewing_reply = _reply_for_utilities_and_viewing(understanding, tool_evidence, content=content)
-    deposit_utilities_reply = _reply_for_deposit_and_utilities(understanding, tool_evidence, content=content)
-    contract_contact_reply = _reply_for_contract_contact(understanding, tool_evidence, content=content)
-    structured_task = dict(understanding.get("structured_task") or {})
-    tool_requirements = dict(structured_task.get("tool_requirements") or {})
-    explicit_viewing_request = bool(deterministic_signals.get("wants_viewing"))
-    viewing_reply = ""
-    if (
-        explicit_viewing_request
-        or (
-            not inventory_search_reply
-            and (
-                tool_requirements.get("needs_viewing_policy")
-                or _normalize_intent(understanding.get("intent")) == "viewing"
-            )
-        )
-    ):
-        viewing_reply = _reply_for_viewing(tool_evidence, allow_password=_content_wants_password(content))
     if planner_missing_reply:
         draft_reply = ""
         deterministic_reply_source = "planner_missing_reply_text"
@@ -9275,12 +9305,6 @@ async def _generate_reply_result(
     elif missing_media_reply:
         draft_reply = missing_media_reply
         deterministic_reply_source = "missing_media_reply"
-    elif utilities_viewing_reply:
-        draft_reply = utilities_viewing_reply
-        deterministic_reply_source = "utilities_viewing_field_reply"
-    elif deposit_utilities_reply and deterministic_signals.get("wants_utilities"):
-        draft_reply = deposit_utilities_reply
-        deterministic_reply_source = "utilities_field_reply"
     elif inventory_search_reply and (
         tool_evidence.get("planner_reply_timeout_tool_grounded_fallback")
         or tool_evidence.get("planner_missing_reply_tool_grounded_fallback")
@@ -9345,23 +9369,28 @@ async def _generate_reply_result(
                     timeout=8,
                 )
                 production_package_payload = kf_dual_llm_production.package_log_payload(production_package)
+                controlled_production_reply = _controlled_reply_from_outbound_package(production_package)
                 outbound_validation = kf_dual_llm_production.validate_production_outbound_package(
                     production_package,
                     task_packet=task_packet,
-                    user_asked_password=_content_wants_password(content),
+                    user_asked_password=_user_explicitly_asked_password_for_controlled_channel(content, understanding),
                     known_constraints=dict(understanding.get("constraint_proof") or {}),
                 )
                 validation_payload = outbound_validation.to_dict()
                 production_package_payload["outbound_validation"] = validation_payload
                 if (
                     kf_dual_llm_production.package_passed(production_package)
-                    and str(production_package.reply_text or "").strip()
                     and outbound_validation.passed
+                    and (str(production_package.reply_text or "").strip() or controlled_production_reply)
                 ):
                     draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
-                        str(production_package.reply_text or "")
+                        controlled_production_reply or str(production_package.reply_text or "")
                     )
-                    deterministic_reply_source = "kf_llm2_outbound_production"
+                    deterministic_reply_source = (
+                        "kf_llm2_outbound_production_controlled"
+                        if controlled_production_reply
+                        else "kf_llm2_outbound_production"
+                    )
                     tool_evidence["deterministic_reply_source"] = deterministic_reply_source
                     outbound_dict = production_package.to_legacy_dict()
                     tool_evidence["llm2_production_outbound_package"] = outbound_dict
@@ -9579,11 +9608,7 @@ async def _generate_reply_result(
         or "逐套说明" in reason
     )
     fallback = str(
-        contract_contact_reply
-        or field_target_error_reply
-        or utilities_viewing_reply
-        or deposit_utilities_reply
-        or viewing_reply
+        field_target_error_reply
         or (sendable_action_fallback if prefer_sendable_action_fallback else "")
         or missing_media_reply
         or inventory_search_reply

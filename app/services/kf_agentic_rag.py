@@ -1539,7 +1539,7 @@ class KfAgenticRagService:
             return AgenticRagAssessment(
                 "fallback",
                 reason=reason,
-                fallback_text=fallback_text,
+                fallback_text="",
                 report=report,
             )
         return AgenticRagAssessment("retry", reason=reason, report=report)

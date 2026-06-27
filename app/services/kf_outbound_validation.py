@@ -134,7 +134,6 @@ PASSWORD_MARKERS = (
     "door_code",
     "doorcode",
     "viewing_password",
-    "viewing",
     "密码",
     "门锁",
     "门禁",
@@ -183,7 +182,7 @@ def validate_prepared_outbound_package(
 
     indexes = _build_indexes(parsed_package)
     issues.extend(_validate_l0(parsed_package, indexes))
-    issues.extend(_validate_l1(parsed_package, indexes))
+    issues.extend(_validate_l1(parsed_package, indexes, validation_context))
     issues.extend(_validate_l2(parsed_package, indexes, validation_context))
     issues.extend(_validate_l3(parsed_package, validation_context))
     return OutboundValidationResult(tuple(issues))
@@ -310,7 +309,11 @@ def _validate_l0(package: PreparedOutboundPackage, indexes: _PackageIndexes) -> 
     return issues
 
 
-def _validate_l1(package: PreparedOutboundPackage, indexes: _PackageIndexes) -> list[ValidationIssue]:
+def _validate_l1(
+    package: PreparedOutboundPackage,
+    indexes: _PackageIndexes,
+    context: OutboundValidationContext,
+) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     for index, claim in enumerate(package.claims):
         path = f"claims[{index}]"
@@ -343,7 +346,7 @@ def _validate_l1(package: PreparedOutboundPackage, indexes: _PackageIndexes) -> 
                 )
             )
 
-    issues.extend(_validate_sensitive_values_are_evidence_only(package))
+    issues.extend(_validate_sensitive_values_are_evidence_only(package, indexes, context))
     return issues
 
 
@@ -388,6 +391,29 @@ def _validate_l2(
                         ValidationLevel.L2,
                         "l2.password_not_requested",
                         "Password send action is not allowed when the customer did not ask for password.",
+                        f"send_actions[{index}]",
+                        action.action_id,
+                    )
+                )
+    else:
+        for index, claim in enumerate(package.claims):
+            if _mentions_password(_claim_visible_payload(claim)) and not _is_evidence_bound_password_claim(claim, indexes):
+                issues.append(
+                    _issue(
+                        ValidationLevel.L2,
+                        "l2.password_not_evidence_bound",
+                        "Password claim is only allowed when it is bound to password evidence.",
+                        f"claims[{index}]",
+                        claim.claim_id,
+                    )
+                )
+        for index, action in enumerate(package.send_actions):
+            if _is_password_action(action) and not _is_evidence_bound_password_action(action, indexes):
+                issues.append(
+                    _issue(
+                        ValidationLevel.L2,
+                        "l2.password_not_evidence_bound",
+                        "Password send action is only allowed when it is bound to password evidence.",
                         f"send_actions[{index}]",
                         action.action_id,
                     )
@@ -550,7 +576,11 @@ def _validate_claim_value_against_evidence(claim: Claim, indexes: _PackageIndexe
     return issues
 
 
-def _validate_sensitive_values_are_evidence_only(package: PreparedOutboundPackage) -> list[ValidationIssue]:
+def _validate_sensitive_values_are_evidence_only(
+    package: PreparedOutboundPackage,
+    indexes: _PackageIndexes,
+    context: OutboundValidationContext,
+) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     if _contains_sensitive_value(package.reply_text):
         issues.append(
@@ -562,7 +592,13 @@ def _validate_sensitive_values_are_evidence_only(package: PreparedOutboundPackag
             )
         )
     for index, claim in enumerate(package.claims):
-        if _contains_sensitive_value(_claim_visible_payload(claim)):
+        payload = _claim_visible_payload(claim)
+        if _contains_sensitive_value(payload) and not (
+            _contains_password_value(payload)
+            and not _contains_link_value(payload)
+            and _user_asked_password(context)
+            and _is_evidence_bound_password_claim(claim, indexes)
+        ):
             issues.append(
                 _issue(
                     ValidationLevel.L1,
@@ -570,10 +606,16 @@ def _validate_sensitive_values_are_evidence_only(package: PreparedOutboundPackag
                     "Password or link value appears outside evidence slots.",
                     f"claims[{index}]",
                     claim.claim_id,
-                )
             )
+        )
     for index, action in enumerate(package.send_actions):
-        if _contains_sensitive_value({"payload": action.payload, "metadata": action.metadata, "sensitive_payload": action.sensitive_payload}):
+        payload = {"payload": action.payload, "metadata": action.metadata, "sensitive_payload": action.sensitive_payload}
+        if _contains_sensitive_value(payload) and not (
+            _contains_password_value(payload)
+            and not _contains_link_value(payload)
+            and _user_asked_password(context)
+            and _is_evidence_bound_password_action(action, indexes)
+        ):
             issues.append(
                 _issue(
                     ValidationLevel.L1,
@@ -864,6 +906,22 @@ def _contains_sensitive_value(value: Any) -> bool:
     return bool(URL_PATTERN.search(text) or PASSWORD_CODE_PATTERN.search(text))
 
 
+def _contains_password_value(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return any(_key_mentions_password(str(key).lower()) or _contains_password_value(item) for key, item in value.items())
+    if isinstance(value, list | tuple | set):
+        return any(_contains_password_value(item) for item in value)
+    return bool(PASSWORD_CODE_PATTERN.search(str(value or "")))
+
+
+def _contains_link_value(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        return any(_key_mentions_link(str(key).lower()) or _contains_link_value(item) for key, item in value.items())
+    if isinstance(value, list | tuple | set):
+        return any(_contains_link_value(item) for item in value)
+    return bool(URL_PATTERN.search(str(value or "")))
+
+
 def _claim_visible_payload(claim: Claim) -> dict[str, Any]:
     return {
         "text": claim.text,
@@ -899,6 +957,35 @@ def _is_password_action(action: SendAction) -> bool:
             "legacy_unknown_fields": action.legacy_unknown_fields,
         }
     )
+
+
+def _is_evidence_bound_password_claim(claim: Claim, indexes: _PackageIndexes) -> bool:
+    refs = [ref for ref in _claim_evidence_refs(claim) if ref in indexes.evidence_by_id]
+    if not refs:
+        return False
+    return any(_evidence_allows_password(indexes.evidence_by_id[ref]) for ref in refs)
+
+
+def _is_evidence_bound_password_action(action: SendAction, indexes: _PackageIndexes) -> bool:
+    refs = [ref for ref in _action_evidence_refs(action) if ref in indexes.evidence_by_id]
+    if not refs:
+        return False
+    if not _mentions_password(
+        {
+            "action_type": action.action_type,
+            "metadata": action.metadata,
+            "legacy_unknown_fields": action.legacy_unknown_fields,
+        }
+    ):
+        return False
+    return any(_evidence_allows_password(indexes.evidence_by_id[ref]) for ref in refs)
+
+
+def _evidence_allows_password(evidence: EvidenceItem) -> bool:
+    evidence_type = str(evidence.evidence_type or "").strip().lower()
+    metadata = evidence.metadata if isinstance(evidence.metadata, Mapping) else {}
+    channel = str(metadata.get("controlled_channel") or "").strip().lower()
+    return evidence_type in {"viewing_password", "password", "viewing"} or channel == "viewing_password"
 
 
 def _is_media_action(action: SendAction) -> bool:

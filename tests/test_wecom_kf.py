@@ -182,9 +182,6 @@ def test_generate_reply_result_production_llm2_bypasses_legacy_planner_reply_gat
             def __init__(self) -> None:
                 self.llm2_called = False
 
-            async def plan_kf_reply_text(self, **kwargs):
-                raise AssertionError("production LLM2 must not be gated by legacy planner reply text")
-
             async def compose_kf_outbound_production(self, **kwargs):
                 self.llm2_called = True
                 return {
@@ -256,6 +253,9 @@ def test_generate_reply_result_production_blocks_l2_validation_failure(monkeypat
                     "self_review": {"status": "pass"},
                 }
 
+            async def assess_kf_final_reply(self, **kwargs):
+                raise AssertionError("validation failure must block before final LLM selfcheck")
+
         original_mode = main.settings.kf_dual_llm_mode
         tool_evidence = {"actions": ["generate_reply"]}
         monkeypatch.setattr(main, "agentic_rag", FakeRag())
@@ -282,10 +282,11 @@ def test_generate_reply_result_production_blocks_l2_validation_failure(monkeypat
         assert result["needs_planner_retry"] is True
         assert result["selfcheck"]["rule"]["source"] == "llm2_production_output_gate"
         assert "kf_outbound_validation L0-L2 blocked" in result["planner_retry_reason"]
-        assert tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]["status"] == "blocked"
+        validation = tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]
+        assert validation["status"] == "blocked"
         assert any(
             issue["code"] == "l2.task_not_answered"
-            for issue in tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]["issues"]
+            for issue in validation["issues"]
         )
         assert "llm2_production_outbound_package" not in tool_evidence
 
@@ -354,6 +355,347 @@ def test_generate_reply_result_production_blocks_l3_validation_rewrite(monkeypat
         assert "llm2_production_outbound_package" not in tool_evidence
 
     asyncio.run(run_case())
+
+
+def test_controlled_password_reply_stays_out_of_internal_artifacts_and_final_llm(monkeypatch) -> None:
+    async def run_case() -> None:
+        password_canary = "432987#"
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "石桥铭苑6-1102密码多少",
+                "task_atoms": [
+                    {
+                        "task_id": "task-password",
+                        "task_type": "viewing_guidance",
+                        "user_text": "石桥铭苑6-1102密码多少",
+                    }
+                ],
+                "tool_plan": {"actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"]},
+            },
+            content="石桥铭苑6-1102密码多少",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_text="")
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+            async def assess_kf_final_reply(self, **kwargs):
+                raise AssertionError("controlled password replies must not enter LLM final selfcheck")
+
+        original_mode = main.settings.kf_dual_llm_mode
+        tool_evidence = {
+            "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+            "target_rows": [{"小区": "石桥铭苑", "房号": "6-1102", "看房方式密码": f"{password_canary} 看房提前联系"}],
+            "inventory_rows": [{"小区": "石桥铭苑", "房号": "6-1102", "看房方式密码": f"{password_canary} 看房提前联系"}],
+            "rule_evidence": {
+                "viewing": {
+                    "rooms": [
+                        {
+                            "room": "石桥铭苑6-1102",
+                            "viewing": f"{password_canary} 看房提前联系",
+                            "has_password": True,
+                            "needs_contact": True,
+                            "listing_id": "listing-viewing-canary",
+                            "evidence_id": "evd-viewing-source-canary",
+                        }
+                    ],
+                    "contact_numbers": list(main.CONTACT_NUMBERS),
+                }
+            },
+        }
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._generate_reply_result(
+                content="石桥铭苑6-1102密码多少",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "viewing",
+                    "effective_query": "石桥铭苑6-1102密码多少",
+                    "structured_task": {"intent": "viewing", "tool_requirements": {}},
+                    "constraint_proof": {},
+                    "llm1_task_packet": task_packet,
+                },
+                tool_evidence=tool_evidence,
+                planner_result={"actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"]},
+            )
+            artifact = main._build_orchestrator_shadow_artifact(
+                content="石桥铭苑6-1102密码多少",
+                open_kfid="kf",
+                external_userid="wm",
+                msgids=["msg-1"],
+                generation=1,
+                inventory_read_context=main._local_inventory_read_context("controlled-password"),
+                understanding={"intent": "viewing", "llm1_task_packet": task_packet},
+                planner_result={"actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"]},
+                tool_evidence=tool_evidence,
+                reply_result=result,
+                final_reply=result["reply"],
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert result["reply"].strip()
+        assert password_canary in result["reply"]
+        assert result["selfcheck"]["llm"]["source"] == "llm_selfcheck_skipped_by_tiered_final_selfcheck"
+        assert tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]["status"] == "pass"
+        for payload in (
+            tool_evidence["outbound_package"],
+            main._tool_evidence_summary(tool_evidence),
+            artifact,
+        ):
+            dumped = json.dumps(payload, ensure_ascii=False, default=str)
+            assert password_canary not in dumped
+
+    asyncio.run(run_case())
+
+
+def test_production_controlled_channels_cover_contract_password_deposit_and_viewing(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_text="")
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                task_types = {str(task.get("task_type") or "") for task in (kwargs.get("task_packet") or {}).get("tasks") or []}
+                if "deposit_policy" in task_types:
+                    return {
+                        "reply_text": (
+                            "免押走支付宝无忧住芝麻信用评估，不是免费免押；"
+                            "服务费按租期一般是5.5%-8%。水电要按具体房源备注查，你把小区+房号发我，我再按那套确认。"
+                        ),
+                        "claims": [],
+                        "action_captions": [],
+                        "self_review": {"status": "pass"},
+                    }
+                return {
+                    "reply_text": "",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        async def run_production_case(*, content: str, task_type: str, actions: list[str], tool_evidence: dict, intent: str) -> dict:
+            task_packet = build_kf_task_packet_shadow(
+                {
+                    "rewritten_query": content,
+                    "task_atoms": [{"task_id": f"task-{task_type}", "task_type": task_type, "user_text": content}],
+                    "tool_plan": {"actions": actions},
+                },
+                content=content,
+                source_label="llm1_production",
+            ).packet.to_safe_dict()
+            return await main._generate_reply_result(
+                content=content,
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": intent,
+                    "effective_query": content,
+                    "structured_task": {"intent": intent, "tool_requirements": {}},
+                    "constraint_proof": {},
+                    "llm1_task_packet": task_packet,
+                },
+                tool_evidence=tool_evidence,
+                planner_result={"actions": actions},
+            )
+
+        original_mode = main.settings.kf_dual_llm_mode
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+        monkeypatch.setattr(main, "_needs_llm_final_selfcheck", lambda **kwargs: False)
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            contract_result = await run_production_case(
+                content="客户看中了怎么定房？定金和合同怎么弄？",
+                task_type="contract_contact",
+                actions=["send_contract_contact", "generate_reply"],
+                tool_evidence={"actions": ["send_contract_contact", "generate_reply"]},
+                intent="contract",
+            )
+            password_result = await run_production_case(
+                content="石桥铭苑6-1102密码发我",
+                task_type="viewing_guidance",
+                actions=["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                tool_evidence={
+                    "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                    "target_rows": [{"小区": "石桥铭苑", "房号": "6-1102", "看房方式密码": "101004# 看房提前联系"}],
+                    "inventory_rows": [{"小区": "石桥铭苑", "房号": "6-1102", "看房方式密码": "101004# 看房提前联系"}],
+                    "rule_evidence": {
+                        "viewing": {
+                            "rooms": [
+                                {
+                                    "room": "石桥铭苑6-1102",
+                                    "viewing": "101004# 看房提前联系",
+                                    "has_password": True,
+                                    "needs_contact": True,
+                                    "listing_id": "listing-viewing-1",
+                                    "evidence_id": "evd-viewing-source-1",
+                                }
+                            ],
+                            "contact_numbers": list(main.CONTACT_NUMBERS),
+                        }
+                    },
+                },
+                intent="viewing",
+            )
+            deposit_result = await run_production_case(
+                content="免押金要什么条件？服务费怎么算？顺便说下这几套水电怎么收。",
+                task_type="deposit_policy",
+                actions=["send_deposit_policy", "generate_reply"],
+                tool_evidence={
+                    "actions": ["send_deposit_policy", "generate_reply"],
+                    "rule_evidence": {"deposit_policy": main._deposit_policy_evidence()},
+                },
+                intent="deposit",
+            )
+            viewing_result = await run_production_case(
+                content="这套还没空出的话能预约看房吗？",
+                task_type="viewing_guidance",
+                actions=["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                tool_evidence={
+                    "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                    "target_rows": [{"小区": "长浜龙吟轩", "房号": "9-901", "看房方式密码": "6.24空出 看房提前联系"}],
+                    "inventory_rows": [{"小区": "长浜龙吟轩", "房号": "9-901", "看房方式密码": "6.24空出 看房提前联系"}],
+                    "rule_evidence": {
+                        "viewing": {
+                            "rooms": [
+                                {
+                                    "room": "长浜龙吟轩9-901",
+                                    "viewing": "6.24空出 看房提前联系",
+                                    "has_password": False,
+                                    "needs_contact": True,
+                                    "future_or_unavailable": True,
+                                    "listing_id": "listing-viewing-2",
+                                    "evidence_id": "evd-viewing-source-2",
+                                }
+                            ],
+                            "contact_numbers": list(main.CONTACT_NUMBERS),
+                        }
+                    },
+                },
+                intent="viewing",
+            )
+            unasked_password_result = await run_production_case(
+                content="石桥铭苑6-1102今天能看吗",
+                task_type="viewing_guidance",
+                actions=["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                tool_evidence={
+                    "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                    "target_rows": [{"小区": "石桥铭苑", "房号": "6-1102", "看房方式密码": "101004# 看房提前联系"}],
+                    "inventory_rows": [{"小区": "石桥铭苑", "房号": "6-1102", "看房方式密码": "101004# 看房提前联系"}],
+                    "rule_evidence": {
+                        "viewing": {
+                            "rooms": [
+                                {
+                                    "room": "石桥铭苑6-1102",
+                                    "viewing": "101004# 看房提前联系",
+                                    "has_password": True,
+                                    "needs_contact": True,
+                                    "listing_id": "listing-viewing-3",
+                                    "evidence_id": "evd-viewing-source-3",
+                                }
+                            ],
+                            "contact_numbers": list(main.CONTACT_NUMBERS),
+                        }
+                    },
+                },
+                intent="viewing",
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        results = [contract_result, password_result, deposit_result, viewing_result, unasked_password_result]
+        for result in results:
+            assert result["reply"].strip(), result
+            assert not result["needs_planner_retry"], result
+            assert "我先帮您确认一下" not in result["reply"]
+            assert "稍后给您准确回复" not in result["reply"]
+
+        assert "18758141785" in contract_result["reply"]
+        assert "电子合同" in contract_result["reply"]
+        assert "定金" in contract_result["reply"]
+        assert "101004#" in password_result["reply"]
+        assert "18758141785" in password_result["reply"]
+        assert "支付宝无忧住" in deposit_result["reply"]
+        assert "5.5%-8%" in deposit_result["reply"]
+        assert "水电" in deposit_result["reply"]
+        assert "18758141785" in viewing_result["reply"]
+        assert "101004#" not in unasked_password_result["reply"]
+
+    asyncio.run(run_case())
+
+
+def test_outbound_validation_allows_password_only_when_user_asked_and_evidence_bound() -> None:
+    from app.services.kf_contracts import EvidenceItem, PreparedOutboundPackage, SendAction, StructuredTaskPacket, TaskAtom, ToolEvidenceBundle
+    from app.services.kf_outbound_validation import OutboundValidationContext, ValidationStatus, validate_prepared_outbound_package
+
+    task_packet = StructuredTaskPacket(
+        tasks=[TaskAtom(task_id="task-password", task_type="viewing_guidance", user_text="石桥铭苑6-1102密码多少")]
+    )
+    evidence_bundle = ToolEvidenceBundle(
+        evidence=[
+            EvidenceItem(
+                evidence_id="evd-controlled-viewing-password-1",
+                evidence_type="viewing_password",
+                summary="石桥铭苑6-1102 的看房密码已由受控通道绑定。",
+                metadata={"controlled_channel": "viewing_password", "evidence_bound": True},
+            )
+        ]
+    )
+    package = PreparedOutboundPackage(
+        reply_text="看房密码由受控通道发送。",
+        evidence_bundle=evidence_bundle,
+        send_actions=[
+            SendAction(
+                action_id="send-controlled-viewing-password-1",
+                action_type="viewing_password",
+                evidence_id="evd-controlled-viewing-password-1",
+                metadata={"controlled_channel": "viewing_password", "evidence_bound": True},
+                sensitive_payload={"viewing_password": "101004#"},
+            )
+        ],
+    )
+
+    allowed = validate_prepared_outbound_package(
+        package,
+        context=OutboundValidationContext(task_packet=task_packet, user_asked_password=True),
+    )
+    blocked = validate_prepared_outbound_package(
+        package,
+        context=OutboundValidationContext(task_packet=task_packet, user_asked_password=False),
+    )
+    unbound_package = package.model_copy(deep=True)
+    unbound_package.send_actions[0].evidence_id = "evd-missing"
+    unbound = validate_prepared_outbound_package(
+        unbound_package,
+        context=OutboundValidationContext(task_packet=task_packet, user_asked_password=True),
+    )
+
+    assert allowed.status == ValidationStatus.PASS
+    assert any(issue.code == "l2.password_not_requested" for issue in blocked.issues)
+    assert any(issue.code in {"l0.unknown_evidence_ref", "l2.password_not_evidence_bound"} for issue in unbound.issues)
 
 
 def test_understand_message_production_skips_legacy_rewrite_and_fallback(monkeypatch) -> None:
@@ -4948,7 +5290,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         class FakeReplyGenerator:
             def __init__(self) -> None:
                 self.rewrite_calls: list[dict] = []
-                self.reply_calls: list[dict] = []
                 self.generate_calls = 0
                 self.selfcheck_calls = 0
 
@@ -4978,26 +5319,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                         "confidence": 0.9,
                         "reason": "模拟 Orchestrator 首次工具计划不完整",
                     },
-                }
-
-            async def plan_kf_reply_text(self, **kwargs):
-                self.reply_calls.append(kwargs)
-                if len(self.reply_calls) == 1:
-                    return {
-                        "reply_text": "免押是支付宝无忧住，服务费5.5%-8%。",
-                        "need_rewrite_clarification": False,
-                        "reason": "模拟工具后 Planner 首次生成了答非所问的草稿",
-                        "selfcheck": {
-                            "status": "retry",
-                            "reason": "客户要查房源，草稿却回答免押，答非所问",
-                            "planner_retry_reason": "重新按拱墅万达1500左右查房源并生成列表回复",
-                        },
-                    }
-                return {
-                    "reply_text": "有的，拱墅万达1500左右目前查到合幢悦府6-1-1204B还在，押一付一1500。",
-                    "need_rewrite_clarification": False,
-                    "reason": "根据工具结果重新生成房源列表回复",
-                    "selfcheck": {"status": "pass", "reason": ""},
                 }
 
             async def assess_kf_final_reply(self, **kwargs):
@@ -5082,7 +5403,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hasattr(fake_reply_generator, "plan_kf_tool_actions"))
         self.assertEqual(len(fake_reply_generator.rewrite_calls), 2)
         self.assertIn("planner_retry_reason", fake_reply_generator.rewrite_calls[1]["planner_feedback"])
-        self.assertEqual(len(fake_reply_generator.reply_calls), 2)
+        self.assertFalse(hasattr(fake_reply_generator, "plan_kf_reply_text"))
         self.assertEqual(fake_reply_generator.selfcheck_calls, 0)
         self.assertIn("合幢悦府6-1-1204B", fake_wecom.texts[-1])
         self.assertNotIn("免押", fake_wecom.texts[-1])
@@ -5161,11 +5482,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("draft_reply", retry_reason)
         self.assertIn("llm_selfcheck", retry_reason)
 
-    async def test_planner_reply_timeout_uses_tool_grounded_inventory_reply(self) -> None:
+    async def test_removed_planner_reply_text_after_retry_uses_tool_grounded_inventory_reply(self) -> None:
         class FakeReplyGenerator:
-            async def plan_kf_reply_text(self, **kwargs):
-                raise TimeoutError()
-
             async def assess_kf_final_reply(self, **kwargs):
                 raise AssertionError("常规工具证据回复不应该再阻塞式调用 LLM 终检")
 
@@ -5230,6 +5548,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     "video_paths": [],
                     "missing_media": [],
                 },
+                retry_reason="planner_retry_after_removed_legacy_reply_text",
             )
         finally:
             for name, value in originals.items():
@@ -5884,18 +6203,18 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             main.inventory = original_inventory
 
         self.assertEqual([main._row_label(row) for row in evidence["target_rows"]], ["白田畈龙吟府4-902B"])
-        reply = main._reply_for_utilities_and_viewing(
-            {
+        self.assertIn("viewing", evidence["rule_evidence"])
+        result = main._constraint_consistency_selfcheck(
+            content="水电和密码一起发我。",
+            draft_reply="白田畈龙吟府4-902B：水电是水30/月，电1元/度；看房方式/密码是902902#。",
+            understanding={
                 "intent": "viewing",
                 "constraint_proof": {"wants_utilities": True},
                 "structured_task": {"tool_requirements": {"needs_viewing_policy": True}},
             },
-            evidence,
-            content="水电和密码一起发我。",
+            tool_evidence=evidence,
         )
-        self.assertIn("白田畈龙吟府4-902B", reply)
-        self.assertIn("水电是水30/月，电1元/度", reply)
-        self.assertIn("看房方式/密码是902902#", reply)
+        self.assertEqual(result["status"], "pass")
 
     def test_candidate_selection_error_reply_explains_candidate_count(self) -> None:
         reply = main._reply_for_candidate_selection_error(
@@ -6005,23 +6324,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("这是", reply)
         self.assertNotIn("的视频", reply)
 
-    def test_utilities_reply_does_not_include_deposit_policy_when_not_requested(self) -> None:
-        reply = main._reply_for_deposit_and_utilities(
-            {
-                "intent": "deposit",
-                "constraint_proof": {"wants_utilities": True},
-            },
-            {
-                "rule_evidence": {"deposit_policy": main._deposit_policy_evidence()},
-                "inventory_rows": [],
-                "target_rows": [],
-            },
-            content="水电怎么收？",
-        )
-
-        self.assertIn("水电要按具体房源备注查", reply)
-        self.assertNotIn("免押", reply)
-        self.assertNotIn("芝麻", reply)
+    def test_legacy_deposit_utilities_direct_reply_is_removed(self) -> None:
+        self.assertFalse(hasattr(main, "_reply_for_deposit_and_utilities"))
 
     def test_safe_deposit_fallback_does_not_inject_deposit_for_water_only(self) -> None:
         reply = main._safe_fallback_for_intent(
@@ -6433,13 +6737,16 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    def test_utilities_reply_uses_remark_field_for_bound_room(self) -> None:
-        reply = main._reply_for_deposit_and_utilities(
-            {
+    def test_utilities_validation_uses_remark_field_for_bound_room(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="这套水电怎么收？",
+            draft_reply="棠润府15-2-801B：水30/月，电1元/度。",
+            understanding={
                 "constraint_proof": {"wants_utilities": True},
                 "query_state": {"wants_utilities": True},
             },
-            {
+            tool_evidence={
+                "actions": ["search_inventory"],
                 "target_rows": [
                     {
                         "小区": "棠润府",
@@ -6449,12 +6756,9 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 ],
                 "rule_evidence": {},
             },
-            content="这套水电怎么收？",
         )
 
-        self.assertIn("棠润府15-2-801B", reply)
-        self.assertIn("水30/月，电1元/度", reply)
-        self.assertNotIn("服务费", reply)
+        self.assertEqual(result["status"], "pass")
 
     def test_bound_room_utilities_selfcheck_ignores_inherited_budget_area_layout(self) -> None:
         result = main._constraint_consistency_selfcheck(
@@ -6540,6 +6844,27 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "pass")
 
+    def test_outbound_package_suppresses_media_when_actions_are_suppressed(self) -> None:
+        package = main._build_outbound_package(
+            "我先按安全回复处理。",
+            {
+                "suppress_actions": True,
+                "inventory_images": ["inventory.png"],
+                "image_paths": ["room.jpg"],
+                "video_paths": ["room.mp4"],
+                "image_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+            },
+        )
+
+        self.assertEqual(package["inventory_images"], [])
+        self.assertEqual(package["image_paths"], [])
+        self.assertEqual(package["video_paths"], [])
+        self.assertNotIn("image_rows", package)
+        self.assertNotIn("video_rows", package)
+        self.assertEqual(package["image_explanations"], [])
+        self.assertEqual(package["video_explanations"], [])
+
     def test_viewing_selfcheck_rejects_reply_without_viewing_field_evidence(self) -> None:
         result = main._constraint_consistency_selfcheck(
             content="这套今天能看吗？",
@@ -6594,9 +6919,30 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(failures)
         self.assertIn("电费写成了水费", failures[0])
 
-    def test_utilities_reply_keeps_price_when_user_asks_both(self) -> None:
-        reply = main._reply_for_deposit_and_utilities(
+    def test_utilities_price_validation_keeps_price_when_user_asks_both(self) -> None:
+        rows = [
             {
+                "小区": "长岳王马府",
+                "房号": "4-2002",
+                "押一付一": "4300",
+                "押二付一": "4000",
+                "备注": "民用水电",
+            },
+            {
+                "小区": "长浜龙吟轩",
+                "房号": "11-1603",
+                "押一付一": "4200",
+                "押二付一": "3900",
+                "备注": "水30/月，电1元/度",
+            },
+        ]
+        result = main._constraint_consistency_selfcheck(
+            content="这两套水电和价格帮我对比一下。",
+            draft_reply=(
+                "长岳王马府4-2002：押一付一4300，押二付一4000，民用水电。\n"
+                "长浜龙吟轩11-1603：押一付一4200，押二付一3900，水30/月，电1元/度。"
+            ),
+            understanding={
                 "intent": "inventory",
                 "constraint_proof": {"wants_utilities": True, "wants_price": True},
                 "query_state": {"wants_utilities": True, "wants_price": True},
@@ -6607,35 +6953,13 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     }
                 },
             },
-            {
-                "inventory_rows": [
-                    {
-                        "小区": "长岳王马府",
-                        "房号": "4-2002",
-                        "押一付一": "4300",
-                        "押二付一": "4000",
-                        "备注": "民用水电",
-                    },
-                    {
-                        "小区": "长浜龙吟轩",
-                        "房号": "11-1603",
-                        "押一付一": "4200",
-                        "押二付一": "3900",
-                        "备注": "水30/月，电1元/度",
-                    },
-                ]
+            tool_evidence={
+                "actions": ["search_inventory"],
+                "inventory_rows": rows,
             },
-            content="这两套水电和价格帮我对比一下。",
         )
 
-        self.assertIn("长岳王马府4-2002", reply)
-        self.assertIn("押一付一4300", reply)
-        self.assertIn("押二付一4000", reply)
-        self.assertIn("民用水电", reply)
-        self.assertIn("长浜龙吟轩11-1603", reply)
-        self.assertIn("押一付一4200", reply)
-        self.assertIn("押二付一3900", reply)
-        self.assertIn("水30/月，电1元/度", reply)
+        self.assertEqual(result["status"], "pass")
 
     def test_multi_room_payment_selfcheck_rejects_aggregate_wrong_price(self) -> None:
         failures = main._payment_field_consistency_failures(
@@ -7044,24 +7368,27 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["房号"] for row in evidence["inventory_rows"]], ["2-1-402A", "20-1606A"])
         self.assertIn("deposit_policy", evidence["rule_evidence"])
 
-    def test_deposit_and_utilities_reply_uses_candidate_remarks(self) -> None:
-        reply = main._reply_for_deposit_and_utilities(
-            {"constraint_proof": {"wants_utilities": True}},
-            {
+    def test_deposit_and_utilities_evidence_survives_without_direct_reply_helper(self) -> None:
+        rows = [
+            {"小区": "大华海派风景", "房号": "2-1-402A", "备注": "水30/月，电1元/度"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "备注": "水30/月，电1元/度"},
+        ]
+        result = main._constraint_consistency_selfcheck(
+            content="免押金要什么条件？服务费怎么算？顺便说下这几套水电怎么收。",
+            draft_reply=(
+                "免押走支付宝无忧住芝麻信用评估，服务费按租期5.5%-8%。\n"
+                "大华海派风景2-1-402A：水30/月，电1元/度。\n"
+                "星桥锦绣嘉苑20-1606A：水30/月，电1元/度。"
+            ),
+            understanding={"constraint_proof": {"wants_utilities": True}},
+            tool_evidence={
+                "actions": ["search_inventory", "send_deposit_policy", "generate_reply"],
                 "rule_evidence": {"deposit_policy": main._deposit_policy_evidence()},
-                "inventory_rows": [
-                    {"小区": "大华海派风景", "房号": "2-1-402A", "备注": "水30/月，电1元/度"},
-                    {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "备注": "水30/月，电1元/度"},
-                ],
+                "inventory_rows": rows,
             },
         )
 
-        self.assertIn("大华海派风景2-1-402A", reply)
-        self.assertIn("星桥锦绣嘉苑20-1606A", reply)
-        self.assertIn("水30/月，电1元/度", reply)
-        self.assertIn("免押", reply)
-        self.assertNotIn("稍后", reply)
-        self.assertNotIn("电话", reply)
+        self.assertEqual(result["status"], "pass")
 
     def test_deposit_utilities_signal_forces_inventory_search(self) -> None:
         planner = main._ensure_required_actions(
@@ -10396,14 +10723,17 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(proof["area"], "石桥街道\n华丰\n石桥\n永佳\n半山")
                 self.assertNotIn("communities", proof)
 
-    def test_utilities_and_viewing_reply_keeps_both_fields(self) -> None:
-        reply = main._reply_for_utilities_and_viewing(
-            {
+    def test_utilities_and_viewing_validation_keeps_both_fields(self) -> None:
+        result = main._constraint_consistency_selfcheck(
+            content="水电和密码一起发我",
+            draft_reply="白田畈16-1-1003：水电是民用水电；看房方式/密码是336699#。",
+            understanding={
                 "intent": "viewing",
                 "constraint_proof": {"wants_utilities": True},
                 "structured_task": {"tool_requirements": {"needs_viewing_policy": True}},
             },
-            {
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
                 "target_rows": [
                     {
                         "小区": "白田畈",
@@ -10413,12 +10743,9 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ]
             },
-            content="水电和密码一起发我",
         )
 
-        self.assertIn("白田畈16-1-1003", reply)
-        self.assertIn("水电是民用水电", reply)
-        self.assertIn("看房方式/密码是336699#", reply)
+        self.assertEqual(result["status"], "pass")
 
     def test_inventory_reply_explains_payment_method_budget_match(self) -> None:
         reply = main._reply_for_inventory_search(
@@ -10599,9 +10926,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         class FakeReplyGenerator:
             async def generate(self, *args, **kwargs):
                 return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
-
-            async def plan_kf_reply_text(self, **kwargs):
-                return {"reply_text": "", "source": "fake_planner_reply_empty"}
 
             async def assess_kf_final_reply(self, **kwargs):
                 return {"status": "pass"}
@@ -10787,49 +11111,38 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("6.19空出", reply)
         self.assertNotIn("101004#", reply)
 
-    def test_viewing_reply_without_password_request_avoids_password_word(self) -> None:
-        tool_evidence = {
-            "rule_evidence": {
-                "viewing": {
-                    "rooms": [
-                        {
-                            "room": "石桥铭苑6-1102",
-                            "viewing": "101004# 看房提前联系",
-                            "has_password": True,
-                            "needs_contact": True,
-                        }
-                    ]
-                }
-            }
-        }
+    def test_legacy_viewing_direct_reply_is_removed(self) -> None:
+        self.assertFalse(hasattr(main, "_reply_for_viewing"))
 
-        reply = main._reply_for_viewing(tool_evidence, allow_password=False)
+    def test_viewing_validation_allows_password_only_when_explicitly_requested(self) -> None:
+        row = {"小区": "石桥铭苑", "房号": "6-1102", "看房方式密码": "101004# 看房提前联系"}
+        result = main._constraint_consistency_selfcheck(
+            content="石桥铭苑6-1102密码发我",
+            draft_reply="石桥铭苑6-1102：看房方式/密码是101004# 看房提前联系。密码不对就联系 18758141785 / 13282125992 / 19941091943。",
+            understanding={
+                "intent": "viewing",
+                "constraint_proof": {"room_refs": ["6-1102"]},
+                "structured_task": {"tool_requirements": {"needs_viewing_policy": True}},
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+                "target_rows": [row],
+                "rule_evidence": {
+                    "viewing": {
+                        "rooms": [
+                            {
+                                "room": "石桥铭苑6-1102",
+                                "viewing": "101004# 看房提前联系",
+                                "has_password": True,
+                                "needs_contact": True,
+                            }
+                        ]
+                    }
+                },
+            },
+        )
 
-        self.assertIn("石桥铭苑6-1102", reply)
-        self.assertIn("看房提前联系", reply)
-        self.assertNotIn("101004#", reply)
-        self.assertNotIn("密码", reply)
-
-    def test_viewing_reply_keeps_password_when_explicitly_requested(self) -> None:
-        tool_evidence = {
-            "rule_evidence": {
-                "viewing": {
-                    "rooms": [
-                        {
-                            "room": "石桥铭苑6-1102",
-                            "viewing": "101004# 看房提前联系",
-                            "has_password": True,
-                            "needs_contact": True,
-                        }
-                    ]
-                }
-            }
-        }
-
-        reply = main._reply_for_viewing(tool_evidence, allow_password=True)
-
-        self.assertIn("101004#", reply)
-        self.assertIn("密码不对", reply)
+        self.assertEqual(result["status"], "pass")
 
     async def test_reply_generation_uses_no_match_evidence_when_llm_waits(self) -> None:
         class FakeReplyGenerator:
@@ -11203,8 +11516,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_planner_missing_reply_before_retry_does_not_enter_selfcheck(self) -> None:
         class FakeReplyGenerator:
-            async def plan_kf_reply_text(self, **kwargs):
-                return {"reply_text": "", "source": "fake_planner_reply_empty"}
+            pass
 
         class FakeRag:
             async def retrieve_for_reply(self, **kwargs):
@@ -11250,9 +11562,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_inventory_rows_after_planner_retry_use_tool_grounded_reply(self) -> None:
         class FakeReplyGenerator:
-            async def plan_kf_reply_text(self, **kwargs):
-                return {"reply_text": "", "source": "fake_planner_reply_empty_after_retry"}
-
             async def assess_kf_final_reply(self, **kwargs):
                 return {"status": "pass"}
 
