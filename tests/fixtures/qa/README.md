@@ -15,6 +15,11 @@ They do not contain real tokens, secrets, server addresses, phone numbers, or vi
   - Source sha256 at generation time: `52ec51b471c2b0aa247c4553e77f1519763031e4f417b6603ef0b03d42aad4bd`.
   - Fixture sha256 at generation time: `a3a60f0ab240e38d0318b329b39570b7c658a7456646ac6a72971e880e9449d4`.
 
+- `real_server_dialogues_sanitized.json`
+  - Optional source: server `data/kf_dialogue_events.jsonl` or an exported server dialogue/event log.
+  - Must be generated with `scripts/export_real_dialogue_fixture.py` so raw customer ids, phone numbers, viewing passwords, tokens, and long runtime identifiers are removed before the file enters tests.
+  - The raw server log must not be committed.
+
 ## Generation command
 
 Run from the repository root with UTF-8 enabled:
@@ -54,3 +59,18 @@ fixture_dir.mkdir(parents=True, exist_ok=True)
 )
 PY
 ```
+
+## Real server dialogue import
+
+After a read-only server log export is available locally, generate the sanitized replay fixture:
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+python scripts/export_real_dialogue_fixture.py `
+  --input tmp/server_dialogues/kf_dialogue_events.jsonl `
+  --output tests/fixtures/qa/real_server_dialogues_sanitized.json `
+  --limit-windows 20
+python -m pytest -q tests/test_real_dialogue_fixtures.py
+```
+
+The fixture stores only sanitized customer turns. Bot replies from old logs are intentionally not used as expected answers, because current correctness must be judged against the latest inventory/tools rather than stale historical output.
