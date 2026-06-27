@@ -38,6 +38,7 @@ QA replay artifact 的业务审计必须保留这些高风险判定：
 包含：
 
 - `tests/test_kf_contracts.py`
+- `tests/test_kf_send_receipts.py`
 - `tests/test_media_manifest.py`
 - `python -m compileall app`
 - `git diff --check`
@@ -45,6 +46,7 @@ QA replay artifact 的业务审计必须保留这些高风险判定：
 覆盖重点：
 
 - RAG contract schema、候选编号、证据链、发送 action 和敏感字段脱敏。
+- SendReceipt 幂等键、重复回调跳过、失败回执脱敏和失败后可重试边界。
 - 素材 manifest 的明确绑定、缺失报告、孤儿素材和模糊候选不自动绑定。
 - Python 语法可编译。
 - diff 中没有尾随空格或冲突标记。
@@ -56,13 +58,16 @@ QA replay artifact 的业务审计必须保留这些高风险判定：
 包含 L1，并追加：
 
 - `tests/test_wecom_kf.py`
+- `tests/test_kf_send_receipt_faults.py`
 - `tests/test_kf_agentic_rag.py`
+- `tests/test_kf_dual_llm_shadow.py`
 - `tests/test_llm.py`
 - `tests/test_media_store.py`
 - `tests/test_media_manifest.py`
 - `tests/test_inventory_query.py`
 - `tests/test_inventory_read_router.py`
 - `tests/test_inventory_sensitive_access.py`
+- `tests/test_qa_utf8_inputs.py`
 
 覆盖重点：
 
@@ -70,6 +75,7 @@ QA replay artifact 的业务审计必须保留这些高风险判定：
 - 问题重写/意图分析结果与工具目标一致。
 - 最近候选集、序号选择、上下文继承和新锚点识别。
 - 图片、视频、原视频链接与目标房源绑定。
+- 重复回调、视频发送失败、SendReceipt 失败回放和不同客户/不同轮次隔离。
 - 看房密码和敏感访问边界。
 - QA replay 审计函数的 UTF-8 输入、候选绑定、否定约束、相似小区污染、素材 listing_id、发送时态和 high/medium 分级。
 

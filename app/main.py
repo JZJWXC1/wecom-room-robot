@@ -9307,7 +9307,7 @@ async def _send_images(open_kfid: str, external_userid: str, paths: list[str]) -
             raise
         except Exception as exc:
             logger.exception("send image failed: %s", exc)
-            sent.append({"type": "image_failed", "path": str(path), "reason": str(exc)})
+            sent.append({"type": "image_failed", "path": str(path), "reason": kf_send_receipts.safe_failure_reason(exc)})
     return sent
 
 
@@ -9333,7 +9333,7 @@ async def _send_videos(
             raise
         except Exception as exc:
             logger.exception("send video failed: %s", exc)
-            sent.append({"type": "video_failed", "path": str(path), "room": label, "reason": str(exc)})
+            sent.append({"type": "video_failed", "path": str(path), "room": label, "reason": kf_send_receipts.safe_failure_reason(exc)})
     return sent
 
 
@@ -9375,7 +9375,7 @@ async def _send_images_with_receipts(
             raise
         except Exception as exc:
             logger.exception("send image failed: %s", exc)
-            sent.append({"type": "image_failed", "path": str(path), "reason": str(exc)})
+            sent.append({"type": "image_failed", "path": str(path), "reason": kf_send_receipts.safe_failure_reason(exc)})
     return sent, context
 
 
@@ -9452,7 +9452,7 @@ async def _send_videos_with_receipts(
             )
             context = kf_send_receipts.append_receipt(context, receipt)
             logger.exception("send video failed: %s", exc)
-            sent.append({"type": "video_failed", "path": str(path), "room": label, "reason": str(exc)})
+            sent.append({"type": "video_failed", "path": str(path), "room": label, "reason": kf_send_receipts.safe_failure_reason(exc)})
     return sent, context
 
 

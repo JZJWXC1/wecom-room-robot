@@ -724,3 +724,11 @@ def test_fast_gate_secret_scan_allows_only_obvious_fixture_placeholders() -> Non
     assert "OpenAI-style key" in script
     assert "assigned runtime secret" in script
     assert "sk-(proj-)?" in script
+
+
+def test_fast_gate_includes_send_receipt_and_fault_replay_tests() -> None:
+    script = Path("scripts/rag-v2-test-gates.ps1").read_text(encoding="utf-8")
+
+    assert '"tests/test_kf_send_receipts.py"' in script
+    assert '"tests/test_kf_send_receipt_faults.py"' in script
+    assert '"tests/test_qa_utf8_inputs.py"' in script

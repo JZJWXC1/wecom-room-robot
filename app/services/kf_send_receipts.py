@@ -219,6 +219,10 @@ def text_hash(value: str) -> str:
     return _stable_digest({"text": value or ""})
 
 
+def safe_failure_reason(error: BaseException | str) -> str:
+    return str(safe_artifact_payload(str(error)))
+
+
 def _receipt_payloads(context: dict[str, Any] | None) -> list[dict[str, Any]]:
     return [item for item in normalize_receipt_ledger(context).get("receipts") or [] if isinstance(item, dict)]
 

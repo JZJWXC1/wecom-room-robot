@@ -52,6 +52,42 @@ def test_idempotency_key_uses_msgid_scope_and_listing_binding() -> None:
     assert kf_send_receipts.build_idempotency_key(action) != kf_send_receipts.build_idempotency_key(other_listing_action)
 
 
+def test_idempotency_key_separates_customers_and_new_turns_without_msgids() -> None:
+    first_customer = kf_send_receipts.build_send_action(
+        open_kfid="kf",
+        external_userid="wm-a",
+        context=_context("turn-a", ""),
+        action_id="send-video-1",
+        action_type="video",
+        listing_id="lst-1",
+        evidence_id="evd-1",
+        payload={"material_hash": "media-hash"},
+    )
+    second_customer = kf_send_receipts.build_send_action(
+        open_kfid="kf",
+        external_userid="wm-b",
+        context=_context("turn-a", ""),
+        action_id="send-video-1",
+        action_type="video",
+        listing_id="lst-1",
+        evidence_id="evd-1",
+        payload={"material_hash": "media-hash"},
+    )
+    later_turn = kf_send_receipts.build_send_action(
+        open_kfid="kf",
+        external_userid="wm-a",
+        context=_context("turn-b", ""),
+        action_id="send-video-1",
+        action_type="video",
+        listing_id="lst-1",
+        evidence_id="evd-1",
+        payload={"material_hash": "media-hash"},
+    )
+
+    assert kf_send_receipts.build_idempotency_key(first_customer) != kf_send_receipts.build_idempotency_key(second_customer)
+    assert kf_send_receipts.build_idempotency_key(first_customer) != kf_send_receipts.build_idempotency_key(later_turn)
+
+
 def test_success_receipt_blocks_duplicate_and_records_skip_receipt() -> None:
     context = _context()
     action = kf_send_receipts.build_send_action(

@@ -218,11 +218,13 @@ function Invoke-Parity20 {
 
 $L1Tests = @(
     "tests/test_kf_contracts.py",
+    "tests/test_kf_send_receipts.py",
     "tests/test_media_manifest.py"
 )
 
 $L2Tests = @(
     "tests/test_wecom_kf.py",
+    "tests/test_kf_send_receipt_faults.py",
     "tests/test_kf_agentic_rag.py",
     "tests/test_kf_dual_llm_shadow.py",
     "tests/test_llm.py",
@@ -230,7 +232,8 @@ $L2Tests = @(
     "tests/test_media_manifest.py",
     "tests/test_inventory_query.py",
     "tests/test_inventory_read_router.py",
-    "tests/test_inventory_sensitive_access.py"
+    "tests/test_inventory_sensitive_access.py",
+    "tests/test_qa_utf8_inputs.py"
 )
 
 $L4RollbackTests = @(
