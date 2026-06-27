@@ -18,6 +18,8 @@ from app.services.region_inventory_utils import safe_name
 
 MEDIA_MANIFEST_SCHEMA_VERSION = "media_manifest.v2"
 MEDIA_MANIFEST_GENERATOR_VERSION = "media_manifest_foundation.v2"
+MEDIA_MANIFEST_PRODUCTION_ADAPTER_PROFILE = "media_manifest.production_read.v1"
+MEDIA_MANIFEST_SHADOW_ADAPTER_PROFILE = "media_manifest.shadow_read.v1"
 
 MEDIA_KIND_IMAGE = "image"
 MEDIA_KIND_VIDEO = "video"
@@ -507,6 +509,8 @@ class MediaManifestEvidence:
     file_name: str = ""
     source_path: str = ""
     material_page_url: str = ""
+    evidence_profile: str = MEDIA_MANIFEST_PRODUCTION_ADAPTER_PROFILE
+    adapter_mode: str = "production_read"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -534,11 +538,21 @@ class MediaManifestEvidence:
             "file_name": self.file_name,
             "source_path": self.source_path,
             "material_page_url": self.material_page_url,
+            "evidence_profile": self.evidence_profile,
+            "adapter_mode": self.adapter_mode,
         }
 
 
-class MediaManifestShadowAdapter:
-    """Read-only evidence adapter for listing_id -> media_id -> local/source material."""
+class MediaManifestProductionAdapter:
+    """Read-only production evidence adapter for listing_id -> media_id material.
+
+    It exposes only exact listing_id-bound, non-ambiguous, non-candidate media.
+    Fuzzy filename matches stay in MediaBindingReport and never resolve to local
+    sendable paths through this adapter.
+    """
+
+    evidence_profile = MEDIA_MANIFEST_PRODUCTION_ADAPTER_PROFILE
+    adapter_mode = "production_read"
 
     def __init__(self, manifest: MediaManifest, *, local_root: Path | None = None) -> None:
         self.manifest = manifest
@@ -546,7 +560,7 @@ class MediaManifestShadowAdapter:
         self._by_media_id = {item.media_id: item for item in manifest.items}
 
     @classmethod
-    def from_path(cls, path: Path, *, local_root: Path | None = None) -> "MediaManifestShadowAdapter":
+    def from_path(cls, path: Path, *, local_root: Path | None = None) -> "MediaManifestProductionAdapter":
         return cls(MediaManifest.read_json(path), local_root=local_root or path.parent)
 
     def evidence_for_listing(
@@ -572,7 +586,7 @@ class MediaManifestShadowAdapter:
 
     def local_file_for_media_id(self, media_id: str) -> Path | None:
         item = self._by_media_id.get(media_id)
-        if not item or not item.local_path:
+        if not item or not self._is_send_ready_item(item) or not item.local_path:
             return None
         path = Path(item.local_path)
         return path if path.is_absolute() else (self.local_root / path if self.local_root else path)
@@ -612,6 +626,8 @@ class MediaManifestShadowAdapter:
             file_name=item.file_name,
             source_path=item.source_path,
             material_page_url=item.material_page_url,
+            evidence_profile=self.evidence_profile,
+            adapter_mode=self.adapter_mode,
         )
 
     def _is_send_ready_item(self, item: MediaItem) -> bool:
@@ -622,6 +638,18 @@ class MediaManifestShadowAdapter:
             and not item.candidate_only
             and item.confidence >= SEND_READY_MIN_CONFIDENCE
         )
+
+
+class MediaManifestShadowAdapter(MediaManifestProductionAdapter):
+    """Compatibility alias for historical shadow callers.
+
+    The filtering rules are intentionally identical to the production read-only
+    adapter; only the evidence profile records that an old shadow entry point
+    was used.
+    """
+
+    evidence_profile = MEDIA_MANIFEST_SHADOW_ADAPTER_PROFILE
+    adapter_mode = "shadow_read"
 
 
 class FeishuDriveMediaManifestAdapter:

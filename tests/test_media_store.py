@@ -57,6 +57,8 @@ class MediaStoreVideoMatchingTests(unittest.TestCase):
                 self.assertTrue(evidence[0]["send_ready"])
                 self.assertFalse(evidence[0]["ambiguity"])
                 self.assertFalse(evidence[0]["candidate_only"])
+                self.assertEqual(evidence[0]["adapter_mode"], "production_read")
+                self.assertEqual(evidence[0]["evidence_profile"], "media_manifest.production_read.v1")
                 self.assertIn("manifest证据.mp4", evidence[0]["local_path"])
                 self.assertEqual(matches, [legacy_video])
             finally:

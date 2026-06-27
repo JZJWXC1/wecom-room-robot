@@ -21,6 +21,12 @@
 - 原视频链接使用 `source_kind=original_video_link`。
 - 链接、文件名、素材路径只允许作为内部证据字段，不允许直接拼进客户可见回复。
 
+## Production read-only adapter
+
+`MediaManifestProductionAdapter` 是 production-ready 的只读 evidence 适配器，只暴露精确 `listing_id` 绑定、非歧义、非候选、`confidence>=0.99` 的 media。`MediaStore.media_manifest_evidence_for_listing()` 默认使用该 adapter，并在 evidence 中标记 `adapter_mode=production_read`。
+
+旧的 `MediaManifestShadowAdapter` 保留为兼容入口，过滤规则与 production adapter 相同；它不会放宽 fuzzy/candidate-only 媒体。
+
 ## 未接入发送决策
 
 `MediaStore.media_manifest_evidence_for_listing()` 仍是只读辅助方法。旧的 `list_room_database_videos()`、`list_room_database_images()` 和 `original_video_sources_for_paths()` 行为保持不变；本轮没有修改 `app/main.py`、真实发送逻辑、企业微信上传逻辑或部署脚本。

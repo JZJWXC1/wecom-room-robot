@@ -5,7 +5,7 @@ import re
 from app.config import settings
 from app.models import RoomMedia
 from app.services.fuzzy_match import fuzzy_contains_score, normalize_search_text
-from app.services.media_manifest import MediaManifestShadowAdapter
+from app.services.media_manifest import MediaManifestProductionAdapter
 
 
 GENERIC_MEDIA_WORDS = (
@@ -113,7 +113,7 @@ class MediaStore:
     ) -> list[dict]:
         path = manifest_path or settings.room_database_path / "media_manifest.json"
         try:
-            adapter = MediaManifestShadowAdapter.from_path(path, local_root=settings.room_database_path)
+            adapter = MediaManifestProductionAdapter.from_path(path, local_root=settings.room_database_path)
         except (FileNotFoundError, json.JSONDecodeError, ValueError):
             return []
         return [item.to_dict() for item in adapter.evidence_for_listing(listing_id)]

@@ -23,6 +23,7 @@ from app.services.media_manifest import (
     FeishuDriveMediaManifestAdapter,
     MediaItem,
     MediaManifest,
+    MediaManifestProductionAdapter,
     MediaManifestShadowAdapter,
 )
 
@@ -436,9 +437,48 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
         )
         manifest = MediaManifest.build(listing_ids=[listing_id], items=[item])
         shadow = MediaManifestShadowAdapter(manifest, local_root=Path("."))
+        production = MediaManifestProductionAdapter(manifest, local_root=Path("."))
 
         self.assertEqual(shadow.evidence_for_listing(listing_id), [])
         self.assertIsNone(shadow.evidence_by_media_id(item.media_id))
+        self.assertEqual(production.evidence_for_listing(listing_id), [])
+        self.assertIsNone(production.evidence_by_media_id(item.media_id))
+        self.assertIsNone(production.local_file_for_media_id(item.media_id))
+
+    async def test_production_adapter_exposes_only_exact_listing_id_bound_media(self) -> None:
+        listing_id = generate_listing_id("寓你花园", "1-101A")
+        exact_item = MediaItem(
+            listing_id=listing_id,
+            kind=MEDIA_KIND_VIDEO,
+            file_name="精确绑定视频.mp4",
+            relative_path="video/listing/精确绑定视频.mp4",
+            binding_method=BINDING_METHOD_LISTING_ID,
+            confidence=1.0,
+            ambiguity=False,
+            candidate_only=False,
+            access_verified=True,
+        )
+        fuzzy_item = MediaItem(
+            listing_id=listing_id,
+            kind=MEDIA_KIND_VIDEO,
+            file_name="模糊候选视频.mp4",
+            relative_path="video/candidate/模糊候选视频.mp4",
+            binding_method=BINDING_METHOD_FUZZY_FILENAME,
+            confidence=0.8,
+            ambiguity=True,
+            candidate_only=True,
+        )
+        manifest = MediaManifest.build(listing_ids=[listing_id], items=[exact_item, fuzzy_item])
+        production = MediaManifestProductionAdapter(manifest, local_root=Path("."))
+
+        evidence = production.evidence_for_listing(listing_id)
+
+        self.assertEqual([item.media_id for item in evidence], [exact_item.media_id])
+        self.assertTrue(evidence[0].send_ready)
+        self.assertEqual(evidence[0].adapter_mode, "production_read")
+        self.assertEqual(evidence[0].evidence_profile, "media_manifest.production_read.v1")
+        self.assertIsNone(production.evidence_by_media_id(fuzzy_item.media_id))
+        self.assertIsNone(production.local_file_for_media_id(fuzzy_item.media_id))
 
     async def test_manifest_safe_serialization_hashes_source_record_fields(self) -> None:
         listing_id = generate_listing_id("寓你花园", "1-101A")
