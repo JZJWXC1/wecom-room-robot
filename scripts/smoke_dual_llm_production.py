@@ -34,7 +34,7 @@ async def _run_smoke() -> int:
         return 2
 
     generator = ReplyGenerator()
-    content = "你好，想先了解一下还有哪些房源可以看。"
+    content = "你好"
     try:
         task_packet = await asyncio.wait_for(
             generator.build_kf_task_packet(
@@ -66,7 +66,7 @@ async def _run_smoke() -> int:
         _print({"ok": False, "stage": "llm1", "reason": "empty_task_packet"})
         return 4
 
-    draft_reply = "我在的，你可以直接告诉我小区、预算、户型、房号，或者说要视频/房源表。"
+    draft_reply = "你好，我在的。你可以直接告诉我小区、预算、户型、房号，或者说要视频/房源表。"
     try:
         package = await asyncio.wait_for(
             compose_production_outbound_package(
