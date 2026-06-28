@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import httpx
 
 import app.main as main
+from app.config import Settings
 from app.models import ReplyPlan
 from app.services import inventory_read_turn, kf_context_memory
 from app.services.inventory_snapshot_models import generate_listing_id
@@ -98,6 +99,195 @@ def test_tool_evidence_rows_can_enrich_legacy_rows_with_stable_listing_id() -> N
 
     assert enriched[0]["listing_id"] == generate_listing_id(community, room_no)
     assert "listing_id" not in row
+
+
+def test_dual_llm_production_timeout_config_defaults() -> None:
+    fields = Settings.model_fields
+
+    assert fields["kf_llm1_production_timeout_seconds"].default == 12.0
+    assert fields["kf_llm2_production_timeout_seconds"].default == 15.0
+
+
+def test_llm1_production_timeout_metadata_uses_config_and_stays_sanitized(monkeypatch) -> None:
+    async def run_case() -> None:
+        sensitive_text = "客户原文 sk-test-secret token=abc123 https://example.test/base?api_key=abc123"
+
+        class SlowReplyGenerator:
+            async def build_kf_task_packet(self, **kwargs):
+                await asyncio.sleep(0.05)
+                raise AssertionError("slow LLM1 should have timed out first")
+
+        monkeypatch.setattr(main, "reply_generator", SlowReplyGenerator())
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+        monkeypatch.setattr(main.settings, "kf_llm1_production_timeout_seconds", 0.01)
+        monkeypatch.setattr(main.settings, "llm_rewrite_provider", "dashscope")
+        monkeypatch.setattr(main.settings, "dashscope_rewrite_model", "rewrite-timeout-model")
+
+        result = await main._apply_llm1_production_task_packet(
+            content=sensitive_text,
+            context={"conversation_id": "conv-1"},
+            result={
+                "structured_task": {},
+                "planner_feedback": {"reason": "retry"},
+            },
+            rewrite_view={"raw_dialog_context": [{"content": sensitive_text}]},
+            inventory_index={},
+            inventory_read_context=SimpleNamespace(
+                request_id="req-1",
+                turn_id="turn-1",
+                decision_id="case-1",
+                snapshot_id="snapshot-1",
+            ),
+        )
+
+        llm1_meta = result["dual_llm_production"]["llm1"]
+        dumped = json.dumps(llm1_meta, ensure_ascii=False, sort_keys=True)
+
+        assert result["tool_plan"]["need_rewrite_clarification"] is True
+        assert llm1_meta["stage"] == "llm1"
+        assert llm1_meta["mode"] == "production"
+        assert llm1_meta["prompt_version"] == "dual_llm_production.llm1_task_packet.v1"
+        assert llm1_meta["status"] == "retry"
+        assert llm1_meta["timeout_seconds"] == 0.01
+        assert llm1_meta["error_type"] == "TimeoutError"
+        assert isinstance(llm1_meta["elapsed_ms"], int)
+        assert llm1_meta["provider"] == "dashscope"
+        assert llm1_meta["model"] == "rewrite-timeout-model"
+        assert "sk-test-secret" not in dumped
+        assert "token=abc123" not in dumped
+        assert "api_key=abc123" not in dumped
+        assert sensitive_text not in dumped
+
+    asyncio.run(run_case())
+
+
+def test_llm2_production_timeout_metadata_uses_config_and_stays_sanitized(monkeypatch) -> None:
+    async def run_case() -> None:
+        sensitive_text = "客户原文 sk-test-secret token=abc123 https://example.test/base?api_key=abc123"
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "plain answer",
+                "task_atoms": [{"task_id": "task-1", "task_type": "reply_text"}],
+                "tool_plan": {"actions": ["generate_reply"]},
+            },
+            content="hello",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                raise AssertionError("LLM2 timeout must gate before final selfcheck")
+
+        class SlowReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                await asyncio.sleep(0.05)
+                raise AssertionError("slow LLM2 should have timed out first")
+
+        tool_evidence = {
+            "actions": ["generate_reply"],
+            "dual_llm_production": {"llm1": {"status": "pass", "source": "test"}},
+        }
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", SlowReplyGenerator())
+        monkeypatch.setattr(main, "_needs_llm_final_selfcheck", lambda **kwargs: False)
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+        monkeypatch.setattr(main.settings, "kf_llm2_production_timeout_seconds", 0.01)
+        monkeypatch.setattr(main.settings, "llm_reply_provider", "dashscope")
+        monkeypatch.setattr(main.settings, "dashscope_reply_model", "reply-timeout-model")
+
+        result = await main._generate_reply_result(
+            content=sensitive_text,
+            context=kf_context_memory.empty_context(),
+            understanding={
+                "intent": "general",
+                "effective_query": "hello",
+                "structured_task": {"tool_requirements": {}},
+                "constraint_proof": {},
+                "llm1_task_packet": task_packet,
+            },
+            tool_evidence=tool_evidence,
+            planner_result={"actions": ["generate_reply"], "reply_text": "旧话术"},
+        )
+
+        llm2_meta = tool_evidence["dual_llm_production"]["llm2"]
+        dumped = json.dumps(llm2_meta, ensure_ascii=False, sort_keys=True)
+
+        assert result["reply"] == ""
+        assert result["needs_planner_retry"] is True
+        assert "LLM2 production outbound failed" in result["planner_retry_reason"]
+        retry_payload = json.loads(result["planner_retry_reason"])
+        retry_dump = json.dumps(retry_payload, ensure_ascii=False, sort_keys=True)
+        assert retry_payload["source"] == "llm2_production_safe_retry_payload"
+        assert "original_content" not in retry_payload
+        assert "effective_query" not in retry_payload
+        assert "draft_reply" not in retry_payload
+        assert "llm2_production_outbound_package" not in tool_evidence
+        assert llm2_meta["stage"] == "llm2"
+        assert llm2_meta["mode"] == "production"
+        assert llm2_meta["prompt_version"] == "kf_llm2_outbound.production.v1"
+        assert llm2_meta["timeout_seconds"] == 0.01
+        assert llm2_meta["error_type"] == "TimeoutError"
+        assert isinstance(llm2_meta["elapsed_ms"], int)
+        assert llm2_meta["provider"] == "dashscope"
+        assert llm2_meta["model"] == "reply-timeout-model"
+        assert llm2_meta["reply_text_present"] is False
+        assert "sk-test-secret" not in dumped
+        assert "token=abc123" not in dumped
+        assert "api_key=abc123" not in dumped
+        assert sensitive_text not in dumped
+        assert "sk-test-secret" not in retry_dump
+        assert "token=abc123" not in retry_dump
+        assert "api_key=abc123" not in retry_dump
+        assert sensitive_text not in retry_dump
+        assert "旧话术" not in retry_dump
+
+    asyncio.run(run_case())
+
+
+def test_llm2_production_retry_payload_redacts_unknown_reason_and_intent() -> None:
+    sensitive_text = "客户原文 sk-test-secret token=abc123 https://example.test/base?api_key=abc123"
+
+    retry_payload = json.loads(
+        main._llm2_production_retry_reason_payload(
+            understanding={
+                "intent": sensitive_text,
+                "effective_query": sensitive_text,
+                "llm1_task_packet": {
+                    "task_atoms": [{"task_id": "task-1", "task_type": "reply_text", "user_text": sensitive_text}],
+                    "tool_plan": {"actions": ["generate_reply"]},
+                },
+            },
+            tool_evidence={
+                "actions": ["generate_reply"],
+                "dual_llm_production": {
+                    "llm2": {
+                        "stage": "llm2",
+                        "mode": "production",
+                        "self_review": {"status": "retry", "reason": sensitive_text},
+                    }
+                },
+            },
+            rule_selfcheck={"status": "retry", "source": "test", "reason": sensitive_text},
+            llm_selfcheck={"status": "retry", "source": "test", "reason": sensitive_text},
+            reason=sensitive_text,
+        )
+    )
+    retry_dump = json.dumps(retry_payload, ensure_ascii=False, sort_keys=True)
+
+    assert retry_payload["reason"] == "LLM2 production output gate requested planner retry."
+    assert retry_payload["intent"] == "unknown"
+    assert "original_content" not in retry_payload
+    assert "effective_query" not in retry_payload
+    assert "draft_reply" not in retry_payload
+    assert "planner_result" not in retry_payload
+    assert sensitive_text not in retry_dump
+    assert "sk-test-secret" not in retry_dump
+    assert "token=abc123" not in retry_dump
+    assert "api_key=abc123" not in retry_dump
 
 
 def test_generate_reply_result_uses_llm2_production_package(monkeypatch) -> None:
@@ -225,13 +415,14 @@ def test_generate_reply_result_production_llm2_bypasses_legacy_planner_reply_gat
 
 def test_generate_reply_result_production_blocks_l2_validation_failure(monkeypatch) -> None:
     async def run_case() -> None:
+        sensitive_text = "第1套视频 sk-test-secret token=abc123 https://example.test/base?api_key=abc123"
         task_packet = build_kf_task_packet_shadow(
             {
                 "rewritten_query": "第1套视频",
                 "task_atoms": [{"task_id": "task-video", "task_type": "send_video", "user_text": "第1套视频"}],
                 "tool_plan": {"actions": ["generate_reply"]},
             },
-            content="第1套视频",
+            content=sensitive_text,
             source_label="llm1_production",
             mode="production",
         ).packet.to_safe_dict()
@@ -263,17 +454,17 @@ def test_generate_reply_result_production_blocks_l2_validation_failure(monkeypat
         main.settings.kf_dual_llm_mode = "production"
         try:
             result = await main._generate_reply_result(
-                content="第1套视频",
+                content=sensitive_text,
                 context=kf_context_memory.empty_context(),
                 understanding={
                     "intent": "media",
-                    "effective_query": "第1套视频",
+                    "effective_query": sensitive_text,
                     "structured_task": {"tool_requirements": {"needs_video": True}},
                     "constraint_proof": {"wants_video": True},
                     "llm1_task_packet": task_packet,
                 },
                 tool_evidence=tool_evidence,
-                planner_result={"actions": ["generate_reply"]},
+                planner_result={"actions": ["generate_reply"], "reply_text": "旧话术 sk-test-secret token=abc123"},
             )
         finally:
             main.settings.kf_dual_llm_mode = original_mode
@@ -282,6 +473,18 @@ def test_generate_reply_result_production_blocks_l2_validation_failure(monkeypat
         assert result["needs_planner_retry"] is True
         assert result["selfcheck"]["rule"]["source"] == "llm2_production_output_gate"
         assert "kf_outbound_validation L0-L2 blocked" in result["planner_retry_reason"]
+        retry_payload = json.loads(result["planner_retry_reason"])
+        retry_dump = json.dumps(retry_payload, ensure_ascii=False, sort_keys=True)
+        assert retry_payload["source"] == "llm2_production_safe_retry_payload"
+        assert "original_content" not in retry_payload
+        assert "effective_query" not in retry_payload
+        assert "draft_reply" not in retry_payload
+        assert "planner_result" not in retry_payload
+        assert sensitive_text not in retry_dump
+        assert "sk-test-secret" not in retry_dump
+        assert "token=abc123" not in retry_dump
+        assert "api_key=abc123" not in retry_dump
+        assert "旧话术" not in retry_dump
         validation = tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]
         assert validation["status"] == "blocked"
         assert any(
@@ -295,13 +498,14 @@ def test_generate_reply_result_production_blocks_l2_validation_failure(monkeypat
 
 def test_generate_reply_result_production_blocks_l3_validation_rewrite(monkeypatch) -> None:
     async def run_case() -> None:
+        sensitive_text = "普通回复 sk-test-secret token=abc123 https://example.test/base?api_key=abc123"
         task_packet = build_kf_task_packet_shadow(
             {
                 "rewritten_query": "普通回复",
                 "task_atoms": [{"task_id": "task-reply", "task_type": "reply_text", "user_text": "普通回复"}],
                 "tool_plan": {"actions": ["generate_reply"]},
             },
-            content="普通回复",
+            content=sensitive_text,
             source_label="llm1_production",
             mode="production",
         ).packet.to_safe_dict()
@@ -329,17 +533,17 @@ def test_generate_reply_result_production_blocks_l3_validation_rewrite(monkeypat
         main.settings.kf_dual_llm_mode = "production"
         try:
             result = await main._generate_reply_result(
-                content="普通回复",
+                content=sensitive_text,
                 context=kf_context_memory.empty_context(),
                 understanding={
                     "intent": "general",
-                    "effective_query": "普通回复",
+                    "effective_query": sensitive_text,
                     "structured_task": {"tool_requirements": {}},
                     "constraint_proof": {},
                     "llm1_task_packet": task_packet,
                 },
                 tool_evidence=tool_evidence,
-                planner_result={"actions": ["generate_reply"]},
+                planner_result={"actions": ["generate_reply"], "reply_text": "旧话术 sk-test-secret token=abc123"},
             )
         finally:
             main.settings.kf_dual_llm_mode = original_mode
@@ -347,6 +551,18 @@ def test_generate_reply_result_production_blocks_l3_validation_rewrite(monkeypat
         assert result["reply"] == ""
         assert result["needs_planner_retry"] is True
         assert "kf_outbound_validation L3 rewrite required" in result["planner_retry_reason"]
+        retry_payload = json.loads(result["planner_retry_reason"])
+        retry_dump = json.dumps(retry_payload, ensure_ascii=False, sort_keys=True)
+        assert retry_payload["source"] == "llm2_production_safe_retry_payload"
+        assert "original_content" not in retry_payload
+        assert "effective_query" not in retry_payload
+        assert "draft_reply" not in retry_payload
+        assert "planner_result" not in retry_payload
+        assert sensitive_text not in retry_dump
+        assert "sk-test-secret" not in retry_dump
+        assert "token=abc123" not in retry_dump
+        assert "api_key=abc123" not in retry_dump
+        assert "旧话术" not in retry_dump
         validation = tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]
         assert validation["status"] == "rewrite_required"
         assert validation["facts_passed"] is True

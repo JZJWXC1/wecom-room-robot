@@ -62,7 +62,7 @@ from app.services.rewrite_inventory_index import (
     slice_rewrite_inventory_index,
     write_rewrite_inventory_index,
 )
-from app.services.video_transcoder import prepare_wecom_video
+from app.services.video_transcoder import cached_wecom_video, prepare_wecom_video
 from app.services.wecom_kf import (
     WeComKfClient,
     WeComKfContextStore,
@@ -673,6 +673,53 @@ def _dual_llm_production_enabled() -> bool:
     return kf_dual_llm_production.production_enabled(getattr(settings, "kf_dual_llm_mode", "shadow"))
 
 
+def _configured_positive_float(value: Any, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
+def _llm1_production_timeout_seconds() -> float:
+    return _configured_positive_float(
+        getattr(settings, "kf_llm1_production_timeout_seconds", 12.0),
+        12.0,
+    )
+
+
+def _llm2_production_timeout_seconds() -> float:
+    return _configured_positive_float(
+        getattr(settings, "kf_llm2_production_timeout_seconds", 15.0),
+        15.0,
+    )
+
+
+def _dual_llm_production_failure_metadata(
+    *,
+    stage: str,
+    timeout_seconds: float,
+    started_at: float,
+    exc: BaseException,
+) -> dict[str, Any]:
+    llm_stage = "reply" if stage == "llm2" else "rewrite"
+    prompt_version = (
+        kf_dual_llm_production.DUAL_LLM_PRODUCTION_LLM2_PROMPT_VERSION
+        if stage == "llm2"
+        else kf_dual_llm_production.DUAL_LLM_PRODUCTION_LLM1_PROMPT_VERSION
+    )
+    return {
+        "stage": stage,
+        "mode": "production",
+        "prompt_version": prompt_version,
+        "timeout_seconds": timeout_seconds,
+        "elapsed_ms": max(0, int((time.monotonic() - started_at) * 1000)),
+        "error_type": type(exc).__name__,
+        "provider": settings.llm_provider_for(llm_stage),
+        "model": settings.llm_model_for(llm_stage),
+    }
+
+
 def _llm1_production_retry_plan(understanding: dict[str, Any]) -> dict[str, Any]:
     if not _dual_llm_production_enabled():
         return {}
@@ -730,6 +777,8 @@ async def _apply_llm1_production_task_packet(
     turn_id = str(inventory_read_context.turn_id or "")
     candidate_set = rewrite_view.get("last_candidate_set") if isinstance(rewrite_view, dict) else {}
     candidate_set_id = str(candidate_set.get("candidate_set_id") or "") if isinstance(candidate_set, dict) else ""
+    timeout_seconds = _llm1_production_timeout_seconds()
+    started_at = time.monotonic()
     try:
         packet = await asyncio.wait_for(
             build_packet(
@@ -747,14 +796,14 @@ async def _apply_llm1_production_task_packet(
                 candidate_set_id=candidate_set_id,
                 mode="production",
             ),
-            timeout=8,
+            timeout=timeout_seconds,
         )
         packet_payload = packet.to_safe_dict() if hasattr(packet, "to_safe_dict") else safe_artifact_payload(packet)
         if not isinstance(packet_payload, dict):
             packet_payload = {}
         tool_plan = kf_dual_llm_production.tool_plan_from_task_packet(packet)
     except Exception as exc:
-        logger.exception("KF LLM1 production task packet failed: %s", exc)
+        logger.warning("KF LLM1 production task packet failed: error_type=%s", type(exc).__name__)
         failure_plan = {
             "actions": [],
             "need_rewrite_clarification": True,
@@ -764,8 +813,18 @@ async def _apply_llm1_production_task_packet(
         }
         result["tool_plan"] = failure_plan
         result.setdefault("structured_task", {})["tool_plan"] = failure_plan
+        failure_metadata = _dual_llm_production_failure_metadata(
+            stage="llm1",
+            timeout_seconds=timeout_seconds,
+            started_at=started_at,
+            exc=exc,
+        )
         result["dual_llm_production"] = {
-            "llm1": {"status": "retry", "source": "llm1_production_error_gate", "error_type": type(exc).__name__}
+            "llm1": {
+                "status": "retry",
+                "source": "llm1_production_error_gate",
+                **failure_metadata,
+            }
         }
         return result
     result["llm1_task_packet"] = packet_payload
@@ -6453,6 +6512,147 @@ def _planner_retry_reason_payload(
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+def _llm2_production_safe_retry_reason(reason: str) -> str:
+    text = str(reason or "").strip()
+    known_reasons = (
+        "LLM1 production task packet is missing",
+        "LLM2 production outbound failed",
+        "LLM2 production composer is unavailable",
+        "LLM2 production outbound guard failed",
+        "kf_outbound_validation L0-L2 blocked",
+        "kf_outbound_validation L3 rewrite required",
+    )
+    for prefix in known_reasons:
+        if text.startswith(prefix):
+            return prefix
+    return "LLM2 production output gate requested planner retry."
+
+
+def _llm2_production_retry_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    safe_keys = (
+        "stage",
+        "mode",
+        "status",
+        "source",
+        "prompt_version",
+        "selfcheck_profile",
+        "timeout_seconds",
+        "elapsed_ms",
+        "error_type",
+        "provider",
+        "model",
+        "reply_source",
+        "reply_text_present",
+        "claim_count",
+        "action_caption_count",
+        "send_action_count",
+    )
+    payload = {key: metadata.get(key) for key in safe_keys if key in metadata}
+    self_review = metadata.get("self_review")
+    if isinstance(self_review, dict):
+        payload["self_review"] = {
+            key: self_review.get(key)
+            for key in ("status", "source", "error_type", "llm2_decides_media_targets")
+            if key in self_review
+        }
+    outbound_validation = metadata.get("outbound_validation")
+    if isinstance(outbound_validation, dict):
+        payload["outbound_validation"] = {
+            key: outbound_validation.get(key)
+            for key in ("status", "passed", "requires_rewrite")
+            if key in outbound_validation
+        }
+        blocking_issues = outbound_validation.get("blocking_issues")
+        if isinstance(blocking_issues, (list, tuple)):
+            payload["outbound_validation"]["blocking_issue_count"] = len(blocking_issues)
+        l3_rewrite_reasons = outbound_validation.get("l3_rewrite_reasons")
+        if isinstance(l3_rewrite_reasons, (list, tuple)):
+            payload["outbound_validation"]["l3_rewrite_reason_count"] = len(l3_rewrite_reasons)
+    return safe_artifact_payload(payload)
+
+
+def _safe_collection_count(value: Any) -> int:
+    if isinstance(value, (list, tuple, set, frozenset, dict)):
+        return len(value)
+    return 0
+
+
+def _llm2_production_safe_retry_intent(understanding: dict[str, Any]) -> str:
+    intent = _normalize_intent(understanding.get("intent") if isinstance(understanding, dict) else "")
+    known_intents = {
+        "general",
+        "inventory",
+        "media",
+        "viewing",
+        "context_followup",
+        "inventory_sheet",
+        "deposit",
+        "contract",
+        "greeting",
+        "unclear",
+        "production_llm1",
+    }
+    return intent if intent in known_intents else "unknown"
+
+
+def _llm2_production_retry_reason_payload(
+    *,
+    understanding: dict[str, Any],
+    tool_evidence: dict[str, Any],
+    rule_selfcheck: dict[str, Any],
+    llm_selfcheck: dict[str, Any],
+    reason: str,
+) -> str:
+    task_packet = understanding.get("llm1_task_packet") if isinstance(understanding, dict) else {}
+    if not isinstance(task_packet, dict):
+        task_packet = {}
+    tool_plan = task_packet.get("tool_plan") if isinstance(task_packet.get("tool_plan"), dict) else {}
+    dual_meta = tool_evidence.get("dual_llm_production") if isinstance(tool_evidence, dict) else {}
+    if not isinstance(dual_meta, dict):
+        dual_meta = {}
+    llm2_meta = dual_meta.get("llm2") if isinstance(dual_meta.get("llm2"), dict) else {}
+    payload = {
+        "reason": _llm2_production_safe_retry_reason(reason),
+        "source": "llm2_production_safe_retry_payload",
+        "intent": _llm2_production_safe_retry_intent(understanding),
+        "counts": {
+            "tool_action_count": _safe_collection_count(tool_evidence.get("actions") if isinstance(tool_evidence, dict) else None),
+            "inventory_row_count": _safe_collection_count(
+                tool_evidence.get("inventory_rows") if isinstance(tool_evidence, dict) else None
+            ),
+            "target_row_count": _safe_collection_count(
+                tool_evidence.get("target_rows") if isinstance(tool_evidence, dict) else None
+            ),
+            "image_count": _safe_collection_count(
+                tool_evidence.get("image_paths") if isinstance(tool_evidence, dict) else None
+            ),
+            "video_count": _safe_collection_count(
+                tool_evidence.get("video_paths") if isinstance(tool_evidence, dict) else None
+            ),
+            "task_atom_count": _safe_collection_count(task_packet.get("task_atoms") or task_packet.get("tasks")),
+            "tool_plan_action_count": _safe_collection_count(tool_plan.get("actions")),
+        },
+        "dual_llm_production": {
+            "llm2": _llm2_production_retry_metadata(llm2_meta),
+        },
+        "selfcheck": {
+            "rule": {
+                key: rule_selfcheck.get(key)
+                for key in ("status", "source")
+                if isinstance(rule_selfcheck, dict) and key in rule_selfcheck
+            },
+            "llm": {
+                key: llm_selfcheck.get(key)
+                for key in ("status", "source", "error_type")
+                if isinstance(llm_selfcheck, dict) and key in llm_selfcheck
+            },
+        },
+    }
+    return json.dumps(safe_artifact_payload(payload), ensure_ascii=False, default=str)
+
+
 def _reply_mentions_any(reply_text: str, values: list[str]) -> bool:
     normalized_reply = normalize_search_text(reply_text)
     for value in values:
@@ -9385,6 +9585,8 @@ async def _generate_reply_result(
                 "reply_text_present": False,
             }
         else:
+            timeout_seconds = _llm2_production_timeout_seconds()
+            started_at = time.monotonic()
             try:
                 production_package = await asyncio.wait_for(
                     kf_dual_llm_production.compose_production_outbound_package(
@@ -9396,7 +9598,7 @@ async def _generate_reply_result(
                         reply_result={"reply": draft_reply, "reply_source": deterministic_reply_source},
                         retry_reason=retry_reason,
                     ),
-                    timeout=8,
+                    timeout=timeout_seconds,
                 )
                 production_package_payload = kf_dual_llm_production.package_log_payload(production_package)
                 controlled_production_reply = _controlled_reply_from_outbound_package(production_package)
@@ -9430,13 +9632,20 @@ async def _generate_reply_result(
                         or kf_dual_llm_production.package_retry_reason(production_package)
                     )
             except Exception as exc:
-                logger.exception("KF LLM2 production outbound failed: %s", exc)
+                logger.warning("KF LLM2 production outbound failed: error_type=%s", type(exc).__name__)
                 llm2_retry_reason = "LLM2 production outbound failed; do not continue with customer-visible facts."
+                failure_metadata = _dual_llm_production_failure_metadata(
+                    stage="llm2",
+                    timeout_seconds=timeout_seconds,
+                    started_at=started_at,
+                    exc=exc,
+                )
                 production_package_payload = {
+                    **failure_metadata,
                     "self_review": {
                         "status": "retry",
                         "source": "llm2_production_error_gate",
-                        "error_type": type(exc).__name__,
+                        "error_type": failure_metadata["error_type"],
                     },
                     "reply_text_present": False,
                 }
@@ -9449,12 +9658,9 @@ async def _generate_reply_result(
                 "source": "llm2_production_output_gate",
                 "reason": llm2_retry_reason,
             }
-            retry_payload = _planner_retry_reason_payload(
-                content=content,
+            retry_payload = _llm2_production_retry_reason_payload(
                 understanding=understanding,
-                planner_result=planner_result or {},
                 tool_evidence=tool_evidence,
-                draft_reply=draft_reply,
                 rule_selfcheck=gate_selfcheck,
                 llm_selfcheck=production_package_payload.get("self_review") or gate_selfcheck,
                 reason=llm2_retry_reason,
@@ -10351,6 +10557,75 @@ def _video_error_allows_transcode_retry(error: Exception) -> bool:
     return any(marker in text for marker in retry_markers) and not any(marker in text for marker in fail_fast_markers)
 
 
+def _elapsed_ms_since(start: float) -> int:
+    return max(0, int(round((time.perf_counter() - start) * 1000)))
+
+
+def _safe_file_size_bytes(path: Path) -> int | None:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _video_send_observability_metadata(
+    *,
+    position: int,
+    caption_sent: bool,
+    transcode_retry: bool,
+    source_path: Path,
+    sent_path: Path,
+    first_upload_ms: int | None,
+    transcode_ms: int | None,
+    retry_upload_ms: int | None,
+    send_total_ms: int | None,
+    transcode_cache_hit: bool,
+    fact_binding: dict[str, Any],
+    outbox_attempt: int,
+    failure_stage: str = "",
+) -> dict[str, Any]:
+    return {
+        "position": position,
+        "caption_sent": caption_sent,
+        "transcode_retry": transcode_retry,
+        "outbox_attempt": outbox_attempt,
+        "failure_stage": failure_stage,
+        "first_upload_ms": first_upload_ms,
+        "transcode_ms": transcode_ms,
+        "retry_upload_ms": retry_upload_ms,
+        "send_total_ms": send_total_ms,
+        "original_file_name": source_path.name,
+        "sent_file_name": sent_path.name,
+        "original_file_size_bytes": _safe_file_size_bytes(source_path),
+        "sent_file_size_bytes": _safe_file_size_bytes(sent_path),
+        "transcode_cache_hit": transcode_cache_hit,
+        "sent_path_hash": kf_send_receipts.material_hash(sent_path),
+        "sent_path_sha256": _file_sha256_for_send(sent_path),
+        "media_evidence_profile": fact_binding.get("media_evidence_profile", ""),
+        "media_adapter_mode": fact_binding.get("media_adapter_mode", ""),
+    }
+
+
+def _video_send_failure_stage(
+    *,
+    caption_sent: bool,
+    transcode_retry: bool,
+    first_upload_ms: int | None,
+    transcode_ms: int | None,
+    retry_upload_ms: int | None,
+) -> str:
+    if not caption_sent:
+        return "caption"
+    if transcode_retry:
+        if retry_upload_ms is not None:
+            return "retry_upload"
+        if transcode_ms is not None:
+            return "transcode"
+    if first_upload_ms is not None:
+        return "first_upload"
+    return "video_send"
+
+
 async def _send_images_with_receipts(
     *,
     open_kfid: str,
@@ -10549,33 +10824,56 @@ async def _send_videos_with_receipts(
             continue
         caption_sent = False
         transcode_retry = False
+        transcode_cache_hit = False
         sent_path = path
+        send_total_start = time.perf_counter()
+        first_upload_ms: int | None = None
+        transcode_ms: int | None = None
+        retry_upload_ms: int | None = None
         try:
             await _send_text(open_kfid, external_userid, caption)
             caption_sent = True
             try:
-                provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, sent_path))
+                first_upload_start = time.perf_counter()
+                try:
+                    provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, sent_path))
+                finally:
+                    first_upload_ms = _elapsed_ms_since(first_upload_start)
             except WeComKfSendLimitError:
                 raise
             except Exception as exc:
                 if not _video_error_allows_transcode_retry(exc):
                     raise
-                sent_path = await asyncio.to_thread(prepare_wecom_video, path, force=True)
                 transcode_retry = True
-                provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, sent_path))
+                transcode_cache_hit = cached_wecom_video(path) is not None
+                transcode_start = time.perf_counter()
+                try:
+                    sent_path = await asyncio.to_thread(prepare_wecom_video, path, force=True)
+                finally:
+                    transcode_ms = _elapsed_ms_since(transcode_start)
+                retry_upload_start = time.perf_counter()
+                try:
+                    provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, sent_path))
+                finally:
+                    retry_upload_ms = _elapsed_ms_since(retry_upload_start)
             receipt = kf_send_receipts.build_sent_receipt(
                 action,
                 idempotency_key=idempotency_key,
                 provider_result=provider_result if isinstance(provider_result, dict) else {},
-                metadata={
-                    "position": index,
-                    "caption_sent": caption_sent,
-                    "transcode_retry": transcode_retry,
-                    "sent_path_hash": kf_send_receipts.material_hash(sent_path),
-                    "sent_path_sha256": _file_sha256_for_send(sent_path),
-                    "media_evidence_profile": fact_binding.get("media_evidence_profile", ""),
-                    "media_adapter_mode": fact_binding.get("media_adapter_mode", ""),
-                },
+                metadata=_video_send_observability_metadata(
+                    position=index,
+                    caption_sent=caption_sent,
+                    transcode_retry=transcode_retry,
+                    source_path=path,
+                    sent_path=sent_path,
+                    first_upload_ms=first_upload_ms,
+                    transcode_ms=transcode_ms,
+                    retry_upload_ms=retry_upload_ms,
+                    send_total_ms=_elapsed_ms_since(send_total_start),
+                    transcode_cache_hit=transcode_cache_hit,
+                    fact_binding=fact_binding,
+                    outbox_attempt=outbox_decision.attempt,
+                ),
             )
             context = kf_send_receipts.append_receipt(context, receipt)
             _record_persistent_send_receipt(
@@ -10594,13 +10892,27 @@ async def _send_videos_with_receipts(
                 action,
                 idempotency_key=idempotency_key,
                 error=exc,
-                metadata={
-                    "position": index,
-                    "caption_sent": caption_sent,
-                    "transcode_retry": transcode_retry,
-                    "media_evidence_profile": fact_binding.get("media_evidence_profile", ""),
-                    "media_adapter_mode": fact_binding.get("media_adapter_mode", ""),
-                },
+                metadata=_video_send_observability_metadata(
+                    position=index,
+                    caption_sent=caption_sent,
+                    transcode_retry=transcode_retry,
+                    source_path=path,
+                    sent_path=sent_path,
+                    first_upload_ms=first_upload_ms,
+                    transcode_ms=transcode_ms,
+                    retry_upload_ms=retry_upload_ms,
+                    send_total_ms=_elapsed_ms_since(send_total_start),
+                    transcode_cache_hit=transcode_cache_hit,
+                    fact_binding=fact_binding,
+                    outbox_attempt=outbox_decision.attempt,
+                    failure_stage=_video_send_failure_stage(
+                        caption_sent=caption_sent,
+                        transcode_retry=transcode_retry,
+                        first_upload_ms=first_upload_ms,
+                        transcode_ms=transcode_ms,
+                        retry_upload_ms=retry_upload_ms,
+                    ),
+                ),
             )
             context = kf_send_receipts.append_receipt(context, receipt)
             _record_persistent_send_receipt(
@@ -10615,13 +10927,27 @@ async def _send_videos_with_receipts(
                 action,
                 idempotency_key=idempotency_key,
                 error=exc,
-                metadata={
-                    "position": index,
-                    "caption_sent": caption_sent,
-                    "transcode_retry": transcode_retry,
-                    "media_evidence_profile": fact_binding.get("media_evidence_profile", ""),
-                    "media_adapter_mode": fact_binding.get("media_adapter_mode", ""),
-                },
+                metadata=_video_send_observability_metadata(
+                    position=index,
+                    caption_sent=caption_sent,
+                    transcode_retry=transcode_retry,
+                    source_path=path,
+                    sent_path=sent_path,
+                    first_upload_ms=first_upload_ms,
+                    transcode_ms=transcode_ms,
+                    retry_upload_ms=retry_upload_ms,
+                    send_total_ms=_elapsed_ms_since(send_total_start),
+                    transcode_cache_hit=transcode_cache_hit,
+                    fact_binding=fact_binding,
+                    outbox_attempt=outbox_decision.attempt,
+                    failure_stage=_video_send_failure_stage(
+                        caption_sent=caption_sent,
+                        transcode_retry=transcode_retry,
+                        first_upload_ms=first_upload_ms,
+                        transcode_ms=transcode_ms,
+                        retry_upload_ms=retry_upload_ms,
+                    ),
+                ),
             )
             context = kf_send_receipts.append_receipt(context, receipt)
             _record_persistent_send_receipt(

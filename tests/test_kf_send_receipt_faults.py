@@ -166,7 +166,113 @@ def test_video_upload_failure_transcodes_with_ffmpeg_and_retries() -> None:
     assert receipt["inventory_snapshot_id"] == "snapshot-test-001"
     assert receipt["source_hash"] == "a" * 64
     assert receipt["sha256"] == hashlib.sha256(b"original-video").hexdigest()
-    assert receipt["metadata"]["transcode_retry"] is True
+    metadata = receipt["metadata"]
+    assert metadata["transcode_retry"] is True
+    assert metadata["outbox_attempt"] == 1
+    assert metadata["failure_stage"] == ""
+    assert metadata["transcode_cache_hit"] is False
+    assert metadata["original_file_name"] == "room.mp4"
+    assert metadata["sent_file_name"] == "room.wecom.mp4"
+    assert metadata["original_file_size_bytes"] == len(b"original-video")
+    assert metadata["sent_file_size_bytes"] == len(b"transcoded-video")
+    for key in ("first_upload_ms", "transcode_ms", "retry_upload_ms", "send_total_ms"):
+        assert isinstance(metadata[key], int)
+        assert metadata[key] >= 0
+    dumped_receipt = json.dumps(receipt, ensure_ascii=False)
+    assert Path(video_path).parent.as_posix() not in dumped_receipt
+
+
+def test_successful_transcode_send_blocks_duplicate_callback_without_recompressing(tmp_path) -> None:
+    class FakeWeComKf:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+            self.video_attempts: list[str] = []
+
+        def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+            self.texts.append(text)
+            return {"errcode": 0}
+
+        def send_video(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+            self.video_attempts.append(str(media_id))
+            if len(self.video_attempts) == 1:
+                raise RuntimeError("video upload failed: file too large")
+            return {"errcode": 0, "msgid": "video-transcoded"}
+
+    async def run_case() -> tuple[dict, dict, FakeWeComKf, list[str], str, str]:
+        fake = FakeWeComKf()
+        transcode_calls: list[str] = []
+        original_wecom = main.wecom_kf
+        original_prepare = main.prepare_wecom_video
+        original_outbox = main.kf_send_outbox
+        main.wecom_kf = fake
+        main.kf_send_outbox = kf_outbox.LocalKfOutboxLedger(tmp_path / "kf_send_outbox.jsonl")
+        try:
+            video_path = tmp_path / "room.mp4"
+            transcoded_path = tmp_path / "room.wecom.mp4"
+            video_path.write_bytes(b"original-video")
+            transcoded_path.write_bytes(b"transcoded-video")
+
+            def fake_prepare(path: Path, *, force: bool = False, **kwargs) -> Path:
+                assert force is True
+                transcode_calls.append(str(path))
+                return transcoded_path
+
+            main.prepare_wecom_video = fake_prepare
+            first = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context={
+                    "structured_memory": {
+                        "current_turn_id": "turn-video-1",
+                        "turn_records": [{"turn_id": "turn-video-1", "msgids": ["msg-video-transcode-once"]}],
+                    }
+                },
+                final_reply="",
+                tool_evidence={
+                    "video_paths": [str(video_path)],
+                    "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                },
+                msgids=["msg-video-transcode-once"],
+            )
+            second = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context={
+                    "structured_memory": {
+                        "current_turn_id": "turn-video-restarted",
+                        "turn_records": [{"turn_id": "turn-video-restarted", "msgids": ["msg-video-transcode-once"]}],
+                    }
+                },
+                final_reply="",
+                tool_evidence={
+                    "video_paths": [str(video_path)],
+                    "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                },
+                msgids=["msg-video-transcode-once"],
+            )
+            return first, second, fake, transcode_calls, str(video_path), str(transcoded_path)
+        finally:
+            main.wecom_kf = original_wecom
+            main.prepare_wecom_video = original_prepare
+            main.kf_send_outbox = original_outbox
+
+    first, second, fake, transcode_calls, video_path, transcoded_path = asyncio.run(run_case())
+
+    assert first["sent_actions"] == [
+        {
+            "type": "video",
+            "path": transcoded_path,
+            "room": "星河苑1-101",
+            "count": 1,
+            "source_path": video_path,
+            "transcode_retry": True,
+        }
+    ]
+    assert second["sent_actions"] == []
+    assert fake.video_attempts == [video_path, transcoded_path]
+    assert len(fake.texts) == 1
+    assert transcode_calls == [video_path]
+    assert second["context"]["send_receipts"]["receipts"][-1]["status"] == "skipped_duplicate"
 
 
 def test_video_auth_failure_does_not_transcode_retry(caplog) -> None:
@@ -221,7 +327,14 @@ def test_video_auth_failure_does_not_transcode_retry(caplog) -> None:
     assert result["sent_actions"][0]["type"] == "video_failed"
     receipt = result["context"]["send_receipts"]["receipts"][-1]
     assert receipt["status"] == "failed"
-    assert receipt["metadata"]["transcode_retry"] is False
+    metadata = receipt["metadata"]
+    assert metadata["transcode_retry"] is False
+    assert metadata["outbox_attempt"] == 1
+    assert metadata["failure_stage"] == "first_upload"
+    assert metadata["first_upload_ms"] >= 0
+    assert metadata["transcode_ms"] is None
+    assert metadata["retry_upload_ms"] is None
+    assert metadata["send_total_ms"] >= 0
     dumped = json.dumps(result["context"], ensure_ascii=False)
     assert "access_token" not in dumped
     assert "access_token" not in caplog.text
@@ -279,7 +392,14 @@ def test_video_rate_limit_upload_failure_does_not_transcode_retry(caplog) -> Non
     assert result["sent_actions"][0]["type"] == "video_failed"
     receipt = result["context"]["send_receipts"]["receipts"][-1]
     assert receipt["status"] == "failed"
-    assert receipt["metadata"]["transcode_retry"] is False
+    metadata = receipt["metadata"]
+    assert metadata["transcode_retry"] is False
+    assert metadata["outbox_attempt"] == 1
+    assert metadata["failure_stage"] == "first_upload"
+    assert metadata["first_upload_ms"] >= 0
+    assert metadata["transcode_ms"] is None
+    assert metadata["retry_upload_ms"] is None
+    assert metadata["send_total_ms"] >= 0
     dumped = json.dumps(result["context"], ensure_ascii=False)
     assert "token_CANARY" not in dumped
     assert "token_CANARY" not in caplog.text
