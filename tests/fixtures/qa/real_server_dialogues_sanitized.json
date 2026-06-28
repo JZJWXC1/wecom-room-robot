@@ -1,0 +1,357 @@
+{
+  "schema": "real_server_dialogues_sanitized.v1",
+  "generated_at_utc": "2026-06-28T05:31:11+00:00",
+  "source_file": "kf_dialogue_events.jsonl",
+  "source_note": "Sanitized from server dialogue/event logs. Raw ids, phones, viewing passwords, and secrets are not stored.",
+  "redaction": {
+    "phone": "<PHONE>",
+    "viewing_password": "<VIEWING_PASSWORD>",
+    "secret": "<REDACTED_SECRET>",
+    "long_identifier": "<ID>"
+  },
+  "line_count": 31798,
+  "extracted_turn_count": 45051,
+  "window_count": 20,
+  "windows": [
+    {
+      "id": "real_server_001",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "干湿分离",
+        "1500到1900的房子",
+        "干湿分离",
+        "1500到1900的房子",
+        "干湿分离",
+        "1500到1900的房子",
+        "干湿分离",
+        "1500到1900的房子",
+        "骏塘名庭",
+        "干湿分离"
+      ]
+    },
+    {
+      "id": "real_server_002",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "1500到1900的房子",
+        "骏塘名庭",
+        "干湿分离",
+        "1500到1900的房子",
+        "骏塘名庭",
+        "1500到1900的房子",
+        "骏塘名庭",
+        "视频",
+        "1500到1900的房子",
+        "骏塘名庭"
+      ]
+    },
+    {
+      "id": "real_server_003",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "视频",
+        "1500到1900的房子",
+        "骏塘名庭",
+        "视频",
+        "1500到1900的房子",
+        "骏塘名庭",
+        "视频",
+        "骏塘名庭",
+        "视频",
+        "大华海派视频"
+      ]
+    },
+    {
+      "id": "real_server_004",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "骏塘名庭",
+        "视频",
+        "大华海派视频",
+        "骏塘名庭",
+        "视频",
+        "大华海派视频",
+        "骏塘名庭",
+        "视频",
+        "大华海派视频",
+        "骏塘名庭"
+      ]
+    },
+    {
+      "id": "real_server_005",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "视频",
+        "大华海派视频",
+        "骏塘名庭",
+        "视频",
+        "大华海派视频",
+        "小洋坝还有房子出租吗",
+        "房源表",
+        "小洋坝还有房子出租吗",
+        "房源表",
+        "小洋坝还有房子出租吗"
+      ]
+    },
+    {
+      "id": "real_server_006",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "房源表",
+        "小洋坝还有房子出租吗",
+        "房源表",
+        "小洋坝还有房子出租吗",
+        "房源表",
+        "小洋坝还有房子出租吗",
+        "房源表",
+        "华丰视频发一下",
+        "小洋坝还有房子出租吗",
+        "房源表"
+      ]
+    },
+    {
+      "id": "real_server_007",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "华丰视频发一下",
+        "小洋坝还有房子出租吗",
+        "房源表",
+        "华丰视频发一下",
+        "房源表",
+        "华丰视频发一下",
+        "10",
+        "房源表",
+        "华丰视频发一下",
+        "10"
+      ]
+    },
+    {
+      "id": "real_server_008",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "房源表",
+        "华丰视频发一下",
+        "10",
+        "房源表",
+        "华丰视频发一下",
+        "10",
+        "房源表",
+        "华丰视频发一下",
+        "10",
+        "现在你们在租的1500-2000的房子有哪些"
+      ]
+    },
+    {
+      "id": "real_server_009",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "第四套视频发我",
+        "现在你们在租的1500-2000的房子有哪些",
+        "第四套视频发我",
+        "现在你们在租的1500-2000的房子有哪些",
+        "第四套视频发我",
+        "现在你们在租的1500-2000的房子有哪些",
+        "第四套视频发我",
+        "现在你们在租的1500-2000的房子有哪些",
+        "第四套视频发我",
+        "现在你们在租的1500-2000的房子有哪些"
+      ]
+    },
+    {
+      "id": "real_server_010",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "第四套视频发我",
+        "现在你们在租的1500-2000的房子有哪些",
+        "第四套视频发我",
+        "东新园还有那些3000-4500的房子",
+        "第四套视频发我",
+        "东新园还有那些3000-4500的房子",
+        "第5个",
+        "东新园还有那些3000-4500的房子",
+        "第5个",
+        "东新园还有那些3000-4500的房子"
+      ]
+    },
+    {
+      "id": "real_server_011",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "第5个",
+        "东新园还有那些3000-4500的房子",
+        "第5个",
+        "视频发我",
+        "东新园还有那些3000-4500的房子",
+        "第5个",
+        "视频发我",
+        "东新园还有那些3000-4500的房子",
+        "第5个",
+        "视频发我"
+      ]
+    },
+    {
+      "id": "real_server_012",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "东新园还有那些3000-4500的房子",
+        "第5个",
+        "视频发我",
+        "第5个",
+        "视频发我",
+        "我要的是新柠长木府 2-702B的视频",
+        "第5个",
+        "视频发我",
+        "我要的是新柠长木府 2-702B的视频",
+        "第5个"
+      ]
+    },
+    {
+      "id": "real_server_013",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "视频发我",
+        "我要的是新柠长木府 2-702B的视频",
+        "东新园有哪4000以下的房子",
+        "第五套",
+        "东新园有哪4000以下的房子",
+        "第五套",
+        "东新园有哪4000以下的房子",
+        "第五套",
+        "房源表发我一下",
+        "杭行荟的视频发我一下"
+      ]
+    },
+    {
+      "id": "real_server_014",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "房源表发我一下",
+        "杭行荟的视频发我一下",
+        "房源表发我一下",
+        "杭行荟的视频发我一下",
+        "房源表发我一下",
+        "杭行荟的视频发我一下",
+        "杭行荟2-1309",
+        "房源表发我一下",
+        "杭行荟的视频发我一下",
+        "杭行荟2-1309"
+      ]
+    },
+    {
+      "id": "real_server_015",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "房源表发我一下",
+        "杭行荟的视频发我一下",
+        "杭行荟2-1309",
+        "杭行荟的视频发我一下",
+        "杭行荟2-1309",
+        "棠润府15-2-801A",
+        "杭行荟的视频发我一下",
+        "杭行荟2-1309",
+        "棠润府15-2-801A",
+        "杭行荟的视频发我一下"
+      ]
+    },
+    {
+      "id": "real_server_016",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "杭行荟2-1309",
+        "棠润府15-2-801A",
+        "杭行荟2-1309",
+        "棠润府15-2-801A",
+        "杭行荟2-1309",
+        "棠润府15-2-801A",
+        "杭行荟2-1309",
+        "棠润府15-2-801A",
+        "杭行荟2-1309",
+        "这一套今天晚上九点钟能看房吗"
+      ]
+    },
+    {
+      "id": "real_server_017",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "杭行荟2-1309",
+        "这一套今天晚上九点钟能看房吗",
+        "房源表",
+        "合塘悦府燃气阳台视频",
+        "大华海派风景视频",
+        "大华海派风景的视频",
+        "大华海派风景视频",
+        "大华海派风景的视频",
+        "大华海派风景视频",
+        "大华海派风景的视频"
+      ]
+    },
+    {
+      "id": "real_server_018",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "大华海派风景视频",
+        "大华海派风景的视频",
+        "大华海派风景视频",
+        "大华海派风景的视频",
+        "大华海派风景视频",
+        "大华海派风景的视频",
+        "大华海派的",
+        "大华海派风景视频",
+        "大华海派风景的视频",
+        "大华海派的"
+      ]
+    },
+    {
+      "id": "real_server_019",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "大华海派风景视频",
+        "大华海派风景的视频",
+        "大华海派的",
+        "大华海派风景的视频",
+        "大华海派的",
+        "大华海派风景的视频",
+        "大华海派的",
+        "大华海派风景的视频",
+        "大华海派的",
+        "发我呀"
+      ]
+    },
+    {
+      "id": "real_server_020",
+      "source": "server_log_sanitized",
+      "source_conversation_hash": "unknown",
+      "turns": [
+        "大华海派的",
+        "发我呀",
+        "大华海派的",
+        "发我呀",
+        "大华海派的",
+        "发我呀",
+        "大华海派的",
+        "发我呀",
+        "孔家埭视频",
+        "孔家埭和府视频"
+      ]
+    }
+  ]
+}

@@ -404,9 +404,12 @@ def _turn_problem(turn: dict[str, Any]) -> dict[str, Any]:
     if chain.get("status") in {"error", "no_output", "retry_needed"}:
         problem["severity"] = "high"
         return problem
-    if chain.get("status") == "clarification" and _has_real_entity_clarification_options(turn):
+    if chain.get("status") == "clarification" and (
+        _has_real_entity_clarification_options(turn)
+        or _is_safe_missing_detail_clarification(turn)
+    ):
         problem["severity"] = "info"
-        problem["reason"] = "基于真实房源候选的小区确认，不计入人工复核失败。"
+        problem["reason"] = "基于安全证据边界的澄清追问，不计入人工复核失败。"
         return problem
     if chain.get("status") in {"clarification", "planner_feedback"}:
         problem["severity"] = "medium"
@@ -742,6 +745,322 @@ def _looks_like_confirmation_clarification(clarification: str) -> bool:
     )
 
 
+def _is_safe_missing_detail_clarification(turn: dict[str, Any]) -> bool:
+    rewrite = turn.get("rewrite") or {}
+    bot = turn.get("bot") or {}
+    tool = turn.get("tool") or {}
+    send = turn.get("send") or {}
+    proof = rewrite.get("constraint_proof") or {}
+    query_state = rewrite.get("query_state") if isinstance(rewrite.get("query_state"), dict) else {}
+    structured_task = rewrite.get("structured_task")
+    if not isinstance(structured_task, dict):
+        structured_task = turn.get("structured_task") if isinstance(turn.get("structured_task"), dict) else {}
+    if isinstance(rewrite.get("tool_requirements"), dict):
+        tool_requirements = rewrite.get("tool_requirements") or {}
+    else:
+        tool_requirements = (
+            structured_task.get("tool_requirements")
+            if isinstance(structured_task.get("tool_requirements"), dict)
+            else {}
+        )
+    user_text = str(turn.get("user") or "")
+    clarification = "\n".join(
+        [
+            str(rewrite.get("clarification_text") or ""),
+            *[str(text) for text in bot.get("texts") or []],
+        ]
+    )
+    if not clarification:
+        return False
+    risky_terms = (
+        "暂时没查到",
+        "没查到",
+        "没有房源",
+        "没有合适",
+        "已发送",
+        "发给你",
+        "密码",
+        "门锁",
+        "合同",
+        "定金",
+        "押金",
+        "免押",
+        "价格",
+        "租金",
+        "水电",
+        "空出",
+        "在租",
+        "可看",
+        "预约",
+    )
+    if any(term in clarification for term in risky_terms):
+        return False
+    user_risky_terms = (
+        "多少钱",
+        "一个月多少",
+        "每月多少",
+        "多少一个月",
+        "一月多少钱",
+        "价格",
+        "房源表",
+        "空房表",
+        "库存表",
+        "在租表",
+        "房态表",
+        "表发",
+        "发表",
+        "租金",
+        "房租",
+        "押一付一",
+        "押二付一",
+        "押金",
+        "免押",
+        "服务费",
+        "水电",
+        "电费",
+        "水费",
+        "合同",
+        "签约",
+        "签合同",
+        "定金",
+        "订房",
+        "预定",
+        "密码",
+        "门锁",
+        "看房",
+        "能看",
+        "可看",
+        "可以看",
+        "去看",
+        "约看",
+        "看下",
+        "看一下",
+        "看一看",
+        "方便看",
+        "上门看",
+        "带我看",
+        "带看",
+        "现场看",
+        "实地看",
+        "预约",
+        "自己看",
+        "自助",
+        "自助看",
+        "钥匙",
+        "门禁",
+        "门禁码",
+        "开门",
+        "怎么进",
+        "进去",
+        "进得去",
+        "进门",
+        "进屋",
+        "进房",
+        "空吗",
+        "空房",
+        "空不空",
+        "空着",
+        "空了",
+        "空出",
+        "空出来",
+        "什么时候空",
+        "哪天空",
+        "还在吗",
+        "还在",
+        "在不在",
+        "在租吗",
+        "有吗",
+        "有没有",
+        "有哪些",
+        "有房",
+        "还有吗",
+        "还有房",
+        "什么时候入住",
+        "什么时候可以入住",
+        "什么时候能入住",
+        "能入住",
+        "入住",
+        "入住时间",
+        "能住",
+        "搬",
+        "现房",
+        "空置",
+        "能租",
+        "可租",
+        "能不能租",
+        "可以租",
+        "租掉",
+        "租出去",
+        "租出",
+        "租了没",
+        "租没租",
+        "已租",
+        "出租",
+        "被租",
+        "租了吗",
+        "定掉",
+        "定出去",
+        "定了",
+        "定了吗",
+        "定了没",
+        "被定",
+        "订掉",
+        "订出去",
+        "订了",
+        "订了吗",
+        "订了没",
+        "被订",
+        "预定",
+        "预订",
+        "被预定",
+        "被预订",
+        "退租",
+        "可以住",
+        "住进去",
+        "空的",
+        "退房",
+    )
+    if any(term in user_text for term in user_risky_terms):
+        return False
+    content_wants_viewing = getattr(main, "_content_wants_viewing", None)
+    if callable(content_wants_viewing):
+        try:
+            if content_wants_viewing(user_text):
+                return False
+        except Exception:
+            pass
+    for signal_func_name in ("_content_wants_price", "_content_wants_deposit"):
+        signal_func = getattr(main, signal_func_name, None)
+        if callable(signal_func):
+            try:
+                if signal_func(user_text):
+                    return False
+            except Exception:
+                pass
+    deterministic_signals = getattr(main, "_deterministic_signals", None)
+    if callable(deterministic_signals):
+        try:
+            signals = deterministic_signals(user_text)
+        except Exception:
+            signals = {}
+        if isinstance(signals, dict) and any(
+            signals.get(key)
+            for key in (
+                "wants_access",
+                "wants_contract_contact",
+                "wants_deposit",
+                "wants_inventory_sheet",
+                "wants_password",
+                "wants_price_contact",
+                "wants_viewing",
+            )
+        ):
+            return False
+    access_markers = ("门", "门禁", "门锁", "钥匙", "密码", "进门", "进屋", "进房", "进去")
+    access_actions = ("开", "怎么", "进", "发", "拿", "给", "能", "可以")
+    if any(marker in user_text for marker in access_markers) and any(action in user_text for action in access_actions):
+        return False
+    onsite_viewing_markers = (
+        "过去",
+        "上门",
+        "现场",
+        "有人带",
+        "带我",
+        "带看",
+        "安排",
+        "方便",
+        "提前联系",
+        "自助",
+    )
+    if any(term in user_text for term in onsite_viewing_markers):
+        return False
+    risky_intents = {
+        "access",
+        "contract",
+        "contract_contact",
+        "deposit",
+        "inventory_sheet",
+        "password",
+        "price",
+        "rent",
+        "utilities",
+        "viewing",
+    }
+    if str(rewrite.get("intent") or query_state.get("intent") or "").strip().lower() in risky_intents:
+        return False
+    risky_proof_keys = (
+        "asks_access",
+        "asks_password",
+        "wants_access",
+        "wants_contract",
+        "wants_contract_contact",
+        "wants_deposit",
+        "wants_inventory_sheet",
+        "wants_password",
+        "wants_price",
+        "wants_rent",
+        "wants_utilities",
+        "wants_viewing",
+    )
+    if any(
+        proof.get(key)
+        for key in risky_proof_keys
+    ):
+        return False
+    risky_state_keys = (
+        "access",
+        "asks_password",
+        "budget_range",
+        "contract",
+        "deposit",
+        "password",
+        "price",
+        "price_range",
+        "rent",
+        "room_status",
+        "status",
+        "utilities",
+        "viewing",
+        "wants_contract_contact",
+        "wants_inventory_sheet",
+        "wants_password",
+        "wants_price",
+        "wants_utilities",
+        "wants_viewing",
+    )
+    if any(query_state.get(key) for key in risky_state_keys):
+        return False
+    risky_requirement_keys = (
+        "needs_access",
+        "needs_contract",
+        "needs_contract_contact",
+        "needs_deposit",
+        "needs_deposit_policy",
+        "needs_inventory_sheet",
+        "needs_password",
+        "needs_price",
+        "needs_price_contact",
+        "needs_rent",
+        "needs_room_status",
+        "needs_utilities",
+        "needs_viewing",
+        "needs_viewing_policy",
+    )
+    if any(tool_requirements.get(key) for key in risky_requirement_keys):
+        return False
+    if any(tool.get(key) for key in ("inventory_rows", "target_rows")):
+        return False
+    if any(_int_count(tool.get(key)) > 0 for key in ("image_count", "video_count")):
+        return False
+    if any(_int_count(bot.get(key)) > 0 for key in ("image_count", "video_count")):
+        return False
+    if send.get("actions"):
+        return False
+    if any(_int_count(send.get(key)) > 0 for key in ("image_count", "video_count")):
+        return False
+    return True
+
+
 def _stage_entries(turn: dict[str, Any], stage: str) -> list[dict[str, Any]]:
     return [
         item
@@ -958,6 +1277,7 @@ def _enrich_turn_report(
         "intent": rewrite.get("intent") or "",
         "query_state": rewrite.get("query_state") or {},
         "constraint_proof": rewrite.get("constraint_proof") or {},
+        "tool_requirements": rewrite.get("tool_requirements") or {},
         "needs_clarification": bool(rewrite.get("needs_clarification")),
         "clarification_text": rewrite.get("clarification_text") or "",
         "read_blackbox": bool(rewrite),

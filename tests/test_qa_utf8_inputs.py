@@ -528,6 +528,410 @@ def test_qa_problem_keeps_not_found_clarification_as_medium() -> None:
     assert problem["severity"] == "medium"
 
 
+def test_qa_problem_allows_safe_missing_detail_clarification_without_tool_claims() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "想找附近的房子。",
+            "bot": {"texts": ["你想看哪个小区或者大概预算多少？发一下我再按最新房源表帮你筛。"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你想看哪个小区或者大概预算多少？发一下我再按最新房源表帮你筛。",
+                "constraint_proof": {},
+            },
+            "tool": {"target_rows": [], "inventory_rows": []},
+        }
+    )
+
+    assert problem["severity"] == "info"
+
+
+def test_qa_problem_keeps_sensitive_missing_detail_clarification_as_medium() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "门锁密码发我。",
+            "bot": {"texts": ["你要哪套房子的密码？"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你要哪套房子的密码？",
+                "constraint_proof": {"wants_access": True},
+            },
+            "tool": {"target_rows": [], "inventory_rows": []},
+        }
+    )
+
+    assert problem["severity"] == "medium"
+
+
+def test_qa_problem_keeps_price_flag_clarification_as_medium() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "这套多少钱？",
+            "bot": {"texts": ["你说的是哪套房？"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你说的是哪套房？",
+                "constraint_proof": {"wants_price": True},
+            },
+        }
+    )
+
+    assert problem["severity"] == "medium"
+
+
+def test_qa_problem_keeps_user_viewing_text_clarification_as_medium() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "今天能自己看吗？",
+            "bot": {"texts": ["你说的是哪套房？"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你说的是哪套房？",
+                "constraint_proof": {},
+            },
+        }
+    )
+
+    assert problem["severity"] == "medium"
+
+
+def test_qa_problem_keeps_contract_contact_key_clarification_as_medium() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "签合同找谁？",
+            "bot": {"texts": ["你说的是哪套房？"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你说的是哪套房？",
+                "constraint_proof": {"wants_contract_contact": True},
+            },
+        }
+    )
+
+    assert problem["severity"] == "medium"
+
+
+def test_qa_problem_reuses_price_and_booking_signals_as_medium() -> None:
+    for user_text in (
+        "月租多少？",
+        "多少一月？",
+        "一个月多少？",
+        "怎么定房？",
+        "定房找谁？",
+        "订金多少？",
+        "交订金怎么交？",
+    ):
+        problem = run_rag_10windows_10turns_utf8._turn_problem(
+            {
+                "user": user_text,
+                "bot": {"texts": ["你说的是哪套房？"]},
+                "chain_judgment": {
+                    "status": "clarification",
+                    "likely_link": "问题重写/意图分析",
+                    "reason": "意图层生成追问。",
+                },
+                "rewrite": {
+                    "clarification_text": "你说的是哪套房？",
+                    "constraint_proof": {},
+                },
+            }
+        )
+
+        assert problem["severity"] == "medium", user_text
+
+
+def test_qa_problem_keeps_inventory_sheet_requests_as_medium() -> None:
+    for user_text in ("房源表发我", "空房表发一下", "表发我"):
+        problem = run_rag_10windows_10turns_utf8._turn_problem(
+            {
+                "user": user_text,
+                "bot": {"texts": ["你想看哪个小区？"]},
+                "chain_judgment": {
+                    "status": "clarification",
+                    "likely_link": "问题重写/意图分析",
+                    "reason": "意图层生成追问。",
+                },
+                "rewrite": {
+                    "clarification_text": "你想看哪个小区？",
+                    "constraint_proof": {},
+                },
+            }
+        )
+
+        assert problem["severity"] == "medium", user_text
+
+
+def test_qa_problem_keeps_inventory_sheet_structural_signals_as_medium() -> None:
+    cases = (
+        {"intent": "inventory_sheet", "constraint_proof": {}, "query_state": {}},
+        {"intent": "general", "constraint_proof": {"wants_inventory_sheet": True}, "query_state": {}},
+        {"intent": "general", "constraint_proof": {}, "query_state": {"wants_inventory_sheet": True}},
+    )
+    for rewrite in cases:
+        problem = run_rag_10windows_10turns_utf8._turn_problem(
+            {
+                "user": "最新表格给我",
+                "bot": {"texts": ["你想看哪个小区？"]},
+                "chain_judgment": {
+                    "status": "clarification",
+                    "likely_link": "问题重写/意图分析",
+                    "reason": "意图层生成追问。",
+                },
+                "rewrite": {
+                    "clarification_text": "你想看哪个小区？",
+                    **rewrite,
+                },
+            }
+        )
+
+        assert problem["severity"] == "medium", rewrite
+
+
+def test_qa_problem_keeps_query_state_and_tool_requirement_risks_as_medium() -> None:
+    price_problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "哪套合适？",
+            "bot": {"texts": ["你说的是哪套房？"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你说的是哪套房？",
+                "query_state": {"price_range": [3000, 4000]},
+                "constraint_proof": {},
+            },
+        }
+    )
+    viewing_problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "哪套合适？",
+            "bot": {"texts": ["你说的是哪套房？"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你说的是哪套房？",
+                "constraint_proof": {},
+                "structured_task": {"tool_requirements": {"needs_viewing_policy": True}},
+            },
+        }
+    )
+    price_contact_problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "哪套合适？",
+            "bot": {"texts": ["你说的是哪套房？"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你说的是哪套房？",
+                "constraint_proof": {},
+                "tool_requirements": {"needs_price_contact": True},
+            },
+        }
+    )
+    deposit_policy_problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "哪套合适？",
+            "bot": {"texts": ["你说的是哪套房？"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你说的是哪套房？",
+                "constraint_proof": {},
+                "tool_requirements": {"needs_deposit_policy": True},
+            },
+        }
+    )
+
+    assert price_problem["severity"] == "medium"
+    assert viewing_problem["severity"] == "medium"
+    assert price_contact_problem["severity"] == "medium"
+    assert deposit_policy_problem["severity"] == "medium"
+
+
+def test_qa_problem_keeps_availability_user_text_clarifications_as_medium() -> None:
+    for user_text in (
+        "这套还在？",
+        "这套还有吗？",
+        "现在空不空？",
+        "什么时候可以入住？",
+        "有房吗？",
+        "这套在不在？",
+        "这套什么时候空出？",
+        "空出来了吗？",
+        "什么时候能入住？",
+        "现在能入住吗？",
+        "这套还空着吗？",
+        "空了吗？",
+        "空了没？",
+        "什么时候空？",
+        "哪天空？",
+        "现在能住吗？",
+        "什么时候能搬？",
+        "什么时候能搬进去？",
+        "现在能搬进去吗？",
+        "现房吗？",
+        "已经空置了吗？",
+        "能租吗？",
+        "还 能租吗？",
+        "可租吗？",
+        "能不能租？",
+        "可以租吗？",
+        "什么时候退租？",
+        "退租了吗？",
+        "这套租掉了吗？",
+        "这套租出去了吗？",
+        "还没租掉吧？",
+        "被租了吗？",
+        "出租了吗？",
+        "已经租了没？",
+        "这套定掉了吗？",
+        "已经定了吗？",
+        "定出去了吗？",
+        "预定了吗？",
+        "现在可以住吗？",
+        "什么时候可以住？",
+        "几号可以住进去？",
+        "还有空的吗？",
+        "什么时候退房？",
+    ):
+        problem = run_rag_10windows_10turns_utf8._turn_problem(
+            {
+                "user": user_text,
+                "bot": {"texts": ["你说的是哪套房？"]},
+                "chain_judgment": {
+                    "status": "clarification",
+                    "likely_link": "问题重写/意图分析",
+                    "reason": "意图层生成追问。",
+                },
+                "rewrite": {
+                    "clarification_text": "你说的是哪套房？",
+                    "constraint_proof": {},
+                },
+            }
+        )
+
+        assert problem["severity"] == "medium", user_text
+
+
+def test_qa_problem_keeps_viewing_and_access_user_text_as_medium() -> None:
+    for user_text in (
+        "可以看吗？",
+        "可以去看吗？",
+        "能约看吗？",
+        "约个时间看下可以吗？",
+        "明天方便看吗？",
+        "这套有钥匙吗？",
+        "门禁码发一下？",
+        "怎么开门？",
+        "门禁怎么进？",
+        "能带看吗？",
+        "可以现场看一下吗？",
+        "可以上门看吗？",
+        "能带我看吗？",
+        "能进去吗？",
+        "进得去吗？",
+        "可以自助吗？",
+        "可以自助看吗？",
+        "门怎么开？",
+        "现在能过去吗？",
+        "我等下过去可以吗？",
+        "能去现场吗？",
+        "现场可以吗？",
+        "有人带吗？",
+        "要提前联系吗？",
+    ):
+        problem = run_rag_10windows_10turns_utf8._turn_problem(
+            {
+                "user": user_text,
+                "bot": {"texts": ["你说的是哪套房？"]},
+                "chain_judgment": {
+                    "status": "clarification",
+                    "likely_link": "问题重写/意图分析",
+                    "reason": "意图层生成追问。",
+                },
+                "rewrite": {
+                    "clarification_text": "你说的是哪套房？",
+                    "constraint_proof": {},
+                },
+            }
+        )
+
+        assert problem["severity"] == "medium", user_text
+
+
+def test_qa_problem_uses_real_rewrite_tool_requirements_for_risk() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "哪套合适？",
+            "bot": {"texts": ["你说的是哪套房？"]},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你说的是哪套房？",
+                "constraint_proof": {},
+                "tool_requirements": {"needs_viewing_policy": True},
+            },
+        }
+    )
+
+    assert problem["severity"] == "medium"
+
+
+def test_qa_problem_allows_media_missing_target_clarification_without_send_actions() -> None:
+    problem = run_rag_10windows_10turns_utf8._turn_problem(
+        {
+            "user": "视频发我。",
+            "bot": {"texts": ["你要哪套房间的视频？发一下小区和房号我再找。"], "video_count": 0},
+            "chain_judgment": {
+                "status": "clarification",
+                "likely_link": "问题重写/意图分析",
+                "reason": "意图层生成追问。",
+            },
+            "rewrite": {
+                "clarification_text": "你要哪套房间的视频？发一下小区和房号我再找。",
+                "constraint_proof": {"wants_video": True},
+            },
+            "tool": {"target_rows": [], "inventory_rows": [], "video_count": 0},
+            "send": {"actions": []},
+        }
+    )
+
+    assert problem["severity"] == "info"
+
+
 def test_qa_problem_detects_area_query_narrowed_to_specific_community() -> None:
     problem = run_rag_10windows_10turns_utf8._turn_problem(
         {

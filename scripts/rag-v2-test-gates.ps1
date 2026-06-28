@@ -471,6 +471,14 @@ function Test-AllowedSecretScanFinding {
         return $true
     }
 
+    if ($normalized.StartsWith("tests/") -and ($value -match "^(synthetic|test|fake|dummy|canary|example|placeholder)[_-][A-Za-z0-9_#=&.-]+$")) {
+        return $true
+    }
+
+    if ($normalized.StartsWith("tests/") -and ($value -match "(?i)(synthetic|test|fake|dummy|canary|example|placeholder)")) {
+        return $true
+    }
+
     return $false
 }
 

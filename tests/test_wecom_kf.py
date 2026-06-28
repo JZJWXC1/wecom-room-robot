@@ -754,6 +754,111 @@ def test_understand_message_production_skips_legacy_rewrite_and_fallback(monkeyp
     asyncio.run(run_case())
 
 
+def test_understand_message_production_routes_unverified_not_found_to_tools(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                raise AssertionError("production LLM1 must not call legacy rewrite")
+
+            async def build_kf_task_packet(self, **kwargs):
+                legacy_rewrite = kwargs["legacy_rewrite"]
+                legacy_rewrite["intent"] = "inventory"
+                legacy_rewrite["needs_clarification"] = True
+                legacy_rewrite["clarification_text"] = "最新房源表里暂时没查到合峙悦府这个小区。你确认一下小区名。"
+                legacy_rewrite["query_state"] = {"intent": "inventory"}
+                return build_kf_task_packet_shadow(
+                    {
+                        "rewritten_query": kwargs["content"],
+                        "tool_plan": {"actions": ["search_inventory", "generate_reply"]},
+                    },
+                    content=kwargs["content"],
+                    source_label="llm1_production",
+                    mode="production",
+                ).packet
+
+        async def fake_rows(*args, **kwargs):
+            return []
+
+        async def fake_index(*args, **kwargs):
+            return {}
+
+        async def fake_meta(*args, **kwargs):
+            return {}
+
+        fake_reply = FakeReplyGenerator()
+        original_mode = main.settings.kf_dual_llm_mode
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        monkeypatch.setattr(main, "_inventory_rows_for_resolution", fake_rows)
+        monkeypatch.setattr(main, "_inventory_rewrite_index_for_read_context", fake_index)
+        monkeypatch.setattr(main, "_inventory_metadata_for_read_context", fake_meta)
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._understand_message(
+                content="合峙悦府有没有在租房源？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("合峙悦府有没有在租房源？"),
+                inventory_read_context=main._local_inventory_read_context("prod-llm1"),
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert result["needs_clarification"] is False
+        assert result["clarification_text"] == ""
+        assert result["rewrite_layer_not_found_claim_routed_to_tools"] is True
+        assert result["query_state"]["needs_tool_verification"] is True
+        assert result["structured_task"]["clarification"]["reason"] == "rewrite_layer_not_found_claim_routed_to_tools"
+
+    asyncio.run(run_case())
+
+
+def test_understand_message_production_early_return_routes_apply_result(monkeypatch) -> None:
+    async def run_case() -> None:
+        async def fake_apply_llm1_production_task_packet(**kwargs):
+            result = kwargs["result"]
+            result["intent"] = "inventory"
+            result["needs_clarification"] = True
+            result["clarification_text"] = "最新房源表里暂时没查到合峙悦府这个小区。你确认一下小区名。"
+            result["query_state"] = {"intent": "inventory"}
+            result.setdefault("structured_task", {})["clarification"] = {
+                "needed": True,
+                "text": result["clarification_text"],
+            }
+            return result
+
+        async def fake_rows(*args, **kwargs):
+            return []
+
+        async def fake_index(*args, **kwargs):
+            return {}
+
+        async def fake_meta(*args, **kwargs):
+            return {}
+
+        original_mode = main.settings.kf_dual_llm_mode
+        monkeypatch.setattr(main, "_apply_llm1_production_task_packet", fake_apply_llm1_production_task_packet)
+        monkeypatch.setattr(main, "_inventory_rows_for_resolution", fake_rows)
+        monkeypatch.setattr(main, "_inventory_rewrite_index_for_read_context", fake_index)
+        monkeypatch.setattr(main, "_inventory_metadata_for_read_context", fake_meta)
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._understand_message(
+                content="合峙悦府有没有在租房源？",
+                context=kf_context_memory.empty_context(),
+                signals=main._deterministic_signals("合峙悦府有没有在租房源？"),
+                inventory_read_context=main._local_inventory_read_context("prod-llm1"),
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert result["needs_clarification"] is False
+        assert result["clarification_text"] == ""
+        assert result["rewrite_layer_not_found_claim_routed_to_tools"] is True
+        assert result["query_state"]["needs_tool_verification"] is True
+        assert result["structured_task"]["clarification"]["reason"] == "rewrite_layer_not_found_claim_routed_to_tools"
+
+    asyncio.run(run_case())
+
+
 def test_orchestrator_artifact_uses_production_audit_in_production_mode(monkeypatch) -> None:
     def fail_shadow_builder(**kwargs):
         raise AssertionError("production mode must not build mode=shadow artifact")
@@ -2614,6 +2719,7 @@ class MainUnderstandingGuardTests(unittest.IsolatedAsyncioTestCase):
             "query_state": {"intent": "media", "wants_video": True},
             "needs_clarification": True,
             "clarification_text": "未在房源表中找到“华丰欣苑14-2-901”的确切匹配，请确认小区名称或房号是否正确？",
+            "structured_task": {"query_state": {}, "clarification": {"needed": True, "text": "旧澄清"}},
         }
 
         routed = main._route_unverified_not_found_to_tools(result, planner_feedback=None)
@@ -2622,6 +2728,12 @@ class MainUnderstandingGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routed["clarification_text"], "")
         self.assertTrue(routed["rewrite_layer_not_found_claim_routed_to_tools"])
         self.assertTrue(routed["query_state"]["needs_tool_verification"])
+        self.assertTrue(routed["structured_task"]["query_state"]["needs_tool_verification"])
+        self.assertFalse(routed["structured_task"]["clarification"]["needed"])
+        self.assertEqual(
+            routed["structured_task"]["clarification"]["reason"],
+            "rewrite_layer_not_found_claim_routed_to_tools",
+        )
 
     def test_planner_feedback_clarification_is_preserved(self) -> None:
         result = {
@@ -2637,6 +2749,50 @@ class MainUnderstandingGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(routed["needs_clarification"])
         self.assertEqual(routed["clarification_text"], "未在房源表中找到，需要确认。")
+
+    def test_selfcheck_retry_not_found_clarification_is_routed_to_tools(self) -> None:
+        result = {
+            "intent": "inventory",
+            "query_state": {"intent": "inventory"},
+            "needs_clarification": True,
+            "clarification_text": "最新房源表里暂时没查到合峙悦府这个小区。你确认一下小区名。",
+            "structured_task": {"query_state": {}, "clarification": {"needed": True, "text": "旧澄清"}},
+        }
+
+        routed = main._route_unverified_not_found_to_tools(
+            result,
+            planner_feedback={"planner_retry_reason": "final_selfcheck_retry"},
+        )
+
+        self.assertFalse(routed["needs_clarification"])
+        self.assertEqual(routed["clarification_text"], "")
+        self.assertTrue(routed["rewrite_layer_not_found_claim_routed_to_tools"])
+        self.assertTrue(routed["query_state"]["needs_tool_verification"])
+
+    def test_inventory_bound_similar_room_clarification_can_be_preserved(self) -> None:
+        result = {
+            "intent": "viewing",
+            "query_state": {"intent": "viewing"},
+            "needs_clarification": True,
+            "clarification_text": "最新房源表没查到兴业杨家府10-1-304这套，只匹配到相近房号：兴业杨家府3-601。你确认是不是这套？",
+            "structured_task": {"query_state": {}, "clarification": {"needed": True, "text": "旧澄清"}},
+        }
+
+        preserved = main._route_unverified_not_found_to_tools(
+            result,
+            planner_feedback=None,
+            allow_inventory_bound_clarification=True,
+        )
+        routed = main._route_unverified_not_found_to_tools(
+            dict(result),
+            planner_feedback=None,
+            allow_inventory_bound_clarification=False,
+        )
+
+        self.assertTrue(preserved["needs_clarification"])
+        self.assertFalse(preserved.get("rewrite_layer_not_found_claim_routed_to_tools", False))
+        self.assertFalse(routed["needs_clarification"])
+        self.assertTrue(routed["query_state"]["needs_tool_verification"])
 
 
 class WeComKfStateStoreTests(unittest.TestCase):
@@ -4986,12 +5142,13 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             for name, value in originals.items():
                 setattr(main, name, value)
 
-        self.assertTrue(result["needs_clarification"])
+        self.assertFalse(result["needs_clarification"])
         self.assertNotIn("合嵣悦府", result["clarification_text"])
-        self.assertIn("最新房源表没查到", result["clarification_text"])
-        self.assertIn(
+        self.assertEqual(result["clarification_text"], "")
+        self.assertTrue(result["query_state"]["needs_tool_verification"])
+        self.assertEqual(
             result["structured_task"]["clarification"]["reason"],
-            {"clarification_rebased_to_current_inventory", "room_ref_not_found_in_current_inventory"},
+            "rewrite_layer_not_found_claim_routed_to_tools",
         )
 
     async def test_rewrite_drops_stale_room_ref_when_current_query_has_no_room_ref(self) -> None:
@@ -5031,7 +5188,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("room_refs", result["constraint_proof"])
         self.assertTrue(result.get("dropped_inherited_room_refs"))
 
-    async def test_similar_community_with_unmatched_room_ref_mentions_room_missing(self) -> None:
+    async def test_similar_community_with_unmatched_room_ref_routes_not_found_to_tools(self) -> None:
         class FakeReplyGenerator:
             async def rewrite_kf_message(self, **kwargs):
                 return {
@@ -5061,10 +5218,13 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             for name, value in originals.items():
                 setattr(main, name, value)
 
-        self.assertTrue(result["needs_clarification"])
-        self.assertIn("合嵣悦府", result["clarification_text"])
-        self.assertIn("6-1-1204B", result["clarification_text"])
-        self.assertIn("没查到", result["clarification_text"])
+        self.assertFalse(result["needs_clarification"])
+        self.assertEqual(result["clarification_text"], "")
+        self.assertTrue(result["query_state"]["needs_tool_verification"])
+        self.assertEqual(
+            result["structured_task"]["clarification"]["reason"],
+            "rewrite_layer_not_found_claim_routed_to_tools",
+        )
 
     async def test_alias_community_with_matching_room_ref_resolves_without_clarification(self) -> None:
         class FakeReplyGenerator:
@@ -12525,7 +12685,10 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeInventory:
             async def all_rows(self, **kwargs):
-                return []
+                return [
+                    {"小区": "兴业杨家府", "房号": "3-601"},
+                    {"小区": "杨乐府", "房号": "1-101"},
+                ]
 
         calls: list[dict] = []
 

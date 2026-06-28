@@ -4485,13 +4485,20 @@ def _clarification_claims_inventory_not_found(text: str) -> bool:
     )
 
 
-def _route_unverified_not_found_to_tools(result: dict[str, Any], *, planner_feedback: dict[str, Any] | None) -> dict[str, Any]:
-    if planner_feedback:
+def _route_unverified_not_found_to_tools(
+    result: dict[str, Any],
+    *,
+    planner_feedback: dict[str, Any] | None,
+    allow_inventory_bound_clarification: bool = False,
+) -> dict[str, Any]:
+    if planner_feedback and planner_feedback.get("need_rewrite_clarification"):
         return result
     if not result.get("needs_clarification"):
         return result
     clarification = str(result.get("clarification_text") or "")
     if not _clarification_claims_inventory_not_found(clarification):
+        return result
+    if allow_inventory_bound_clarification:
         return result
     intent = _normalize_intent(result.get("intent"), "general")
     if intent not in {"inventory", "media", "viewing", "context_followup", "general"}:
@@ -4503,6 +4510,14 @@ def _route_unverified_not_found_to_tools(result: dict[str, Any], *, planner_feed
     query_state = dict(result.get("query_state") or {})
     query_state["needs_tool_verification"] = True
     result["query_state"] = query_state
+    structured_task = result.get("structured_task")
+    if isinstance(structured_task, dict):
+        structured_task["query_state"] = query_state
+        structured_task["clarification"] = {
+            "needed": False,
+            "text": "",
+            "reason": "rewrite_layer_not_found_claim_routed_to_tools",
+        }
     return result
 
 
@@ -4960,7 +4975,7 @@ async def _understand_message(
         }
         if planner_feedback:
             result["planner_feedback"] = planner_feedback
-        return await _apply_llm1_production_task_packet(
+        result = await _apply_llm1_production_task_packet(
             content=content,
             context=context,
             result=result,
@@ -4968,6 +4983,7 @@ async def _understand_message(
             inventory_index=inventory_index,
             inventory_read_context=inventory_read_context,
         )
+        return _route_unverified_not_found_to_tools(result, planner_feedback=planner_feedback)
     try:
         result = await asyncio.wait_for(
             reply_generator.rewrite_kf_message(
@@ -5322,6 +5338,20 @@ async def _understand_message(
         rewrite_view=rewrite_view,
         inventory_index=inventory_index,
         inventory_read_context=inventory_read_context,
+    )
+    allow_inventory_bound_clarification = bool(
+        result.get("needs_clarification")
+        and "相近房号" in str(result.get("clarification_text") or "")
+        and _clarification_mentions_current_inventory(
+            str(result.get("clarification_text") or ""),
+            resolution_rows,
+            entity_resolution,
+        )
+    )
+    result = _route_unverified_not_found_to_tools(
+        result,
+        planner_feedback=planner_feedback,
+        allow_inventory_bound_clarification=allow_inventory_bound_clarification,
     )
     return result
 
