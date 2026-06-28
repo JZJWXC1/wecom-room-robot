@@ -215,7 +215,7 @@ switch ($Action) {
         Invoke-RemoteCommand "curl -sS http://127.0.0.1:8000/health"
     }
     "Test" {
-        Invoke-RemoteCommand "cd $ProjectDir && .venv/bin/python -m pytest -q"
+        Invoke-RemoteCommand "cd $ProjectDir && test_dir=current && if [ ! -d current ]; then test_dir=.; fi && cd `$test_dir && .venv/bin/python -m pytest -q"
     }
     "Restart" {
         Invoke-RemoteCommand "systemctl restart wecom-room-robot && sleep 2 && systemctl status wecom-room-robot --no-pager && curl -sS http://127.0.0.1:8000/health"
