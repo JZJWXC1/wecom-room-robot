@@ -76,7 +76,7 @@ def test_video_send_failure_records_failed_receipt_and_allows_replay() -> None:
     assert second["sent_actions"] == [{"type": "video", "path": video_path, "room": "星河苑1-101", "count": 1}]
     assert fake.videos == [video_path]
     statuses = [item["status"] for item in second["context"]["send_receipts"]["receipts"]]
-    assert statuses == ["failed", "sent"]
+    assert statuses == ["sent", "failed", "skipped_duplicate", "sent"]
     dumped = json.dumps(second["context"], ensure_ascii=False)
     assert "abc123" not in dumped
     assert "19900009999" not in dumped
@@ -594,6 +594,7 @@ def test_uncertain_video_result_blocks_automatic_replay_after_context_loss(tmp_p
     assert first["context"]["send_receipts"]["receipts"][-1]["status"] == "send_uncertain"
     assert second["context"]["send_receipts"]["receipts"][-1]["status"] == "skipped_duplicate"
     assert [record["status"] for record in records if record["record_type"] == "receipt"] == [
+        "sent",
         "send_uncertain",
         "skipped_duplicate",
     ]
