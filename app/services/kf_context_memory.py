@@ -15,6 +15,10 @@ DEFAULT_TURN_TRACE_LIMIT = 10
 MAX_STRUCTURED_TEXT_CHARS = 500
 MAX_STRUCTURED_ACTION_ITEMS = 10
 SAFE_CONTEXT_SCHEMA_VERSION = "wecom_kf_context.safe.v1"
+DEFAULT_CANDIDATE_TTL_SECONDS = 45 * 60
+DEFAULT_CONFIRMED_ROOM_TTL_SECONDS = 45 * 60
+DEFAULT_ACTIVE_QUERY_STATE_TTL_SECONDS = 45 * 60
+DEFAULT_PENDING_VIDEO_TTL_SECONDS = 2 * 60 * 60
 
 
 def _bounded_int(value: Any, *, default: int = 0, minimum: int = 0) -> int:
@@ -31,6 +35,29 @@ def _bounded_float(value: Any, *, default: float = 0.0, minimum: float = 0.0, ma
     except (TypeError, ValueError):
         number = default
     return max(minimum, min(maximum, number))
+
+
+def _timestamp(value: Any, *, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _expiry_timestamp(
+    value: Any,
+    *,
+    created_at: float,
+    ttl_seconds: int | None,
+) -> float:
+    if ttl_seconds is None or ttl_seconds <= 0:
+        return 0.0
+    raw = _timestamp(value, default=0.0)
+    return raw if raw > 0 else created_at + ttl_seconds
+
+
+def _is_expired(*, expires_at: float, current_time: float) -> bool:
+    return bool(expires_at and current_time >= expires_at)
 
 
 def conversation_key(open_kfid: str, external_userid: str) -> str:
@@ -61,10 +88,12 @@ def normalize_last_candidate_set(
     value: Any,
     *,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
+    ttl_seconds: int | None = DEFAULT_CANDIDATE_TTL_SECONDS,
     now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
+    current_time = now()
     candidates = [
         item
         for item in value.get("candidates") or []
@@ -72,37 +101,61 @@ def normalize_last_candidate_set(
     ]
     if not candidates:
         return {}
+    created_at = _timestamp(value.get("created_at"), default=current_time)
+    expires_at = _expiry_timestamp(
+        value.get("expires_at"),
+        created_at=created_at,
+        ttl_seconds=ttl_seconds,
+    )
+    if _is_expired(expires_at=expires_at, current_time=current_time):
+        return {}
     shown_count = _bounded_int(value.get("shown_count"), default=0)
     total_count = _bounded_int(value.get("total_count"), default=len(candidates))
     shown_count = min(shown_count, len(candidates))
-    return {
+    normalized = {
         "intent": str(value.get("intent") or "details"),
         "query": str(value.get("query") or ""),
         "candidates": candidates[:candidate_limit],
-        "created_at": float(value.get("created_at") or now()),
+        "created_at": created_at,
         "inventory_cache_meta": dict(value.get("inventory_cache_meta") or {}),
         "shown_count": shown_count,
         "total_count": max(total_count, len(candidates)),
     }
+    if expires_at:
+        normalized["expires_at"] = expires_at
+    return normalized
 
 
 def normalize_confirmed_room_context(
     value: Any,
     *,
+    ttl_seconds: int | None = DEFAULT_CONFIRMED_ROOM_TTL_SECONDS,
     now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
+    current_time = now()
     row = value.get("row")
     if not isinstance(row, dict):
         return {}
-    return {
+    created_at = _timestamp(value.get("created_at"), default=current_time)
+    expires_at = _expiry_timestamp(
+        value.get("expires_at"),
+        created_at=created_at,
+        ttl_seconds=ttl_seconds,
+    )
+    if _is_expired(expires_at=expires_at, current_time=current_time):
+        return {}
+    normalized = {
         "row": row,
         "label": str(value.get("label") or "").strip(),
         "intent": str(value.get("intent") or "details"),
-        "created_at": float(value.get("created_at") or now()),
+        "created_at": created_at,
         "inventory_cache_meta": dict(value.get("inventory_cache_meta") or {}),
     }
+    if expires_at:
+        normalized["expires_at"] = expires_at
+    return normalized
 
 
 def normalize_reference_confirmation(
@@ -164,9 +217,19 @@ def normalize_last_message_understanding(
 def normalize_active_query_state(
     value: Any,
     *,
+    ttl_seconds: int | None = DEFAULT_ACTIVE_QUERY_STATE_TTL_SECONDS,
     now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
+        return {}
+    current_time = now()
+    created_at = _timestamp(value.get("created_at"), default=current_time)
+    expires_at = _expiry_timestamp(
+        value.get("expires_at"),
+        created_at=created_at,
+        ttl_seconds=ttl_seconds,
+    )
+    if _is_expired(expires_at=expires_at, current_time=current_time):
         return {}
     normalized: dict[str, Any] = {}
     string_keys = (
@@ -193,7 +256,9 @@ def normalize_active_query_state(
         if key in value:
             normalized[key] = bool(value.get(key))
     if normalized:
-        normalized["created_at"] = float(value.get("created_at") or now())
+        normalized["created_at"] = created_at
+        if expires_at:
+            normalized["expires_at"] = expires_at
     return normalized
 
 
@@ -224,23 +289,36 @@ def normalize_active_context_binding(
 def normalize_pending_video_sends(
     value: Any,
     *,
+    ttl_seconds: int | None = DEFAULT_PENDING_VIDEO_TTL_SECONDS,
     now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
+    current_time = now()
     paths = [Path(item) for item in value.get("paths") or [] if item]
     labels = [str(item).strip() for item in value.get("labels") or [] if str(item).strip()]
     if not paths and not labels:
         return {}
-    return {
+    created_at = _timestamp(value.get("created_at"), default=current_time)
+    expires_at = _expiry_timestamp(
+        value.get("expires_at"),
+        created_at=created_at,
+        ttl_seconds=ttl_seconds,
+    )
+    if _is_expired(expires_at=expires_at, current_time=current_time):
+        return {}
+    normalized = {
         "paths": paths[:DEFAULT_CANDIDATE_LIMIT],
         "labels": labels[:DEFAULT_CANDIDATE_LIMIT],
         "reason": str(value.get("reason") or "send_pending"),
-        "created_at": float(value.get("created_at") or now()),
+        "created_at": created_at,
         "attempts": _bounded_int(value.get("attempts"), default=0),
         "requested_count": _bounded_int(value.get("requested_count"), default=len(paths) or len(labels)),
         "sent_count": _bounded_int(value.get("sent_count"), default=0),
     }
+    if expires_at:
+        normalized["expires_at"] = expires_at
+    return normalized
 
 
 def _clip_structured_text(value: Any, *, limit: int = MAX_STRUCTURED_TEXT_CHARS) -> str:
@@ -352,7 +430,9 @@ def _normalize_sent_or_blocked_action(value: Any) -> dict[str, Any]:
         return {}
     action = {
         "type": str(value.get("type") or "").strip(),
+        "subtype": str(value.get("subtype") or "").strip(),
         "count": _bounded_int(value.get("count"), default=0),
+        "room": _clip_structured_text(value.get("room") or value.get("label"), limit=160),
         "room_keys": [
             str(item).strip()
             for item in list(value.get("room_keys") or [])[:MAX_STRUCTURED_ACTION_ITEMS]
@@ -921,6 +1001,457 @@ def record_structured_assistant_output(
     return context
 
 
+def _contextual_memory_state_summary(
+    context: dict[str, Any],
+    *,
+    now: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    candidate_set = normalize_last_candidate_set(context.get("last_candidate_set"), now=now)
+    confirmed = normalize_confirmed_room_context(context.get("confirmed_room"), now=now)
+    pending = normalize_pending_video_sends(context.get("pending_video_sends"), now=now)
+    summary: dict[str, Any] = {}
+    if candidate_set:
+        summary["candidate_set"] = {
+            "query": candidate_set.get("query", ""),
+            "shown_count": candidate_set.get("shown_count", 0),
+            "total_count": candidate_set.get("total_count", 0),
+            "created_at": candidate_set.get("created_at", 0),
+            "expires_at": candidate_set.get("expires_at", 0),
+        }
+    if confirmed:
+        summary["confirmed_room"] = {
+            "label": confirmed.get("label", ""),
+            "row": summarize_row(confirmed.get("row")),
+            "created_at": confirmed.get("created_at", 0),
+            "expires_at": confirmed.get("expires_at", 0),
+        }
+    if pending:
+        summary["pending_video_sends"] = {
+            "requested_count": pending.get("requested_count", 0),
+            "sent_count": pending.get("sent_count", 0),
+            "labels": pending.get("labels", []),
+            "attempts": pending.get("attempts", 0),
+            "expires_at": pending.get("expires_at", 0),
+        }
+    inventory_read_context = context.get("inventory_read_context")
+    if isinstance(inventory_read_context, dict):
+        summary["inventory_read_context"] = _jsonable_structured_value(inventory_read_context)
+    return summary
+
+
+def _normalize_reducer_candidate_set(
+    value: Any,
+    *,
+    now: Callable[[], float],
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    if str(value.get("action") or "").strip().lower() == "clear":
+        return {"action": "clear"}
+    rows = [
+        row
+        for row in (value.get("candidates") or value.get("rows") or [])
+        if isinstance(row, dict)
+    ]
+    if not rows:
+        return {}
+    current_time = now()
+    return normalize_last_candidate_set(
+        {
+            "intent": value.get("intent") or "inventory",
+            "query": value.get("query") or "",
+            "candidates": rows,
+            "created_at": value.get("created_at") or current_time,
+            "expires_at": value.get("expires_at") or current_time + DEFAULT_CANDIDATE_TTL_SECONDS,
+            "shown_count": value.get("shown_count") or min(len(rows), DEFAULT_CANDIDATE_LIMIT),
+            "total_count": value.get("total_count") or len(rows),
+            "inventory_cache_meta": value.get("inventory_cache_meta") or {},
+        },
+        now=now,
+    )
+
+
+def _normalize_reducer_confirmed_room(
+    value: Any,
+    *,
+    now: Callable[[], float],
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    if str(value.get("action") or "").strip().lower() == "clear":
+        return {"action": "clear"}
+    row = value.get("row")
+    if not isinstance(row, dict):
+        rows = [item for item in value.get("rows") or [] if isinstance(item, dict)]
+        row = rows[0] if rows else None
+    if not isinstance(row, dict):
+        return {}
+    current_time = now()
+    return normalize_confirmed_room_context(
+        {
+            "row": row,
+            "label": value.get("label") or room_key_from_row(row),
+            "intent": value.get("intent") or "details",
+            "created_at": value.get("created_at") or current_time,
+            "expires_at": value.get("expires_at") or current_time + DEFAULT_CONFIRMED_ROOM_TTL_SECONDS,
+            "inventory_cache_meta": value.get("inventory_cache_meta") or {},
+        },
+        now=now,
+    )
+
+
+def _normalize_reducer_pending_video(
+    value: Any,
+    *,
+    now: Callable[[], float],
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    if str(value.get("action") or "").strip().lower() == "clear":
+        return {"action": "clear"}
+    current_time = now()
+    return normalize_pending_video_sends(
+        {
+            "paths": value.get("paths") or [],
+            "labels": value.get("labels") or [],
+            "reason": value.get("reason") or "send_pending",
+            "created_at": value.get("created_at") or current_time,
+            "expires_at": value.get("expires_at") or current_time + DEFAULT_PENDING_VIDEO_TTL_SECONDS,
+            "attempts": value.get("attempts") or 0,
+            "requested_count": value.get("requested_count") or 0,
+            "sent_count": value.get("sent_count") or 0,
+        },
+        now=now,
+    )
+
+
+def _dedupe_texts(values: list[Any]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped
+
+
+def _merge_pending_video_records(
+    existing: dict[str, Any],
+    update: dict[str, Any],
+    *,
+    now: Callable[[], float],
+    attempts_increment: int = 0,
+) -> dict[str, Any]:
+    if update.get("action") == "clear":
+        return {}
+    current_time = now()
+    existing = normalize_pending_video_sends(existing, now=now)
+    update = normalize_pending_video_sends(update, now=now)
+    paths = _dedupe_paths(
+        [Path(item) for item in existing.get("paths") or []]
+        + [Path(item) for item in update.get("paths") or []]
+    )[:DEFAULT_CANDIDATE_LIMIT]
+    labels = _dedupe_texts(
+        list(existing.get("labels") or []) + list(update.get("labels") or [])
+    )[:DEFAULT_CANDIDATE_LIMIT]
+    if not paths and not labels:
+        return {}
+    created_at = current_time if update else float(existing.get("created_at") or current_time)
+    expires_at = (
+        current_time + DEFAULT_PENDING_VIDEO_TTL_SECONDS
+        if update or attempts_increment
+        else float(existing.get("expires_at") or 0)
+    )
+    return normalize_pending_video_sends(
+        {
+            "paths": paths,
+            "labels": labels,
+            "reason": update.get("reason") or existing.get("reason") or "send_pending",
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "attempts": _bounded_int(existing.get("attempts"), default=0) + attempts_increment,
+            "requested_count": max(
+                _bounded_int(existing.get("requested_count"), default=0),
+                _bounded_int(update.get("requested_count"), default=0),
+                len(paths),
+                len(labels),
+            ),
+            "sent_count": max(
+                _bounded_int(existing.get("sent_count"), default=0),
+                _bounded_int(update.get("sent_count"), default=0),
+            ),
+        },
+        now=now,
+    )
+
+
+def _sent_actions_from_result(
+    *,
+    send_result: dict[str, Any] | None,
+    sent_actions: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    raw_actions = sent_actions
+    if raw_actions is None and isinstance(send_result, dict):
+        raw_actions = send_result.get("sent_actions")
+    return [dict(action) for action in raw_actions or [] if isinstance(action, dict)]
+
+
+def _successful_video_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [action for action in actions if str(action.get("type") or "") == "video"]
+
+
+def _failed_video_actions(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        action
+        for action in actions
+        if str(action.get("type") or "") in {"video_failed", "video_blocked"}
+    ]
+
+
+def _video_action_matches_pending(action: dict[str, Any], pending: dict[str, Any]) -> bool:
+    path = str(action.get("path") or "").strip()
+    label = str(action.get("room") or action.get("label") or "").strip()
+    pending_paths = {str(item) for item in pending.get("paths") or []}
+    pending_labels = {str(item) for item in pending.get("labels") or []}
+    return bool((path and path in pending_paths) or (label and label in pending_labels))
+
+
+def _remove_successful_videos_from_pending(
+    pending: dict[str, Any],
+    actions: list[dict[str, Any]],
+    *,
+    now: Callable[[], float],
+) -> dict[str, Any]:
+    if not pending:
+        return {}
+    sent_paths = {str(action.get("path") or "").strip() for action in actions}
+    sent_labels = {
+        str(action.get("room") or action.get("label") or "").strip()
+        for action in actions
+    }
+    sent_paths.discard("")
+    sent_labels.discard("")
+    remaining_paths = [
+        Path(path)
+        for path in pending.get("paths") or []
+        if str(path) not in sent_paths
+    ]
+    remaining_labels = [
+        label
+        for label in pending.get("labels") or []
+        if str(label) not in sent_labels
+    ]
+    if not remaining_paths and not remaining_labels:
+        return {}
+    current_time = now()
+    return normalize_pending_video_sends(
+        {
+            **pending,
+            "paths": remaining_paths,
+            "labels": remaining_labels,
+            "sent_count": max(
+                _bounded_int(pending.get("sent_count"), default=0),
+                len(actions),
+            ),
+            "expires_at": current_time + DEFAULT_PENDING_VIDEO_TTL_SECONDS,
+        },
+        now=now,
+    )
+
+
+def _pending_video_source_used(tool_evidence: dict[str, Any] | None) -> bool:
+    if not isinstance(tool_evidence, dict):
+        return False
+    media_status = tool_evidence.get("media_status")
+    if not isinstance(media_status, dict):
+        return False
+    video_status = media_status.get("video")
+    if not isinstance(video_status, dict):
+        return False
+    sync_status = video_status.get("sync_status")
+    return isinstance(sync_status, dict) and sync_status.get("source") == "pending_video_sends"
+
+
+def _record_reduced_assistant_output(
+    context: dict[str, Any],
+    *,
+    draft_reply: str,
+    final_reply: str,
+    sent_actions: list[dict[str, Any]],
+    now: Callable[[], float],
+) -> dict[str, Any]:
+    candidate_state = _contextual_memory_state_summary(context, now=now)
+    actions = sent_actions or []
+    if not actions:
+        return record_structured_assistant_output(
+            context,
+            draft_reply=draft_reply,
+            final_reply=final_reply,
+            candidate_state=candidate_state,
+            now=now,
+        ) or context
+    for action in actions:
+        context = record_structured_assistant_output(
+            context,
+            draft_reply=draft_reply,
+            final_reply=final_reply if str(action.get("type") or "") == "text" else "",
+            sent_action=action,
+            candidate_state=candidate_state,
+            now=now,
+        ) or context
+    return context
+
+
+def reduce_turn_context(
+    previous_context: dict[str, Any] | None,
+    *,
+    understanding: dict[str, Any] | None,
+    tool_evidence: dict[str, Any] | None,
+    send_result: dict[str, Any] | None = None,
+    sent_actions: list[dict[str, Any]] | None = None,
+    final_package: dict[str, Any] | None = None,
+    now: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    current = dict(previous_context or empty_context(now=now))
+    current_time = now()
+    understanding = understanding if isinstance(understanding, dict) else {}
+    tool_evidence = tool_evidence if isinstance(tool_evidence, dict) else {}
+    final_package = final_package if isinstance(final_package, dict) else {}
+    reducer_meta: dict[str, Any] = {}
+    for source in (
+        understanding.get("memory_reducer"),
+        tool_evidence.get("memory_reducer"),
+        final_package.get("memory_reducer"),
+    ):
+        if isinstance(source, dict):
+            reducer_meta.update(source)
+
+    # Expire contextual fields before applying this turn's reducer output.
+    candidate_set = normalize_last_candidate_set(current.get("last_candidate_set"), now=now)
+    if candidate_set:
+        current["last_candidate_set"] = candidate_set
+    else:
+        current.pop("last_candidate_set", None)
+    confirmed = normalize_confirmed_room_context(current.get("confirmed_room"), now=now)
+    if confirmed:
+        current["confirmed_room"] = confirmed
+    else:
+        current.pop("confirmed_room", None)
+    pending = normalize_pending_video_sends(current.get("pending_video_sends"), now=now)
+    if pending:
+        current["pending_video_sends"] = pending
+    else:
+        current.pop("pending_video_sends", None)
+    active_query_state = normalize_active_query_state(current.get("active_query_state"), now=now)
+    if active_query_state:
+        current["active_query_state"] = active_query_state
+    else:
+        current.pop("active_query_state", None)
+
+    if reducer_meta.get("clear_room_context"):
+        current.pop("last_candidate_set", None)
+        current.pop("confirmed_room", None)
+
+    candidate_update = _normalize_reducer_candidate_set(
+        reducer_meta.get("last_candidate_set") or reducer_meta.get("candidate_set"),
+        now=now,
+    )
+    if candidate_update.get("action") == "clear":
+        current.pop("last_candidate_set", None)
+    elif candidate_update:
+        current["last_candidate_set"] = candidate_update
+
+    confirmed_update = _normalize_reducer_confirmed_room(
+        reducer_meta.get("confirmed_room"),
+        now=now,
+    )
+    if confirmed_update.get("action") == "clear":
+        current.pop("confirmed_room", None)
+    elif confirmed_update:
+        current["confirmed_room"] = confirmed_update
+
+    raw_query_state = understanding.get("query_state") if isinstance(understanding.get("query_state"), dict) else {}
+    query_state = normalize_active_query_state(
+        {
+            **raw_query_state,
+            "created_at": current_time,
+            "expires_at": current_time + DEFAULT_ACTIVE_QUERY_STATE_TTL_SECONDS,
+        },
+        now=now,
+    )
+    if query_state:
+        current["active_query_state"] = query_state
+    else:
+        current.pop("active_query_state", None)
+
+    actions = _sent_actions_from_result(send_result=send_result, sent_actions=sent_actions)
+    pending_update = _normalize_reducer_pending_video(
+        reducer_meta.get("pending_video_sends"),
+        now=now,
+    )
+    if pending_update.get("action") == "clear":
+        current.pop("pending_video_sends", None)
+        pending = {}
+    elif pending_update:
+        pending = _merge_pending_video_records(
+            current.get("pending_video_sends") or {},
+            pending_update,
+            now=now,
+        )
+    else:
+        pending = normalize_pending_video_sends(current.get("pending_video_sends") or {}, now=now)
+    success_actions = _successful_video_actions(actions)
+    failure_actions = _failed_video_actions(actions)
+    success_matches_pending = any(_video_action_matches_pending(action, pending) for action in success_actions)
+    if success_actions and (_pending_video_source_used(tool_evidence) or success_matches_pending or pending_update):
+        pending = _remove_successful_videos_from_pending(pending, success_actions, now=now)
+    if failure_actions:
+        failure_update = {
+            "paths": [action.get("path") for action in failure_actions if action.get("path")],
+            "labels": [
+                action.get("room") or action.get("label")
+                for action in failure_actions
+                if action.get("room") or action.get("label")
+            ],
+            "reason": "video_send_failed",
+            "requested_count": len(failure_actions),
+        }
+        pending = _merge_pending_video_records(
+            pending,
+            failure_update,
+            now=now,
+            attempts_increment=1,
+        )
+    if pending:
+        current["pending_video_sends"] = pending
+    else:
+        current.pop("pending_video_sends", None)
+
+    final_reply = str(final_package.get("final_reply") or "").strip()
+    draft_reply = str(final_package.get("draft_reply") or final_reply).strip()
+    if final_reply and final_package.get("append_assistant_message", True):
+        if any(str(action.get("type") or "") == "text" for action in actions):
+            current = append_dialog_message(
+                current,
+                role="assistant",
+                content=final_reply,
+                now=now,
+            ) or current
+    if final_reply or draft_reply or actions:
+        current = _record_reduced_assistant_output(
+            current,
+            draft_reply=draft_reply,
+            final_reply=final_reply,
+            sent_actions=actions,
+            now=now,
+        )
+
+    current["updated_at"] = current_time
+    return current
+
+
 def structured_memory_summary(context: dict[str, Any] | None) -> dict[str, Any]:
     if not context:
         return {}
@@ -1042,19 +1573,25 @@ def last_candidate_set(
     context: dict[str, Any] | None,
     *,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
+    now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     if not context:
         return {}
     return normalize_last_candidate_set(
         context.get("last_candidate_set"),
         candidate_limit=candidate_limit,
+        now=now,
     )
 
 
-def pending_video_sends(context: dict[str, Any] | None) -> dict[str, Any]:
+def pending_video_sends(
+    context: dict[str, Any] | None,
+    *,
+    now: Callable[[], float] = time.time,
+) -> dict[str, Any]:
     if not context:
         return {}
-    return normalize_pending_video_sends(context.get("pending_video_sends"))
+    return normalize_pending_video_sends(context.get("pending_video_sends"), now=now)
 
 
 def remember_pending_video_sends(
@@ -1068,6 +1605,7 @@ def remember_pending_video_sends(
     now: Callable[[], float] = time.time,
 ) -> dict[str, Any]:
     current = context or empty_context(now=now)
+    current_time = now()
     existing = normalize_pending_video_sends(current.get("pending_video_sends"), now=now)
     existing_paths = [Path(item) for item in existing.get("paths") or [] if item]
     pending_paths = _dedupe_paths(existing_paths + paths)[:DEFAULT_CANDIDATE_LIMIT]
@@ -1077,7 +1615,8 @@ def remember_pending_video_sends(
         "paths": pending_paths,
         "labels": pending_labels,
         "reason": reason or existing.get("reason") or "send_pending",
-        "created_at": float(existing.get("created_at") or now()),
+        "created_at": float(existing.get("created_at") or current_time),
+        "expires_at": current_time + DEFAULT_PENDING_VIDEO_TTL_SECONDS,
         "attempts": _bounded_int(existing.get("attempts"), default=0),
         "requested_count": max(_bounded_int(requested_count), _bounded_int(existing.get("requested_count"))),
         "sent_count": max(_bounded_int(sent_count), _bounded_int(existing.get("sent_count"))),
@@ -1104,10 +1643,11 @@ def clear_pending_video_sends(
     context: dict[str, Any] | None,
     *,
     sent_paths: list[Path] | None = None,
+    now: Callable[[], float] = time.time,
 ) -> dict[str, Any] | None:
     if not context:
         return None
-    pending = normalize_pending_video_sends(context.get("pending_video_sends"))
+    pending = normalize_pending_video_sends(context.get("pending_video_sends"), now=now)
     if not pending:
         context["pending_video_sends"] = {}
         return context

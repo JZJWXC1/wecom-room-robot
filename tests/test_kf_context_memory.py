@@ -59,7 +59,7 @@ def test_normalize_media_context_keeps_only_current_rag_state() -> None:
         "updated_at": 3,
     }
 
-    normalized = kf_context_memory.normalize_media_context(context, candidate_limit=10)
+    normalized = kf_context_memory.normalize_media_context(context, candidate_limit=10, now=lambda: 3)
 
     assert normalized["image_paths"] == [Path("a.png")]
     assert normalized["video_paths"] == [Path("v.mp4")]
@@ -344,7 +344,6 @@ def test_last_candidate_set_replaces_old_pending_confirmation_state() -> None:
             "query": "拱墅万达1500左右",
             "intent": "inventory",
             "candidates": [{"小区": "荣润府", "房号": "15-2-801B"}],
-            "created_at": 20,
             "shown_count": 1,
             "total_count": 6,
         }
@@ -376,12 +375,12 @@ def test_pending_video_sends_are_deduped_and_clearable() -> None:
         now=lambda: 11,
     )
 
-    pending = kf_context_memory.pending_video_sends(context)
+    pending = kf_context_memory.pending_video_sends(context, now=lambda: 11)
     assert pending["paths"] == [Path("a.mp4"), Path("b.mp4"), Path("c.mp4")]
     assert pending["requested_count"] == 3
 
-    context = kf_context_memory.clear_pending_video_sends(context, sent_paths=[Path("a.mp4")])
-    assert kf_context_memory.pending_video_sends(context)["paths"] == [Path("b.mp4"), Path("c.mp4")]
+    context = kf_context_memory.clear_pending_video_sends(context, sent_paths=[Path("a.mp4")], now=lambda: 11)
+    assert kf_context_memory.pending_video_sends(context, now=lambda: 11)["paths"] == [Path("b.mp4"), Path("c.mp4")]
 
 
 def test_structured_memory_records_minimal_turn_records_and_assistant_summary() -> None:
