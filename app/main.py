@@ -8913,14 +8913,26 @@ def _has_tool_grounded_reply_fallback(tool_evidence: dict[str, Any]) -> bool:
     )
 
 
+def _inventory_reply_rows_from_evidence(tool_evidence: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in (
+            tool_evidence.get("target_rows")
+            or tool_evidence.get("inventory_rows")
+            or []
+        )
+        if isinstance(row, dict)
+    ]
+
+
 def _can_use_inventory_reply_when_planner_missing(
     understanding: dict[str, Any],
     tool_evidence: dict[str, Any],
 ) -> bool:
     actions = [str(action) for action in tool_evidence.get("actions") or []]
-    if not any(action in actions for action in ("search_inventory", "compact_listing")):
+    if not any(action in actions for action in ("search_inventory", "compact_listing", "continue_search")):
         return False
-    if not tool_evidence.get("inventory_rows"):
+    if not _inventory_reply_rows_from_evidence(tool_evidence):
         return False
     action_blockers = {
         "send_video",
@@ -8930,6 +8942,11 @@ def _can_use_inventory_reply_when_planner_missing(
         "explain_missing_media",
     }
     if any(action in action_blockers for action in actions):
+        return False
+    if any(
+        tool_evidence.get(key)
+        for key in ("inventory_read_error", "selection_error", "field_target_error")
+    ):
         return False
     proof = dict(understanding.get("constraint_proof") or {})
     task = dict(understanding.get("structured_task") or {})
@@ -8943,6 +8960,23 @@ def _can_use_inventory_reply_when_planner_missing(
     ):
         return False
     return True
+
+
+def _can_use_grounded_inventory_reply_fallback(
+    understanding: dict[str, Any],
+    tool_evidence: dict[str, Any],
+) -> bool:
+    if not _can_use_inventory_reply_when_planner_missing(understanding, tool_evidence):
+        return False
+    actions = {str(action) for action in tool_evidence.get("actions") or [] if str(action)}
+    inventory_only_actions = {
+        "search_inventory",
+        "compact_listing",
+        "continue_search",
+        "context_tools",
+        "generate_reply",
+    }
+    return actions.issubset(inventory_only_actions)
 
 
 def _planner_reply_conflicts_with_inventory_rows(reply: str, tool_evidence: dict[str, Any]) -> bool:
@@ -9569,32 +9603,45 @@ async def _generate_reply_result(
                 "planner_retry_reason": retry_payload,
             }
         if llm2_retry_reason:
-            gate_selfcheck = {
-                "status": "retry",
-                "source": "llm2_production_output_gate",
-                "reason": llm2_retry_reason,
-                "retry_target": "llm1_tools",
-            }
-            return {
-                "reply": "",
-                "draft_reply": draft_reply,
-                "planner_reply_result": planner_reply_result,
-                "context": context,
-                "selfcheck": {
+            grounded_fallback = (
+                _final_inventory_evidence_fallback(understanding, tool_evidence)
+                if _can_use_grounded_inventory_reply_fallback(understanding, tool_evidence)
+                else ""
+            )
+            if grounded_fallback:
+                draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(grounded_fallback)
+                deterministic_reply_source = "tool_grounded_reply"
+                tool_evidence["llm2_production_grounded_fallback_used"] = True
+                tool_evidence["llm2_production_grounded_fallback_reason"] = safe_artifact_payload(llm2_retry_reason)
+                tool_evidence.pop("suppress_actions", None)
+                tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+            else:
+                gate_selfcheck = {
                     "status": "retry",
-                    "rule": gate_selfcheck,
-                    "llm": production_summary.get("self_review") or gate_selfcheck,
-                },
-                "needs_planner_retry": False,
-                "planner_retry_reason": _llm2_production_retry_reason_payload(
-                    understanding=understanding,
-                    tool_evidence=tool_evidence,
-                    rule_selfcheck=gate_selfcheck,
-                    llm_selfcheck=production_summary.get("self_review") or gate_selfcheck,
-                    reason=llm2_retry_reason,
-                ),
-                "send_blocked": True,
-            }
+                    "source": "llm2_production_output_gate",
+                    "reason": llm2_retry_reason,
+                    "retry_target": "llm1_tools",
+                }
+                return {
+                    "reply": "",
+                    "draft_reply": draft_reply,
+                    "planner_reply_result": planner_reply_result,
+                    "context": context,
+                    "selfcheck": {
+                        "status": "retry",
+                        "rule": gate_selfcheck,
+                        "llm": production_summary.get("self_review") or gate_selfcheck,
+                    },
+                    "needs_planner_retry": False,
+                    "planner_retry_reason": _llm2_production_retry_reason_payload(
+                        understanding=understanding,
+                        tool_evidence=tool_evidence,
+                        rule_selfcheck=gate_selfcheck,
+                        llm_selfcheck=production_summary.get("self_review") or gate_selfcheck,
+                        reason=llm2_retry_reason,
+                    ),
+                    "send_blocked": True,
+                }
         if llm2_rewrite_reason:
             gate_selfcheck = {
                 "status": "rewrite_required",
@@ -9827,21 +9874,15 @@ async def _generate_reply_result(
         if preserve_sendable_actions
         else ""
     )
-    prefer_sendable_action_fallback = bool(sendable_action_fallback) and (
-        reason == "robotic_template_reply"
-        or "多套视频动作" in reason
-        or "多套图片动作" in reason
-        or "逐套说明" in reason
-    )
     fallback = str(
         field_target_error_reply
-        or (sendable_action_fallback if prefer_sendable_action_fallback else "")
+        or (missing_media_reply if tool_evidence.get("missing_media") else "")
+        or (sendable_action_fallback if preserve_sendable_actions else "")
         or missing_media_reply
         or inventory_search_reply
         or llm_selfcheck.get("fallback_reply")
         or rule_selfcheck.get("fallback_reply")
         or rule_selfcheck.get("fallback_text")
-        or sendable_action_fallback
         or settings.default_fallback_reply
     ).strip()
     fallback = _constraint_preserving_inventory_fallback(
@@ -9884,7 +9925,11 @@ async def _generate_reply_result(
     ).lower()
     fallback_llm_status = str(fallback_llm_selfcheck.get("status") or "pass").lower()
     if fallback_rule_status != "pass":
-        inventory_evidence_fallback = _final_inventory_evidence_fallback(understanding, tool_evidence)
+        inventory_evidence_fallback = (
+            _final_inventory_evidence_fallback(understanding, tool_evidence)
+            if _can_use_grounded_inventory_reply_fallback(understanding, tool_evidence)
+            else ""
+        )
         if inventory_evidence_fallback:
             tool_evidence.pop("suppress_actions", None)
             fallback = _normalize_customer_visible_reply_text_before_selfcheck(inventory_evidence_fallback)

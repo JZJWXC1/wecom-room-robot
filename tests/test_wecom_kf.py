@@ -582,6 +582,186 @@ def test_generate_reply_result_production_retries_l3_validation_with_llm2(monkey
     asyncio.run(run_case())
 
 
+def test_llm2_production_second_retry_uses_grounded_inventory_rows(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "杨家新雅苑第1和第3套还在吗",
+                "task_atoms": [
+                    {"task_id": "task-search", "task_type": "inventory_search", "user_text": "1和3"},
+                    {"task_id": "task-reply", "task_type": "reply_text", "user_text": "1和3"},
+                ],
+                "tool_plan": {"actions": ["search_inventory", "compact_listing", "generate_reply"]},
+                "constraints": {"candidate_numbers": [1, 3], "communities": ["杨家新雅苑"]},
+            },
+            content="1和3",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_text="")
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {
+                        "status": "retry",
+                        "reason": "证据缺失：field_values 为空，无法生成话术。",
+                    },
+                }
+
+            async def assess_kf_final_reply(self, **kwargs):
+                raise AssertionError("工具事实兜底不应再进入最终 LLM 自检")
+
+        rows = [
+            {
+                "listing_id": "lst-yjx-46-1204a",
+                "区域": "石桥街道 华丰 石桥 永佳 半山",
+                "小区": "杨家新雅苑",
+                "房号": "46-1204A",
+                "户型描述": "一室一厅",
+                "押一付一": "2500",
+                "押二付一": "2300",
+                "备注": "水30/月，电1元/度",
+                "看房方式密码": "101004# 看房提前联系",
+            },
+            {
+                "listing_id": "lst-yjx-36-1-1102",
+                "区域": "石桥街道 华丰 石桥 永佳 半山",
+                "小区": "杨家新雅苑",
+                "房号": "36-1-1102",
+                "户型描述": "三室一厅",
+                "押一付一": "5600",
+                "押二付一": "5300",
+                "备注": "民用水电",
+                "看房方式密码": "336699# 看房提前联系",
+            },
+        ]
+        tool_evidence = {
+            "actions": ["search_inventory", "compact_listing", "generate_reply"],
+            "inventory_rows": rows,
+            "target_rows": rows,
+            "dual_llm_production": {"llm1": {"status": "pass", "source": "test"}},
+        }
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+        result = await main._generate_reply_result(
+            content="1和3",
+            context=kf_context_memory.empty_context(),
+            understanding={
+                "intent": "inventory",
+                "effective_query": "杨家新雅苑第1和第3套还在吗",
+                "structured_task": {"intent": "inventory", "tool_requirements": {}},
+                "constraint_proof": {"intent": "inventory", "communities": ["杨家新雅苑"], "selected_indices": [1, 3]},
+                "llm1_task_packet": task_packet,
+            },
+            tool_evidence=tool_evidence,
+            planner_result={"actions": ["search_inventory", "compact_listing", "generate_reply"], "reply_text": ""},
+            retry_reason="llm2_production_safe_retry_payload",
+        )
+
+        assert result["needs_planner_retry"] is False
+        assert "杨家新雅苑46-1204A" in result["reply"]
+        assert "杨家新雅苑36-1-1102" in result["reply"]
+        assert "押一付一2500" in result["reply"]
+        assert "押一付一5600" in result["reply"]
+        assert "稍后给您准确回复" not in result["reply"]
+        assert "我先帮您确认一下最新房态" not in result["reply"]
+        assert "101004#" not in result["reply"]
+        assert "336699#" not in result["reply"]
+        assert tool_evidence["deterministic_reply_source"] == "tool_grounded_reply"
+        assert tool_evidence["llm2_production_grounded_fallback_used"] is True
+        assert "suppress_actions" not in tool_evidence
+
+    asyncio.run(run_case())
+
+
+def test_llm2_production_second_retry_does_not_replace_media_actions_with_inventory_list(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "杨家新雅苑第1套视频",
+                "task_atoms": [
+                    {"task_id": "task-video", "task_type": "send_video", "user_text": "第1套视频"},
+                    {"task_id": "task-reply", "task_type": "reply_text", "user_text": "第1套视频"},
+                ],
+                "tool_plan": {"actions": ["search_inventory", "send_video", "generate_reply"]},
+                "constraints": {"candidate_numbers": [1]},
+            },
+            content="第1套视频",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_text="")
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "retry", "reason": "LLM2 timeout/retry"},
+                }
+
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        row = {"listing_id": "lst-yjx-46-1204a", "小区": "杨家新雅苑", "房号": "46-1204A", "户型描述": "一室一厅"}
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            tool_evidence = {
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "media_request": {"wants_video": True, "requested_count": 1},
+                "inventory_rows": [row],
+                "target_rows": [row],
+                "video_rows": [row],
+                "video_paths": [video.name],
+                "dual_llm_production": {"llm1": {"status": "pass", "source": "test"}},
+            }
+            monkeypatch.setattr(main, "agentic_rag", FakeRag())
+            monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+            monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+            result = await main._generate_reply_result(
+                content="第1套视频",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "effective_query": "杨家新雅苑第1套视频",
+                    "structured_task": {"intent": "media", "tool_requirements": {"needs_video": True}},
+                    "constraint_proof": {"intent": "media", "wants_video": True, "selected_indices": [1]},
+                    "llm1_task_packet": task_packet,
+                },
+                tool_evidence=tool_evidence,
+                planner_result={"actions": ["search_inventory", "send_video", "generate_reply"], "reply_text": ""},
+                retry_reason="llm2_production_safe_retry_payload",
+            )
+
+        assert result["needs_planner_retry"] is False
+        assert result["send_blocked"] is True
+        assert result["reply"] == ""
+        assert tool_evidence.get("deterministic_reply_source") != "llm2_production_safe_fallback"
+        assert tool_evidence.get("llm2_production_grounded_fallback_used") is not True
+        assert "outbound_package" not in tool_evidence
+
+    asyncio.run(run_case())
+
+
 def test_controlled_password_reply_stays_out_of_internal_artifacts_and_final_llm(monkeypatch) -> None:
     async def run_case() -> None:
         password_canary = "432987#"
@@ -12862,6 +13042,136 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_evidence["outbound_package"]["video_paths"], [video.name])
         self.assertIn("这是棠润府15-2-801B的视频。", tool_evidence["outbound_package"]["video_explanations"])
         self.assertIn("小洋坝家园三区12-1003B", result["reply"])
+
+    async def test_final_inventory_fallback_does_not_override_failed_video_action_package(self) -> None:
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(
+                    action="fallback",
+                    status="fallback",
+                    reason="forced_video_package_retry",
+                    fallback_text="我先查一下，稍等。",
+                    fallback_reply="我先查一下，稍等。",
+                )
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            row = {"小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅"}
+            tool_evidence = {
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "media_request": {"wants_video": True, "requested_count": 1},
+                "inventory_rows": [row],
+                "target_rows": [row],
+                "video_rows": [row],
+                "video_paths": [video.name],
+            }
+            originals = {
+                "reply_generator": main.reply_generator,
+                "agentic_rag": main.agentic_rag,
+                "_outbound_package_selfcheck": main._outbound_package_selfcheck,
+            }
+            main.reply_generator = FakeReplyGenerator()
+            main.agentic_rag = FakeRag()
+            main._outbound_package_selfcheck = lambda **kwargs: {
+                "status": "retry",
+                "action": "retry",
+                "reason": "forced_video_package_retry",
+                "source": "test_forced_video_package_retry",
+            }
+            try:
+                result = await main._generate_reply_result(
+                    content="棠润府15-2-801B视频发我。",
+                    context=kf_context_memory.empty_context(),
+                    understanding={
+                        "intent": "media",
+                        "effective_query": "棠润府15-2-801B视频",
+                        "constraint_proof": {"intent": "media", "wants_video": True},
+                        "structured_task": {"intent": "media", "tool_requirements": {"needs_video": True}},
+                    },
+                    tool_evidence=tool_evidence,
+                    planner_result={
+                        "actions": ["search_inventory", "send_video", "generate_reply"],
+                        "reply_text": "我先查一下，稍等。",
+                    },
+                    retry_reason="selfcheck_retry",
+                )
+            finally:
+                main.reply_generator = originals["reply_generator"]
+                main.agentic_rag = originals["agentic_rag"]
+                main._outbound_package_selfcheck = originals["_outbound_package_selfcheck"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertTrue(tool_evidence.get("suppress_actions"))
+        self.assertEqual(tool_evidence["outbound_package"]["video_paths"], [])
+        self.assertNotIn("有的，我查到这些还在租", result["reply"])
+        self.assertNotEqual(
+            result["selfcheck"]["fallback"]["rule"]["source"],
+            "tool_grounded_inventory_final_fallback",
+        )
+
+    async def test_sendable_video_fallback_beats_inventory_list_when_final_selfcheck_fails(self) -> None:
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(
+                    action="fallback",
+                    status="fallback",
+                    reason="forced_context_retry",
+                    fallback_text="我先查一下，稍等。",
+                    fallback_reply="我先查一下，稍等。",
+                )
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            row = {"小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅"}
+            tool_evidence = {
+                "actions": ["search_inventory", "send_video", "generate_reply"],
+                "inventory_rows": [row],
+                "target_rows": [row],
+                "video_rows": [row],
+                "video_paths": [video.name],
+            }
+            originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+            main.reply_generator = FakeReplyGenerator()
+            main.agentic_rag = FakeRag()
+            try:
+                result = await main._generate_reply_result(
+                    content="刚才第一套发我",
+                    context=kf_context_memory.empty_context(),
+                    understanding={
+                        "intent": "inventory",
+                        "effective_query": "刚才第一套",
+                        "constraint_proof": {"intent": "inventory", "selected_indices": [1]},
+                        "structured_task": {"intent": "inventory"},
+                    },
+                    tool_evidence=tool_evidence,
+                    planner_result={
+                        "actions": ["search_inventory", "send_video", "generate_reply"],
+                        "reply_text": "我先查一下，稍等。",
+                    },
+                    retry_reason="selfcheck_retry",
+                )
+            finally:
+                main.reply_generator = originals["reply_generator"]
+                main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertFalse(bool(tool_evidence.get("suppress_actions")))
+        self.assertEqual(tool_evidence["outbound_package"]["video_paths"], [video.name])
+        self.assertIn("这套视频我发你", result["reply"])
+        self.assertIn("棠润府15-2-801B", result["reply"])
+        self.assertNotIn("我查到这些还在租", result["reply"])
 
     async def test_robotic_tone_fallback_keeps_verified_batch_video_actions(self) -> None:
         class FakeReplyGenerator:

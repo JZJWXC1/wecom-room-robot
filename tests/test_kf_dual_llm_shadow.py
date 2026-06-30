@@ -5,6 +5,7 @@ import json
 from app.services.kf_contracts import PreparedOutboundPackage, ResponseStrategy, StructuredTaskPacket
 from app.services.kf_dual_llm_shadow import (
     DUAL_LLM_SHADOW_SCHEMA_VERSION,
+    build_program_outbound_contract_inputs,
     build_dual_llm_shadow_record,
     build_shadow_task_packet,
     compose_shadow_outbound,
@@ -172,6 +173,51 @@ def test_claims_evidence_and_legacy_roundtrip_are_safe_and_supported() -> None:
     assert roundtrip.to_legacy_dict()["evidence_bundle"]["evidence"][0]["listing_id"] == "lst-9"
     assert roundtrip.to_legacy_dict()["evidence_bundle"]["evidence"][0]["field_values"]["community"] == "新塘河"
     assert roundtrip.to_legacy_dict()["reply_text"] == "新塘河 9-402B 押一付一 4200。"
+
+
+def test_program_outbound_inventory_field_values_are_rich_and_password_redacted() -> None:
+    packet = build_shadow_task_packet(
+        {"tasks": [{"id": "search", "type": "inventory_search", "text": "杨家府 1和3"}]},
+        {"actions": ["search_inventory", "compact_listing", "generate_reply"]},
+        conversation_id="conv-rich-fields",
+        turn_id="turn-rich-fields",
+    )
+
+    evidence_bundle, _, _ = build_program_outbound_contract_inputs(
+        task_packet=packet,
+        tool_evidence={
+            "actions": ["search_inventory", "compact_listing", "generate_reply"],
+            "target_rows": [
+                {
+                    "listing_id": "lst-yjf-46-1204a",
+                    "区域": "石桥街道 华丰 石桥 永佳 半山",
+                    "小区": "杨家新雅苑",
+                    "房号": "46-1204A",
+                    "户型描述": "一室一厅朝南带阳台",
+                    "押一付一": "2500",
+                    "押二付一": "2300",
+                    "备注": "水30/月，电1元/度",
+                    "看房方式密码": "101004# 看房提前联系",
+                }
+            ],
+        },
+        planner_result={"actions": ["search_inventory", "compact_listing", "generate_reply"]},
+    )
+
+    candidate = next(item for item in evidence_bundle.evidence if item.evidence_type == "inventory_candidate")
+    fields = candidate.field_values
+    dumped = json.dumps(evidence_bundle.to_safe_dict(), ensure_ascii=False, sort_keys=True)
+
+    assert fields["community"] == "杨家新雅苑"
+    assert fields["room_no"] == "46-1204A"
+    assert fields["area"] == "石桥街道 华丰 石桥 永佳 半山"
+    assert fields["layout_description"] == "一室一厅朝南带阳台"
+    assert fields["rent_pay1"] == 2500
+    assert fields["rent_pay2"] == 2300
+    assert fields["utilities"] == "水30/月，电1元/度"
+    assert fields["has_viewing_text"] is True
+    assert "101004#" not in dumped
+    assert "看房方式密码" not in dumped
 
 
 def test_shadow_artifact_redacts_password_phone_and_token_from_repr_and_json() -> None:
