@@ -10470,7 +10470,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kf_context_memory.pending_media_target(context), {})
         self.assertNotIn("last_candidate_set", context)
 
-    async def test_production_understanding_applies_pending_media_target_guard(self) -> None:
+    async def test_production_understanding_does_not_override_llm1_plan_with_pending_media_target(self) -> None:
         context = kf_context_memory.remember_pending_media_target(
             kf_context_memory.empty_context(),
             media_kind="video",
@@ -10490,6 +10490,18 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 return build_kf_task_packet_shadow(
                     {
                         "rewritten_query": kwargs["content"],
+                        "task_atoms": [
+                            {
+                                "task_id": "task-search",
+                                "task_type": "inventory_search",
+                                "user_text": kwargs["content"],
+                            },
+                            {
+                                "task_id": "task-compose",
+                                "task_type": "reply_compose_signal",
+                                "user_text": kwargs["content"],
+                            },
+                        ],
                         "tool_plan": {"actions": ["search_inventory", "generate_reply"]},
                     },
                     content=kwargs["content"],
@@ -10532,10 +10544,15 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             main._inventory_rewrite_index_for_read_context = originals["_inventory_rewrite_index_for_read_context"]
             main._inventory_metadata_for_read_context = originals["_inventory_metadata_for_read_context"]
 
-        self.assertEqual(result["intent"], "media")
-        self.assertEqual(result["tool_plan"]["source"], "pending_media_target_bound")
-        self.assertIn("send_video", result["tool_plan"]["actions"])
-        self.assertEqual([main._row_label(row) for row in result["target_rows"]], ["东新园8-1201"])
+        self.assertNotEqual(result.get("intent"), "media")
+        self.assertNotEqual(result["tool_plan"].get("source"), "pending_media_target_bound")
+        self.assertEqual(result["tool_plan"]["actions"], ["search_inventory", "generate_reply"])
+        self.assertNotIn("send_video", result["tool_plan"]["actions"])
+        self.assertNotIn("target_rows", result)
+        self.assertEqual(
+            [main._row_label(row) for row in kf_context_memory.pending_media_target(context)["candidate_rows"]],
+            ["东新园8-1201", "东新园9-1302"],
+        )
 
     def test_pending_media_target_community_only_does_not_bind_multiple_rows(self) -> None:
         context = kf_context_memory.remember_pending_media_target(

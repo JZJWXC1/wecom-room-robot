@@ -1242,6 +1242,8 @@ def _force_pending_media_target_task(
     content: str,
     result: dict[str, Any],
     context: dict[str, Any],
+    *,
+    allow_task_rewrite: bool = True,
 ) -> dict[str, Any]:
     pending = kf_context_memory.pending_media_target(context)
     media_kind = str(pending.get("media_kind") or "").strip()
@@ -1262,6 +1264,8 @@ def _force_pending_media_target_task(
         return result
     target_rows = _pending_media_target_rows_for_content(content, result, context)
     if not target_rows:
+        return result
+    if not allow_task_rewrite:
         return result
 
     normalized = dict(result)
@@ -5245,7 +5249,12 @@ async def _understand_message(
             inventory_index=inventory_index,
             inventory_read_context=inventory_read_context,
         )
-        result = _force_pending_media_target_task(content, result, context)
+        result = _force_pending_media_target_task(
+            content,
+            result,
+            context,
+            allow_task_rewrite=False,
+        )
         return _route_unverified_not_found_to_tools(result, planner_feedback=planner_feedback)
     try:
         result = await asyncio.wait_for(
