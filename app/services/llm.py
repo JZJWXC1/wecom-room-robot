@@ -364,14 +364,19 @@ Planner 回传的内部缺失证据：
         system_prompt = (
             f"你是租房客服 Agentic RAG 的 LLM2 outbound {mode_label}，只负责怎么说。"
             "你必须基于 StructuredTaskPacket、ToolEvidenceBundle 和 ResponseStrategy 生成 PreparedOutboundPackage 的文本字段。"
+            "production 模式下，客户可见自然回复只能来自你生成的 reply_text/action_captions 加受控渲染边界；"
+            "本地 inventory/media/deposit/contract fallback 只会作为 evidence 或 error code，不会替你改写最终话术。"
             "不得决定发哪套房、发什么素材、改 candidate_number、改 listing_id、改 send action。"
             "价格、房态、密码、链接、素材目标只能来自 ToolEvidenceBundle；证据没有返回就不能写。"
+            "房源表、缺素材、免押政策、合同联系、看房联系/密码都会以 evidence_type 或受控 send action 形式提供，"
+            "你只能引用这些证据来组织客户可见表达。"
             "朝南、有电梯、已空出、可养猫、近地铁等普通事实也必须来自 ToolEvidenceBundle，并写入 claims。"
             "密码和链接属于高风险内容：不要抄写真值，只引用 evidence_id/slot 让受控发送边界处理。"
             "合同联系电话和看房密码如出现在受控 send action，只写 action_captions 或留给发送边界渲染，不要在 reply_text 里输出手机号或密码真值。"
             "话术要像真实租房客服，短句、自然、直接；不要暴露 listing_id、evidence_id、ToolEvidence、send action 等内部名。"
             "已有媒体 send action 时，用“这是某某房间的视频/图片。”这类当前动作说明，"
             "不要说“稍后发、等下发、会发你、素材已准备好”。"
+            "如果上一轮 retry/rewrite reason 是 L3 文案问题，只重写表达和 captions，必须保留原有 facts/actions 绑定，不要要求回 LLM1。"
             "如果证据不足或发现会越界，只返回 retry/rewrite reason，不生成事实文本。"
             "只返回 JSON，不要 Markdown。"
         )
@@ -412,9 +417,13 @@ ResponseStrategy：
 - action_captions 只能引用已有 action_id，且只能描述该 action 对应 evidence，不能新增 send_actions。
 - 不要输出真实密码、完整手机号、token、URL 真值。
 - 合同联系电话、看房密码必须通过受控 action/evidence slot 表达；LLM2 不能自己写手机号或密码真值。
+- evidence_type=deposit_policy 时可以回答免押条件/服务费；evidence_type=missing_media 时只能说明对应素材缺失，不能承诺稍后补发。
+- evidence_type=inventory_sheet 或已有 send_inventory_sheet 动作时，只说明房源表图片会由动作发送，不要改成纯文字房源表。
+- 受控合同/看房 action 存在时，reply_text 写自然引导，真实手机号/密码由受控边界追加；你不得直接生成这些真值。
 - 不要把房号数字当价格，不要新增工具证据外的价格、房态、朝南、有电梯、已空出、可养猫、近地铁等事实。
 - 客户可见话术必须口语化、短句，不出现内部字段名或工具名。
 - 已有媒体 send action 时，reply_text/action_captions 用“这是某某房间的视频/图片。”，不要写稍后、等下、会发你或素材已准备好。
+- 如果上一轮 retry/rewrite reason 提到 L3、internal name、template 或 action tense，只改话术，不改 claims/send action/action_id/evidence_ref。
 - 失败时 reply_text 为空，self_review.status=retry，并写 retry_reason。
 """
         response = await self._client_for_stage("reply").chat.completions.create(

@@ -94,6 +94,7 @@ async def compose_production_outbound_package(
             prompt_version=DUAL_LLM_PRODUCTION_LLM2_PROMPT_VERSION,
             selfcheck_profile=DUAL_LLM_PRODUCTION_SELFCHECK_PROFILE,
             reply_source=DUAL_LLM_PRODUCTION_REPLY_SOURCE,
+            allow_deterministic_fallback=False,
         )
     compose_llm2 = getattr(reply_generator, "compose_kf_outbound_production", None)
     if not callable(compose_llm2):
@@ -123,6 +124,7 @@ async def compose_production_outbound_package(
         prompt_version=DUAL_LLM_PRODUCTION_LLM2_PROMPT_VERSION,
         selfcheck_profile=DUAL_LLM_PRODUCTION_SELFCHECK_PROFILE,
         reply_source=DUAL_LLM_PRODUCTION_REPLY_SOURCE,
+        allow_deterministic_fallback=False,
     )
 
 

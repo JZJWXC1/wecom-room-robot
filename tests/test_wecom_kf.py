@@ -496,7 +496,7 @@ def test_generate_reply_result_production_blocks_l2_validation_failure(monkeypat
     asyncio.run(run_case())
 
 
-def test_generate_reply_result_production_blocks_l3_validation_rewrite(monkeypatch) -> None:
+def test_generate_reply_result_production_retries_l3_validation_with_llm2(monkeypatch) -> None:
     async def run_case() -> None:
         sensitive_text = "普通回复 sk-test-secret token=abc123 https://example.test/base?api_key=abc123"
         task_packet = build_kf_task_packet_shadow(
@@ -515,10 +515,22 @@ def test_generate_reply_result_production_blocks_l3_validation_rewrite(monkeypat
                 return SimpleNamespace(context_text="")
 
             def assess_reply(self, **kwargs):
-                raise AssertionError("L3 rewrite gate must run before final selfcheck")
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_text="")
 
         class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.call_count = 0
+
             async def compose_kf_outbound_production(self, **kwargs):
+                self.call_count += 1
+                if self.call_count == 2:
+                    assert "kf_outbound_validation L3 rewrite required" in kwargs["retry_reason"]
+                    return {
+                        "reply_text": "我这边按证据给你回复。",
+                        "claims": [],
+                        "action_captions": [],
+                        "self_review": {"status": "pass"},
+                    }
                 return {
                     "reply_text": "listing_id=lst-1，我这边按证据给你回复。",
                     "claims": [],
@@ -529,7 +541,8 @@ def test_generate_reply_result_production_blocks_l3_validation_rewrite(monkeypat
         original_mode = main.settings.kf_dual_llm_mode
         tool_evidence = {"actions": ["generate_reply"]}
         monkeypatch.setattr(main, "agentic_rag", FakeRag())
-        monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+        fake_reply = FakeReplyGenerator()
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
         main.settings.kf_dual_llm_mode = "production"
         try:
             result = await main._generate_reply_result(
@@ -548,27 +561,84 @@ def test_generate_reply_result_production_blocks_l3_validation_rewrite(monkeypat
         finally:
             main.settings.kf_dual_llm_mode = original_mode
 
-        assert result["reply"] == ""
-        assert result["needs_planner_retry"] is True
-        assert "kf_outbound_validation L3 rewrite required" in result["planner_retry_reason"]
-        retry_payload = json.loads(result["planner_retry_reason"])
-        retry_dump = json.dumps(retry_payload, ensure_ascii=False, sort_keys=True)
-        assert retry_payload["source"] == "llm2_production_safe_retry_payload"
-        assert "original_content" not in retry_payload
-        assert "effective_query" not in retry_payload
-        assert "draft_reply" not in retry_payload
-        assert "planner_result" not in retry_payload
-        assert sensitive_text not in retry_dump
-        assert "sk-test-secret" not in retry_dump
-        assert "token=abc123" not in retry_dump
-        assert "api_key=abc123" not in retry_dump
-        assert "旧话术" not in retry_dump
-        validation = tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]
-        assert validation["status"] == "rewrite_required"
-        assert validation["facts_passed"] is True
-        assert validation["send_allowed"] is False
-        assert any(issue["code"] == "l3.internal_name_leak" for issue in validation["issues"])
-        assert "llm2_production_outbound_package" not in tool_evidence
+        assert fake_reply.call_count == 2
+        assert result["reply"] == "我这边按证据给你回复。"
+        assert result["needs_planner_retry"] is False
+        assert result["planner_retry_reason"] == ""
+        assert tool_evidence["deterministic_reply_source"] == "kf_llm2_outbound_production"
+        llm2_meta = tool_evidence["dual_llm_production"]["llm2"]
+        assert llm2_meta["selected_attempt"] == "l3_retry"
+        assert llm2_meta["outbound_validation"]["status"] == "pass"
+        assert llm2_meta["l3_initial"]["outbound_validation"]["status"] == "rewrite_required"
+        assert "listing_id" not in result["reply"]
+        assert "旧话术" not in json.dumps(llm2_meta, ensure_ascii=False)
+
+    asyncio.run(run_case())
+
+
+def test_generate_reply_result_production_l3_retry_failure_uses_llm2_safe_fallback(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "普通回复",
+                "task_atoms": [{"task_id": "task-reply", "task_type": "reply_text", "user_text": "普通回复"}],
+                "tool_plan": {"actions": ["generate_reply"]},
+            },
+            content="普通回复",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_text="")
+
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.call_count = 0
+
+            async def compose_kf_outbound_production(self, **kwargs):
+                self.call_count += 1
+                return {
+                    "reply_text": "listing_id=lst-1，我这边按证据给你回复。",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+        fake_reply = FakeReplyGenerator()
+        original_mode = main.settings.kf_dual_llm_mode
+        tool_evidence = {"actions": ["generate_reply"]}
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._generate_reply_result(
+                content="普通回复",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "general",
+                    "effective_query": "普通回复",
+                    "structured_task": {"tool_requirements": {}},
+                    "constraint_proof": {},
+                    "llm1_task_packet": task_packet,
+                },
+                tool_evidence=tool_evidence,
+                planner_result={"actions": ["generate_reply"], "reply_text": "旧话术"},
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert fake_reply.call_count == 2
+        assert result["needs_planner_retry"] is False
+        assert result["planner_retry_reason"] == ""
+        assert tool_evidence["deterministic_reply_source"] == "llm2_production_l3_safe_fallback"
+        assert tool_evidence["dual_llm_production"]["llm2"]["selected_attempt"] == "l3_safe_fallback"
+        assert "listing_id" not in result["reply"]
+        assert "旧话术" not in result["reply"]
 
     asyncio.run(run_case())
 
@@ -693,6 +763,13 @@ def test_production_controlled_channels_cover_contract_password_deposit_and_view
         class FakeReplyGenerator:
             async def compose_kf_outbound_production(self, **kwargs):
                 task_types = {str(task.get("task_type") or "") for task in (kwargs.get("task_packet") or {}).get("tasks") or []}
+                if "contract_contact" in task_types:
+                    return {
+                        "reply_text": "这单可以直接走定房和电子合同。",
+                        "claims": [],
+                        "action_captions": [],
+                        "self_review": {"status": "pass"},
+                    }
                 if "deposit_policy" in task_types:
                     return {
                         "reply_text": (
@@ -850,6 +927,7 @@ def test_production_controlled_channels_cover_contract_password_deposit_and_view
             assert "稍后给您准确回复" not in result["reply"]
 
         assert "18758141785" in contract_result["reply"]
+        assert contract_result["reply"].startswith("这单可以直接走定房和电子合同。")
         assert "电子合同" in contract_result["reply"]
         assert "定金" in contract_result["reply"]
         assert "101004#" in password_result["reply"]

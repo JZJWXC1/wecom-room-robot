@@ -206,8 +206,12 @@ def test_compose_kf_outbound_shadow_prompt_requires_oralized_media_tense(monkeyp
     assert captured["model"] == "reply-model"
     assert "话术要像真实租房客服" in system_prompt
     assert "不要说“稍后发、等下发、会发你、素材已准备好”" in system_prompt
+    assert "本地 inventory/media/deposit/contract fallback 只会作为 evidence 或 error code" in system_prompt
+    assert "受控渲染边界" in system_prompt
     assert "客户可见话术必须口语化" in user_prompt
     assert "已有媒体 send action" in user_prompt
+    assert "evidence_type=missing_media" in user_prompt
+    assert "只改话术，不改 claims/send action/action_id/evidence_ref" in user_prompt
 
 
 def test_settings_support_deepseek_provider_without_changing_stage_contract(monkeypatch) -> None:

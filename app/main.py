@@ -7726,6 +7726,46 @@ def _controlled_reply_from_outbound_package(package: Any) -> str:
     return "\n".join(dict.fromkeys(line for line in lines if line)).strip()
 
 
+def _caption_reply_from_outbound_package(package: Any) -> str:
+    lines: list[str] = []
+    for caption in getattr(package, "action_captions", []) or []:
+        action_type = str(getattr(caption, "action_type", "") or "")
+        if action_type in {"contract_contact", "viewing_password", "viewing_contact"}:
+            continue
+        text = str(getattr(caption, "text", "") or "").strip()
+        if text:
+            lines.append(text)
+    return "\n".join(dict.fromkeys(lines)).strip()
+
+
+def _customer_visible_reply_from_outbound_package(package: Any) -> str:
+    llm_text = str(getattr(package, "reply_text", "") or "").strip()
+    controlled_text = _controlled_reply_from_outbound_package(package)
+    return "\n".join(dict.fromkeys(part for part in (llm_text, controlled_text) if part)).strip()
+
+
+def _llm2_production_safe_fallback_reply(
+    *,
+    package: Any,
+    understanding: dict[str, Any],
+    tool_evidence: dict[str, Any],
+) -> str:
+    caption_text = _caption_reply_from_outbound_package(package)
+    controlled_text = _controlled_reply_from_outbound_package(package)
+    combined = "\n".join(dict.fromkeys(part for part in (caption_text, controlled_text) if part)).strip()
+    if combined:
+        return combined
+    actions = {str(action) for action in tool_evidence.get("actions") or []}
+    if "send_inventory_sheet" in actions or tool_evidence.get("inventory_images"):
+        return "房源表发你了，你可以让客户先整体看一下。"
+    if tool_evidence.get("missing_media"):
+        return "这次没有稳定匹配到可发送素材，我先不乱发。你回小区+房号，我再按那套重新查。"
+    intent = _normalize_intent(understanding.get("intent"))
+    if intent == "deposit":
+        return "免押需要按支付宝无忧住页面的芝麻信用评估结果确认，我这边先不展开没有证据的金额。"
+    return "我这边先不乱说。你把小区、房号或想确认的信息再发我，我按最新房源表重新核对。"
+
+
 def _reply_for_missing_media(understanding: dict[str, Any], tool_evidence: dict[str, Any]) -> str:
     proof = dict(understanding.get("constraint_proof") or {})
     missing = [str(item) for item in tool_evidence.get("missing_media") or [] if str(item).strip()]
@@ -8986,7 +9026,11 @@ def _needs_llm_final_selfcheck(
         return False
     if retry_reason:
         return False
-    if deterministic_reply_source == "kf_llm2_outbound_production_controlled":
+    if deterministic_reply_source in {
+        "kf_llm2_outbound_production",
+        "kf_llm2_outbound_production_controlled",
+        "llm2_production_l3_safe_fallback",
+    }:
         return False
     proof = dict(understanding.get("constraint_proof") or {})
     actions = [str(action) for action in tool_evidence.get("actions") or []]
@@ -9549,6 +9593,7 @@ async def _generate_reply_result(
         tool_evidence["deterministic_reply_source"] = deterministic_reply_source
     if _dual_llm_production_enabled():
         llm2_retry_reason = ""
+        llm2_safe_fallback_reason = ""
         task_packet = understanding.get("llm1_task_packet")
         production_package_payload: dict[str, Any] = {}
         if not isinstance(task_packet, dict) or not task_packet:
@@ -9574,7 +9619,7 @@ async def _generate_reply_result(
                     timeout=timeout_seconds,
                 )
                 production_package_payload = kf_dual_llm_production.package_log_payload(production_package)
-                controlled_production_reply = _controlled_reply_from_outbound_package(production_package)
+                production_visible_reply = _customer_visible_reply_from_outbound_package(production_package)
                 outbound_validation = kf_dual_llm_production.validate_production_outbound_package(
                     production_package,
                     task_packet=task_packet,
@@ -9586,19 +9631,128 @@ async def _generate_reply_result(
                 if (
                     kf_dual_llm_production.package_passed(production_package)
                     and outbound_validation.passed
-                    and (str(production_package.reply_text or "").strip() or controlled_production_reply)
+                    and production_visible_reply
                 ):
                     draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
-                        controlled_production_reply or str(production_package.reply_text or "")
+                        production_visible_reply
                     )
                     deterministic_reply_source = (
                         "kf_llm2_outbound_production_controlled"
-                        if controlled_production_reply
+                        if _controlled_reply_from_outbound_package(production_package)
                         else "kf_llm2_outbound_production"
                     )
                     tool_evidence["deterministic_reply_source"] = deterministic_reply_source
                     outbound_dict = production_package.to_legacy_dict()
                     tool_evidence["llm2_production_outbound_package"] = outbound_dict
+                elif (
+                    kf_dual_llm_production.package_passed(production_package)
+                    and outbound_validation.requires_rewrite
+                    and not outbound_validation.blocking_issues
+                ):
+                    l3_retry_reason = kf_dual_llm_production.outbound_validation_retry_reason(outbound_validation)
+                    initial_l3_payload = dict(production_package_payload)
+                    retry_started_at = time.monotonic()
+                    try:
+                        retry_package = await asyncio.wait_for(
+                            kf_dual_llm_production.compose_production_outbound_package(
+                                reply_generator=reply_generator,
+                                task_packet=task_packet,
+                                tool_evidence=tool_evidence,
+                                draft_reply="",
+                                planner_result=planner_result or {},
+                                reply_result={"reply": "", "reply_source": "llm2_l3_retry"},
+                                retry_reason=l3_retry_reason,
+                            ),
+                            timeout=timeout_seconds,
+                        )
+                        retry_payload = kf_dual_llm_production.package_log_payload(retry_package)
+                        retry_validation = kf_dual_llm_production.validate_production_outbound_package(
+                            retry_package,
+                            task_packet=task_packet,
+                            user_asked_password=_user_explicitly_asked_password_for_controlled_channel(content, understanding),
+                            known_constraints=dict(understanding.get("constraint_proof") or {}),
+                        )
+                        retry_payload["outbound_validation"] = retry_validation.to_dict()
+                        production_package_payload["l3_retry"] = retry_payload
+                        retry_visible_reply = _customer_visible_reply_from_outbound_package(retry_package)
+                        if (
+                            kf_dual_llm_production.package_passed(retry_package)
+                            and retry_validation.passed
+                            and retry_visible_reply
+                        ):
+                            production_package_payload = {
+                                **retry_payload,
+                                "selected_attempt": "l3_retry",
+                                "l3_initial": initial_l3_payload,
+                            }
+                            draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
+                                retry_visible_reply
+                            )
+                            deterministic_reply_source = (
+                                "kf_llm2_outbound_production_controlled"
+                                if _controlled_reply_from_outbound_package(retry_package)
+                                else "kf_llm2_outbound_production"
+                            )
+                            tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+                            outbound_dict = retry_package.to_legacy_dict()
+                            tool_evidence["llm2_production_outbound_package"] = outbound_dict
+                        elif (
+                            kf_dual_llm_production.package_passed(retry_package)
+                            and retry_validation.requires_rewrite
+                            and not retry_validation.blocking_issues
+                        ):
+                            fallback_reply = _llm2_production_safe_fallback_reply(
+                                package=retry_package,
+                                understanding=understanding,
+                                tool_evidence=tool_evidence,
+                            )
+                            draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(fallback_reply)
+                            deterministic_reply_source = "llm2_production_l3_safe_fallback"
+                            tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+                            llm2_safe_fallback_reason = (
+                                kf_dual_llm_production.outbound_validation_retry_reason(retry_validation)
+                                or l3_retry_reason
+                            )
+                            production_package_payload["selected_attempt"] = "l3_safe_fallback"
+                            production_package_payload["l3_safe_fallback"] = {
+                                "source": "llm2_production_l3_safe_fallback",
+                                "reason": _llm2_production_safe_retry_reason(llm2_safe_fallback_reason),
+                                "reply_text_present": bool(draft_reply),
+                            }
+                        else:
+                            llm2_retry_reason = (
+                                kf_dual_llm_production.outbound_validation_retry_reason(retry_validation)
+                                or kf_dual_llm_production.package_retry_reason(retry_package)
+                            )
+                    except Exception as exc:
+                        logger.warning("KF LLM2 production L3 retry failed: error_type=%s", type(exc).__name__)
+                        fallback_reply = _llm2_production_safe_fallback_reply(
+                            package=production_package,
+                            understanding=understanding,
+                            tool_evidence=tool_evidence,
+                        )
+                        draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(fallback_reply)
+                        deterministic_reply_source = "llm2_production_l3_safe_fallback"
+                        tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+                        llm2_safe_fallback_reason = l3_retry_reason or "kf_outbound_validation L3 rewrite required"
+                        production_package_payload["selected_attempt"] = "l3_safe_fallback"
+                        production_package_payload["l3_retry"] = {
+                            **_dual_llm_production_failure_metadata(
+                                stage="llm2",
+                                timeout_seconds=timeout_seconds,
+                                started_at=retry_started_at,
+                                exc=exc,
+                            ),
+                            "self_review": {
+                                "status": "retry",
+                                "source": "llm2_production_l3_retry_error",
+                            },
+                        }
+                        production_package_payload["l3_safe_fallback"] = {
+                            "source": "llm2_production_l3_safe_fallback",
+                            "reason": _llm2_production_safe_retry_reason(llm2_safe_fallback_reason),
+                            "reply_text_present": bool(draft_reply),
+                        }
                 else:
                     llm2_retry_reason = (
                         kf_dual_llm_production.outbound_validation_retry_reason(outbound_validation)
@@ -9625,6 +9779,10 @@ async def _generate_reply_result(
         dual_meta = dict(tool_evidence.get("dual_llm_production") or understanding.get("dual_llm_production") or {})
         dual_meta["llm2"] = production_package_payload
         tool_evidence["dual_llm_production"] = safe_artifact_payload(dual_meta)
+        if llm2_safe_fallback_reason:
+            tool_evidence["llm2_production_l3_safe_fallback_reason"] = _llm2_production_safe_retry_reason(
+                llm2_safe_fallback_reason
+            )
         if llm2_retry_reason and not retry_reason:
             gate_selfcheck = {
                 "status": "retry",
