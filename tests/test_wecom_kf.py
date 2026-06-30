@@ -7258,6 +7258,101 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(selected_rows, [])
 
+    async def test_tool_resolver_binds_second_candidate_with_metadata(self) -> None:
+        candidate_rows = [
+            {"小区": "棠润府", "房号": "15-2-801B"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+        ]
+
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return []
+
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达一室",
+            "candidates": candidate_rows,
+            "shown_count": 2,
+            "total_count": 2,
+        }
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools"],
+                content="第二套视频发我。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "第二套视频",
+                    "rewritten_query": "第二套视频",
+                    "selected_indices": [2],
+                    "constraint_proof": {"selected_indices": [2], "wants_video": True},
+                    "structured_task": {
+                        "original_text": "第二套视频发我。",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual([main._row_label(row) for row in evidence["target_rows"]], ["星桥锦绣嘉苑20-1606A"])
+        self.assertEqual(evidence["candidate_binding"]["status"], "bound")
+        self.assertEqual(evidence["candidate_binding"]["source"], "candidate_set_selection")
+        self.assertEqual(evidence["candidate_binding"]["selected_indices"], [2])
+        self.assertNotIn("selection_error", evidence)
+
+    async def test_tool_resolver_inherits_these_video_targets_from_candidate_context(self) -> None:
+        candidate_rows = [
+            {"小区": "棠润府", "房号": "15-2-801B"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+        ]
+
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return []
+
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达一室",
+            "candidates": candidate_rows,
+            "shown_count": 2,
+            "total_count": 2,
+        }
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools"],
+                content="这几套视频也发我。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "这几套视频",
+                    "rewritten_query": "这几套视频",
+                    "context_reference": True,
+                    "constraint_proof": {"wants_video": True},
+                    "structured_task": {
+                        "original_text": "这几套视频也发我。",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertEqual(
+            [main._row_label(row) for row in evidence["target_rows"]],
+            ["棠润府15-2-801B", "星桥锦绣嘉苑20-1606A"],
+        )
+        self.assertEqual(evidence["candidate_binding"]["status"], "bound")
+        self.assertEqual(evidence["candidate_binding"]["source"], "candidate_context")
+        self.assertNotIn("selection_error", evidence)
+        self.assertNotIn("field_target_error", evidence)
+
     def test_unresolved_community_clarification_requires_real_entity_shape(self) -> None:
         weak_resolution = {
             "communities": [],

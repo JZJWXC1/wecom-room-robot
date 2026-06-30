@@ -27,6 +27,7 @@ from app.services import (
     kf_orchestrator_shadow,
     kf_outbox,
     kf_send_receipts,
+    kf_tool_resolver,
     kf_turn_flow,
 )
 from app.services.config_check import get_config_status
@@ -4382,186 +4383,14 @@ def _target_rows_from_understanding(
     context: dict[str, Any],
     search_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    explicit_rows = [row for row in understanding.get("target_rows") or [] if isinstance(row, dict)]
-    if explicit_rows:
-        return explicit_rows
-
-    proof = dict(understanding.get("constraint_proof") or {})
     task = dict(understanding.get("structured_task") or {})
-    requirements = dict(task.get("tool_requirements") or {})
-    query_text = " ".join(
-        str(part).strip()
-        for part in (
-            task.get("original_text"),
-            understanding.get("effective_query"),
-            understanding.get("rewritten_query"),
-        )
-            if str(part or "").strip()
+    return kf_tool_resolver.resolve_target_rows(
+        understanding,
+        context,
+        search_rows,
+        content=str(task.get("original_text") or ""),
+        target_limit=KF_VIDEO_SEND_LIMIT,
     )
-    current_text = " ".join(
-        str(part).strip()
-        for part in (
-            task.get("original_text"),
-            understanding.get("original_query"),
-        )
-        if str(part or "").strip()
-    )
-    current_turn_has_room_refs = bool(_room_refs_from_text(current_text))
-    explicit_room_refs = bool(
-        proof.get("room_refs")
-        or _room_refs_from_text(query_text)
-    )
-    wants_viewing = bool(
-        requirements.get("needs_viewing_policy")
-        or _normalize_intent(understanding.get("intent")) == "viewing"
-        or _content_wants_viewing(query_text)
-    )
-    candidates = _candidate_rows(context)
-    selected = _selected_indices_from_understanding(understanding, current_text or query_text)
-    if not selected:
-        matched_by_room_ref = _target_rows_from_room_refs(understanding, search_rows)
-        if matched_by_room_ref:
-            return matched_by_room_ref
-        if explicit_room_refs:
-            candidate_room_ref_rows = _candidate_rows_from_room_ref_hint(
-                candidates=candidates,
-                query_text=query_text,
-                proof=proof,
-            )
-            if candidate_room_ref_rows:
-                return candidate_room_ref_rows
-            return []
-    elif current_turn_has_room_refs:
-        matched_by_room_ref = _rows_matching_original_room_refs(current_text, search_rows)
-        if matched_by_room_ref:
-            return matched_by_room_ref
-
-    confirmed = _confirmed_row(context)
-    if (
-        confirmed
-        and _should_bind_confirmed_room_context(understanding, query_text)
-        and (
-            _has_single_room_context_pronoun(query_text)
-            or _has_bound_room_field_followup(str(task.get("original_text") or ""))
-        )
-        and not _has_explicit_candidate_selection(query_text)
-    ):
-        return [confirmed]
-
-    proof_communities = {
-        normalize_search_text(str(item))
-        for item in proof.get("communities") or []
-        if normalize_search_text(str(item))
-    }
-    current_text_norm = normalize_search_text(current_text)
-    current_mentions_proof_community = bool(
-        proof_communities
-        and current_text_norm
-        and any(community in current_text_norm for community in proof_communities)
-    )
-    if not selected and current_mentions_proof_community:
-        explicit_selected = _explicit_selected_indices_from_understanding(understanding, current_text or query_text)
-        if explicit_selected:
-            selected = explicit_selected
-        elif _has_single_room_context_pronoun(current_text):
-            selected = _structured_selected_indices_from_understanding(understanding)
-    if selected and current_mentions_proof_community:
-        if not search_rows:
-            return []
-        current_search_rows = [
-            row
-            for row in search_rows
-            if normalize_search_text(_row_value(row, ("小区", "小区名"))) in proof_communities
-        ]
-        if not current_search_rows:
-            return []
-        if current_search_rows and any(index > len(current_search_rows) for index in selected):
-            return []
-        current_selected_rows = [
-            current_search_rows[index - 1]
-            for index in selected
-            if 1 <= index <= len(current_search_rows)
-        ]
-        return current_selected_rows or []
-
-    if selected:
-        if not candidates:
-            return []
-        if any(index > len(candidates) for index in selected):
-            return []
-        selected_rows = [
-            candidates[index - 1]
-            for index in selected
-            if 1 <= index <= len(candidates)
-        ]
-        return selected_rows or []
-
-    wants_media = bool(
-        proof.get("wants_video")
-        or proof.get("wants_image")
-        or proof.get("wants_original_video")
-    )
-    if wants_media:
-        recent_media_rows = _recent_assistant_mentioned_rows(
-            context,
-            [*search_rows, *candidates],
-            query_text=query_text,
-        )
-        if recent_media_rows:
-            return recent_media_rows
-
-    candidate_hint_rows = _candidate_rows_from_context_hint(
-        candidates=candidates,
-        query_text=query_text,
-        proof=proof,
-        context_reference=bool(understanding.get("context_reference")),
-    )
-    if candidate_hint_rows:
-        return candidate_hint_rows
-
-    if (
-        candidates
-        and bool(understanding.get("context_reference"))
-        and wants_media
-        and _media_request_targets_previous_candidates(str(task.get("original_text") or query_text))
-    ):
-        return candidates[:KF_VIDEO_SEND_LIMIT]
-
-    if (
-        candidates
-        and bool(understanding.get("context_reference"))
-        and wants_viewing
-        and _references_unbound_room_context(query_text)
-    ):
-        return candidates[:10]
-
-    if (
-        confirmed
-        and _should_bind_confirmed_room_context(understanding, query_text)
-        and not _has_explicit_candidate_selection(query_text)
-    ):
-        return [confirmed]
-
-    if search_rows and wants_media:
-        media_query_text = " ".join(
-            str(part).strip()
-            for part in (
-                task.get("original_text"),
-                understanding.get("effective_query"),
-                understanding.get("rewritten_query"),
-                proof.get("budget_label"),
-            )
-            if str(part or "").strip()
-        )
-        requested_count = _requested_room_count_from_text(media_query_text)
-        if requested_count:
-            return search_rows[: min(requested_count, KF_VIDEO_SEND_LIMIT)]
-        if any(word in media_query_text for word in ("最合适", "几套", "几间", "推荐")):
-            return search_rows[: min(len(search_rows), KF_VIDEO_SEND_LIMIT)]
-
-    if len(search_rows) == 1:
-        return search_rows
-    return []
 
 
 def _media_target_error_for_unclear_room(
@@ -6124,29 +5953,6 @@ async def _execute_tools(
                 original_ref_rows = []
             if original_ref_rows:
                 rows = original_ref_rows[:10]
-        early_selected_indices = _selected_indices_from_understanding(
-            understanding,
-            original_room_text,
-        )
-        selection_has_current_scope = bool(
-            proof.get("communities")
-            or proof.get("area")
-            or proof.get("room_refs")
-            or _room_refs_from_text(original_room_text)
-        )
-        if (
-            early_selected_indices
-            and not _candidate_rows(context)
-            and not selection_has_current_scope
-            and not proof.get("wants_original_video")
-        ):
-            rows = []
-            evidence["selection_error"] = {
-                "requested_indices": early_selected_indices,
-                "candidate_count": 0,
-                "candidate_labels": [],
-                "reason": "missing_current_candidate_set",
-            }
         if proof.get("wants_utilities") and any(word in content for word in ("这几套", "这几间", "这些", "刚才", "上面")):
             candidate_rows = _candidate_rows(context)
             if candidate_rows:
@@ -6209,261 +6015,57 @@ async def _execute_tools(
     else:
         rows = []
 
-    field_followup_requires_specific_room = _field_followup_needs_specific_room(content, understanding)
-    media_target_error = (
-        {}
-        if pending_video_handled
-        else _media_target_error_for_unclear_room(
-            content=content,
-            understanding=understanding,
-            search_rows=rows,
-        )
-    )
-    target_selection_query_text = " ".join(
-        str(part).strip()
-        for part in (
-            content,
-            task.get("original_text"),
-        )
-        if str(part or "").strip()
-    )
-    target_selection_indices = _selected_indices_from_understanding(
-        understanding,
-        target_selection_query_text,
-    )
-    target_selection_uses_candidates = bool(
-        target_selection_indices
-        and _candidate_rows(context)
-        and not _room_refs_from_text(original_room_text)
-    )
-    target_rows = (
-        []
-        if pending_video_handled or field_followup_requires_specific_room or media_target_error
-        else _target_rows_from_understanding(understanding, context, rows)
-    )
-    if not target_selection_uses_candidates:
-        target_rows = _enforce_target_rows_community_constraints(target_rows, rows, proof)
+    pending_video_rows: list[dict[str, Any]] = []
     if (
-        not target_rows
-        and not pending_video_handled
+        not pending_video_handled
         and "send_video" in actions
         and proof.get("wants_original_video")
     ):
-        pending_rows = await _pending_video_label_rows(
+        pending_video_rows = await _pending_video_label_rows(
             context,
             inventory_read_context=inventory_read_context,
         )
-        if pending_rows:
-            target_rows = pending_rows
-            rows = pending_rows
-            evidence["inventory_rows"] = pending_rows
-            evidence["pending_video_context_bound"] = {
-                "reason": "original_video_followup_uses_pending_missing_video_labels",
-                "labels": [_row_label(row) for row in pending_rows],
-            }
-            target_rows = _enforce_target_rows_community_constraints(target_rows, rows, proof)
-    original_video_target_error = (
-        not target_rows
-        and not pending_video_handled
-        and "send_video" in actions
-        and _original_video_followup_without_explicit_target(content, understanding)
+
+    tool_resolution = kf_tool_resolver.resolve_tool_targets(
+        actions=actions,
+        content=content,
+        context=context,
+        understanding=understanding,
+        inventory_rows=rows,
+        pending_video=pending_video,
+        pending_video_rows=pending_video_rows,
+        pending_video_handled=pending_video_handled,
+        target_limit=KF_VIDEO_SEND_LIMIT,
     )
-    if not target_rows and not pending_video_handled and _has_bound_room_field_followup(content):
-        confirmed_row = _confirmed_row(context)
-        if confirmed_row and not _has_explicit_candidate_selection(content):
-            target_rows = [confirmed_row]
-            target_rows = _enforce_target_rows_community_constraints(target_rows, rows, proof)
-    selection_query_text = target_selection_query_text
-    candidate_rows_for_selection = _candidate_rows(context)
-    selected_indices = target_selection_indices
-    current_selection_text = " ".join(
-        str(part).strip()
-        for part in (content, task.get("original_text"))
-        if str(part or "").strip()
-    )
-    selection_has_direct_room_ref = bool(
-        _room_refs_from_text(current_selection_text)
-    )
-    selection_proof_communities = _proof_community_norms(proof)
-    selection_current_text_norm = normalize_search_text(current_selection_text)
-    selection_has_current_community_scope = bool(
-        selection_proof_communities
-        and selection_current_text_norm
-        and any(community in selection_current_text_norm for community in selection_proof_communities)
-    )
-    selection_has_prior_context = bool(
-        candidate_rows_for_selection or pending_video
-    )
-    missing_candidate_selection_context = bool(
-        selected_indices
-        and not selection_has_prior_context
-        and not selection_has_direct_room_ref
-        and not original_video_target_error
-    )
-    invalid_candidate_selection = bool(
-        selected_indices
-        and candidate_rows_for_selection
-        and not target_rows
-        and any(index > len(candidate_rows_for_selection) for index in selected_indices)
-    )
-    invalid_search_selection = bool(
-        selected_indices
-        and not missing_candidate_selection_context
-        and not candidate_rows_for_selection
-        and rows
-        and any(index > len(rows) for index in selected_indices)
-    )
-    current_scope_selection_miss = bool(
-        selected_indices
-        and selection_has_current_community_scope
-        and not selection_has_direct_room_ref
-        and not target_rows
-    )
-    if current_scope_selection_miss:
-        candidate_labels = [_row_label(row) for row in rows[:10]]
-        evidence["selection_error"] = {
-            "requested_indices": selected_indices,
-            "candidate_count": len(rows),
-            "candidate_labels": candidate_labels,
-            "reason": "current_scope_selection_not_found",
-        }
-        rows = []
-        target_rows = []
-        evidence["inventory_rows"] = []
-        evidence["image_rows"] = []
-        evidence["video_rows"] = []
-        evidence["image_paths"] = []
-        evidence["video_paths"] = []
-    elif invalid_candidate_selection or invalid_search_selection:
-        selection_rows = candidate_rows_for_selection or rows
-        candidate_labels = [_row_label(row) for row in selection_rows[:10]]
-        evidence["selection_error"] = {
-            "requested_indices": selected_indices,
-            "candidate_count": len(selection_rows),
-            "candidate_labels": candidate_labels,
-            "reason": "requested_candidate_index_out_of_range",
-        }
-        rows = []
-        target_rows = []
-        evidence["inventory_rows"] = []
-        evidence["image_rows"] = []
-        evidence["video_rows"] = []
-        evidence["image_paths"] = []
-        evidence["video_paths"] = []
-    elif missing_candidate_selection_context:
-        evidence["selection_error"] = {
-            "requested_indices": selected_indices,
-            "candidate_count": 0,
-            "candidate_labels": [],
-            "reason": "missing_current_candidate_set",
-        }
-        rows = []
-        target_rows = []
-        evidence["inventory_rows"] = []
-        evidence["image_rows"] = []
-        evidence["video_rows"] = []
-        evidence["image_paths"] = []
-        evidence["video_paths"] = []
-    if (
-        not target_rows
-        and not evidence.get("selection_error")
-        and field_followup_requires_specific_room
-        and not original_video_target_error
-    ):
-        candidate_labels = [_row_label(row) for row in candidate_rows_for_selection[:10]]
-        evidence["field_target_error"] = {
-            "field": _field_followup_label(content),
-            "reason": "missing_specific_room_for_field_followup",
-            "candidate_count": len(candidate_rows_for_selection),
-            "candidate_labels": candidate_labels,
-        }
-        rows = []
-        evidence["inventory_rows"] = []
-    if (
-        not target_rows
-        and not evidence.get("selection_error")
-        and media_target_error
-    ):
-        evidence["field_target_error"] = media_target_error
-        rows = []
-        evidence["inventory_rows"] = []
-    if (
-        not target_rows
-        and not evidence.get("selection_error")
-        and not evidence.get("field_target_error")
-        and original_video_target_error
-    ):
-        pending_labels = [
-            str(label).strip()
-            for label in (pending_video or {}).get("labels") or []
-            if str(label).strip()
-        ]
-        pending_labels = list(dict.fromkeys(pending_labels))[:KF_VIDEO_SEND_LIMIT]
-        evidence["field_target_error"] = {
-            "field": "原视频",
-            "reason": "original_video_followup_missing_stable_video_target",
-            "candidate_count": 0,
-            "candidate_labels": [],
-            "pending_labels": pending_labels,
-        }
+    target_rows = tool_resolution.target_rows
+    selected_indices = tool_resolution.selected_indices
+    if tool_resolution.candidate_binding:
+        evidence["candidate_binding"] = tool_resolution.candidate_binding
+    if tool_resolution.missing_target_reason:
+        evidence["missing_target_reason"] = tool_resolution.missing_target_reason
+    if tool_resolution.selection_error:
+        evidence["selection_error"] = tool_resolution.selection_error
+    if tool_resolution.field_target_error:
+        evidence["field_target_error"] = tool_resolution.field_target_error
+    if tool_resolution.pending_video_context_bound:
+        evidence["pending_video_context_bound"] = tool_resolution.pending_video_context_bound
+    if tool_resolution.original_video_target_binding:
         original_video_request = dict(evidence.get("original_video_request") or {})
         if original_video_request.get("requested"):
-            original_video_request["target_binding"] = {
-                "stable": False,
-                "reason": "previous_video_target_not_bound",
-                "pending_labels": pending_labels,
-            }
+            original_video_request["target_binding"] = tool_resolution.original_video_target_binding
             original_video_request["reason"] = "上一轮没有稳定匹配到视频目标，不能直接给原视频/高清源。"
             evidence["original_video_request"] = original_video_request
+    if tool_resolution.inventory_rows_override is not None:
+        rows = tool_resolution.inventory_rows_override
+        evidence["inventory_rows"] = rows
+    if tool_resolution.clear_inventory_rows:
         rows = []
         evidence["inventory_rows"] = []
-    if (
-        not target_rows
-        and "explain_unavailable_viewing" in actions
-        and wants_bound_viewing_context
-        and not invalid_candidate_selection
-        and not invalid_search_selection
-    ):
-        candidate_rows = _candidate_rows(context)
-        if not candidate_rows:
-            candidate_query = _last_candidate_query_from_memory(context)
-            if candidate_query:
-                try:
-                    candidate_rows, candidate_evidence = await _inventory_search_rows_for_context(
-                        inventory_read_context,
-                        candidate_query,
-                        limit=10,
-                    )
-                    inventory_read_turn.extend_listing_evidence(inventory_listing_evidence, candidate_evidence)
-                except InventoryReadError as exc:
-                    logger.warning("viewing inventory search blocked by read router: %s", exc.to_dict())
-                    inventory_read_turn.clear_fact_evidence(evidence, exc)
-                    candidate_rows = []
-            if candidate_rows:
-                context["last_candidate_set"] = {
-                    "intent": "inventory",
-                    "query": candidate_query,
-                    "candidates": candidate_rows[:10],
-                    "created_at": time.time(),
-                    "shown_count": min(len(candidate_rows), 10),
-                    "total_count": len(candidate_rows),
-                    "inventory_cache_meta": inventory_source_metadata,
-                }
-        if candidate_rows:
-            target_rows = candidate_rows[:10]
-    explicit_room_refs = bool(proof.get("room_refs"))
-    if (
-        not target_rows
-        and rows
-        and not explicit_room_refs
-        and not invalid_candidate_selection
-        and not invalid_search_selection
-        and not media_target_error
-        and not original_video_target_error
-        and not selected_indices
-        and any(action in actions for action in ("send_image", "send_video"))
-    ):
-        target_rows = rows[:KF_VIDEO_SEND_LIMIT]
+    if tool_resolution.clear_media_outputs:
+        evidence["image_rows"] = []
+        evidence["video_rows"] = []
+        evidence["image_paths"] = []
+        evidence["video_paths"] = []
     rows = _rows_with_listing_ids(rows)
     target_rows = _rows_with_listing_ids(target_rows)
     evidence["inventory_rows"] = _rows_with_listing_ids(evidence.get("inventory_rows") or rows)
