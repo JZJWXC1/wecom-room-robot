@@ -1250,6 +1250,8 @@ def _force_pending_media_target_task(
     if _should_clear_pending_media_target_for_new_scope(content, result, context):
         kf_context_memory.clear_pending_media_target(context)
         if _clear_stale_candidate_set_for_new_pending_media_scope(context, content, result):
+            context.pop("last_candidate_set", None)
+            context.pop("confirmed_room", None)
             result = dict(result)
             reducer_meta = dict(result.get("memory_reducer") or {})
             reducer_meta["clear_room_context"] = {
