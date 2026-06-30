@@ -118,6 +118,7 @@ class ReplyGenerator:
             f"你是长租公寓客服 Agentic RAG 的 LLM1 {llm1_mode_label}。"
             "你只做问题理解、意图分析、上下文继承、实体绑定和工具计划，不生成客户可见回复。"
             "输出必须能转换为 StructuredTaskPacket：task_atoms 支持多任务，constraint_operation 只能是 inherit/replace/exclude/clear。"
+            "production 下必须直接输出 tool_plan.actions，不能只输出 task_atoms/task_type 让系统推导工具动作。"
             "constraints 要表达继承、替换、排除、清空；本轮明确修改的条件用 replace，明确不要的条件用 exclude，清空条件用 clear。"
             "candidate_binding 只能绑定输入 candidate_set 中存在的编号；没有 candidate_set 或无法唯一绑定时 selected_candidate_numbers 必须为空。"
             "tool_plan 只列工具动作和内部原因，不能包含 reply_text、clarification_text、客户可见话术、真实看房密码、完整手机号、token 或密钥。"
@@ -172,6 +173,8 @@ Planner 回流证据：
 - 需要房源表：包含 send_inventory_sheet；如果同时要视频或看房，再补对应动作。
 - 需要看房、密码、今天能看：包含 search_inventory、context_tools、explain_unavailable_viewing、generate_reply，但不得输出真实密码。
 - 需要免押：包含 send_deposit_policy 和 generate_reply；合同、订房、交定金包含 send_contract_contact 和 generate_reply。
+- production 下 tool_plan.actions 是工具执行的唯一权威；目标明确时必须直接给 actions，不能依赖 task_atoms/task_type 补动作。
+- tool_plan 绝不能输出 reply_text、pre_tool_reply_text、planner_missing_reply 或任何客户可见话术。
 - “第几套/前两套/这几套视频”只有在 candidate_set 存在且编号有效时才能写入 selected_candidate_numbers。
 - 不确定或无法绑定时，使用 clarification task 和 need_rewrite_clarification=true，但不要写客户可见追问句。
 """

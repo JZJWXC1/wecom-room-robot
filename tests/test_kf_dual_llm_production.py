@@ -40,6 +40,72 @@ def test_llm1_production_tool_plan_strips_customer_visible_reply_fields() -> Non
     assert "final_reply" not in plan
 
 
+def test_llm1_production_tool_plan_keeps_legal_actions_exactly() -> None:
+    build = build_kf_task_packet_shadow(
+        {
+            "rewritten_query": "发房源表",
+            "task_atoms": [
+                {"task_id": "task-sheet", "task_type": "send_inventory_sheet"},
+            ],
+            "tool_plan": {"actions": ["send_inventory_sheet"]},
+        },
+        content="房源表发一下",
+        source_label="llm1_production",
+        mode="production",
+    )
+
+    plan = tool_plan_from_task_packet(build.packet)
+
+    assert plan["actions"] == ["send_inventory_sheet"]
+    assert not plan.get("retry_required")
+    assert plan["reply_text"] == ""
+
+
+def test_llm1_production_empty_tool_plan_does_not_fallback_from_task_types() -> None:
+    build = build_kf_task_packet_shadow(
+        {
+            "rewritten_query": "第1套视频",
+            "task_atoms": [
+                {"task_id": "task-video", "task_type": "send_video"},
+            ],
+            "tool_plan": {"actions": []},
+        },
+        content="第1套视频发我",
+        source_label="llm1_production",
+        mode="production",
+    )
+
+    plan = tool_plan_from_task_packet(build.packet)
+
+    assert plan["actions"] == []
+    assert plan["retry_required"] is True
+    assert plan["need_rewrite_clarification"] is True
+    assert "send_video" not in plan["actions"]
+    assert "empty" in plan["missing_evidence"]
+
+
+def test_llm1_production_unsupported_action_forces_retry_without_tools() -> None:
+    build = build_kf_task_packet_shadow(
+        {
+            "rewritten_query": "查房源",
+            "task_atoms": [
+                {"task_id": "task-search", "task_type": "inventory_search"},
+            ],
+            "tool_plan": {"actions": ["search_inventory", "local_magic_action"]},
+        },
+        content="房源查一下",
+        source_label="llm1_production",
+        mode="production",
+    )
+
+    plan = tool_plan_from_task_packet(build.packet)
+
+    assert plan["actions"] == []
+    assert plan["retry_required"] is True
+    assert plan["invalid_actions"] == ["local_magic_action"]
+    assert "unsupported action" in plan["missing_evidence"]
+
+
 def test_llm2_production_ignores_llm_supplied_send_actions() -> None:
     async def run_case() -> None:
         build = build_kf_task_packet_shadow(

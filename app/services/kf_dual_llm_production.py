@@ -4,6 +4,7 @@ from typing import Any
 
 from app.services import kf_dual_llm_shadow
 from app.services.kf_contracts import PreparedOutboundPackage, StructuredTaskPacket, safe_artifact_payload
+from app.services.kf_llm1_task_packet import ACTION_TO_TOOL
 from app.services.kf_llm2_outbound import compose_kf_outbound
 from app.services.kf_outbound_validation import (
     OutboundValidationContext,
@@ -17,6 +18,7 @@ DUAL_LLM_PRODUCTION_LLM2_PROMPT_VERSION = "kf_llm2_outbound.production.v1"
 DUAL_LLM_PRODUCTION_SELFCHECK_PROFILE = "kf_llm2_outbound.production_guard.v1"
 DUAL_LLM_PRODUCTION_REPLY_SOURCE = "kf_llm2_outbound_production"
 SUPPORTED_DUAL_LLM_MODES = {"shadow", "production"}
+LLM1_PRODUCTION_ALLOWED_ACTIONS = frozenset(ACTION_TO_TOOL)
 
 
 def normalize_mode(value: Any) -> str:
@@ -33,20 +35,37 @@ def tool_plan_from_task_packet(task_packet: StructuredTaskPacket | dict[str, Any
     metadata = _llm1_metadata(packet)
     raw_plan = metadata.get("tool_plan") if isinstance(metadata, dict) else {}
     plan = dict(raw_plan) if isinstance(raw_plan, dict) else {}
-    actions = _string_list(plan.get("actions")) or _actions_from_task_types(
-        [task.task_type for task in packet.tasks]
-    )
-    if not actions and str(packet.response_strategy.mode) == "ask_clarification":
-        plan["need_rewrite_clarification"] = True
-        plan.setdefault("missing_evidence", "LLM1 production task packet requires clarification.")
+    actions = _string_list(plan.get("actions"))
+    invalid_actions = [action for action in actions if action not in LLM1_PRODUCTION_ALLOWED_ACTIONS]
+    retry_reason = ""
+    if not isinstance(raw_plan, dict):
+        retry_reason = "LLM1 production task packet missing tool_plan; retry rewrite before tool planning."
+    elif invalid_actions:
+        retry_reason = "LLM1 production tool_plan contains unsupported action; retry rewrite before tool execution."
+    elif not actions:
+        retry_reason = "LLM1 production tool_plan.actions is empty; retry rewrite before tool execution."
     if str(packet.response_strategy.mode) == "retry" or str(metadata.get("status") or "") == "retry_required":
+        retry_reason = str(
+            metadata.get("retry_reason")
+            or plan.get("missing_evidence")
+            or retry_reason
+            or "LLM1 production task packet requires retry."
+        )
+    if retry_reason:
         plan["retry_required"] = True
         plan["need_rewrite_clarification"] = True
-        plan.setdefault("missing_evidence", metadata.get("retry_reason") or "LLM1 production task packet requires retry.")
-    plan["actions"] = actions
+        plan["actions"] = []
+        plan["missing_evidence"] = retry_reason
+        if invalid_actions:
+            plan["invalid_actions"] = invalid_actions
+    else:
+        plan["actions"] = actions
     plan["source"] = _source_from_llm1_metadata(metadata)
     plan.pop("reply", None)
     plan.pop("final_reply", None)
+    plan.pop("pre_tool_reply_text", None)
+    plan.pop("planner_missing_reply", None)
+    plan.pop("clarification_text", None)
     plan["reply_text"] = ""
     return safe_artifact_payload(plan)
 

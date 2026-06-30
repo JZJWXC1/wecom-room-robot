@@ -219,6 +219,7 @@ def build_kf_task_packet_shadow(
         turn_id=turn_id,
         case_id=case_id,
         inventory_snapshot_id=inventory_snapshot_id,
+        production_mode=production_mode,
     )
     try:
         packet = StructuredTaskPacket(**payload)
@@ -251,6 +252,7 @@ def build_kf_task_packet_shadow(
             turn_id=turn_id,
             case_id=case_id,
             inventory_snapshot_id=inventory_snapshot_id,
+            production_mode=production_mode,
         )
         packet = StructuredTaskPacket(**payload)
 
@@ -448,13 +450,19 @@ def _packet_payload_from_llm1(
     turn_id: str,
     case_id: str,
     inventory_snapshot_id: str,
+    production_mode: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     constraints_payload = _constraint_payload(raw_output, legacy_rewrite, legacy_planner)
     raw_tasks = _raw_tasks(raw_output)
     raw_actions = _actions_from_payloads(raw_output)
     legacy_actions = _actions_from_payloads(legacy_rewrite, legacy_planner)
     actions = raw_actions or _actions_from_tasks(raw_tasks) or legacy_actions
-    tool_plan = _tool_plan_from(raw_output, actions=actions, legacy_planner=legacy_planner)
+    tool_plan = _tool_plan_from(
+        raw_output,
+        actions=actions,
+        legacy_planner=legacy_planner,
+        production_mode=production_mode,
+    )
     actions = _string_list(tool_plan.get("actions")) or actions
     candidate_binding = _candidate_binding_from(raw_output, raw_tasks, legacy_rewrite, legacy_planner, candidate_context)
     base_constraints = _base_task_constraints(raw_output, legacy_rewrite, legacy_planner)
@@ -585,11 +593,19 @@ def _tasks_from_actions(
     return tasks
 
 
-def _tool_plan_from(raw_output: dict[str, Any], *, actions: list[str], legacy_planner: dict[str, Any]) -> dict[str, Any]:
+def _tool_plan_from(
+    raw_output: dict[str, Any],
+    *,
+    actions: list[str],
+    legacy_planner: dict[str, Any],
+    production_mode: bool = False,
+) -> dict[str, Any]:
     raw_plan = raw_output.get("tool_plan") if isinstance(raw_output.get("tool_plan"), dict) else {}
-    plan_actions = _string_list(raw_plan.get("actions")) or actions
+    plan_actions = _string_list(raw_plan.get("actions"))
+    if not production_mode:
+        plan_actions = plan_actions or actions
     plan = _drop_reply_output(dict(raw_plan))
-    plan["actions"] = _dedupe(plan_actions)
+    plan["actions"] = plan_actions if production_mode else _dedupe(plan_actions)
     plan["required_tools"] = _dedupe(
         _string_list(plan.get("required_tools"))
         or [ACTION_TO_TOOL[action] for action in plan["actions"] if action in ACTION_TO_TOOL]

@@ -1596,6 +1596,33 @@ def _ensure_planner_action_contract(
     signals: dict[str, Any],
 ) -> dict[str, Any]:
     result = dict(planner_result or {})
+    if _dual_llm_production_enabled():
+        for key in (
+            "reply",
+            "reply_text",
+            "final_reply",
+            "pre_tool_reply_text",
+            "planner_missing_reply",
+            "post_tool_reply_result",
+        ):
+            result.pop(key, None)
+        result["reply_text"] = ""
+        if result.get("retry_required"):
+            result["actions"] = []
+            result["need_rewrite_clarification"] = True
+        if result.get("need_rewrite_clarification"):
+            if not str(result.get("missing_evidence") or "").strip():
+                result["missing_evidence"] = "LLM1 production tool_plan 需要重试，发送前不得用本地规则补动作或生成文本。"
+            return result
+        actions = _safe_action_list(result)
+        if not actions:
+            result["actions"] = []
+            result["need_rewrite_clarification"] = True
+            result["missing_evidence"] = "LLM1 production tool_plan.actions 为空，必须重试 LLM1。"
+            result["source"] = f"{result.get('source') or 'llm1_production'}+missing_action_contract"
+            return result
+        result["source"] = f"{result.get('source') or 'llm1_production'}+action_contract"
+        return result
     if result.get("need_rewrite_clarification"):
         result["reply_text"] = ""
         if not str(result.get("missing_evidence") or "").strip():
@@ -5806,6 +5833,24 @@ async def _plan_actions(
     retry_reason: str = "",
 ) -> dict[str, Any]:
     result = _orchestrator_tool_plan_from_understanding(understanding)
+    if _dual_llm_production_enabled():
+        if result:
+            result["source"] = f"{result.get('source') or 'llm1_production_tool_plan'}+from_llm1"
+        else:
+            result = {
+                "actions": [],
+                "need_rewrite_clarification": True,
+                "missing_evidence": "LLM1 production 没有写入 tool_plan，必须重试 LLM1，不能用本地 deterministic signals 补动作。",
+                "source": "llm1_production_missing_tool_plan_gate",
+                "reply_text": "",
+            }
+        llm1_retry_plan = _llm1_production_retry_plan(understanding)
+        if llm1_retry_plan:
+            result = llm1_retry_plan
+        if retry_reason:
+            result["planner_retry_reason"] = retry_reason
+            result["source"] = f"{result.get('source') or 'llm1_production_tool_plan'}+retry_packet"
+        return _ensure_planner_action_contract(result, understanding, signals)
     if result:
         result["source"] = f"{result.get('source') or 'orchestrator_pre_tool_plan'}+from_rewrite"
     else:
@@ -9628,16 +9673,19 @@ async def _generate_reply_result(
     rows = [row for row in tool_evidence.get("inventory_rows") or [] if isinstance(row, dict)]
     target_rows = [row for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)]
     evidence_rows = target_rows or rows
-    planner_reply = str(
-        (planner_result or {}).get("reply")
-        or (planner_result or {}).get("reply_text")
-        or (planner_result or {}).get("final_reply")
-        or ""
-    ).strip()
+    production_mode = _dual_llm_production_enabled()
+    planner_reply = ""
+    if not production_mode:
+        planner_reply = str(
+            (planner_result or {}).get("reply")
+            or (planner_result or {}).get("reply_text")
+            or (planner_result or {}).get("final_reply")
+            or ""
+        ).strip()
     planner_requires_reply = (
         bool(planner_result)
         and not (planner_result or {}).get("need_rewrite_clarification")
-        and not _dual_llm_production_enabled()
+        and not production_mode
     )
     if planner_requires_reply and not planner_reply:
         post_tool_reply_result: dict[str, Any] = {
@@ -9891,7 +9939,7 @@ async def _generate_reply_result(
     if planner_missing_reply:
         draft_reply = ""
         deterministic_reply_source = "planner_missing_reply_text"
-    elif clarification_only and planner_reply:
+    elif clarification_only and planner_reply and not production_mode:
         draft_reply = planner_reply
         deterministic_reply_source = "rewrite_clarification"
     elif candidate_selection_error_reply:
@@ -9913,12 +9961,12 @@ async def _generate_reply_result(
     ):
         draft_reply = inventory_search_reply
         deterministic_reply_source = "tool_grounded_reply"
-    elif planner_reply:
+    elif planner_reply and not production_mode:
         draft_reply = _safe_fallback_for_intent(understanding, planner_reply)
         deterministic_reply_source = "planner_reply_text"
     else:
         draft_reply = ""
-        deterministic_reply_source = "planner_missing_reply_text"
+        deterministic_reply_source = "llm2_production_pending" if production_mode else "planner_missing_reply_text"
     normalized_reply = _normalize_inventory_sheet_reply_before_selfcheck(
         draft_reply=draft_reply,
         understanding=understanding,
@@ -9945,7 +9993,7 @@ async def _generate_reply_result(
         draft_reply = normalized_reply
     if deterministic_reply_source:
         tool_evidence["deterministic_reply_source"] = deterministic_reply_source
-    if _dual_llm_production_enabled():
+    if production_mode:
         llm2_retry_reason = ""
         task_packet = understanding.get("llm1_task_packet")
         production_package_payload: dict[str, Any] = {}
