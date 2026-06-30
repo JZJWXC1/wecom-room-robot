@@ -123,6 +123,7 @@ class OutboundValidationResult:
 @dataclass(frozen=True)
 class _PackageIndexes:
     evidence_by_id: dict[str, EvidenceItem]
+    action_by_id: dict[str, SendAction]
     action_ids: set[str]
     candidate_numbers: set[int]
     listing_ids: set[str]
@@ -161,6 +162,10 @@ TEMPLATE_PATTERN = re.compile(r"(?:XX|某某|某小区|某房号|TODO|\{\{|\}\}|
 FUTURE_SEND_PATTERN = re.compile(r"(?:稍后|等下|待会|晚点|之后).{0,8}(?:发|传)|(?:可以|能|会).{0,4}发你")
 PAST_SENT_PATTERN = re.compile(r"(?:已发|发你了|已经发|给你发过去了|这是.{0,16}(?:视频|图片|房源表))")
 MISSING_MEDIA_PATTERN = re.compile(r"(?:暂无|没有|没找到|暂时没).{0,8}(?:视频|图片|照片)")
+HARD_FORBIDDEN_HUMAN_PATTERN = re.compile(
+    r"(?:作为(?:一个)?AI|系统显示|根据上下文|无法完成该请求|马上通知[你您]|稍后(?:会)?通知[你您]|稍后(?:会)?为[你您]推送|"
+    r"有新(?:房源|资源)(?:会)?第一时间通知)",
+)
 
 
 def validate_prepared_outbound_package(
@@ -234,6 +239,7 @@ def _coerce_package(
 def _build_indexes(package: PreparedOutboundPackage) -> _PackageIndexes:
     evidence_items = _evidence_items(package.evidence_bundle)
     evidence_by_id = {item.evidence_id: item for item in evidence_items if item.evidence_id}
+    action_by_id = {action.action_id: action for action in package.send_actions if action.action_id}
     candidate_numbers = {item.candidate_number for item in _candidate_items(package.candidate_set)}
     listing_ids = {
         listing_id
@@ -246,6 +252,7 @@ def _build_indexes(package: PreparedOutboundPackage) -> _PackageIndexes:
     action_ids = {action.action_id for action in package.send_actions if action.action_id}
     return _PackageIndexes(
         evidence_by_id=evidence_by_id,
+        action_by_id=action_by_id,
         action_ids=action_ids,
         candidate_numbers=candidate_numbers,
         listing_ids=listing_ids,
@@ -304,6 +311,46 @@ def _validate_l0(package: PreparedOutboundPackage, indexes: _PackageIndexes) -> 
             issues.append(_issue(ValidationLevel.L0, "l0.missing_evidence_ref", "Claim must reference at least one evidence item.", path, claim.claim_id))
         issues.extend(_validate_evidence_refs(refs, indexes, path, claim.claim_id))
         issues.extend(_validate_candidate_ref_types(claim, path))
+
+    caption_action_ids_seen: set[str] = set()
+    for index, caption in enumerate(package.action_captions):
+        path = f"action_captions[{index}]"
+        if not caption.action_id:
+            issues.append(_issue(ValidationLevel.L0, "l0.missing_action_ref", "Action caption must reference a send action.", path))
+            continue
+        if caption.action_id in caption_action_ids_seen:
+            issues.append(
+                _issue(
+                    ValidationLevel.L0,
+                    "l0.duplicate_action_caption",
+                    "Duplicate action caption for the same action_id is not allowed.",
+                    f"{path}.action_id",
+                    caption.action_id,
+                )
+            )
+        caption_action_ids_seen.add(caption.action_id)
+        action = indexes.action_by_id.get(caption.action_id)
+        if action is None:
+            issues.append(
+                _issue(
+                    ValidationLevel.L0,
+                    "l0.unknown_action_ref",
+                    "Action caption references a send action that does not exist.",
+                    f"{path}.action_id",
+                    caption.action_id,
+                )
+            )
+            continue
+        if caption.action_type and caption.action_type != action.action_type:
+            issues.append(
+                _issue(
+                    ValidationLevel.L0,
+                    "l0.action_caption_type_mismatch",
+                    "Action caption action_type must match the referenced send action.",
+                    f"{path}.action_type",
+                    caption.action_id,
+                )
+            )
 
     issues.extend(_validate_package_level_action_refs(package, indexes))
     return issues
@@ -424,32 +471,67 @@ def _validate_l2(
 def _validate_l3(package: PreparedOutboundPackage, context: OutboundValidationContext) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     text = package.reply_text or ""
+    has_media_action = any(_is_media_action(action) for action in package.send_actions)
+    if text:
+        issues.extend(_validate_l3_text(text, "reply_text", context=context, has_media_action=has_media_action))
+    for index, caption in enumerate(package.action_captions):
+        action = _action_for_caption(caption.action_id, package)
+        caption_has_media_action = _is_media_action(action) if action is not None else False
+        issues.extend(
+            _validate_l3_text(
+                caption.text,
+                f"action_captions[{index}].text",
+                context=None,
+                has_media_action=caption_has_media_action,
+            )
+        )
+    return issues
+
+
+def _validate_l3_text(
+    text: str,
+    path: str,
+    *,
+    context: OutboundValidationContext | None,
+    has_media_action: bool,
+) -> list[ValidationIssue]:
     if not text:
-        return issues
+        return []
+    issues: list[ValidationIssue] = []
     if INTERNAL_LEAK_PATTERN.search(text):
         issues.append(
-            _issue(ValidationLevel.L3, "l3.internal_name_leak", "Reply leaks internal field/tool names; regenerate wording only.", "reply_text")
+            _issue(ValidationLevel.L3, "l3.internal_name_leak", "Reply leaks internal field/tool names; regenerate wording only.", path)
+        )
+    if HARD_FORBIDDEN_HUMAN_PATTERN.search(text):
+        issues.append(
+            _issue(ValidationLevel.L3, "l3.forbidden_human_phrase", "Reply contains a hard-forbidden customer-service phrase; regenerate wording only.", path)
         )
     if TEMPLATE_PATTERN.search(text):
-        issues.append(_issue(ValidationLevel.L3, "l3.template_talk", "Reply contains placeholder or template wording; regenerate wording only.", "reply_text"))
-    if _asks_known_condition_again(text, context):
+        issues.append(_issue(ValidationLevel.L3, "l3.template_talk", "Reply contains placeholder or template wording; regenerate wording only.", path))
+    if context is not None and _asks_known_condition_again(text, context):
         issues.append(
-            _issue(ValidationLevel.L3, "l3.repeats_known_condition", "Reply asks again for conditions already known in context.", "reply_text")
+            _issue(ValidationLevel.L3, "l3.repeats_known_condition", "Reply asks again for conditions already known in context.", path)
         )
-    has_media_action = any(_is_media_action(action) for action in package.send_actions)
     if has_media_action and FUTURE_SEND_PATTERN.search(text):
         issues.append(
-            _issue(ValidationLevel.L3, "l3.action_tense_error", "Reply uses future tense although media action is already prepared.", "reply_text")
+            _issue(ValidationLevel.L3, "l3.action_tense_error", "Reply uses future tense although media action is already prepared.", path)
         )
     if not has_media_action and PAST_SENT_PATTERN.search(text):
         issues.append(
-            _issue(ValidationLevel.L3, "l3.action_tense_error", "Reply claims a media action was sent but no media action is prepared.", "reply_text")
+            _issue(ValidationLevel.L3, "l3.action_tense_error", "Reply claims a media action was sent but no media action is prepared.", path)
         )
     if has_media_action and MISSING_MEDIA_PATTERN.search(text):
         issues.append(
-            _issue(ValidationLevel.L3, "l3.action_tense_error", "Reply says media is missing while a media send action is prepared.", "reply_text")
+            _issue(ValidationLevel.L3, "l3.action_tense_error", "Reply says media is missing while a media send action is prepared.", path)
         )
     return issues
+
+
+def _action_for_caption(action_id: str, package: PreparedOutboundPackage) -> SendAction | None:
+    for action in package.send_actions:
+        if action.action_id == action_id:
+            return action
+    return None
 
 
 def _validate_listing_ref(
