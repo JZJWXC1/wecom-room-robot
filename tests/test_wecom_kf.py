@@ -2626,6 +2626,250 @@ class MainUnderstandingGuardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target_rows, [rows[0], rows[4]])
 
+    def test_selected_indices_parse_sparse_video_number_connectors(self) -> None:
+        understanding = {"intent": "media", "constraint_proof": {"wants_video": True}}
+
+        self.assertEqual(
+            main._selected_indices_from_understanding(understanding, "1和3的视频发我"),
+            [1, 3],
+        )
+        self.assertEqual(
+            main._selected_indices_from_understanding(understanding, "1、3的视频发我"),
+            [1, 3],
+        )
+
+    def test_structured_selected_indices_win_over_incomplete_text_selection(self) -> None:
+        original_selection = main._selection_indices_from_text
+        main._selection_indices_from_text = lambda text: [1]
+        try:
+            selected = main._selected_indices_from_understanding(
+                {
+                    "intent": "media",
+                    "selected_indices": [1, 3],
+                    "constraint_proof": {"selected_indices": [1, 3], "wants_video": True},
+                },
+                "1和3的视频发我",
+            )
+        finally:
+            main._selection_indices_from_text = original_selection
+
+        self.assertEqual(selected, [1, 3])
+
+    def test_selected_indices_bind_first_and_third_candidate_rows(self) -> None:
+        rows = [
+            {"小区": "棠润府", "房号": "15-2-801B"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+            {"小区": "合峙悦府", "房号": "6-1-1204B"},
+        ]
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达2000以内一室",
+            "candidates": rows,
+            "shown_count": 3,
+            "total_count": 3,
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "1和3的视频发我",
+                "rewritten_query": "发送候选第1和第3套视频",
+                "context_reference": True,
+                "intent": "media",
+                "selected_indices": [1, 3],
+                "constraint_proof": {"selected_indices": [1, 3], "wants_video": True},
+                "structured_task": {
+                    "original_text": "1和3的视频发我",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            [{"小区": "当前搜索小区", "房号": "1-101"}],
+        )
+
+        self.assertEqual(target_rows, [rows[0], rows[2]])
+
+    def test_selected_indices_without_candidate_set_do_not_bind_current_search_rows(self) -> None:
+        search_rows = [
+            {"小区": "当前搜索小区", "房号": "1-101"},
+            {"小区": "当前搜索小区", "房号": "1-102"},
+            {"小区": "当前搜索小区", "房号": "1-103"},
+        ]
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "1和3的视频发我",
+                "rewritten_query": "发送候选第1和第3套视频",
+                "context_reference": True,
+                "intent": "media",
+                "selected_indices": [1, 3],
+                "constraint_proof": {"selected_indices": [1, 3], "wants_video": True},
+                "structured_task": {
+                    "original_text": "1和3的视频发我",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            kf_context_memory.empty_context(),
+            search_rows,
+        )
+
+        self.assertEqual(target_rows, [])
+
+    def test_send_all_limit_phrase_is_not_selected_index_five(self) -> None:
+        phrase = "能发的都发，先不要超过5套。"
+
+        self.assertEqual(main._selection_indices_from_text(phrase), [])
+        self.assertEqual(main._selected_indices_from_understanding({}, phrase), [])
+
+    def test_llm1_bound_candidate_numbers_work_without_text_heuristic(self) -> None:
+        packet = {
+            "legacy_unknown_fields": {
+                "llm1_production": {
+                    "candidate_binding": {
+                        "status": "bound",
+                        "selected_candidate_numbers": [1, 3],
+                        "dropped_candidate_numbers": [],
+                        "candidate_count": 5,
+                    }
+                }
+            },
+            "tasks": [{"constraints": {"candidate_numbers": [1, 3]}}],
+        }
+
+        self.assertEqual(
+            main._selected_indices_from_understanding(
+                {
+                    "intent": "media",
+                    "llm1_task_packet": packet,
+                    "constraint_proof": {"wants_video": True},
+                },
+                "上面那两个视频发我",
+            ),
+            [1, 3],
+        )
+
+    def test_partial_llm1_binding_does_not_revive_task_candidate_numbers(self) -> None:
+        packet = {
+            "legacy_unknown_fields": {
+                "llm1_production": {
+                    "candidate_binding": {
+                        "status": "partial",
+                        "selected_candidate_numbers": [1],
+                        "dropped_candidate_numbers": [3],
+                        "candidate_count": 2,
+                    }
+                }
+            },
+            "tasks": [{"constraints": {"candidate_numbers": [1]}}],
+        }
+
+        self.assertEqual(
+            main._selected_indices_from_understanding(
+                {
+                    "intent": "media",
+                    "llm1_task_packet": packet,
+                    "constraint_proof": {"wants_video": True},
+                },
+                "上面那两个视频发我",
+            ),
+            [],
+        )
+
+    def test_llm1_task_constraints_without_candidate_binding_are_not_trusted_selection(self) -> None:
+        packet = {"tasks": [{"constraints": {"candidate_numbers": [1, 2, 3, 4, 5]}}]}
+
+        understanding = {
+            "intent": "media",
+            "llm1_task_packet": packet,
+            "constraint_proof": {"wants_video": True},
+        }
+
+        self.assertEqual(
+            main._selected_indices_from_understanding(understanding, "上面那几个视频发我"),
+            [],
+        )
+        self.assertEqual(
+            main._pending_media_selection_indices("能发的都发，先不要超过5套。", understanding),
+            [],
+        )
+
+    def test_rewritten_query_candidate_number_does_not_bind_without_user_selection_or_llm1_binding(self) -> None:
+        rows = [
+            {"小区": "棠润府", "房号": "15-2-801B"},
+            {"小区": "星桥锦绣嘉苑", "房号": "20-1606A"},
+        ]
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达2000以内一室",
+            "candidates": rows,
+            "shown_count": 2,
+            "total_count": 2,
+        }
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "第1套视频",
+                "rewritten_query": "第1套视频",
+                "context_reference": False,
+                "intent": "media",
+                "constraint_proof": {"wants_video": True},
+                "structured_task": {
+                    "original_text": "视频发我",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+            [],
+        )
+
+        self.assertEqual(target_rows, [])
+
+    def test_current_community_media_request_without_selection_does_not_bind_first_search_row(self) -> None:
+        search_rows = [
+            {"小区": "棠润府", "房号": "15-2-801B"},
+            {"小区": "棠润府", "房号": "15-2-802B"},
+        ]
+
+        target_rows = main._target_rows_from_understanding(
+            {
+                "effective_query": "棠润府第1套视频",
+                "rewritten_query": "棠润府第1套视频",
+                "context_reference": False,
+                "intent": "media",
+                "selected_indices": [1],
+                "constraint_proof": {
+                    "communities": ["棠润府"],
+                    "selected_indices": [1],
+                    "wants_video": True,
+                },
+                "structured_task": {
+                    "original_text": "棠润府视频发我",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            kf_context_memory.empty_context(),
+            search_rows,
+        )
+
+        self.assertEqual(target_rows, [])
+
+    def test_pending_media_send_all_limit_phrase_ignores_structured_selected_indices(self) -> None:
+        self.assertEqual(
+            main._pending_media_selection_indices(
+                "能发的都发，先不要超过5套。",
+                {
+                    "intent": "media",
+                    "selected_indices": [1, 2, 3, 4, 5],
+                    "constraint_proof": {
+                        "selected_indices": [1, 2, 3, 4, 5],
+                        "wants_video": True,
+                    },
+                },
+            ),
+            [],
+        )
+
     def test_selected_indices_ignore_inherited_room_refs_for_candidate_binding(self) -> None:
         rows = [
             {"\u5c0f\u533a": "\u68e0\u6da6\u5e9c", "\u623f\u53f7": "15-2-801B"},
@@ -9495,7 +9739,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(evidence["image_rows"], [])
         self.assertEqual(evidence["image_paths"], [])
         self.assertEqual(evidence["selection_error"]["reason"], "missing_current_candidate_set")
-        self.assertEqual(evidence["selection_error"]["requested_indices"], [1])
+        self.assertEqual(evidence["selection_error"]["requested_indices"], [1, 2])
         self.assertEqual(evidence["selection_error"]["candidate_count"], 0)
 
     async def test_selected_indices_without_candidates_ignore_inherited_room_refs(self) -> None:

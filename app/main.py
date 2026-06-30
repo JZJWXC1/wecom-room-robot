@@ -474,6 +474,7 @@ def _candidate_selection_count_from_text(text: str) -> int:
 
 def _selection_indices_from_text(text: str) -> list[int]:
     value = str(text or "")
+    word_matches = []
     for word, index in (
         ("第一套", 1),
         ("第一个", 1),
@@ -487,7 +488,9 @@ def _selection_indices_from_text(text: str) -> list[int]:
         ("第五个", 5),
     ):
         if word in value:
-            return [index]
+            word_matches.append(index)
+    if word_matches:
+        return list(dict.fromkeys(word_matches))[:KF_VIDEO_SEND_LIMIT]
     ordinal_numbers = [int(item) for item in re.findall(r"第\s*([1-9])\s*(?:套|个)?", value)]
     if ordinal_numbers:
         return list(dict.fromkeys(number for number in ordinal_numbers if number > 0))[:KF_VIDEO_SEND_LIMIT]
@@ -495,7 +498,10 @@ def _selection_indices_from_text(text: str) -> list[int]:
         int(item)
         for item in re.findall(r"(?<!\d)([1-9])(?:\s*(?:和|跟|、|,|，)\s*|号?和)", value)
     ]
-    trailing = re.findall(r"(?:和|跟|、|,|，)\s*([1-9])(?:\s*套|\s*个|视频|图片|$)", value)
+    trailing = re.findall(
+        r"(?:和|跟|、|,|，)\s*([1-9])(?:\s*套|\s*个|\s*的?\s*(?:视频|图片|照片|素材)|$)",
+        value,
+    )
     numbers.extend(int(item) for item in trailing)
     if numbers:
         return list(dict.fromkeys(number for number in numbers if number > 0))[:KF_VIDEO_SEND_LIMIT]
@@ -538,25 +544,121 @@ def _has_explicit_candidate_selection(text: str) -> bool:
     )
 
 
+def _candidate_numbers_from_llm1_packet(packet: Any) -> list[int]:
+    if not isinstance(packet, dict):
+        return []
+    trusted_candidates: list[int] = []
+    metadata = dict(packet.get("legacy_unknown_fields") or {})
+    for key in ("llm1_production", "llm1_shadow"):
+        llm1_meta = metadata.get(key)
+        if not isinstance(llm1_meta, dict):
+            continue
+        binding = llm1_meta.get("candidate_binding")
+        if not isinstance(binding, dict):
+            continue
+        dropped = _int_list(binding.get("dropped_candidate_numbers"))
+        status = str(binding.get("status") or "").strip().lower()
+        selected = _int_list(binding.get("selected_candidate_numbers"))
+        try:
+            candidate_count = int(binding.get("candidate_count") or 0)
+        except (TypeError, ValueError):
+            candidate_count = 0
+        if status != "bound" or dropped or not selected or candidate_count <= 0:
+            continue
+        trusted_candidates.extend(selected)
+    return list(dict.fromkeys(number for number in trusted_candidates if number > 0))[:KF_VIDEO_SEND_LIMIT]
+
+
+def _llm1_selected_indices_from_understanding(understanding: dict[str, Any]) -> list[int]:
+    structured_task = dict(understanding.get("structured_task") or {})
+    for packet in (
+        understanding.get("llm1_task_packet"),
+        structured_task.get("llm1_task_packet"),
+    ):
+        candidates = _candidate_numbers_from_llm1_packet(packet)
+        if candidates:
+            return candidates
+    return []
+
+
+def _structured_selected_indices_from_understanding(understanding: dict[str, Any]) -> list[int]:
+    proof = dict(understanding.get("constraint_proof") or {})
+    structured_task = dict(understanding.get("structured_task") or {})
+    candidates: list[int] = []
+    for source in (structured_task, proof, understanding):
+        for key in ("candidate_numbers", "selected_candidate_numbers", "selected_indices"):
+            candidates.extend(_int_list(source.get(key)))
+    return list(dict.fromkeys(number for number in candidates if number > 0))[:KF_VIDEO_SEND_LIMIT]
+
+
+def _selection_text_allows_structured_expansion(query_text: str) -> bool:
+    value = str(query_text or "")
+    return bool(
+        re.search(
+            r"(?:第\s*)?[1-9]\s*(?:套|个)?\s*(?:和|跟|、|,|，)\s*(?:第\s*)?[1-9]",
+            value,
+        )
+    )
+
+
+def _merge_text_and_structured_selected_indices(
+    *,
+    query_text: str = "",
+    text_selected: list[int],
+    structured_selected: list[int],
+) -> list[int]:
+    text_selected = list(dict.fromkeys(text_selected))[:KF_VIDEO_SEND_LIMIT]
+    structured_selected = list(dict.fromkeys(structured_selected))[:KF_VIDEO_SEND_LIMIT]
+    if not structured_selected:
+        return text_selected
+    if not text_selected:
+        return structured_selected
+    if text_selected == structured_selected:
+        return structured_selected
+    if all(index in structured_selected for index in text_selected):
+        if _selection_text_allows_structured_expansion(query_text):
+            return structured_selected
+        return text_selected
+    if all(index in text_selected for index in structured_selected):
+        return text_selected
+    return text_selected
+
+
 def _selected_indices_from_understanding(understanding: dict[str, Any], query_text: str) -> list[int]:
     proof = dict(understanding.get("constraint_proof") or {})
     if str(proof.get("pending_video_action") or "").lower() == "continue":
         return []
+    llm1_selected = _llm1_selected_indices_from_understanding(understanding)
     text_selected = _selection_indices_from_text(query_text)
     if text_selected:
-        return text_selected[:KF_VIDEO_SEND_LIMIT]
+        return _merge_text_and_structured_selected_indices(
+            query_text=query_text,
+            text_selected=text_selected,
+            structured_selected=llm1_selected or _structured_selected_indices_from_understanding(understanding),
+        )
+    if llm1_selected:
+        return llm1_selected
     if not _has_explicit_candidate_selection(query_text):
         return []
-    selected = _int_list(understanding.get("selected_indices"))
-    proof_selected = _int_list(proof.get("selected_indices"))
-    structured_selected: list[int] = []
-    for items in (selected, proof_selected):
-        for index in items:
-            if index not in structured_selected:
-                structured_selected.append(index)
-    if structured_selected:
-        return structured_selected[:KF_VIDEO_SEND_LIMIT]
-    return []
+    return _merge_text_and_structured_selected_indices(
+        query_text=query_text,
+        text_selected=text_selected,
+        structured_selected=_structured_selected_indices_from_understanding(understanding),
+    )
+
+
+def _explicit_selected_indices_from_understanding(understanding: dict[str, Any], query_text: str) -> list[int]:
+    text_selected = _selection_indices_from_text(query_text)
+    if text_selected:
+        return _merge_text_and_structured_selected_indices(
+            query_text=query_text,
+            text_selected=text_selected,
+            structured_selected=(
+                _llm1_selected_indices_from_understanding(understanding)
+                or _structured_selected_indices_from_understanding(understanding)
+            ),
+        )
+    return _llm1_selected_indices_from_understanding(understanding)
 
 
 def _has_single_room_context_pronoun(text: str) -> bool:
@@ -831,6 +933,13 @@ async def _apply_llm1_production_task_packet(
     result["tool_plan"] = tool_plan
     result.setdefault("structured_task", {})["llm1_task_packet"] = packet_payload
     result["structured_task"]["tool_plan"] = tool_plan
+    selected_candidate_numbers = _candidate_numbers_from_llm1_packet(packet_payload)
+    if selected_candidate_numbers:
+        result["selected_indices"] = selected_candidate_numbers
+        result["candidate_action"] = "select"
+        constraint_proof = dict(result.get("constraint_proof") or {})
+        constraint_proof["selected_indices"] = selected_candidate_numbers
+        result["constraint_proof"] = constraint_proof
     llm1_status = "retry" if tool_plan.get("retry_required") or tool_plan.get("need_rewrite_clarification") else "pass"
     result["dual_llm_production"] = {
         "llm1": {
@@ -962,6 +1071,276 @@ def _force_pending_video_continue_task(
         }
         normalized["structured_task"] = structured_task
 
+    return normalized
+
+
+def _pending_media_selection_indices(content: str, understanding: dict[str, Any]) -> list[int]:
+    text = str(content or "").strip()
+    if re.fullmatch(r"(?:第\s*)?[1-9]\s*(?:套|个)?", text):
+        number = int(re.search(r"[1-9]", text).group(0))
+        return [number]
+    return _explicit_selected_indices_from_understanding(understanding, text)
+
+
+def _pending_media_target_rows_for_content(
+    content: str,
+    understanding: dict[str, Any],
+    context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    pending = kf_context_memory.pending_media_target(context)
+    rows = [row for row in pending.get("candidate_rows") or [] if isinstance(row, dict)]
+    if not rows:
+        return []
+
+    selected = _pending_media_selection_indices(content, understanding)
+    if selected:
+        selected_rows = [rows[index - 1] for index in selected if 1 <= index <= len(rows)]
+        return selected_rows[:KF_VIDEO_SEND_LIMIT]
+
+    task = dict(understanding.get("structured_task") or {})
+    proof = dict(understanding.get("constraint_proof") or {})
+    text = " ".join(
+        str(part).strip()
+        for part in (content, task.get("original_text"))
+        if str(part or "").strip()
+    )
+    normalized_text = normalize_search_text(text)
+    refs = set(_room_refs_from_text(text))
+    refs.update(_normalize_room_ref(ref) for ref in proof.get("room_refs") or [] if str(ref).strip())
+    proof_communities = {
+        normalize_search_text(str(item))
+        for item in proof.get("communities") or []
+        if normalize_search_text(str(item))
+    }
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        label = normalize_search_text(_row_label(row))
+        community = normalize_search_text(_row_value(row, ("小区", "小区名", "社区", "楼盘")))
+        room_no = _normalize_room_ref(_row_value(row, ("房号", "房间号", "门牌")))
+        if label and label in normalized_text:
+            matches.append(row)
+            continue
+        if room_no and room_no in refs:
+            if proof_communities and community not in proof_communities:
+                continue
+            if not proof_communities and community and community not in normalized_text:
+                same_room_rows = [
+                    item
+                    for item in rows
+                    if _normalize_room_ref(_row_value(item, ("房号", "房间号", "门牌"))) == room_no
+                ]
+                if len(same_room_rows) > 1:
+                    continue
+            matches.append(row)
+    return matches[:KF_VIDEO_SEND_LIMIT]
+
+
+def _rows_scope_overlaps_query(
+    rows: list[dict[str, Any]],
+    content: str,
+    understanding: dict[str, Any],
+) -> bool:
+    if not rows:
+        return False
+    task = dict(understanding.get("structured_task") or {})
+    query_text = " ".join(
+        str(part).strip()
+        for part in (
+            content,
+            task.get("original_text"),
+            understanding.get("effective_query"),
+            understanding.get("rewritten_query"),
+        )
+        if str(part or "").strip()
+    )
+    normalized_text = normalize_search_text(query_text)
+    if not normalized_text:
+        return False
+    for row in rows:
+        label = normalize_search_text(_row_label(row))
+        community = normalize_search_text(_row_value(row, ("小区", "小区名", "社区", "楼盘")))
+        if label and label in normalized_text:
+            return True
+        if community and community in normalized_text:
+            return True
+    return False
+
+
+def _pending_media_scope_overlaps_query(
+    content: str,
+    understanding: dict[str, Any],
+    context: dict[str, Any],
+) -> bool:
+    pending = kf_context_memory.pending_media_target(context)
+    rows = [row for row in pending.get("candidate_rows") or [] if isinstance(row, dict)]
+    return _rows_scope_overlaps_query(rows, content, understanding)
+
+
+def _clear_stale_candidate_set_for_new_pending_media_scope(
+    context: dict[str, Any],
+    content: str,
+    understanding: dict[str, Any],
+) -> None:
+    candidate_rows = _candidate_rows(context)
+    if candidate_rows and not _rows_scope_overlaps_query(candidate_rows, content, understanding):
+        context.pop("last_candidate_set", None)
+
+
+def _should_clear_pending_media_target_for_new_scope(
+    content: str,
+    understanding: dict[str, Any],
+    context: dict[str, Any],
+) -> bool:
+    proof = dict(understanding.get("constraint_proof") or {})
+    task = dict(understanding.get("structured_task") or {})
+    requirements = dict(task.get("tool_requirements") or {})
+    query_text = " ".join(
+        str(part).strip()
+        for part in (
+            content,
+            task.get("original_text"),
+            understanding.get("effective_query"),
+            understanding.get("rewritten_query"),
+        )
+        if str(part or "").strip()
+    )
+    if not query_text:
+        return False
+    if _has_single_room_context_pronoun(query_text):
+        return False
+    has_new_scope = bool(
+        proof.get("area")
+        or proof.get("communities")
+        or proof.get("budget_range")
+        or proof.get("layout")
+        or _area_alias_hits(query_text)
+        or _possible_community_mentions(query_text)
+    )
+    wants_media = bool(
+        proof.get("wants_video")
+        or proof.get("wants_image")
+        or proof.get("wants_original_video")
+        or requirements.get("needs_video")
+        or requirements.get("needs_image")
+        or _normalize_intent(understanding.get("intent")) == "media"
+    )
+    if has_new_scope and wants_media and _has_explicit_candidate_selection(query_text):
+        return not _pending_media_scope_overlaps_query(content, understanding, context)
+    if _has_explicit_candidate_selection(query_text) and not (
+        proof.get("area")
+        or proof.get("communities")
+        or proof.get("budget_range")
+        or proof.get("layout")
+    ):
+        return False
+    return _looks_like_new_scoped_inventory_query(query_text, proof)
+
+
+def _force_pending_media_target_task(
+    content: str,
+    result: dict[str, Any],
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    pending = kf_context_memory.pending_media_target(context)
+    media_kind = str(pending.get("media_kind") or "").strip()
+    if media_kind not in {"video", "image"}:
+        return result
+    if _should_clear_pending_media_target_for_new_scope(content, result, context):
+        kf_context_memory.clear_pending_media_target(context)
+        _clear_stale_candidate_set_for_new_pending_media_scope(context, content, result)
+        return result
+    target_rows = _pending_media_target_rows_for_content(content, result, context)
+    if not target_rows:
+        return result
+
+    normalized = dict(result)
+    normalized["intent"] = "media"
+    normalized["context_reference"] = True
+    normalized["needs_clarification"] = False
+    normalized["clarification_text"] = ""
+    normalized["target_rows"] = target_rows
+
+    media_label = "视频" if media_kind == "video" else "图片"
+    labels = [_row_label(row) for row in target_rows if _row_label(row)]
+    task_text = f"发送{'、'.join(labels) or '已确认房源'}的{media_label}。"
+    if content.strip():
+        task_text += f" 客户原话：{content.strip()}"
+    normalized["rewritten_query"] = task_text
+    normalized["effective_query"] = task_text
+
+    query_state = dict(normalized.get("query_state") or {})
+    query_state.update(
+        {
+            "intent": "media",
+            "media_kind": media_kind,
+            "wants_video": media_kind == "video",
+            "wants_image": media_kind == "image",
+            "pending_media_target_bound": True,
+        }
+    )
+    normalized["query_state"] = query_state
+
+    communities = list(dict.fromkeys(_row_value(row, ("小区", "小区名", "社区", "楼盘")) for row in target_rows if _row_value(row, ("小区", "小区名", "社区", "楼盘"))))
+    room_refs = list(dict.fromkeys(_row_value(row, ("房号", "房间号", "门牌")) for row in target_rows if _row_value(row, ("房号", "房间号", "门牌"))))
+    constraint_proof = dict(normalized.get("constraint_proof") or {})
+    constraint_proof.update(
+        {
+            "intent": "media",
+            "wants_video": media_kind == "video",
+            "wants_image": media_kind == "image",
+            "communities": communities,
+            "room_refs": room_refs,
+            "proof_status": "complete",
+            "pending_media_target_bound": True,
+        }
+    )
+    selected = _pending_media_selection_indices(content, result)
+    if selected:
+        constraint_proof["selected_indices"] = selected
+        normalized["selected_indices"] = selected
+    normalized["constraint_proof"] = constraint_proof
+
+    structured_task = dict(normalized.get("structured_task") or {})
+    structured_task.update(
+        {
+            "intent": "media",
+            "original_text": str(structured_task.get("original_text") or content),
+            "effective_query": task_text,
+            "query_state": query_state,
+            "constraint_proof": constraint_proof,
+            "target_binding": {
+                "context_reference": True,
+                "candidate_action": "pending_media_target",
+                "selected_indices": selected,
+                "target_rows": labels,
+            },
+            "clarification": {
+                "needed": False,
+                "text": "",
+                "reason": "pending_media_target_bound",
+            },
+        }
+    )
+    requirements = dict(structured_task.get("tool_requirements") or {})
+    requirements.update(
+        {
+            "needs_inventory_search": True,
+            "needs_video": media_kind == "video",
+            "needs_image": media_kind == "image",
+            "needs_inventory_sheet": False,
+        }
+    )
+    structured_task["tool_requirements"] = requirements
+    media_action = "send_video" if media_kind == "video" else "send_image"
+    tool_plan = {
+        "actions": ["search_inventory", "context_tools", media_action, "explain_missing_media", "generate_reply"],
+        "confidence": 1.0,
+        "source": "pending_media_target_bound",
+        "reason": "客户补充了上一轮待绑定素材目标的序号或小区+房号，工具层继承素材动作。",
+    }
+    structured_task["tool_plan"] = tool_plan
+    normalized["tool_plan"] = tool_plan
+    normalized["structured_task"] = structured_task
     return normalized
 
 
@@ -2635,10 +3014,7 @@ def _build_constraint_proof(
     layout = _constraint_layout(parsed_content.room_type_labels or parsed_effective.room_type_labels)
     features = list(dict.fromkeys([*parsed_content.feature_labels, *parsed_effective.feature_labels]))
     room_refs = list(dict.fromkeys([*parsed_content.room_refs, *parsed_effective.room_refs]))
-    selected_indices = _int_list(understanding.get("selected_indices"))
-    deterministic_indices = _selection_indices_from_text(content)
-    if deterministic_indices:
-        selected_indices = deterministic_indices
+    selected_indices = _selected_indices_from_understanding(understanding, content)
     proof = {
         "intent": _normalize_intent(understanding.get("intent")),
         "area": area or query_state_area,
@@ -4041,7 +4417,7 @@ def _target_rows_from_understanding(
         or _content_wants_viewing(query_text)
     )
     candidates = _candidate_rows(context)
-    selected = _selected_indices_from_understanding(understanding, query_text)
+    selected = _selected_indices_from_understanding(understanding, current_text or query_text)
     if not selected:
         matched_by_room_ref = _target_rows_from_room_refs(understanding, search_rows)
         if matched_by_room_ref:
@@ -4083,6 +4459,12 @@ def _target_rows_from_understanding(
         and current_text_norm
         and any(community in current_text_norm for community in proof_communities)
     )
+    if not selected and current_mentions_proof_community:
+        explicit_selected = _explicit_selected_indices_from_understanding(understanding, current_text or query_text)
+        if explicit_selected:
+            selected = explicit_selected
+        elif _has_single_room_context_pronoun(current_text):
+            selected = _structured_selected_indices_from_understanding(understanding)
     if selected and current_mentions_proof_community:
         if not search_rows:
             return []
@@ -5744,16 +6126,7 @@ async def _execute_tools(
                 rows = original_ref_rows[:10]
         early_selected_indices = _selected_indices_from_understanding(
             understanding,
-            " ".join(
-                str(part).strip()
-                for part in (
-                    content,
-                    task.get("original_text"),
-                    effective_query,
-                    understanding.get("rewritten_query"),
-                )
-                if str(part or "").strip()
-            ),
+            original_room_text,
         )
         selection_has_current_scope = bool(
             proof.get("communities")
@@ -5851,8 +6224,6 @@ async def _execute_tools(
         for part in (
             content,
             task.get("original_text"),
-            effective_query,
-            understanding.get("rewritten_query"),
         )
         if str(part or "").strip()
     )
