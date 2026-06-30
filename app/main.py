@@ -8602,6 +8602,215 @@ def _build_outbound_package(reply_text: str, tool_evidence: dict[str, Any]) -> d
     }
 
 
+def _prepared_outbound_package_payload(tool_evidence: dict[str, Any]) -> dict[str, Any]:
+    payload = tool_evidence.get("llm2_production_outbound_package")
+    return dict(payload) if isinstance(payload, dict) and payload else {}
+
+
+def _outbound_package_action_kind(action: dict[str, Any]) -> str:
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    metadata = action.get("metadata") if isinstance(action.get("metadata"), dict) else {}
+    raw_kind = str(metadata.get("kind") or payload.get("kind") or "").strip().lower()
+    if raw_kind in {"inventory_sheet", "sheet", "inventory"}:
+        return "inventory_sheet"
+    if raw_kind in {"video", "image"}:
+        return raw_kind
+    action_type = str(action.get("action_type") or "").strip().lower()
+    marker = f"{action.get('action_id') or ''} {action.get('evidence_id') or ''}".lower()
+    if "inventory_sheet" in marker or "inventory-sheet" in marker:
+        return "inventory_sheet"
+    if action_type == "video":
+        return "video"
+    if action_type == "image":
+        return "image"
+    return ""
+
+
+def _outbound_package_action_position(action: dict[str, Any], fallback: int) -> int:
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    metadata = action.get("metadata") if isinstance(action.get("metadata"), dict) else {}
+    for source in (payload, metadata, action):
+        for key in ("media_number", "position", "display_order", "index"):
+            try:
+                value = int(source.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+    marker = f"{action.get('action_id') or ''} {action.get('evidence_id') or ''}"
+    match = re.search(r"(?:video|image|inventory[_-]?sheet)[_-](\d+)", marker, re.I)
+    if match:
+        try:
+            return max(1, int(match.group(1)))
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def _outbound_package_paths_for_kind(tool_evidence: dict[str, Any], kind: str) -> list[str]:
+    if kind == "video":
+        return [str(path) for path in tool_evidence.get("video_paths") or [] if str(path).strip()]
+    if kind == "image":
+        return [str(path) for path in tool_evidence.get("image_paths") or [] if str(path).strip()]
+    if kind == "inventory_sheet":
+        return [
+            str(path)
+            for path in (tool_evidence.get("inventory_image_paths") or tool_evidence.get("inventory_images") or [])
+            if str(path).strip()
+        ]
+    return []
+
+
+def _outbound_package_rows_for_kind(tool_evidence: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    key = "video_rows" if kind == "video" else "image_rows" if kind == "image" else ""
+    return [row for row in tool_evidence.get(key) or [] if isinstance(row, dict)] if key else []
+
+
+def _outbound_package_path_for_action(
+    action: dict[str, Any],
+    *,
+    tool_evidence: dict[str, Any],
+    kind: str,
+    position: int,
+) -> str:
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    metadata = action.get("metadata") if isinstance(action.get("metadata"), dict) else {}
+    for source in (payload, metadata, action):
+        for key in ("local_path", "path", "file_path", "media_path"):
+            value = str(source.get(key) or "").strip()
+            if value:
+                return value
+    paths = _outbound_package_paths_for_kind(tool_evidence, kind)
+    return paths[position - 1] if 0 < position <= len(paths) else ""
+
+
+def _outbound_package_caption_by_action_id(package: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    captions = [item for item in package.get("action_captions") or [] if isinstance(item, dict)]
+
+    def sort_key(item: dict[str, Any]) -> int:
+        try:
+            return int(item.get("display_order"))
+        except (TypeError, ValueError):
+            return 10_000
+
+    result: dict[str, dict[str, Any]] = {}
+    for caption in sorted(captions, key=sort_key):
+        action_id = str(caption.get("action_id") or "").strip()
+        if action_id and action_id not in result:
+            result[action_id] = caption
+    return result
+
+
+def _execution_package_from_prepared_outbound_package(
+    *,
+    reply_text: str,
+    tool_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    package = _prepared_outbound_package_payload(tool_evidence)
+    if not package:
+        return {}
+    captions_by_action_id = _outbound_package_caption_by_action_id(package)
+    send_actions = [item for item in package.get("send_actions") or [] if isinstance(item, dict)]
+    prepared_actions: list[dict[str, Any]] = []
+    inventory_images: list[str] = []
+    image_paths: list[str] = []
+    video_paths: list[str] = []
+    inventory_caption = ""
+    image_captions: list[str] = []
+    video_captions: list[str] = []
+    for fallback_position, action in enumerate(send_actions, start=1):
+        kind = _outbound_package_action_kind(action)
+        if kind not in {"inventory_sheet", "image", "video"}:
+            continue
+        position = _outbound_package_action_position(action, fallback_position)
+        path = _outbound_package_path_for_action(
+            action,
+            tool_evidence=tool_evidence,
+            kind=kind,
+            position=position,
+        )
+        if not path:
+            continue
+        action_id = str(action.get("action_id") or "").strip()
+        caption = captions_by_action_id.get(action_id, {})
+        caption_text = str(caption.get("text") or "").strip()
+        prepared_action = {
+            "action_id": action_id,
+            "action_type": str(action.get("action_type") or "").strip(),
+            "kind": kind,
+            "path": path,
+            "position": position,
+            "caption": caption_text,
+            "caption_id": str(caption.get("caption_id") or "").strip(),
+            "send_action": safe_artifact_payload(action),
+        }
+        prepared_actions.append(prepared_action)
+        if kind == "inventory_sheet":
+            inventory_images.append(path)
+            if caption_text and not inventory_caption:
+                inventory_caption = caption_text
+        elif kind == "image":
+            image_paths.append(path)
+            if caption_text:
+                image_captions.append(caption_text)
+        elif kind == "video":
+            video_paths.append(path)
+            if caption_text:
+                video_captions.append(caption_text)
+    return {
+        "text": safe_artifact_payload(str(package.get("reply_text") or reply_text or "")),
+        "prepared_outbound_package": True,
+        "prepared_package_source": "llm2_production_outbound_package",
+        "inventory_images": inventory_images,
+        "inventory_explanation": inventory_caption,
+        "image_paths": image_paths,
+        "image_explanations": image_captions,
+        "video_paths": video_paths,
+        "video_explanations": video_captions,
+        "prepared_actions": prepared_actions,
+        "action_captions": safe_artifact_payload(package.get("action_captions") or []),
+        "send_actions": safe_artifact_payload(send_actions),
+        "missing_media": list(tool_evidence.get("missing_media") or []),
+        "media_request": tool_evidence.get("media_request") or {},
+        "media_status": tool_evidence.get("media_status") or {},
+        "original_video_request": tool_evidence.get("original_video_request") or {},
+        "original_video_urls": list(tool_evidence.get("original_video_urls") or []),
+        "material_page_urls": list(tool_evidence.get("material_page_urls") or []),
+        "rule_evidence": inventory_sensitive_access.safe_rule_evidence_for_summary(
+            tool_evidence.get("rule_evidence") or {}
+        ),
+        "reply_source": str(package.get("reply_source") or tool_evidence.get("deterministic_reply_source") or ""),
+        "target_rooms": [_row_brief(row) for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)],
+    }
+
+
+def _outbound_package_for_current_mode(reply_text: str, tool_evidence: dict[str, Any]) -> dict[str, Any]:
+    if _dual_llm_production_enabled():
+        prepared_package = _execution_package_from_prepared_outbound_package(
+            reply_text=reply_text,
+            tool_evidence=tool_evidence,
+        )
+        if prepared_package:
+            return prepared_package
+        if not bool(tool_evidence.get("suppress_actions")):
+            return {
+                "text": safe_artifact_payload(reply_text),
+                "inventory_images": [],
+                "inventory_explanation": "",
+                "image_paths": [],
+                "image_explanations": [],
+                "video_paths": [],
+                "video_explanations": [],
+                "missing_media": list(tool_evidence.get("missing_media") or []),
+                "media_request": tool_evidence.get("media_request") or {},
+                "media_status": tool_evidence.get("media_status") or {},
+                "reply_source": str(tool_evidence.get("deterministic_reply_source") or ""),
+                "prepared_outbound_package": False,
+                "legacy_builder_blocked_in_production": True,
+            }
+    return tool_evidence.get("outbound_package") or _build_outbound_package(reply_text, tool_evidence)
+
+
 def _normalize_inventory_sheet_reply_before_selfcheck(
     *,
     draft_reply: str,
@@ -10056,7 +10265,7 @@ async def _generate_reply_result(
             deterministic_reply_source = "llm2_production_safe_fallback"
             tool_evidence["deterministic_reply_source"] = deterministic_reply_source
             tool_evidence["suppress_actions"] = True
-    outbound_package = _build_outbound_package(draft_reply, tool_evidence)
+    outbound_package = _outbound_package_for_current_mode(draft_reply, tool_evidence)
     tool_evidence["outbound_package"] = outbound_package
     selfcheck_stage = timer.stage("final_selfcheck") if timer else nullcontext()
     with selfcheck_stage:
@@ -10406,6 +10615,7 @@ async def _execute_send_action_once(
     action: Any,
     send_call: Callable[[], Any],
     receipt_metadata: dict[str, Any] | None = None,
+    stale_guard: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], bool, dict[str, Any]]:
     idempotency_key = kf_send_receipts.build_idempotency_key(action)
     existing = kf_send_receipts.find_blocking_receipt(context, idempotency_key)
@@ -10429,6 +10639,8 @@ async def _execute_send_action_once(
         return context, False, duplicate.to_safe_dict()
 
     try:
+        if stale_guard is not None:
+            stale_guard()
         provider_result = await _await_if_needed(send_call())
     except Exception as exc:
         failed = _build_send_error_receipt(
@@ -10470,6 +10682,15 @@ def _send_action_for_text(
     action_id: str,
     text_role: str,
     msgids: list[str] | None = None,
+    extra_payload: dict[str, Any] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+    listing_id: str = "",
+    evidence_id: str = "",
+    inventory_snapshot_id: str = "",
+    source_hash: str = "",
+    candidate_set_id: str = "",
+    media_id: str = "",
+    sha256: str = "",
 ) -> Any:
     normalized = text.strip()
     digest = kf_send_receipts.text_hash(normalized)
@@ -10480,8 +10701,24 @@ def _send_action_for_text(
         msgids=msgids,
         action_id=action_id,
         action_type="text",
-        payload={"text_hash": digest, "text_role": text_role, "text_length": len(normalized)},
-        metadata={"text_hash": digest, "text_role": text_role},
+        listing_id=listing_id,
+        evidence_id=evidence_id,
+        inventory_snapshot_id=inventory_snapshot_id,
+        source_hash=source_hash,
+        candidate_set_id=candidate_set_id,
+        media_id=media_id,
+        sha256=sha256,
+        payload={
+            "text_hash": digest,
+            "text_role": text_role,
+            "text_length": len(normalized),
+            **dict(extra_payload or {}),
+        },
+        metadata={
+            "text_hash": digest,
+            "text_role": text_role,
+            **dict(extra_metadata or {}),
+        },
     )
 
 
@@ -10750,6 +10987,16 @@ async def _send_text_with_receipt(
     action_id: str,
     text_role: str,
     msgids: list[str] | None = None,
+    extra_payload: dict[str, Any] | None = None,
+    extra_metadata: dict[str, Any] | None = None,
+    listing_id: str = "",
+    evidence_id: str = "",
+    inventory_snapshot_id: str = "",
+    source_hash: str = "",
+    candidate_set_id: str = "",
+    media_id: str = "",
+    sha256: str = "",
+    stale_guard: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], bool, dict[str, Any]]:
     text = text.strip()
     if not text:
@@ -10762,12 +11009,22 @@ async def _send_text_with_receipt(
         action_id=action_id,
         text_role=text_role,
         msgids=msgids,
+        extra_payload=extra_payload,
+        extra_metadata=extra_metadata,
+        listing_id=listing_id,
+        evidence_id=evidence_id,
+        inventory_snapshot_id=inventory_snapshot_id,
+        source_hash=source_hash,
+        candidate_set_id=candidate_set_id,
+        media_id=media_id,
+        sha256=sha256,
     )
     return await _execute_send_action_once(
         context=context,
         action=action,
         send_call=lambda: _send_text(open_kfid, external_userid, text),
-        receipt_metadata={"text_role": text_role},
+        receipt_metadata={"text_role": text_role, **dict(extra_metadata or {})},
+        stale_guard=stale_guard,
     )
 
 
@@ -10857,6 +11114,7 @@ async def _send_videos(
     external_userid: str,
     paths: list[str],
     rows: list[dict[str, Any]],
+    captions: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     sent: list[dict[str, Any]] = []
     for index, raw_path in enumerate(paths[:KF_VIDEO_SEND_LIMIT]):
@@ -10866,7 +11124,9 @@ async def _send_videos(
         label = _normalize_customer_visible_reply_text_before_selfcheck(
             _row_label(rows[index]) if index < len(rows) else path.stem
         )
-        await _send_text(open_kfid, external_userid, f"这是{label}的视频。")
+        caption = str(captions[index] if captions and index < len(captions) else "").strip()
+        if caption:
+            await _send_text(open_kfid, external_userid, caption)
         try:
             await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, path))
             sent.append({"type": "video", "path": str(path), "room": label, "count": 1})
@@ -11008,11 +11268,26 @@ async def _send_images_with_receipts(
     rows: list[dict[str, Any]] | None = None,
     tool_evidence: dict[str, Any] | None = None,
     require_media_manifest: bool = False,
+    captions: list[str] | None = None,
+    action_ids: list[str] | None = None,
+    caption_ids: list[str] | None = None,
+    positions: list[int] | None = None,
+    require_captions: bool = False,
+    caption_role: str = "image_caption",
+    stale_guard: Callable[[], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     sent: list[dict[str, Any]] = []
     rows = rows or []
     tool_evidence = tool_evidence or {}
     for index, raw_path in enumerate(paths, start=1):
+        position = positions[index - 1] if positions and index <= len(positions) else index
+        action_id = (
+            str(action_ids[index - 1]).strip()
+            if action_ids and index <= len(action_ids) and str(action_ids[index - 1]).strip()
+            else ""
+        )
+        if not action_id:
+            action_id = f"{action_prefix}-{position}-{kf_send_receipts.material_hash(raw_path)[:12]}"
         path = Path(raw_path)
         if not path.exists():
             continue
@@ -11032,11 +11307,11 @@ async def _send_images_with_receipts(
                     external_userid=external_userid,
                     context=context,
                     path=path,
-                    action_id=f"{action_prefix}-{index}-{kf_send_receipts.material_hash(path)[:12]}",
+                    action_id=action_id,
                     action_type="image",
                     msgids=msgids,
-                    extra_payload={"position": index, "blocked": True, "media_manifest_required": True},
-                    extra_metadata={"position": index, "blocked": True, "media_manifest_required": True},
+                    extra_payload={"position": position, "blocked": True, "media_manifest_required": True},
+                    extra_metadata={"position": position, "blocked": True, "media_manifest_required": True},
                     listing_id=fallback_binding.get("listing_id", ""),
                     evidence_id=fallback_binding.get("evidence_id", ""),
                     inventory_snapshot_id=fallback_binding.get("inventory_snapshot_id", ""),
@@ -11048,13 +11323,78 @@ async def _send_images_with_receipts(
                     action,
                     idempotency_key=idempotency_key,
                     error=MediaManifestSendEvidenceError("missing exact MediaManifest evidence for production image send"),
-                    metadata={"position": index, "blocked": True, "media_manifest_required": True},
+                    metadata={"position": position, "blocked": True, "media_manifest_required": True},
                 )
                 context = kf_send_receipts.append_receipt(context, receipt)
                 sent.append({"type": "image_blocked", "path": str(path), "reason": "missing_media_manifest_evidence"})
                 continue
-        extra_payload = {"position": index}
-        extra_metadata = {"position": index}
+        caption = (
+            str(captions[index - 1]).strip()
+            if captions and index <= len(captions)
+            else ""
+        )
+        caption_id = (
+            str(caption_ids[index - 1]).strip()
+            if caption_ids and index <= len(caption_ids)
+            else ""
+        )
+        if require_captions and not caption:
+            fallback_binding = fact_binding or _send_fact_binding_for_row(row, tool_evidence, path)
+            action = _send_action_for_path(
+                open_kfid=open_kfid,
+                external_userid=external_userid,
+                context=context,
+                path=path,
+                action_id=action_id,
+                action_type="image",
+                msgids=msgids,
+                extra_payload={"position": position, "blocked": True, "missing_action_caption": True},
+                extra_metadata={"position": position, "blocked": True, "missing_action_caption": True},
+                listing_id=fallback_binding.get("listing_id", ""),
+                evidence_id=fallback_binding.get("evidence_id", ""),
+                inventory_snapshot_id=fallback_binding.get("inventory_snapshot_id", ""),
+                source_hash=fallback_binding.get("source_hash", ""),
+                sha256=fallback_binding.get("sha256", ""),
+                media_id=fallback_binding.get("media_id", ""),
+            )
+            idempotency_key = kf_send_receipts.build_idempotency_key(action)
+            receipt = kf_send_receipts.build_failed_receipt(
+                action,
+                idempotency_key=idempotency_key,
+                error=MediaManifestSendEvidenceError("missing package action caption for production image send"),
+                metadata={"position": position, "blocked": True, "missing_action_caption": True},
+            )
+            context = kf_send_receipts.append_receipt(context, receipt)
+            sent.append({"type": "image_blocked", "path": str(path), "reason": "missing_action_caption"})
+            continue
+        if caption:
+            caption_metadata = {
+                "position": position,
+                "caption_id": caption_id,
+                "related_action_id": action_id,
+                "related_action_type": "image",
+                "caption_hash": kf_send_receipts.text_hash(caption),
+            }
+            context, _did_send_caption, _caption_receipt = await _send_text_with_receipt(
+                open_kfid=open_kfid,
+                external_userid=external_userid,
+                context=context,
+                text=caption,
+                action_id=f"{action_id}-caption",
+                text_role=caption_role,
+                msgids=msgids,
+                extra_payload=caption_metadata,
+                extra_metadata=caption_metadata,
+                listing_id=fact_binding.get("listing_id", ""),
+                evidence_id=fact_binding.get("evidence_id", ""),
+                inventory_snapshot_id=fact_binding.get("inventory_snapshot_id", ""),
+                source_hash=fact_binding.get("source_hash", ""),
+                media_id=fact_binding.get("media_id", ""),
+                sha256=fact_binding.get("sha256", ""),
+                stale_guard=stale_guard,
+            )
+        extra_payload = {"position": position}
+        extra_metadata = {"position": position}
         if fact_binding:
             extra_payload["media_evidence_profile"] = fact_binding.get("media_evidence_profile", "")
             extra_metadata["media_evidence_profile"] = fact_binding.get("media_evidence_profile", "")
@@ -11064,7 +11404,7 @@ async def _send_images_with_receipts(
             external_userid=external_userid,
             context=context,
             path=path,
-            action_id=f"{action_prefix}-{index}-{kf_send_receipts.material_hash(path)[:12]}",
+            action_id=action_id,
             action_type="image",
             msgids=msgids,
             extra_payload=extra_payload,
@@ -11082,6 +11422,7 @@ async def _send_images_with_receipts(
                 action=action,
                 send_call=lambda path=path: wecom_kf.send_image(open_kfid, external_userid, path),
                 receipt_metadata=extra_metadata,
+                stale_guard=stale_guard,
             )
             if did_send:
                 sent.append({"type": "image", "path": str(path), "count": 1})
@@ -11102,10 +11443,24 @@ async def _send_videos_with_receipts(
     rows: list[dict[str, Any]],
     tool_evidence: dict[str, Any] | None = None,
     msgids: list[str] | None = None,
+    captions: list[str] | None = None,
+    action_ids: list[str] | None = None,
+    caption_ids: list[str] | None = None,
+    positions: list[int] | None = None,
+    require_captions: bool = False,
+    stale_guard: Callable[[], None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     sent: list[dict[str, Any]] = []
     tool_evidence = tool_evidence or {}
     for index, raw_path in enumerate(paths[:KF_VIDEO_SEND_LIMIT], start=1):
+        position = positions[index - 1] if positions and index <= len(positions) else index
+        action_id = (
+            str(action_ids[index - 1]).strip()
+            if action_ids and index <= len(action_ids) and str(action_ids[index - 1]).strip()
+            else ""
+        )
+        if not action_id:
+            action_id = f"send-video-{position}-{kf_send_receipts.material_hash(raw_path)[:12]}"
         path = Path(raw_path)
         if not path.exists():
             continue
@@ -11123,11 +11478,11 @@ async def _send_videos_with_receipts(
                 external_userid=external_userid,
                 context=context,
                 path=path,
-                action_id=f"send-video-{index}-{kf_send_receipts.material_hash(path)[:12]}",
+                action_id=action_id,
                 action_type="video",
                 msgids=msgids,
-                extra_payload={"position": index, "blocked": True, "media_manifest_required": True},
-                extra_metadata={"position": index, "blocked": True, "media_manifest_required": True},
+                extra_payload={"position": position, "blocked": True, "media_manifest_required": True},
+                extra_metadata={"position": position, "blocked": True, "media_manifest_required": True},
                 listing_id=fallback_binding.get("listing_id", ""),
                 evidence_id=fallback_binding.get("evidence_id", ""),
                 inventory_snapshot_id=fallback_binding.get("inventory_snapshot_id", ""),
@@ -11139,30 +11494,70 @@ async def _send_videos_with_receipts(
                 action,
                 idempotency_key=idempotency_key,
                 error=MediaManifestSendEvidenceError("missing exact MediaManifest evidence for production video send"),
-                metadata={"position": index, "blocked": True, "media_manifest_required": True},
+                metadata={"position": position, "blocked": True, "media_manifest_required": True},
             )
             context = kf_send_receipts.append_receipt(context, receipt)
             sent.append({"type": "video_blocked", "path": str(path), "reason": "missing_media_manifest_evidence"})
             continue
+        caption = (
+            str(captions[index - 1]).strip()
+            if captions and index <= len(captions)
+            else ""
+        )
+        caption_id = (
+            str(caption_ids[index - 1]).strip()
+            if caption_ids and index <= len(caption_ids)
+            else ""
+        )
         label = _normalize_customer_visible_reply_text_before_selfcheck(
             _row_label(row) if row else path.stem
         )
-        caption = f"这是{label}的视频。"
+        if require_captions and not caption:
+            fallback_binding = fact_binding or _send_fact_binding_for_row(row, tool_evidence, path)
+            action = _send_action_for_path(
+                open_kfid=open_kfid,
+                external_userid=external_userid,
+                context=context,
+                path=path,
+                action_id=action_id,
+                action_type="video",
+                msgids=msgids,
+                extra_payload={"position": position, "blocked": True, "missing_action_caption": True},
+                extra_metadata={"position": position, "blocked": True, "missing_action_caption": True},
+                listing_id=fallback_binding.get("listing_id", ""),
+                evidence_id=fallback_binding.get("evidence_id", ""),
+                inventory_snapshot_id=fallback_binding.get("inventory_snapshot_id", ""),
+                source_hash=fallback_binding.get("source_hash", ""),
+                sha256=fallback_binding.get("sha256", ""),
+                media_id=fallback_binding.get("media_id", ""),
+            )
+            idempotency_key = kf_send_receipts.build_idempotency_key(action)
+            receipt = kf_send_receipts.build_failed_receipt(
+                action,
+                idempotency_key=idempotency_key,
+                error=MediaManifestSendEvidenceError("missing package action caption for production video send"),
+                metadata={"position": position, "blocked": True, "missing_action_caption": True},
+            )
+            context = kf_send_receipts.append_receipt(context, receipt)
+            sent.append({"type": "video_blocked", "path": str(path), "reason": "missing_action_caption"})
+            continue
         action = _send_action_for_path(
             open_kfid=open_kfid,
             external_userid=external_userid,
             context=context,
             path=path,
-            action_id=f"send-video-{index}-{kf_send_receipts.material_hash(path)[:12]}",
+            action_id=action_id,
             action_type="video",
             msgids=msgids,
             extra_payload={
-                "position": index,
+                "position": position,
                 "caption_hash": kf_send_receipts.text_hash(caption),
+                "caption_id": caption_id,
             },
             extra_metadata={
-                "position": index,
+                "position": position,
                 "caption_hash": kf_send_receipts.text_hash(caption),
+                "caption_id": caption_id,
                 "transaction": "caption_then_video",
                 "media_evidence_profile": fact_binding.get("media_evidence_profile", ""),
                 "media_adapter_mode": fact_binding.get("media_adapter_mode", ""),
@@ -11202,11 +11597,39 @@ async def _send_videos_with_receipts(
         transcode_ms: int | None = None
         retry_upload_ms: int | None = None
         try:
-            await _send_text(open_kfid, external_userid, caption)
-            caption_sent = True
+            if caption:
+                caption_metadata = {
+                    "position": position,
+                    "caption_id": caption_id,
+                    "related_action_id": action_id,
+                    "related_action_type": "video",
+                    "caption_hash": kf_send_receipts.text_hash(caption),
+                    "transaction": "caption_then_video",
+                }
+                context, _did_send_caption, _caption_receipt = await _send_text_with_receipt(
+                    open_kfid=open_kfid,
+                    external_userid=external_userid,
+                    context=context,
+                    text=caption,
+                    action_id=f"{action_id}-caption",
+                    text_role="video_caption",
+                    msgids=msgids,
+                    extra_payload=caption_metadata,
+                    extra_metadata=caption_metadata,
+                    listing_id=fact_binding.get("listing_id", ""),
+                    evidence_id=fact_binding.get("evidence_id", ""),
+                    inventory_snapshot_id=fact_binding.get("inventory_snapshot_id", ""),
+                    source_hash=fact_binding.get("source_hash", ""),
+                    media_id=fact_binding.get("media_id", ""),
+                    sha256=fact_binding.get("sha256", ""),
+                    stale_guard=stale_guard,
+                )
+                caption_sent = True
             try:
                 first_upload_start = time.perf_counter()
                 try:
+                    if stale_guard is not None:
+                        stale_guard()
                     provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, sent_path))
                 finally:
                     first_upload_ms = _elapsed_ms_since(first_upload_start)
@@ -11224,6 +11647,8 @@ async def _send_videos_with_receipts(
                     transcode_ms = _elapsed_ms_since(transcode_start)
                 retry_upload_start = time.perf_counter()
                 try:
+                    if stale_guard is not None:
+                        stale_guard()
                     provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, sent_path))
                 finally:
                     retry_upload_ms = _elapsed_ms_since(retry_upload_start)
@@ -11232,7 +11657,7 @@ async def _send_videos_with_receipts(
                 idempotency_key=idempotency_key,
                 provider_result=provider_result if isinstance(provider_result, dict) else {},
                 metadata=_video_send_observability_metadata(
-                    position=index,
+                    position=position,
                     caption_sent=caption_sent,
                     transcode_retry=transcode_retry,
                     source_path=path,
@@ -11264,7 +11689,7 @@ async def _send_videos_with_receipts(
                 idempotency_key=idempotency_key,
                 error=exc,
                 metadata=_video_send_observability_metadata(
-                    position=index,
+                    position=position,
                     caption_sent=caption_sent,
                     transcode_retry=transcode_retry,
                     source_path=path,
@@ -11299,7 +11724,7 @@ async def _send_videos_with_receipts(
                 idempotency_key=idempotency_key,
                 error=exc,
                 metadata=_video_send_observability_metadata(
-                    position=index,
+                    position=position,
                     caption_sent=caption_sent,
                     transcode_retry=transcode_retry,
                     source_path=path,
@@ -11368,16 +11793,27 @@ async def _send_final_actions(
     final_reply: str,
     tool_evidence: dict[str, Any],
     msgids: list[str] | None = None,
+    stale_guard: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     sent_actions: list[dict[str, Any]] = []
-    final_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_reply)
-    outbound_package = tool_evidence.get("outbound_package") or _build_outbound_package(final_reply, tool_evidence)
-    suppress_actions = bool(tool_evidence.get("suppress_actions"))
-    context = _reconcile_last_candidate_set_with_visible_reply(
-        context,
-        final_reply,
-        tool_evidence,
+    if stale_guard is not None:
+        stale_guard()
+    outbound_package = _outbound_package_for_current_mode(final_reply, tool_evidence)
+    using_prepared_package = bool(
+        _dual_llm_production_enabled()
+        and isinstance(outbound_package, dict)
+        and outbound_package.get("prepared_outbound_package")
     )
+    if using_prepared_package:
+        final_reply = str(outbound_package.get("text") or "")
+    final_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_reply)
+    suppress_actions = bool(tool_evidence.get("suppress_actions"))
+    if not using_prepared_package:
+        context = _reconcile_last_candidate_set_with_visible_reply(
+            context,
+            final_reply,
+            tool_evidence,
+        )
     context, did_send_text, _receipt = await _send_text_with_receipt(
         open_kfid=open_kfid,
         external_userid=external_userid,
@@ -11386,11 +11822,75 @@ async def _send_final_actions(
         action_id="send-text-final-reply",
         text_role="final_reply",
         msgids=msgids,
+        stale_guard=stale_guard,
     )
     if final_reply and did_send_text:
         sent_actions.append({"type": "text", "count": 1})
 
     if suppress_actions:
+        for action in sent_actions:
+            context = kf_context_memory.record_structured_assistant_output(
+                context,
+                final_reply=final_reply if action.get("type") == "text" else "",
+                sent_action=action,
+                candidate_state=_candidate_state_summary(context),
+            ) or context
+        return {"sent_actions": sent_actions, "context": context}
+
+    if using_prepared_package:
+        for prepared_action in outbound_package.get("prepared_actions") or []:
+            if not isinstance(prepared_action, dict):
+                continue
+            kind = str(prepared_action.get("kind") or "").strip()
+            path = str(prepared_action.get("path") or "").strip()
+            if not path:
+                continue
+            try:
+                position = int(prepared_action.get("position") or 1)
+            except (TypeError, ValueError):
+                position = 1
+            rows = _outbound_package_rows_for_kind(tool_evidence, kind)
+            row = rows[position - 1] if 0 < position <= len(rows) else {}
+            action_id = str(prepared_action.get("action_id") or "").strip()
+            caption = str(prepared_action.get("caption") or "").strip()
+            caption_id = str(prepared_action.get("caption_id") or "").strip()
+            if kind == "video":
+                video_actions, context = await _send_videos_with_receipts(
+                    open_kfid=open_kfid,
+                    external_userid=external_userid,
+                    context=context,
+                    paths=[path],
+                    rows=[row] if isinstance(row, dict) else [],
+                    tool_evidence=tool_evidence,
+                    msgids=msgids,
+                    captions=[caption],
+                    action_ids=[action_id],
+                    caption_ids=[caption_id],
+                    positions=[position],
+                    require_captions=True,
+                    stale_guard=stale_guard,
+                )
+                sent_actions.extend(video_actions)
+            elif kind in {"image", "inventory_sheet"}:
+                image_actions, context = await _send_images_with_receipts(
+                    open_kfid=open_kfid,
+                    external_userid=external_userid,
+                    context=context,
+                    paths=[path],
+                    msgids=msgids,
+                    action_prefix="send-prepared-inventory-image" if kind == "inventory_sheet" else "send-prepared-room-image",
+                    rows=[row] if isinstance(row, dict) else [],
+                    tool_evidence=tool_evidence,
+                    require_media_manifest=(kind == "image"),
+                    captions=[caption],
+                    action_ids=[action_id],
+                    caption_ids=[caption_id],
+                    positions=[position],
+                    require_captions=True,
+                    caption_role="inventory_sheet_caption" if kind == "inventory_sheet" else "image_caption",
+                    stale_guard=stale_guard,
+                )
+                sent_actions.extend(image_actions)
         for action in sent_actions:
             context = kf_context_memory.record_structured_assistant_output(
                 context,
@@ -11415,6 +11915,7 @@ async def _send_final_actions(
             action_id="send-text-inventory-explanation",
             text_role="inventory_explanation",
             msgids=msgids,
+            stale_guard=stale_guard,
         )
         if did_send_inventory_text:
             sent_actions.append({"type": "text", "subtype": "inventory_explanation", "count": 1})
@@ -11426,6 +11927,7 @@ async def _send_final_actions(
         paths=list(tool_evidence.get("inventory_images") or []),
         msgids=msgids,
         action_prefix="send-inventory-image",
+        stale_guard=stale_guard,
     )
     sent_actions.extend(image_actions)
 
@@ -11438,6 +11940,7 @@ async def _send_final_actions(
             action_id=f"send-text-image-explanation-{index}",
             text_role="image_explanation",
             msgids=msgids,
+            stale_guard=stale_guard,
         )
         if did_send_image_text:
             sent_actions.append({"type": "text", "subtype": "image_explanation", "count": 1})
@@ -11451,6 +11954,7 @@ async def _send_final_actions(
         rows=[row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict)],
         tool_evidence=tool_evidence,
         require_media_manifest=_dual_llm_production_enabled(),
+        stale_guard=stale_guard,
     )
     sent_actions.extend(image_actions)
 
@@ -11462,6 +11966,8 @@ async def _send_final_actions(
         rows=[row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)],
         tool_evidence=tool_evidence,
         msgids=msgids,
+        captions=[str(item) for item in outbound_package.get("video_explanations") or []],
+        stale_guard=stale_guard,
     )
     sent_actions.extend(video_actions)
 
@@ -11848,6 +12354,7 @@ async def _process_text_turn(
                 final_reply=final_reply,
                 tool_evidence=tool_evidence,
                 msgids=msgids,
+                stale_guard=lambda: _raise_if_stale_kf_turn(conversation_key, generation),
             )
         context = send_result["context"]
         context = kf_context_memory.append_dialog_message(context, role="assistant", content=final_reply) or context

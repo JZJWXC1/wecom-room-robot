@@ -1421,13 +1421,17 @@ def test_send_videos_production_uses_manifest_evidence_in_receipt(monkeypatch) -
                         "video_rows": [row],
                         "video_media_manifest_evidence": [media_evidence],
                     },
+                    captions=["PACKAGE 视频说明。"],
+                    action_ids=["pkg-video-1"],
+                    caption_ids=["cap-video-1"],
+                    require_captions=True,
                 )
             finally:
                 main.wecom_kf = original_wecom
                 main.settings.kf_dual_llm_mode = original_mode
                 main.settings.room_database_path = previous_room_database_path
 
-            assert fake.texts == ["这是星河苑1-101的视频。"]
+            assert fake.texts == ["PACKAGE 视频说明。"]
             assert fake.videos == [str(video_path)]
             assert sent == [{"type": "video", "path": str(video_path), "room": "星河苑1-101", "count": 1}]
             receipt = context["send_receipts"]["receipts"][-1]
@@ -13946,7 +13950,320 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(first["sent_actions"]), 1)
         self.assertEqual(second["sent_actions"], [])
         statuses = [item["status"] for item in second["context"]["send_receipts"]["receipts"]]
-        self.assertEqual(statuses, ["sent", "skipped_duplicate"])
+        self.assertEqual(statuses, ["sent", "sent", "skipped_duplicate"])
+
+    async def test_send_final_actions_production_executes_prepared_package_captions(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+                self.images: list[str] = []
+                self.videos: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0, "msgid": f"text-{len(self.texts)}"}
+
+            def send_image(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+                self.images.append(str(media_id))
+                return {"errcode": 0, "msgid": f"image-{len(self.images)}"}
+
+            def send_video(self, open_kfid: str, external_userid: str, media_id: str, title: str = "") -> dict:
+                self.videos.append(str(media_id))
+                return {"errcode": 0, "msgid": f"video-{len(self.videos)}"}
+
+        class FakeMediaStore:
+            def __init__(self, evidences: list[dict]) -> None:
+                self.evidences = evidences
+
+            def media_manifest_evidence_for_listing(self, value: str):
+                return [item for item in self.evidences if item["listing_id"] == value]
+
+        def manifest_evidence(listing_id: str, media_kind: str, path: Path, media_id: str) -> dict:
+            return {
+                "listing_id": listing_id,
+                "media_type": media_kind,
+                "kind": media_kind,
+                "media_id": media_id,
+                "evidence_id": f"media_manifest:test:{media_id}",
+                "source_hash": hashlib.sha256(f"{media_id}:source".encode("utf-8")).hexdigest(),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "send_ready": True,
+                "candidate_only": False,
+                "ambiguity": False,
+                "binding_method": "listing_id",
+                "adapter_mode": "production_read",
+                "evidence_profile": "media_manifest.production_read.v1",
+                "local_path": str(path),
+            }
+
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        original_media_store = main.media_store
+        original_mode = main.settings.kf_dual_llm_mode
+        main.wecom_kf = fake
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                video_path = root / "room.mp4"
+                image_path = root / "room.jpg"
+                sheet_path = root / "sheet.png"
+                video_path.write_bytes(b"video")
+                image_path.write_bytes(b"image")
+                sheet_path.write_bytes(b"png")
+                listing_id = generate_listing_id("星河苑", "1-101")
+                video_evidence = manifest_evidence(listing_id, MEDIA_KIND_VIDEO, video_path, "med-prod-video")
+                image_evidence = manifest_evidence(listing_id, MEDIA_KIND_IMAGE, image_path, "med-prod-image")
+                main.media_store = FakeMediaStore([video_evidence, image_evidence])
+                row = {"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}
+                result = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm-prod-package",
+                    context=kf_context_memory.empty_context(),
+                    final_reply="这句旧 final_reply 不应该发送。",
+                    tool_evidence={
+                        "video_paths": [str(video_path)],
+                        "image_paths": [str(image_path)],
+                        "inventory_images": [str(sheet_path)],
+                        "video_rows": [row],
+                        "image_rows": [row],
+                        "video_media_manifest_evidence": [video_evidence],
+                        "image_media_manifest_evidence": [image_evidence],
+                        "llm2_production_outbound_package": {
+                            "reply_text": "PACKAGE 正文。",
+                            "send_actions": [
+                                {
+                                    "action_id": "pkg-video-1",
+                                    "action_type": "video",
+                                    "listing_id": listing_id,
+                                    "evidence_id": video_evidence["evidence_id"],
+                                    "payload": {"media_number": 1},
+                                    "metadata": {"kind": "video"},
+                                },
+                                {
+                                    "action_id": "pkg-image-1",
+                                    "action_type": "image",
+                                    "listing_id": listing_id,
+                                    "evidence_id": image_evidence["evidence_id"],
+                                    "payload": {"media_number": 1},
+                                    "metadata": {"kind": "image"},
+                                },
+                                {
+                                    "action_id": "pkg-sheet-1",
+                                    "action_type": "image",
+                                    "payload": {"media_number": 1},
+                                    "metadata": {"kind": "inventory_sheet"},
+                                },
+                            ],
+                            "action_captions": [
+                                {
+                                    "caption_id": "cap-video-1",
+                                    "action_id": "pkg-video-1",
+                                    "action_type": "video",
+                                    "text": "PACKAGE 视频说明。",
+                                    "display_order": 1,
+                                },
+                                {
+                                    "caption_id": "cap-image-1",
+                                    "action_id": "pkg-image-1",
+                                    "action_type": "image",
+                                    "text": "PACKAGE 图片说明。",
+                                    "display_order": 2,
+                                },
+                                {
+                                    "caption_id": "cap-sheet-1",
+                                    "action_id": "pkg-sheet-1",
+                                    "action_type": "image",
+                                    "text": "PACKAGE 房源表说明。",
+                                    "display_order": 3,
+                                },
+                            ],
+                            "self_review": {"status": "pass"},
+                            "reply_source": "kf_llm2_outbound_production",
+                        },
+                    },
+                    msgids=["msg-prod-package"],
+                )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+            main.media_store = original_media_store
+            main.wecom_kf = original_wecom
+
+        self.assertEqual(fake.texts, ["PACKAGE 正文。", "PACKAGE 视频说明。", "PACKAGE 图片说明。", "PACKAGE 房源表说明。"])
+        self.assertEqual(fake.videos, [str(video_path)])
+        self.assertEqual(fake.images, [str(image_path), str(sheet_path)])
+        self.assertNotIn("这句旧 final_reply 不应该发送。", fake.texts)
+        self.assertFalse(any("这是星河苑" in text for text in fake.texts))
+        text_roles = [
+            item["metadata"]["text_role"]
+            for item in result["context"]["send_receipts"]["receipts"]
+            if item["action_type"] == "text"
+        ]
+        self.assertEqual(text_roles, ["final_reply", "video_caption", "image_caption", "inventory_sheet_caption"])
+
+    async def test_send_final_actions_production_blocks_media_without_package_caption(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+                self.videos: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+            def send_video(self, open_kfid: str, external_userid: str, media_id: str, title: str = "") -> dict:
+                self.videos.append(str(media_id))
+                return {"errcode": 0}
+
+        class FakeMediaStore:
+            def __init__(self, evidence: dict) -> None:
+                self.evidence = evidence
+
+            def media_manifest_evidence_for_listing(self, value: str):
+                return [self.evidence]
+
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        original_media_store = main.media_store
+        original_mode = main.settings.kf_dual_llm_mode
+        main.wecom_kf = fake
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                video_path = Path(directory) / "room.mp4"
+                video_path.write_bytes(b"video")
+                listing_id = generate_listing_id("星河苑", "1-101")
+                evidence = {
+                    "listing_id": listing_id,
+                    "media_type": "video",
+                    "kind": "video",
+                    "media_id": "med-no-caption",
+                    "evidence_id": "media_manifest:test:med-no-caption",
+                    "source_hash": hashlib.sha256(b"no-caption-source").hexdigest(),
+                    "sha256": hashlib.sha256(video_path.read_bytes()).hexdigest(),
+                    "send_ready": True,
+                    "candidate_only": False,
+                    "ambiguity": False,
+                    "binding_method": "listing_id",
+                    "adapter_mode": "production_read",
+                    "evidence_profile": "media_manifest.production_read.v1",
+                    "local_path": str(video_path),
+                }
+                main.media_store = FakeMediaStore(evidence)
+                result = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm-prod-no-caption",
+                    context=kf_context_memory.empty_context(),
+                    final_reply="旧文本",
+                    tool_evidence={
+                        "video_paths": [str(video_path)],
+                        "video_rows": [{"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}],
+                        "video_media_manifest_evidence": [evidence],
+                        "llm2_production_outbound_package": {
+                            "reply_text": "PACKAGE 正文。",
+                            "send_actions": [
+                                {
+                                    "action_id": "pkg-video-no-caption",
+                                    "action_type": "video",
+                                    "listing_id": listing_id,
+                                    "evidence_id": evidence["evidence_id"],
+                                    "payload": {"media_number": 1},
+                                    "metadata": {"kind": "video"},
+                                }
+                            ],
+                            "action_captions": [],
+                            "self_review": {"status": "pass"},
+                        },
+                    },
+                    msgids=["msg-prod-no-caption"],
+                )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+            main.media_store = original_media_store
+            main.wecom_kf = original_wecom
+
+        self.assertEqual(fake.texts, ["PACKAGE 正文。"])
+        self.assertEqual(fake.videos, [])
+        self.assertIn({"type": "video_blocked", "path": str(video_path), "reason": "missing_action_caption"}, result["sent_actions"])
+        statuses = [item["status"] for item in result["context"]["send_receipts"]["receipts"]]
+        self.assertEqual(statuses, ["sent", "failed"])
+
+    async def test_send_final_actions_production_does_not_reconcile_candidate_memory(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "query": "星河苑",
+            "candidates": [
+                {"小区": "星河苑", "房号": "1-101"},
+                {"小区": "星河苑", "房号": "1-102"},
+            ],
+            "shown_count": 2,
+            "total_count": 2,
+        }
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        original_mode = main.settings.kf_dual_llm_mode
+        main.wecom_kf = fake
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm-prod-memory",
+                context=context,
+                final_reply="旧文本",
+                tool_evidence={
+                    "inventory_rows": context["last_candidate_set"]["candidates"],
+                    "llm2_production_outbound_package": {
+                        "reply_text": "星河苑1-101还在租。",
+                        "send_actions": [],
+                        "action_captions": [],
+                        "self_review": {"status": "pass"},
+                    },
+                },
+                msgids=["msg-prod-memory"],
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+            main.wecom_kf = original_wecom
+
+        self.assertEqual(fake.texts, ["星河苑1-101还在租。"])
+        self.assertEqual(result["context"]["last_candidate_set"]["shown_count"], 2)
+        self.assertEqual(len(result["context"]["last_candidate_set"]["candidates"]), 2)
+
+    async def test_send_final_actions_stale_guard_cancels_before_provider_send(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        main.wecom_kf = fake
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm-stale",
+                    context=kf_context_memory.empty_context(),
+                    final_reply="这条不能发送。",
+                    tool_evidence={"suppress_actions": True},
+                    msgids=["msg-stale"],
+                    stale_guard=lambda: (_ for _ in ()).throw(asyncio.CancelledError()),
+                )
+        finally:
+            main.wecom_kf = original_wecom
+
+        self.assertEqual(fake.texts, [])
 
     async def test_interleaved_customers_do_not_share_candidate_context(self) -> None:
         class FakeStateStore:
