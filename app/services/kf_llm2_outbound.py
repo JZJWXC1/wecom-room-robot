@@ -144,6 +144,13 @@ def compose_kf_outbound(
     caption_result = _action_captions_from_output(packet, trusted_actions, output.get("action_captions"), evidence_by_id)
     guard_reasons.extend(claim_result.errors)
     guard_reasons.extend(caption_result.errors)
+    if not allow_deterministic_fallback:
+        guard_reasons.extend(
+            _missing_production_media_action_captions(
+                trusted_actions,
+                caption_result.items,
+            )
+        )
     guard_reasons.extend(_unsupported_plain_facts_in_reply(reply_text, bundle, claim_result.items))
 
     if guard_reasons:
@@ -436,6 +443,20 @@ def _claims_from_output(
             )
         )
     return _BuildResult(result, errors)
+
+
+def _missing_production_media_action_captions(
+    send_actions: list[SendAction],
+    captions: list[ActionCaption],
+) -> list[str]:
+    media_action_types = {"video", "image", "inventory_sheet", "send_video", "send_image", "send_inventory_sheet"}
+    captioned_action_ids = {caption.action_id for caption in captions}
+    return [
+        f"production_missing_action_caption:{action.action_id}"
+        for action in send_actions
+        if str(action.action_type or "").strip() in media_action_types
+        and action.action_id not in captioned_action_ids
+    ]
 
 
 def _claim_changes_listing_or_candidate(

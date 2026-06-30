@@ -141,6 +141,27 @@ def test_deterministic_llm2_shadow_fallback_is_oralized_and_l3_clean() -> None:
     assert not validation.l3_rewrite_reasons
 
 
+def test_production_requires_llm2_action_captions_for_media_actions() -> None:
+    package = compose_kf_outbound(
+        _task_packet(),
+        _evidence_bundle(),
+        ResponseStrategy.SEND_MEDIA,
+        llm_output={
+            "reply_text": "有的，这是棠润府 15-2-801B 的视频。",
+            "claims": [],
+            "action_captions": [],
+            "self_review": {"status": "pass"},
+        },
+        reply_source="kf_llm2_outbound_production",
+        allow_deterministic_fallback=False,
+    )
+
+    assert package.response_strategy == ResponseStrategy.RETRY
+    assert package.reply_text == ""
+    assert package.action_captions == []
+    assert "production_missing_action_caption:send-video-1" in package.self_review["retry_reason"]
+
+
 def test_compose_kf_outbound_retries_when_llm2_invents_price() -> None:
     package = compose_kf_outbound(
         _task_packet(),
