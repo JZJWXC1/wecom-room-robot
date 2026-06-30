@@ -9240,7 +9240,11 @@ async def _generate_reply_result(
         planner_result["missing_evidence"] = str(post_tool_reply_result["reason"])
         tool_evidence["planner_reply_result"] = post_tool_reply_result
     planner_reply_result = (planner_result or {}).get("post_tool_reply_result") or {}
-    inventory_search_reply = _reply_for_inventory_search(understanding, tool_evidence)
+    inventory_search_reply = (
+        ""
+        if production_mode
+        else _reply_for_inventory_search(understanding, tool_evidence)
+    )
     planner_missing_reply = planner_requires_reply and not planner_reply
     if (
         planner_missing_reply
@@ -9476,8 +9480,16 @@ async def _generate_reply_result(
     deterministic_reply_source = ""
     candidate_selection_error_reply = _reply_for_candidate_selection_error(tool_evidence)
     field_target_error_reply = _reply_for_field_target_error(tool_evidence)
-    prepared_media_reply = _reply_for_prepared_media(understanding, tool_evidence)
-    missing_media_reply = _reply_for_missing_media(understanding, tool_evidence)
+    prepared_media_reply = (
+        ""
+        if production_mode
+        else _reply_for_prepared_media(understanding, tool_evidence)
+    )
+    missing_media_reply = (
+        ""
+        if production_mode
+        else _reply_for_missing_media(understanding, tool_evidence)
+    )
     if planner_missing_reply:
         draft_reply = ""
         deterministic_reply_source = "planner_missing_reply_text"
@@ -9496,7 +9508,7 @@ async def _generate_reply_result(
     elif missing_media_reply:
         draft_reply = missing_media_reply
         deterministic_reply_source = "missing_media_reply"
-    elif inventory_search_reply and (
+    elif inventory_search_reply and not production_mode and (
         tool_evidence.get("planner_reply_timeout_tool_grounded_fallback")
         or tool_evidence.get("planner_missing_reply_tool_grounded_fallback")
         or tool_evidence.get("planner_invalid_inventory_reply_replaced")
@@ -9680,45 +9692,32 @@ async def _generate_reply_result(
                 "planner_retry_reason": retry_payload,
             }
         if llm2_retry_reason:
-            grounded_fallback = (
-                _final_inventory_evidence_fallback(understanding, tool_evidence)
-                if _can_use_grounded_inventory_reply_fallback(understanding, tool_evidence)
-                else ""
-            )
-            if grounded_fallback:
-                draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(grounded_fallback)
-                deterministic_reply_source = "tool_grounded_reply"
-                tool_evidence["llm2_production_grounded_fallback_used"] = True
-                tool_evidence["llm2_production_grounded_fallback_reason"] = safe_artifact_payload(llm2_retry_reason)
-                tool_evidence.pop("suppress_actions", None)
-                tool_evidence["deterministic_reply_source"] = deterministic_reply_source
-            else:
-                gate_selfcheck = {
+            gate_selfcheck = {
+                "status": "retry",
+                "source": "llm2_production_output_gate",
+                "reason": llm2_retry_reason,
+                "retry_target": "llm1_tools",
+            }
+            return {
+                "reply": "",
+                "draft_reply": draft_reply,
+                "planner_reply_result": planner_reply_result,
+                "context": context,
+                "selfcheck": {
                     "status": "retry",
-                    "source": "llm2_production_output_gate",
-                    "reason": llm2_retry_reason,
-                    "retry_target": "llm1_tools",
-                }
-                return {
-                    "reply": "",
-                    "draft_reply": draft_reply,
-                    "planner_reply_result": planner_reply_result,
-                    "context": context,
-                    "selfcheck": {
-                        "status": "retry",
-                        "rule": gate_selfcheck,
-                        "llm": production_summary.get("self_review") or gate_selfcheck,
-                    },
-                    "needs_planner_retry": False,
-                    "planner_retry_reason": _llm2_production_retry_reason_payload(
-                        understanding=understanding,
-                        tool_evidence=tool_evidence,
-                        rule_selfcheck=gate_selfcheck,
-                        llm_selfcheck=production_summary.get("self_review") or gate_selfcheck,
-                        reason=llm2_retry_reason,
-                    ),
-                    "send_blocked": True,
-                }
+                    "rule": gate_selfcheck,
+                    "llm": production_summary.get("self_review") or gate_selfcheck,
+                },
+                "needs_planner_retry": False,
+                "planner_retry_reason": _llm2_production_retry_reason_payload(
+                    understanding=understanding,
+                    tool_evidence=tool_evidence,
+                    rule_selfcheck=gate_selfcheck,
+                    llm_selfcheck=production_summary.get("self_review") or gate_selfcheck,
+                    reason=llm2_retry_reason,
+                ),
+                "send_blocked": True,
+            }
         if llm2_rewrite_reason:
             gate_selfcheck = {
                 "status": "rewrite_required",
@@ -9910,6 +9909,27 @@ async def _generate_reply_result(
             "selfcheck": {"status": final_status, "rule": rule_selfcheck, "llm": llm_selfcheck},
             "needs_planner_retry": True,
             "planner_retry_reason": planner_retry_reason,
+        }
+    if production_mode:
+        gate_selfcheck = {
+            "status": final_status,
+            "source": "production_final_selfcheck_output_gate",
+            "reason": reason,
+            "retry_target": "llm1_tools",
+        }
+        return {
+            "reply": "",
+            "draft_reply": draft_reply,
+            "planner_reply_result": planner_reply_result,
+            "context": context,
+            "selfcheck": {
+                "status": final_status,
+                "rule": gate_selfcheck,
+                "llm": llm_selfcheck,
+            },
+            "needs_planner_retry": False,
+            "planner_retry_reason": planner_retry_reason,
+            "send_blocked": True,
         }
     if planner_missing_reply:
         fallback = _safe_fallback_for_intent(

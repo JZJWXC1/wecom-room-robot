@@ -582,7 +582,7 @@ def test_generate_reply_result_production_retries_l3_validation_with_llm2(monkey
     asyncio.run(run_case())
 
 
-def test_llm2_production_second_retry_uses_grounded_inventory_rows(monkeypatch) -> None:
+def test_llm2_production_second_retry_blocks_instead_of_grounded_inventory_rows(monkeypatch) -> None:
     async def run_case() -> None:
         task_packet = build_kf_task_packet_shadow(
             {
@@ -671,17 +671,13 @@ def test_llm2_production_second_retry_uses_grounded_inventory_rows(monkeypatch) 
         )
 
         assert result["needs_planner_retry"] is False
-        assert "杨家新雅苑46-1204A" in result["reply"]
-        assert "杨家新雅苑36-1-1102" in result["reply"]
-        assert "押一付一2500" in result["reply"]
-        assert "押一付一5600" in result["reply"]
-        assert "稍后给您准确回复" not in result["reply"]
-        assert "我先帮您确认一下最新房态" not in result["reply"]
-        assert "101004#" not in result["reply"]
-        assert "336699#" not in result["reply"]
-        assert tool_evidence["deterministic_reply_source"] == "tool_grounded_reply"
-        assert tool_evidence["llm2_production_grounded_fallback_used"] is True
-        assert "suppress_actions" not in tool_evidence
+        assert result["send_blocked"] is True
+        assert result["reply"] == ""
+        assert result["selfcheck"]["status"] == "retry"
+        assert result["selfcheck"]["rule"]["source"] == "llm2_production_output_gate"
+        assert tool_evidence.get("deterministic_reply_source") != "tool_grounded_reply"
+        assert tool_evidence.get("llm2_production_grounded_fallback_used") is not True
+        assert "outbound_package" not in tool_evidence
 
     asyncio.run(run_case())
 
