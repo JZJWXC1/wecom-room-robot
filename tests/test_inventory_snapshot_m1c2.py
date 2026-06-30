@@ -565,3 +565,388 @@ def test_region_inventory_script_passes_unique_sync_run_id_without_second_fetch(
 
     assert result["ok"] is True
     assert calls == {"refresh": 1, "shadow": 1}
+
+
+def test_region_inventory_runtime_artifacts_refreshes_media_manifest_from_same_rows(
+    monkeypatch,
+) -> None:
+    import scripts.sync_feishu_region_inventory as script
+
+    rows = [
+        {"小区": "长浜龙吟轩", "房号": "11-1603"},
+        {"小区": "新柠长木府", "房号": "3-1002A"},
+    ]
+    calls: dict[str, Any] = {"refresh": 0, "rewrite_rows": None, "manifest_rows": None}
+
+    class FakeFrame:
+        def fillna(self, value: str) -> "FakeFrame":
+            return self
+
+        def to_dict(self, orient: str) -> list[dict[str, Any]]:
+            assert orient == "records"
+            return rows
+
+    class FakeInventoryService:
+        cache_meta = {"hash": "cache-hash"}
+
+        async def refresh(self) -> FakeFrame:
+            calls["refresh"] += 1
+            return FakeFrame()
+
+    def fake_rewrite_payload(*, rows: list[dict[str, Any]], cache_meta: dict[str, Any]) -> dict[str, Any]:
+        calls["rewrite_rows"] = rows
+        return {"ok": True, "row_count": len(rows), "signature": cache_meta["hash"]}
+
+    async def fake_refresh_media_manifest(manifest_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        calls["manifest_rows"] = manifest_rows
+        listing_ids, labels = script.media_manifest_context_for_rows(manifest_rows)
+        return {
+            "ok": True,
+            "listing_id_count": len(listing_ids),
+            "labels": labels,
+        }
+
+    monkeypatch.setattr(script, "InventoryService", FakeInventoryService)
+    monkeypatch.setattr(script, "build_rewrite_inventory_payload", fake_rewrite_payload)
+    monkeypatch.setattr(script, "refresh_media_manifest", fake_refresh_media_manifest)
+
+    result = asyncio.run(script.refresh_runtime_artifacts(sync_media_manifest=True))
+
+    assert result["rewrite_index"]["ok"] is True
+    assert result["media_manifest"]["ok"] is True
+    assert result["media_manifest"]["listing_id_count"] == 2
+    assert calls["refresh"] == 1
+    assert calls["rewrite_rows"] is rows
+    assert calls["manifest_rows"] is rows
+
+
+def test_region_inventory_refresh_media_manifest_binds_target_drive_room_label(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.sync_feishu_region_inventory as script
+    from app.services.media_manifest import MediaManifestProductionAdapter
+
+    rows = [{"小区": "长浜龙吟轩", "房号": "11-1603"}]
+    payloads = {"video-token": b"longham-video"}
+    tree = {
+        "root": [{"name": "东新园 杭氧 新天地", "type": "folder", "token": "area"}],
+        "area": [{"name": "长浜龙吟轩11-1603", "type": "folder", "token": "room"}],
+        "room": [
+            {
+                "name": "lv_0_20260627144514.mp4",
+                "type": "file",
+                "token": "video-token",
+                "size": len(payloads["video-token"]),
+            }
+        ],
+    }
+
+    class FakeFeishuClient:
+        async def list_folder_files(self, folder_token: str) -> list[dict[str, Any]]:
+            return list(tree.get(folder_token, []))
+
+        async def download_file(self, file_token: str, target_path: Path) -> Path:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(payloads[file_token])
+            return target_path
+
+    monkeypatch.setattr(script, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(script.settings, "room_database_path", tmp_path / "room_database")
+    monkeypatch.setattr(script.settings, "feishu_region_sync_target_drive_folder_token", "root")
+
+    result = asyncio.run(script.refresh_media_manifest(rows))
+    listing_ids, _labels = script.media_manifest_context_for_rows(rows)
+    evidence = MediaManifestProductionAdapter.from_path(
+        tmp_path / "room_database" / "media_manifest.json",
+        local_root=tmp_path / "room_database",
+    ).evidence_for_listing(listing_ids[0])
+
+    assert result["ok"] is True
+    assert result["video_count"] == 1
+    assert result["report"]["bound_count"] == 1
+    assert result["report"]["orphan_count"] == 0
+    assert len(evidence) == 1
+    assert evidence[0].media_type == "video"
+    assert evidence[0].send_ready is True
+
+
+def test_region_inventory_refresh_media_manifest_marks_expected_missing_video_degraded(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.sync_feishu_region_inventory as script
+
+    rows = [{"小区": "长浜龙吟轩", "房号": "11-1603", "视频": "有"}]
+    tree = {
+        "root": [{"name": "东新园 杭氧 新天地", "type": "folder", "token": "area"}],
+        "area": [{"name": "长浜龙吟轩11-1603", "type": "folder", "token": "room"}],
+        "room": [],
+    }
+
+    class FakeFeishuClient:
+        async def list_folder_files(self, folder_token: str) -> list[dict[str, Any]]:
+            return list(tree.get(folder_token, []))
+
+        async def download_file(self, file_token: str, target_path: Path) -> Path:
+            raise AssertionError("no files should be downloaded")
+
+    monkeypatch.setattr(script, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(script.settings, "room_database_path", tmp_path / "room_database")
+    monkeypatch.setattr(script.settings, "feishu_region_sync_target_drive_folder_token", "root")
+
+    result = asyncio.run(script.refresh_media_manifest(rows))
+
+    assert result["generated"] is True
+    assert result["ok"] is False
+    assert result["ready"] is False
+    assert result["status"] == "degraded"
+    assert result["blocking_count"] == 1
+    assert result["report"]["missing_count"] == 1
+    assert result["report"]["missing_sample"][0]["missing_kinds"] == ["video"]
+    assert not (tmp_path / "room_database" / "media_manifest.json").exists()
+    assert Path(result["candidate_path"]).is_file()
+
+
+def test_region_inventory_refresh_media_manifest_keeps_previous_manifest_when_degraded(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    import scripts.sync_feishu_region_inventory as script
+    from app.services.inventory_snapshot_models import generate_listing_id
+    from app.services.media_manifest import MEDIA_KIND_VIDEO, MediaItem, MediaManifest
+
+    room_database = tmp_path / "room_database"
+    old_listing_id = generate_listing_id("旧花园", "1-101")
+    old_video_path = room_database / "video" / old_listing_id / "old.mp4"
+    old_video_payload = b"old-send-ready-video"
+    old_video_path.parent.mkdir(parents=True, exist_ok=True)
+    old_video_path.write_bytes(old_video_payload)
+    old_manifest = MediaManifest.build(
+        listing_ids=[old_listing_id],
+        items=[
+            MediaItem(
+                listing_id=old_listing_id,
+                kind=MEDIA_KIND_VIDEO,
+                file_name="old.mp4",
+                relative_path=f"video/{old_listing_id}/old.mp4",
+                local_path=f"video/{old_listing_id}/old.mp4",
+                size=len(old_video_payload),
+                sha256=hashlib.sha256(old_video_payload).hexdigest(),
+                access_verified=True,
+                wecom_sendable=True,
+            )
+        ],
+    )
+    manifest_path = room_database / "media_manifest.json"
+    old_manifest.write_json(manifest_path)
+    before = manifest_path.read_text(encoding="utf-8")
+
+    rows = [{"小区": "长浜龙吟轩", "房号": "11-1603", "视频": "有"}]
+    tree = {
+        "root": [{"name": "东新园 杭氧 新天地", "type": "folder", "token": "area"}],
+        "area": [{"name": "长浜龙吟轩11-1603", "type": "folder", "token": "room"}],
+        "room": [],
+    }
+
+    class FakeFeishuClient:
+        async def list_folder_files(self, folder_token: str) -> list[dict[str, Any]]:
+            return list(tree.get(folder_token, []))
+
+        async def download_file(self, file_token: str, target_path: Path) -> Path:
+            raise AssertionError("no files should be downloaded")
+
+    monkeypatch.setattr(script, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(script.settings, "room_database_path", room_database)
+    monkeypatch.setattr(script.settings, "feishu_region_sync_target_drive_folder_token", "root")
+
+    result = asyncio.run(script.refresh_media_manifest(rows))
+
+    assert result["ok"] is False
+    assert result["status"] == "degraded"
+    assert manifest_path.read_text(encoding="utf-8") == before
+    assert Path(result["candidate_path"]).is_file()
+    assert "11-1603" not in manifest_path.read_text(encoding="utf-8")
+
+
+def test_region_inventory_degraded_candidate_manifest_keeps_review_files(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.sync_feishu_region_inventory as script
+    from app.services.media_manifest import MediaManifestProductionAdapter
+
+    rows = [{"小区": "长浜龙吟轩", "房号": "11-1603", "视频": "有", "图片": "有"}]
+    payloads = {"video-token": b"candidate-review-video"}
+    tree = {
+        "root": [{"name": "东新园 杭氧 新天地", "type": "folder", "token": "area"}],
+        "area": [{"name": "长浜龙吟轩11-1603", "type": "folder", "token": "room"}],
+        "room": [
+            {
+                "name": "lv_0_20260627144514.mp4",
+                "type": "file",
+                "token": "video-token",
+                "size": len(payloads["video-token"]),
+            }
+        ],
+    }
+
+    class FakeFeishuClient:
+        async def list_folder_files(self, folder_token: str) -> list[dict[str, Any]]:
+            return list(tree.get(folder_token, []))
+
+        async def download_file(self, file_token: str, target_path: Path) -> Path:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(payloads[file_token])
+            return target_path
+
+    monkeypatch.setattr(script, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(script.settings, "room_database_path", tmp_path / "room_database")
+    monkeypatch.setattr(script.settings, "feishu_region_sync_target_drive_folder_token", "root")
+
+    result = asyncio.run(script.refresh_media_manifest(rows))
+    listing_ids, _labels = script.media_manifest_context_for_rows(rows)
+    candidate_evidence = MediaManifestProductionAdapter.from_path(
+        Path(result["candidate_path"]),
+    ).evidence_for_listing(listing_ids[0])
+
+    assert result["ok"] is False
+    assert result["status"] == "degraded"
+    assert result["report"]["missing_sample"][0]["missing_kinds"] == ["image"]
+    assert not (tmp_path / "room_database" / "media_manifest.json").exists()
+    assert Path(result["candidate_files_path"]).is_dir()
+    assert len(candidate_evidence) == 1
+    assert candidate_evidence[0].media_type == "video"
+    assert Path(candidate_evidence[0].local_path).is_file()
+
+
+def test_region_inventory_ready_publish_failure_keeps_old_manifest_and_files(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    import scripts.sync_feishu_region_inventory as script
+    from app.services.inventory_snapshot_models import generate_listing_id
+    from app.services.media_manifest import (
+        MEDIA_KIND_VIDEO,
+        MediaItem,
+        MediaManifest,
+        MediaManifestProductionAdapter,
+    )
+
+    room_database = tmp_path / "room_database"
+    listing_id = generate_listing_id("长浜龙吟轩", "11-1603")
+    relative_path = f"video/{listing_id}/lv_0_20260627144514.mp4"
+    old_video_payload = b"old-production-video"
+    old_video_path = room_database / Path(relative_path)
+    old_video_path.parent.mkdir(parents=True, exist_ok=True)
+    old_video_path.write_bytes(old_video_payload)
+    old_manifest = MediaManifest.build(
+        listing_ids=[listing_id],
+        items=[
+            MediaItem(
+                listing_id=listing_id,
+                kind=MEDIA_KIND_VIDEO,
+                file_name="lv_0_20260627144514.mp4",
+                relative_path=relative_path,
+                local_path=relative_path,
+                size=len(old_video_payload),
+                sha256=hashlib.sha256(old_video_payload).hexdigest(),
+                access_verified=True,
+                wecom_sendable=True,
+            )
+        ],
+    )
+    manifest_path = room_database / "media_manifest.json"
+    old_manifest.write_json(manifest_path)
+    before_manifest = manifest_path.read_text(encoding="utf-8")
+
+    rows = [{"小区": "长浜龙吟轩", "房号": "11-1603", "视频": "有"}]
+    new_video_payload = b"new-ready-video-with-same-name"
+    tree = {
+        "root": [{"name": "东新园 杭氧 新天地", "type": "folder", "token": "area"}],
+        "area": [{"name": "长浜龙吟轩11-1603", "type": "folder", "token": "room"}],
+        "room": [
+            {
+                "name": "lv_0_20260627144514.mp4",
+                "type": "file",
+                "token": "video-token",
+                "size": len(new_video_payload),
+            }
+        ],
+    }
+
+    class FakeFeishuClient:
+        async def list_folder_files(self, folder_token: str) -> list[dict[str, Any]]:
+            return list(tree.get(folder_token, []))
+
+        async def download_file(self, file_token: str, target_path: Path) -> Path:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(new_video_payload)
+            return target_path
+
+    def fail_manifest_write(manifest: Any, path: Path) -> None:
+        raise RuntimeError("manifest write failed")
+
+    monkeypatch.setattr(script, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(script.settings, "room_database_path", room_database)
+    monkeypatch.setattr(script.settings, "feishu_region_sync_target_drive_folder_token", "root")
+    monkeypatch.setattr(script, "_write_manifest_atomically", fail_manifest_write)
+
+    try:
+        asyncio.run(script.refresh_media_manifest(rows))
+    except RuntimeError as exc:
+        assert "manifest write failed" in str(exc)
+    else:
+        raise AssertionError("manifest write failure should bubble up")
+
+    evidence = MediaManifestProductionAdapter.from_path(
+        manifest_path,
+        local_root=room_database,
+    ).evidence_for_listing(listing_id)
+    assert manifest_path.read_text(encoding="utf-8") == before_manifest
+    assert old_video_path.read_bytes() == old_video_payload
+    assert len(evidence) == 1
+    assert Path(evidence[0].local_path).read_bytes() == old_video_payload
+
+
+def test_region_inventory_media_expectations_accept_aliases_and_counts() -> None:
+    import scripts.sync_feishu_region_inventory as script
+
+    rows = [
+        {
+            "小区": "长浜龙吟轩",
+            "房号": "11-1603",
+            "房源视频": "2",
+            "图片数量": 1,
+        },
+        {
+            "小区": "新柠长木府",
+            "房号": "3-1002A",
+            "视频数量": "0",
+            "房源图片": "无",
+        },
+    ]
+
+    expected = script.expected_media_kinds_by_listing(rows)
+
+    assert len(expected) == 1
+    assert set(next(iter(expected.values()))) == {"image", "video"}
+
+
+def test_region_inventory_manifest_context_requires_community_and_room() -> None:
+    import scripts.sync_feishu_region_inventory as script
+
+    rows = [
+        {"小区": "长浜龙吟轩"},
+        {"房号": "11-1603"},
+        {"小区": "长浜龙吟轩", "房号": "11-1603"},
+    ]
+
+    listing_ids, labels = script.media_manifest_context_for_rows(rows)
+
+    assert len(listing_ids) == 1
+    assert labels == {listing_ids[0]: "长浜龙吟轩11-1603"}

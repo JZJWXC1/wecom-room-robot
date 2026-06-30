@@ -14,7 +14,7 @@ from app.services.inventory_snapshot_models import (
     is_safe_listing_id,
     now_utc_iso,
 )
-from app.services.region_inventory_utils import safe_name
+from app.services.region_inventory_utils import folder_match_key, safe_name
 
 
 MEDIA_MANIFEST_SCHEMA_VERSION = "media_manifest.v2"
@@ -480,9 +480,20 @@ class MediaBindingReport:
     def ok(self) -> bool:
         return not self.failed
 
+    @property
+    def ready(self) -> bool:
+        return (
+            self.ok
+            and not self.missing
+            and not self.ambiguous_items
+            and not self.orphan_items
+            and not self.fuzzy_candidates
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
+            "ready": self.ready,
             "generated_at": self.generated_at,
             "listing_ids": self.listing_ids,
             "bound_count": len(self.bound_items),
@@ -746,6 +757,7 @@ class FeishuDriveMediaManifestAdapter:
             for listing_id, label in (listing_labels or {}).items()
             if listing_id in self.known_listing_ids and str(label).strip()
         }
+        self._listing_ids_by_exact_label = self._build_exact_label_index()
         self.quarantine_dir = quarantine_dir or target_root / "_manual_review"
 
     async def sync_from_drive(
@@ -805,16 +817,22 @@ class FeishuDriveMediaManifestAdapter:
             report.skipped.append({"source_path": source_path, "reason": "unsupported_media_type"})
             return
 
-        listing_ids = self._listing_ids_for_item(item, path_parts)
+        explicit_listing_ids = self._explicit_listing_ids_for_item(item, path_parts)
+        exact_label_listing_ids = self._exact_label_listing_ids_for_path(path_parts)
+        listing_ids = list(dict.fromkeys([*explicit_listing_ids, *exact_label_listing_ids]))
         known_ids = [listing_id for listing_id in listing_ids if listing_id in self.known_listing_ids]
         unknown_ids = [listing_id for listing_id in listing_ids if listing_id not in self.known_listing_ids]
         if len(known_ids) == 1 and not unknown_ids:
+            binding_source = "listing_id"
+            if not explicit_listing_ids and exact_label_listing_ids:
+                binding_source = "exact_listing_label"
             media_item = await self._bind_item(
                 item,
                 known_ids[0],
                 kind,
                 source_path,
                 report,
+                binding_source=binding_source,
             )
             if media_item:
                 items.append(media_item)
@@ -832,6 +850,7 @@ class FeishuDriveMediaManifestAdapter:
                         "confidence": media_item.confidence,
                         "ambiguity": media_item.ambiguity,
                         "candidate_only": media_item.candidate_only,
+                        "binding_source": media_item.metadata.get("binding_source", ""),
                         "send_ready": True,
                         "manifest_version": media_item.manifest_version,
                     }
@@ -896,6 +915,8 @@ class FeishuDriveMediaManifestAdapter:
         kind: str,
         source_path: str,
         report: MediaBindingReport,
+        *,
+        binding_source: str = "listing_id",
     ) -> MediaItem | None:
         name = safe_name(_item_name(item))
         original_url = _first_http_url(item, URL_FIELDS)
@@ -955,6 +976,7 @@ class FeishuDriveMediaManifestAdapter:
             manifest_version=MEDIA_MANIFEST_SCHEMA_VERSION,
             access_verified=bool(sha256 or original_url),
             wecom_sendable=kind == MEDIA_KIND_VIDEO,
+            metadata={"binding_source": binding_source},
         )
 
     async def _sync_file(
@@ -1033,6 +1055,16 @@ class FeishuDriveMediaManifestAdapter:
         )
 
     def _listing_ids_for_item(self, item: dict[str, Any], path_parts: list[str]) -> list[str]:
+        return list(
+            dict.fromkeys(
+                [
+                    *self._explicit_listing_ids_for_item(item, path_parts),
+                    *self._exact_label_listing_ids_for_path(path_parts),
+                ]
+            )
+        )
+
+    def _explicit_listing_ids_for_item(self, item: dict[str, Any], path_parts: list[str]) -> list[str]:
         ids: list[str] = []
         for key in ("listing_id", "listingId", "房源ID", "房源编号"):
             value = str(item.get(key) or "").strip()
@@ -1041,6 +1073,28 @@ class FeishuDriveMediaManifestAdapter:
         texts = [*path_parts, _item_name(item)]
         for text in texts:
             ids.extend(match.group(0).lower() for match in LISTING_ID_RE.finditer(str(text)))
+        return list(dict.fromkeys(ids))
+
+    def _build_exact_label_index(self) -> dict[str, list[str]]:
+        index: dict[str, list[str]] = {}
+        for listing_id, label in self.listing_labels.items():
+            if not _is_specific_listing_label(label):
+                continue
+            key = folder_match_key(label)
+            if not key:
+                continue
+            index.setdefault(key, [])
+            if listing_id not in index[key]:
+                index[key].append(listing_id)
+        return index
+
+    def _exact_label_listing_ids_for_path(self, path_parts: list[str]) -> list[str]:
+        ids: list[str] = []
+        for part in path_parts:
+            key = folder_match_key(part)
+            matched = self._listing_ids_by_exact_label.get(key) or []
+            if len(matched) == 1:
+                ids.append(matched[0])
         return list(dict.fromkeys(ids))
 
     def _fuzzy_candidates(self, source_path: str) -> list[dict[str, Any]]:
@@ -1098,6 +1152,15 @@ def _dedupe_listing_ids(listing_ids: Iterable[str]) -> list[str]:
             for listing_id in listing_ids
             if is_safe_listing_id(str(listing_id).strip())
         )
+    )
+
+
+def _is_specific_listing_label(value: str) -> bool:
+    key = folder_match_key(value)
+    return (
+        len(key) >= 4
+        and any(char.isdigit() for char in key)
+        and any("\u4e00" <= char <= "\u9fff" for char in key)
     )
 
 
