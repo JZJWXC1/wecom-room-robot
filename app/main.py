@@ -4394,7 +4394,48 @@ def _media_target_error_for_unclear_room(
         "reason": "community_media_request_missing_room_ref",
         "candidate_count": len(matched_rows),
         "candidate_labels": [_row_label(row) for row in matched_rows[:10]],
+        "candidate_rows": matched_rows[:10],
     }
+
+
+def _pending_media_kind_from_field_error(error: dict[str, Any], proof: dict[str, Any]) -> str:
+    field = str(error.get("field") or "").strip()
+    if field == "图片" or (proof.get("wants_image") and not proof.get("wants_video")):
+        return "image"
+    if field in {"视频", "原视频", "素材"} or proof.get("wants_video") or proof.get("wants_original_video"):
+        return "video"
+    return ""
+
+
+def _remember_pending_media_target_from_error(
+    context: dict[str, Any],
+    *,
+    error: dict[str, Any],
+    proof: dict[str, Any],
+    candidate_rows: list[dict[str, Any]],
+) -> None:
+    media_kind = _pending_media_kind_from_field_error(error, proof)
+    if not media_kind:
+        return
+    rows = [
+        row
+        for row in (error.get("candidate_rows") or candidate_rows or [])
+        if isinstance(row, dict)
+    ][:KF_VIDEO_SEND_LIMIT]
+    labels = [
+        str(label).strip()
+        for label in (error.get("candidate_labels") or [_row_label(row) for row in rows])
+        if str(label).strip()
+    ][:KF_VIDEO_SEND_LIMIT]
+    if not rows and not labels:
+        return
+    kf_context_memory.remember_pending_media_target(
+        context,
+        media_kind=media_kind,
+        candidate_rows=rows,
+        candidate_labels=labels,
+        reason=str(error.get("reason") or "field_target_error"),
+    )
 
 
 def _normalize_room_ref(value: str) -> str:
@@ -4649,14 +4690,25 @@ def _should_bind_confirmed_room_context(
     task = dict(understanding.get("structured_task") or {})
     original_text = str(task.get("original_text") or "")
     is_bound_field_followup = _has_bound_room_field_followup(original_text)
+    requirements = dict(task.get("tool_requirements") or {})
+    intent = _normalize_intent(understanding.get("intent"))
+    wants_bound_action = bool(
+        proof.get("wants_video")
+        or proof.get("wants_image")
+        or requirements.get("needs_video")
+        or requirements.get("needs_image")
+        or requirements.get("needs_viewing_policy")
+        or intent in {"media", "viewing"}
+        or _content_wants_viewing(query_text)
+    )
+    if _has_specific_room_context_reference(query_text) and wants_bound_action:
+        return True
     if not is_bound_field_followup and _looks_like_new_scoped_inventory_query(query_text, proof):
         return False
     if not bool(understanding.get("context_reference")) and not is_bound_field_followup:
         return False
     if _has_specific_room_context_reference(query_text):
         return True
-    requirements = dict(task.get("tool_requirements") or {})
-    intent = _normalize_intent(understanding.get("intent"))
     if intent in {"media", "viewing"}:
         return True
     if is_bound_field_followup:
@@ -5191,6 +5243,7 @@ async def _understand_message(
             inventory_index=inventory_index,
             inventory_read_context=inventory_read_context,
         )
+        result = _force_pending_media_target_task(content, result, context)
         return _route_unverified_not_found_to_tools(result, planner_feedback=planner_feedback)
     try:
         result = await asyncio.wait_for(
@@ -5313,6 +5366,7 @@ async def _understand_message(
         result["structured_task"]["tool_plan"] = orchestrator_tool_plan
     result = _normalize_field_lookup_understanding(content, result)
     result = _force_pending_video_continue_task(content, result, context)
+    result = _force_pending_media_target_task(content, result, context)
     constraint_proof = dict(result.get("constraint_proof") or constraint_proof)
     query_state = dict(result.get("query_state") or {})
     skip_unresolved_community_clarification = bool(
@@ -6101,6 +6155,21 @@ async def _execute_tools(
         evidence["selection_error"] = tool_resolution.selection_error
     if tool_resolution.field_target_error:
         evidence["field_target_error"] = tool_resolution.field_target_error
+        pending_candidate_rows = [
+            row
+            for row in (
+                tool_resolution.field_target_error.get("candidate_rows")
+                or rows
+                or _candidate_rows(working_context)
+            )
+            if isinstance(row, dict)
+        ]
+        _remember_pending_media_target_from_error(
+            context,
+            error=tool_resolution.field_target_error,
+            proof=proof,
+            candidate_rows=pending_candidate_rows,
+        )
     if tool_resolution.pending_video_context_bound:
         evidence["pending_video_context_bound"] = tool_resolution.pending_video_context_bound
     if tool_resolution.original_video_target_binding:
@@ -6124,6 +6193,12 @@ async def _execute_tools(
     target_rows = _rows_with_listing_ids(target_rows)
     evidence["inventory_rows"] = _rows_with_listing_ids(evidence.get("inventory_rows") or rows)
     evidence["target_rows"] = target_rows
+    if target_rows and dict(understanding.get("query_state") or {}).get("pending_media_target_bound"):
+        evidence["pending_media_target_bound"] = {
+            "media_kind": str(dict(understanding.get("query_state") or {}).get("media_kind") or ""),
+            "target_labels": [_row_label(row) for row in target_rows],
+        }
+        kf_context_memory.clear_pending_media_target(context)
     if target_rows and selected_indices:
         rows = target_rows
         evidence["inventory_rows"] = target_rows

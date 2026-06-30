@@ -10295,6 +10295,424 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([main._row_label(row) for row in rows], ["长岳王马府4-2002", "长浜龙吟轩11-1603"])
 
+    async def test_pending_media_target_room_ref_inherits_video_action(self) -> None:
+        rows = [
+            {"小区": "东新园", "房号": "8-1201"},
+            {"小区": "东新园", "房号": "9-1302"},
+        ]
+        video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        video.write(b"video")
+        video.close()
+
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return rows
+
+        class FakeMediaStore:
+            def list_room_database_videos(self, query: str, limit: int = 6):
+                return [Path(video.name)] if "8-1201" in query else []
+
+            def list_room_database_images(self, query: str, limit: int = 6):
+                return []
+
+        context = kf_context_memory.empty_context()
+        originals = {"inventory": main.inventory, "media_store": main.media_store}
+        main.inventory = FakeInventory()
+        main.media_store = FakeMediaStore()
+        try:
+            first = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                content="东新园视频发我。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "东新园视频",
+                    "constraint_proof": {"communities": ["东新园"], "wants_video": True},
+                    "structured_task": {
+                        "intent": "media",
+                        "original_text": "东新园视频发我。",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+            self.assertEqual(first["field_target_error"]["reason"], "community_media_request_missing_room_ref")
+            pending = kf_context_memory.pending_media_target(context)
+            self.assertEqual(pending["media_kind"], "video")
+            self.assertEqual(pending["candidate_labels"], ["东新园8-1201", "东新园9-1302"])
+
+            content = "东新园8-1201"
+            understanding = main._force_pending_media_target_task(
+                content,
+                {
+                    "intent": "inventory",
+                    "effective_query": content,
+                    "rewritten_query": content,
+                    "constraint_proof": {},
+                    "structured_task": {"intent": "inventory", "tool_requirements": {"needs_inventory_search": True}},
+                },
+                context,
+            )
+            planner = await main._plan_actions(
+                content=content,
+                context=context,
+                understanding=understanding,
+                signals=main._deterministic_signals(content),
+            )
+            evidence = await main._execute_tools(
+                actions=main._safe_action_list(planner),
+                content=content,
+                context=context,
+                understanding=understanding,
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+            Path(video.name).unlink(missing_ok=True)
+
+        self.assertIn("send_video", planner["actions"])
+        self.assertEqual([main._row_label(row) for row in evidence["target_rows"]], ["东新园8-1201"])
+        self.assertEqual(evidence["video_paths"], [video.name])
+        self.assertEqual(kf_context_memory.pending_media_target(context), {})
+
+    def test_new_scoped_inventory_query_clears_pending_media_target(self) -> None:
+        context = kf_context_memory.remember_pending_media_target(
+            kf_context_memory.empty_context(),
+            media_kind="video",
+            candidate_rows=[
+                {"小区": "东新园", "房号": "8-1201"},
+                {"小区": "东新园", "房号": "9-1302"},
+            ],
+            candidate_labels=["东新园8-1201", "东新园9-1302"],
+            reason="community_media_request_missing_room_ref",
+        )
+
+        result = main._force_pending_media_target_task(
+            "拱墅万达1500以内有哪些一室？",
+            {
+                "intent": "inventory",
+                "effective_query": "拱墅万达1500以内一室房源",
+                "rewritten_query": "查询拱墅万达1500以内一室房源",
+                "constraint_proof": {
+                    "area": "拱墅万达\n北部软件园\n城北万象城",
+                    "budget_range": [0, 1500],
+                    "layout": "一室",
+                },
+                "structured_task": {
+                    "intent": "inventory",
+                    "original_text": "拱墅万达1500以内有哪些一室？",
+                    "tool_requirements": {"needs_inventory_search": True},
+                },
+            },
+            context,
+        )
+
+        self.assertEqual(result["intent"], "inventory")
+        self.assertNotIn("send_video", (result.get("tool_plan") or {}).get("actions", []))
+        self.assertEqual(kf_context_memory.pending_media_target(context), {})
+
+        followup = main._force_pending_media_target_task(
+            "第1套视频",
+            {
+                "intent": "media",
+                "effective_query": "第1套视频",
+                "constraint_proof": {"wants_video": True, "selected_indices": [1]},
+                "selected_indices": [1],
+                "structured_task": {
+                    "intent": "media",
+                    "original_text": "第1套视频",
+                    "tool_requirements": {"needs_video": True},
+                },
+            },
+            context,
+        )
+        self.assertNotEqual((followup.get("tool_plan") or {}).get("source"), "pending_media_target_bound")
+
+    def test_new_scoped_numbered_media_query_does_not_use_stale_pending_target(self) -> None:
+        context = kf_context_memory.remember_pending_media_target(
+            kf_context_memory.empty_context(),
+            media_kind="video",
+            candidate_rows=[
+                {"小区": "东新园", "房号": "8-1201"},
+                {"小区": "东新园", "房号": "9-1302"},
+            ],
+            candidate_labels=["东新园8-1201", "东新园9-1302"],
+            reason="community_media_request_missing_room_ref",
+        )
+        context["last_candidate_set"] = {
+            "intent": "media",
+            "query": "东新园视频",
+            "candidates": [
+                {"小区": "东新园", "房号": "8-1201"},
+                {"小区": "东新园", "房号": "9-1302"},
+            ],
+            "shown_count": 2,
+            "total_count": 2,
+        }
+
+        result = main._force_pending_media_target_task(
+            "拱墅万达第1套视频",
+            {
+                "intent": "media",
+                "effective_query": "拱墅万达第1套视频",
+                "rewritten_query": "发送拱墅万达候选第1套视频",
+                "selected_indices": [1],
+                "constraint_proof": {
+                    "area": "拱墅万达\n北部软件园\n城北万象城",
+                    "selected_indices": [1],
+                    "wants_video": True,
+                },
+                "structured_task": {
+                    "intent": "media",
+                    "original_text": "拱墅万达第1套视频",
+                    "tool_requirements": {"needs_video": True, "needs_inventory_search": True},
+                },
+            },
+            context,
+        )
+
+        self.assertNotEqual((result.get("tool_plan") or {}).get("source"), "pending_media_target_bound")
+        self.assertEqual(kf_context_memory.pending_media_target(context), {})
+        self.assertNotIn("last_candidate_set", context)
+
+    async def test_production_understanding_applies_pending_media_target_guard(self) -> None:
+        context = kf_context_memory.remember_pending_media_target(
+            kf_context_memory.empty_context(),
+            media_kind="video",
+            candidate_rows=[
+                {"小区": "东新园", "房号": "8-1201"},
+                {"小区": "东新园", "房号": "9-1302"},
+            ],
+            candidate_labels=["东新园8-1201", "东新园9-1302"],
+            reason="community_media_request_missing_room_ref",
+        )
+
+        class FakeReplyGenerator:
+            async def rewrite_kf_message(self, **kwargs):
+                raise AssertionError("production LLM1 must not call legacy rewrite")
+
+            async def build_kf_task_packet(self, **kwargs):
+                return build_kf_task_packet_shadow(
+                    {
+                        "rewritten_query": kwargs["content"],
+                        "tool_plan": {"actions": ["search_inventory", "generate_reply"]},
+                    },
+                    content=kwargs["content"],
+                    source_label="llm1_production",
+                    mode="production",
+                ).packet
+
+        async def fake_rows(*args, **kwargs):
+            return []
+
+        async def fake_index(*args, **kwargs):
+            return {}
+
+        async def fake_meta(*args, **kwargs):
+            return {}
+
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "reply_generator": main.reply_generator,
+            "_inventory_rows_for_resolution": main._inventory_rows_for_resolution,
+            "_inventory_rewrite_index_for_read_context": main._inventory_rewrite_index_for_read_context,
+            "_inventory_metadata_for_read_context": main._inventory_metadata_for_read_context,
+        }
+        main.settings.kf_dual_llm_mode = "production"
+        main.reply_generator = FakeReplyGenerator()
+        main._inventory_rows_for_resolution = fake_rows
+        main._inventory_rewrite_index_for_read_context = fake_index
+        main._inventory_metadata_for_read_context = fake_meta
+        try:
+            result = await main._understand_message(
+                content="东新园8-1201",
+                context=context,
+                signals=main._deterministic_signals("东新园8-1201"),
+                inventory_read_context=main._local_inventory_read_context("prod-pending-media"),
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
+            main.reply_generator = originals["reply_generator"]
+            main._inventory_rows_for_resolution = originals["_inventory_rows_for_resolution"]
+            main._inventory_rewrite_index_for_read_context = originals["_inventory_rewrite_index_for_read_context"]
+            main._inventory_metadata_for_read_context = originals["_inventory_metadata_for_read_context"]
+
+        self.assertEqual(result["intent"], "media")
+        self.assertEqual(result["tool_plan"]["source"], "pending_media_target_bound")
+        self.assertIn("send_video", result["tool_plan"]["actions"])
+        self.assertEqual([main._row_label(row) for row in result["target_rows"]], ["东新园8-1201"])
+
+    def test_pending_media_target_community_only_does_not_bind_multiple_rows(self) -> None:
+        context = kf_context_memory.remember_pending_media_target(
+            kf_context_memory.empty_context(),
+            media_kind="video",
+            candidate_rows=[
+                {"小区": "东新园", "房号": "8-1201"},
+                {"小区": "东新园", "房号": "9-1302"},
+            ],
+            candidate_labels=["东新园8-1201", "东新园9-1302"],
+            reason="community_media_request_missing_room_ref",
+        )
+
+        result = main._force_pending_media_target_task(
+            "东新园",
+            {
+                "intent": "inventory",
+                "effective_query": "东新园",
+                "constraint_proof": {"communities": ["东新园"]},
+                "structured_task": {
+                    "intent": "inventory",
+                    "original_text": "东新园",
+                    "tool_requirements": {"needs_inventory_search": True},
+                },
+            },
+            context,
+        )
+
+        self.assertEqual(result["intent"], "inventory")
+        self.assertNotEqual((result.get("tool_plan") or {}).get("source"), "pending_media_target_bound")
+        self.assertEqual(
+            [main._row_label(row) for row in kf_context_memory.pending_media_target(context)["candidate_rows"]],
+            ["东新园8-1201", "东新园9-1302"],
+        )
+
+    async def test_this_video_request_targets_confirmed_room_without_context_flag(self) -> None:
+        confirmed = {"小区": "长浜龙吟轩", "房号": "11-1603"}
+        other = {"小区": "新柠长木府", "房号": "3-1002A"}
+        video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        video.write(b"video")
+        video.close()
+
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return [other]
+
+        class FakeMediaStore:
+            def list_room_database_videos(self, query: str, limit: int = 6):
+                return [Path(video.name)] if "长浜龙吟轩" in query else []
+
+            def list_room_database_images(self, query: str, limit: int = 6):
+                return []
+
+        context = kf_context_memory.empty_context()
+        context["confirmed_room"] = {"row": confirmed, "label": "长浜龙吟轩11-1603"}
+        originals = {"inventory": main.inventory, "media_store": main.media_store}
+        main.inventory = FakeInventory()
+        main.media_store = FakeMediaStore()
+        try:
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                content="这套视频发我。",
+                context=context,
+                understanding={
+                    "intent": "media",
+                    "effective_query": "这套视频",
+                    "context_reference": False,
+                    "constraint_proof": {"wants_video": True},
+                    "structured_task": {
+                        "intent": "media",
+                        "original_text": "这套视频发我。",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+            Path(video.name).unlink(missing_ok=True)
+
+        self.assertEqual([main._row_label(row) for row in evidence["target_rows"]], ["长浜龙吟轩11-1603"])
+        self.assertEqual(evidence["video_paths"], [video.name])
+        self.assertNotIn("新柠长木府3-1002A", [main._row_label(row) for row in evidence["target_rows"]])
+
+    async def test_existing_room_missing_video_reply_does_not_claim_inventory_not_found(self) -> None:
+        row = {"小区": "长浜龙吟轩", "房号": "11-1603"}
+
+        class FakeInventory:
+            async def search(self, *args, **kwargs):
+                return [row]
+
+            def format_rows(self, rows, limit: int = 10):
+                return "\n".join(main._row_label(item) for item in rows[:limit])
+
+            async def snapshot(self, limit: int = 20):
+                return main._row_label(row)
+
+        class FakeMediaStore:
+            def list_room_database_videos(self, query: str, limit: int = 6):
+                return []
+
+            def list_room_database_images(self, query: str, limit: int = 6):
+                return []
+
+        class FakeFeishuClient:
+            async def sync_media_for_rooms(self, *args, **kwargs):
+                return {}
+
+            async def sync_drive_media_for_rooms(self, *args, **kwargs):
+                return {}
+
+        class FakeReplyGenerator:
+            async def assess_kf_final_reply(self, **kwargs):
+                return {"status": "pass"}
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
+
+        context = kf_context_memory.empty_context()
+        context["confirmed_room"] = {"row": row, "label": "长浜龙吟轩11-1603"}
+        originals = {
+            "inventory": main.inventory,
+            "media_store": main.media_store,
+            "FeishuClient": main.FeishuClient,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.inventory = FakeInventory()
+        main.media_store = FakeMediaStore()
+        main.FeishuClient = FakeFeishuClient
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            understanding = {
+                "intent": "media",
+                "effective_query": "这套视频",
+                "constraint_proof": {"wants_video": True},
+                "structured_task": {
+                    "intent": "media",
+                    "original_text": "这套视频发我。",
+                    "tool_requirements": {"needs_video": True},
+                },
+            }
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                content="这套视频发我。",
+                context=context,
+                understanding=understanding,
+            )
+            result = await main._generate_reply_result(
+                content="这套视频发我。",
+                context=context,
+                understanding=understanding,
+                tool_evidence=evidence,
+                planner_result={
+                    "actions": ["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                    "reply_text": "我这边暂时没查到完全匹配的在租房源。",
+                },
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        self.assertEqual([main._row_label(item) for item in evidence["target_rows"]], ["长浜龙吟轩11-1603"])
+        self.assertIn("长浜龙吟轩11-1603:视频", evidence["missing_media"])
+        self.assertIn("房源我查到了", result["reply"])
+        self.assertIn("本地暂时没找到视频", result["reply"])
+        self.assertNotIn("没查到完全匹配的在租房源", result["reply"])
+
     async def test_selected_indices_without_candidates_do_not_fallback_to_inventory_search(self) -> None:
         class FakeInventory:
             async def search(self, *args, **kwargs):
