@@ -1,6 +1,6 @@
 ---
 id: planner_batch_video
-stage: planner
+stage: tool_resolver
 intents: media
 triggers: 前两套 这三套 1和5 都发视频 继续发 剩下的视频
 priority: 94

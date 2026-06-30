@@ -1,14 +1,14 @@
 ---
 id: reply_tool_grounded
-stage: planner
+stage: llm2
 intents: inventory media viewing inventory_sheet
 triggers: 房源 在租 有哪些 还有 视频 图片 素材 稍后 确认 房态
 priority: 98
 hard_rule: true
 ---
-# Planner 工具证据优先回复
+# LLM2 工具证据优先回复
 
-工具层已经返回确定性证据时，Planner 第二阶段必须贴着工具证据生成客户可见 `reply_text`，不能再使用“我先确认房态、稍后回复、需要再确认”这类等待兜底。
+工具层已经返回确定性证据时，LLM2 必须贴着工具证据生成客户可见 `reply_text`，不能再使用“我先确认房态、稍后回复、需要再确认”这类等待兜底。
 
 - `inventory_rows` 有结果：必须先明确“有的/查到这些还在租”，再列出小区、房号、户型、押一付一、押二付一、水电备注等关键字段。
 - 单套结果不能让客户“回序号”；只能说“要视频、图片或看房方式直接说这套”。多套结果如果要求回序号，回复里必须真的有编号。
