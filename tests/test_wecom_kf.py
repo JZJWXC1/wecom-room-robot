@@ -3385,6 +3385,7 @@ class WeComKfContextStoreTests(unittest.TestCase):
                 "shown_count": 1,
                 "total_count": 6,
                 "created_at": 100.0,
+                "expires_at": 9999999999.0,
             }
             context = kf_context_memory.start_structured_turn(
                 context,
@@ -3444,6 +3445,7 @@ class WeComKfContextStoreTests(unittest.TestCase):
                 "shown_count": 1,
                 "total_count": 1,
                 "created_at": 100.0,
+                "expires_at": 9999999999.0,
             }
             context["confirmed_room"] = {
                 "row": {
@@ -3455,6 +3457,7 @@ class WeComKfContextStoreTests(unittest.TestCase):
                 },
                 "label": "荣润府15-2-801B",
                 "created_at": 100.0,
+                "expires_at": 9999999999.0,
                 "inventory_cache_meta": {"msg_signature": "sig_CANARY_abcdefghijklmnopqrstuvwxyz"},
             }
 
@@ -6215,7 +6218,17 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             main.inventory = original_inventory
 
         self.assertEqual(len(evidence["inventory_rows"]), 1)
-        self.assertEqual(context["last_candidate_set"]["inventory_cache_meta"]["source"], "test_property")
+        self.assertNotIn("last_candidate_set", context)
+        self.assertEqual(
+            evidence["memory_reducer"]["last_candidate_set"]["inventory_cache_meta"]["source"],
+            "test_property",
+        )
+        reduced = kf_context_memory.reduce_turn_context(
+            context,
+            understanding={"query_state": {"intent": "inventory"}},
+            tool_evidence=evidence,
+        )
+        self.assertEqual(reduced["last_candidate_set"]["inventory_cache_meta"]["source"], "test_property")
 
     def test_tool_evidence_summary_redacts_viewing_secret(self) -> None:
         canary = "M1D2B1_SUMMARY_SECRET#"
@@ -6444,6 +6457,15 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     },
                 },
             )
+            context = kf_context_memory.reduce_turn_context(
+                context,
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "闸弄口 新塘 元宝塘 东站 4000左右 两室",
+                    "query_state": {"intent": "inventory"},
+                },
+                tool_evidence=first_evidence,
+            )
 
             second_evidence = await main._execute_tools(
                 actions=["search_inventory", "send_video", "generate_reply"],
@@ -6470,6 +6492,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first_evidence["inventory_rows"], [])
         self.assertEqual(first_evidence["candidate_context_cleared"]["reason"], "empty_new_scoped_inventory_search")
+        self.assertIn("clear_room_context", first_evidence["memory_reducer"])
         self.assertNotIn("last_candidate_set", context)
         self.assertNotIn("confirmed_room", context)
         self.assertEqual(second_evidence["target_rows"], [])
@@ -6520,6 +6543,16 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                         "tool_requirements": {"needs_inventory_search": True},
                     },
                 },
+            )
+            self.assertNotEqual(context["last_candidate_set"]["candidates"][0]["房号"], "9-402B")
+            context = kf_context_memory.reduce_turn_context(
+                context,
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "2600以下一室 带独厨卫",
+                    "query_state": {"intent": "inventory"},
+                },
+                tool_evidence=first_evidence,
             )
 
             second_evidence = await main._execute_tools(
@@ -6919,7 +6952,14 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(evidence["field_target_error"]["field"], "视频")
         self.assertIn("兴业杨家府10-1-1205", evidence["field_target_error"]["candidate_labels"])
-        self.assertIn("last_candidate_set", context)
+        self.assertNotIn("last_candidate_set", context)
+        self.assertIn("last_candidate_set", evidence["memory_reducer"])
+        reduced = kf_context_memory.reduce_turn_context(
+            context,
+            understanding={"query_state": {"intent": "media"}},
+            tool_evidence=evidence,
+        )
+        self.assertIn("last_candidate_set", reduced)
 
     def test_community_media_target_error_reply_asks_room_selection(self) -> None:
         reply = main._reply_for_field_target_error(
@@ -7187,9 +7227,15 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([row["房号"] for row in evidence["target_rows"]], ["20-1606A", "15-2-801B"])
         self.assertEqual(evidence["media_request"]["requested_count"], 2)
-        self.assertEqual(context["last_candidate_set"]["shown_count"], 3)
+        self.assertNotIn("last_candidate_set", context)
+        reduced = kf_context_memory.reduce_turn_context(
+            context,
+            understanding={"query_state": {"intent": "media", "area": "拱墅万达", "wants_video": True}},
+            tool_evidence=evidence,
+        )
+        self.assertEqual(reduced["last_candidate_set"]["shown_count"], 3)
 
-    def test_candidate_set_reconciles_to_visible_reply_order(self) -> None:
+    def test_memory_reducer_uses_structured_candidate_order_not_visible_reply_text(self) -> None:
         raw_rows = [
             {"区域": "拱墅万达", "小区": "瑷颐湾", "房号": "13-1-402A"},
             {"区域": "拱墅万达", "小区": "大华海派风景", "房号": "2-1-402A"},
@@ -7205,26 +7251,37 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             "shown_count": len(raw_rows),
             "total_count": len(raw_rows),
         }
-        reply = "\n".join(
-            [
-                "有的，万达2000以下一室优先看这几套：",
-                "1. 棠润府15-2-801B，一室一厅，押一付1600",
-                "2. 小洋坝家园二区7-1001E，一室一厅，押一付1800",
-                "3. 星桥锦绣嘉苑20-1606A，一室一厅，押一付1900",
-            ]
-        )
-
-        context = main._reconcile_last_candidate_set_with_visible_reply(
+        reduced = kf_context_memory.reduce_turn_context(
             context,
-            reply,
-            {"inventory_rows": raw_rows},
+            understanding={"query_state": {"intent": "inventory"}},
+            tool_evidence={
+                "memory_reducer": {
+                    "last_candidate_set": {
+                        "intent": "inventory",
+                        "query": "万达2000以下一室",
+                        "candidates": raw_rows,
+                        "shown_count": len(raw_rows),
+                        "total_count": len(raw_rows),
+                    }
+                }
+            },
+            final_package={
+                "final_reply": "\n".join(
+                    [
+                        "有的，万达2000以下一室优先看这几套：",
+                        "1. 棠润府15-2-801B，一室一厅，押一付1600",
+                        "2. 小洋坝家园二区7-1001E，一室一厅，押一付1800",
+                        "3. 星桥锦绣嘉苑20-1606A，一室一厅，押一付1900",
+                    ]
+                ),
+            },
         )
 
         self.assertEqual(
-            [row["房号"] for row in context["last_candidate_set"]["candidates"]],
-            ["15-2-801B", "7-1001E", "20-1606A"],
+            [row["房号"] for row in reduced["last_candidate_set"]["candidates"]],
+            ["13-1-402A", "2-1-402A", "15-2-801B", "7-1001E", "20-1606A"],
         )
-        self.assertEqual(context["last_candidate_set"]["shown_count"], 3)
+        self.assertEqual(reduced["last_candidate_set"]["shown_count"], 5)
 
         selected_rows = main._target_rows_from_understanding(
             {
@@ -7233,10 +7290,104 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 "selected_indices": [1, 2],
                 "constraint_proof": {"selected_indices": [1, 2], "wants_video": True},
             },
-            context,
+            reduced,
             raw_rows,
         )
-        self.assertEqual([row["房号"] for row in selected_rows], ["15-2-801B", "7-1001E"])
+        self.assertEqual([row["房号"] for row in selected_rows], ["13-1-402A", "2-1-402A"])
+
+    def test_memory_reducer_expires_stale_candidate_and_pending_video(self) -> None:
+        stale_context = kf_context_memory.empty_context(now=lambda: 100.0)
+        stale_context["last_candidate_set"] = {
+            "query": "旧候选",
+            "candidates": [{"小区": "旧小区", "房号": "1-101"}],
+            "shown_count": 1,
+            "total_count": 1,
+            "created_at": 100.0,
+            "expires_at": 110.0,
+        }
+        stale_context["confirmed_room"] = {
+            "row": {"小区": "旧小区", "房号": "1-101"},
+            "label": "旧小区1-101",
+            "created_at": 100.0,
+            "expires_at": 110.0,
+        }
+        stale_context["pending_video_sends"] = {
+            "labels": ["旧小区1-101"],
+            "created_at": 100.0,
+            "expires_at": 110.0,
+        }
+
+        reduced = kf_context_memory.reduce_turn_context(
+            stale_context,
+            understanding={},
+            tool_evidence={},
+            now=lambda: 200.0,
+        )
+
+        self.assertNotIn("last_candidate_set", reduced)
+        self.assertNotIn("confirmed_room", reduced)
+        self.assertNotIn("pending_video_sends", reduced)
+
+    def test_memory_reducer_reconciles_pending_video_success_missing_and_failure(self) -> None:
+        pending_context = kf_context_memory.empty_context(now=lambda: 1000.0)
+        pending_context["pending_video_sends"] = {
+            "paths": [Path("room_database/video/A.mp4")],
+            "labels": ["星河苑1-101"],
+            "requested_count": 1,
+            "sent_count": 0,
+            "created_at": 1000.0,
+            "expires_at": 2000.0,
+        }
+
+        cleared = kf_context_memory.reduce_turn_context(
+            pending_context,
+            understanding={"query_state": {"intent": "media", "wants_video": True}},
+            tool_evidence={"media_status": {"video": {"sync_status": {"source": "pending_video_sends"}}}},
+            send_result={
+                "sent_actions": [
+                    {"type": "video", "path": str(Path("room_database/video/A.mp4")), "room": "星河苑1-101"}
+                ]
+            },
+            now=lambda: 1200.0,
+        )
+        self.assertNotIn("pending_video_sends", cleared)
+
+        kept = kf_context_memory.reduce_turn_context(
+            kf_context_memory.empty_context(now=lambda: 2000.0),
+            understanding={"query_state": {"intent": "media", "wants_video": True}},
+            tool_evidence={
+                "memory_reducer": {
+                    "pending_video_sends": {
+                        "labels": ["星河苑2-202"],
+                        "reason": "missing_or_pending_video",
+                        "requested_count": 2,
+                        "sent_count": 1,
+                    }
+                }
+            },
+            send_result={
+                "sent_actions": [
+                    {"type": "video", "path": str(Path("room_database/video/A.mp4")), "room": "星河苑1-101"}
+                ]
+            },
+            now=lambda: 3000.0,
+        )
+        self.assertEqual(kept["pending_video_sends"]["labels"], ["星河苑2-202"])
+        self.assertEqual(kept["pending_video_sends"]["expires_at"], 3000.0 + kf_context_memory.DEFAULT_PENDING_VIDEO_TTL_SECONDS)
+
+        failed = kf_context_memory.reduce_turn_context(
+            kf_context_memory.empty_context(now=lambda: 4000.0),
+            understanding={"query_state": {"intent": "media", "wants_video": True}},
+            tool_evidence={},
+            send_result={
+                "sent_actions": [
+                    {"type": "video_failed", "path": str(Path("room_database/video/C.mp4")), "room": "星河苑3-303"}
+                ]
+            },
+            now=lambda: 4000.0,
+        )
+        self.assertEqual(failed["pending_video_sends"]["labels"], ["星河苑3-303"])
+        self.assertEqual(failed["pending_video_sends"]["attempts"], 1)
 
     def test_selected_media_request_without_candidates_does_not_bind_single_search_row(self) -> None:
         rows = [{"小区": "石桥铭苑", "房号": "6-1102"}]
@@ -9414,7 +9565,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         viewing_rooms = evidence["rule_evidence"]["viewing"]["rooms"]
         self.assertEqual([room["room"] for room in viewing_rooms], ["棠润府15-2-801B", "星桥锦绣嘉苑20-1606A"])
 
-    async def test_viewing_execute_tools_recovers_candidate_rows_from_memory_query(self) -> None:
+    async def test_viewing_execute_tools_ignores_stale_structured_candidate_query(self) -> None:
         candidates = [
             {"小区": "棠润府", "房号": "15-2-801B", "看房方式密码": "6.19空出 看房提前联系"},
             {"小区": "星桥锦绣嘉苑", "房号": "20-1606A", "看房方式密码": "960615#"},
@@ -9466,9 +9617,16 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         finally:
             main.inventory = original_inventory
 
-        self.assertEqual(fake_inventory.last_query, "万达2000以下一室")
-        self.assertEqual([row["房号"] for row in evidence["target_rows"]], ["15-2-801B", "20-1606A"])
-        self.assertEqual([row["房号"] for row in context["last_candidate_set"]["candidates"]], ["15-2-801B", "20-1606A"])
+        self.assertNotEqual(fake_inventory.last_query, "万达2000以下一室")
+        self.assertIn("查询这几套看房密码", fake_inventory.last_query)
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertNotIn("memory_reducer", evidence)
+        context = kf_context_memory.reduce_turn_context(
+            context,
+            understanding=understanding,
+            tool_evidence=evidence,
+        )
+        self.assertNotIn("last_candidate_set", context)
 
     def test_single_exact_room_does_not_overwrite_candidate_set(self) -> None:
         self.assertFalse(

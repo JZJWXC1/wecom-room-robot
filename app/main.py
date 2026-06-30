@@ -1180,10 +1180,11 @@ def _clear_stale_candidate_set_for_new_pending_media_scope(
     context: dict[str, Any],
     content: str,
     understanding: dict[str, Any],
-) -> None:
+) -> bool:
     candidate_rows = _candidate_rows(context)
     if candidate_rows and not _rows_scope_overlaps_query(candidate_rows, content, understanding):
-        context.pop("last_candidate_set", None)
+        return True
+    return False
 
 
 def _should_clear_pending_media_target_for_new_scope(
@@ -1247,7 +1248,14 @@ def _force_pending_media_target_task(
         return result
     if _should_clear_pending_media_target_for_new_scope(content, result, context):
         kf_context_memory.clear_pending_media_target(context)
-        _clear_stale_candidate_set_for_new_pending_media_scope(context, content, result)
+        if _clear_stale_candidate_set_for_new_pending_media_scope(context, content, result):
+            result = dict(result)
+            reducer_meta = dict(result.get("memory_reducer") or {})
+            reducer_meta["clear_room_context"] = {
+                "reason": "new_pending_media_scope",
+                "query": str(result.get("effective_query") or content),
+            }
+            result["memory_reducer"] = reducer_meta
         return result
     target_rows = _pending_media_target_rows_for_content(content, result, context)
     if not target_rows:
@@ -1881,97 +1889,6 @@ def _row_with_listing_id(row: dict[str, Any]) -> dict[str, Any]:
 
 def _rows_with_listing_ids(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [_row_with_listing_id(row) for row in rows if isinstance(row, dict)]
-
-
-def _normalized_room_label(row: dict[str, Any]) -> str:
-    return normalize_search_text(_row_label(row))
-
-
-def _displayed_candidate_rows_from_reply(
-    reply: str,
-    rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Return rows in the same numbered order the customer actually saw."""
-    if not reply or not rows:
-        return []
-    by_label = {
-        _normalized_room_label(row): row
-        for row in rows
-        if _normalized_room_label(row)
-    }
-    by_room: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        room_no = normalize_search_text(_row_value(row, ("房号", "房间号", "room", "room_no")))
-        if room_no:
-            by_room.setdefault(room_no, []).append(row)
-
-    found: list[tuple[int, int, dict[str, Any]]] = []
-    seen_labels: set[str] = set()
-    pattern = re.compile(r"(?m)^\s*(\d{1,2})[\.、)]\s*([^\n，,。；;]+)")
-    for match in pattern.finditer(reply):
-        try:
-            display_index = int(match.group(1))
-        except ValueError:
-            continue
-        text = match.group(2).strip()
-        normalized_text = normalize_search_text(text)
-        if not normalized_text:
-            continue
-
-        matched_row: dict[str, Any] | None = None
-        matched_label = ""
-        for label, row in by_label.items():
-            if label and (label in normalized_text or normalized_text in label):
-                matched_row = row
-                matched_label = label
-                break
-        if matched_row is None:
-            for room_no, room_rows in by_room.items():
-                if room_no and room_no in normalized_text and len(room_rows) == 1:
-                    matched_row = room_rows[0]
-                    matched_label = _normalized_room_label(matched_row)
-                    break
-        if matched_row is None or not matched_label or matched_label in seen_labels:
-            continue
-        seen_labels.add(matched_label)
-        found.append((display_index, match.start(), matched_row))
-
-    if not found:
-        return []
-    found.sort(key=lambda item: (item[0], item[1]))
-    return [row for _, _, row in found]
-
-
-def _reconcile_last_candidate_set_with_visible_reply(
-    context: dict[str, Any],
-    final_reply: str,
-    tool_evidence: dict[str, Any],
-) -> dict[str, Any]:
-    candidate_set = kf_context_memory.normalize_last_candidate_set(
-        context.get("last_candidate_set")
-    )
-    if not candidate_set:
-        return context
-    source_rows = [
-        row for row in (
-            tool_evidence.get("inventory_rows")
-            or candidate_set.get("candidates")
-            or []
-        )
-        if isinstance(row, dict)
-    ]
-    displayed_rows = _displayed_candidate_rows_from_reply(final_reply, source_rows)
-    if not displayed_rows:
-        return context
-    context["last_candidate_set"] = {
-        **candidate_set,
-        "candidates": displayed_rows[:10],
-        "shown_count": len(displayed_rows[:10]),
-        "total_count": len(displayed_rows),
-        "displayed_summary": _normalize_customer_visible_reply_text_before_selfcheck(final_reply),
-        "created_at": time.time(),
-    }
-    return context
 
 
 def _area_alias_hits(text: str) -> list[dict[str, str]]:
@@ -4159,7 +4076,9 @@ def _build_structured_task(
 
 
 def _candidate_rows(context: dict[str, Any]) -> list[dict[str, Any]]:
-    candidate_set = context.get("last_candidate_set") or {}
+    candidate_set = kf_context_memory.normalize_last_candidate_set(
+        context.get("last_candidate_set") if isinstance(context, dict) else {}
+    )
     return [row for row in candidate_set.get("candidates") or [] if isinstance(row, dict)]
 
 
@@ -4334,24 +4253,16 @@ def _enforce_target_rows_community_constraints(
 
 
 def _last_candidate_query_from_memory(context: dict[str, Any]) -> str:
-    memory = context.get("structured_memory") or {}
-    records = memory.get("turn_records") if isinstance(memory, dict) else []
-    if not isinstance(records, list):
-        return ""
-    for record in reversed(records):
-        if not isinstance(record, dict):
-            continue
-        summary = record.get("assistant_sent_summary") or {}
-        candidate_state = summary.get("candidate_state") if isinstance(summary, dict) else {}
-        candidate_set = candidate_state.get("candidate_set") if isinstance(candidate_state, dict) else {}
-        query = str(candidate_set.get("query") or "").strip() if isinstance(candidate_set, dict) else ""
-        if query:
-            return query
-    return ""
+    candidate_set = kf_context_memory.normalize_last_candidate_set(
+        context.get("last_candidate_set") if isinstance(context, dict) else {}
+    )
+    return str(candidate_set.get("query") or "").strip()
 
 
 def _confirmed_row(context: dict[str, Any]) -> dict[str, Any]:
-    confirmed = context.get("confirmed_room") or {}
+    confirmed = kf_context_memory.normalize_confirmed_room_context(
+        context.get("confirmed_room") if isinstance(context, dict) else {}
+    )
     row = confirmed.get("row") if isinstance(confirmed, dict) else {}
     return row if isinstance(row, dict) else {}
 
@@ -5979,6 +5890,101 @@ async def _collect_room_media(
     return paths, matched_rows, missing, sync_result
 
 
+def _memory_reducer_meta(evidence: dict[str, Any]) -> dict[str, Any]:
+    meta = evidence.setdefault("memory_reducer", {})
+    if not isinstance(meta, dict):
+        meta = {}
+        evidence["memory_reducer"] = meta
+    return meta
+
+
+def _suggest_last_candidate_set_memory(
+    evidence: dict[str, Any],
+    working_context: dict[str, Any],
+    *,
+    intent: str,
+    query: str,
+    rows: list[dict[str, Any]],
+    inventory_cache_meta: dict[str, Any],
+) -> None:
+    if not rows:
+        return
+    created_at = time.time()
+    candidate_set = {
+        "intent": intent or "inventory",
+        "query": query,
+        "candidates": rows[:10],
+        "created_at": created_at,
+        "expires_at": created_at + kf_context_memory.DEFAULT_CANDIDATE_TTL_SECONDS,
+        "shown_count": min(len(rows), 10),
+        "total_count": len(rows),
+        "inventory_cache_meta": inventory_cache_meta,
+    }
+    _memory_reducer_meta(evidence)["last_candidate_set"] = candidate_set
+    working_context["last_candidate_set"] = candidate_set
+
+
+def _suggest_clear_room_context_memory(
+    evidence: dict[str, Any],
+    working_context: dict[str, Any],
+    *,
+    reason: str,
+    query: str,
+) -> None:
+    _memory_reducer_meta(evidence)["clear_room_context"] = {
+        "reason": reason,
+        "query": query,
+    }
+    working_context.pop("last_candidate_set", None)
+    working_context.pop("confirmed_room", None)
+
+
+def _suggest_confirmed_room_memory(
+    evidence: dict[str, Any],
+    working_context: dict[str, Any],
+    *,
+    row: dict[str, Any],
+    intent: str,
+    inventory_cache_meta: dict[str, Any],
+) -> None:
+    if not isinstance(row, dict) or not row:
+        return
+    created_at = time.time()
+    confirmed = {
+        "row": row,
+        "label": _row_label(row),
+        "intent": intent or "details",
+        "created_at": created_at,
+        "expires_at": created_at + kf_context_memory.DEFAULT_CONFIRMED_ROOM_TTL_SECONDS,
+        "inventory_cache_meta": inventory_cache_meta,
+    }
+    _memory_reducer_meta(evidence)["confirmed_room"] = confirmed
+    working_context["confirmed_room"] = confirmed
+
+
+def _suggest_pending_video_memory(
+    evidence: dict[str, Any],
+    *,
+    paths: list[Path] | list[str] | None = None,
+    labels: list[str] | None = None,
+    reason: str = "send_pending",
+    requested_count: int = 0,
+    sent_count: int = 0,
+) -> None:
+    if not (paths or labels):
+        return
+    created_at = time.time()
+    _memory_reducer_meta(evidence)["pending_video_sends"] = {
+        "paths": list(paths or []),
+        "labels": list(labels or []),
+        "reason": reason,
+        "created_at": created_at,
+        "expires_at": created_at + kf_context_memory.DEFAULT_PENDING_VIDEO_TTL_SECONDS,
+        "requested_count": requested_count,
+        "sent_count": sent_count,
+    }
+
+
 async def _execute_tools(
     *,
     actions: list[str],
@@ -5989,6 +5995,7 @@ async def _execute_tools(
 ) -> dict[str, Any]:
     inventory_read_context = inventory_read_context or _local_inventory_read_context("tools")
     context = _remember_inventory_read_context(context, inventory_read_context)
+    working_context = dict(context)
     inventory_source_metadata = await _inventory_metadata_for_read_context(inventory_read_context)
     inventory_listing_evidence: list[InventoryListingEvidence] = []
     effective_query = str(understanding.get("effective_query") or content)
@@ -6017,7 +6024,7 @@ async def _execute_tools(
     wants_bound_viewing_context = _content_wants_viewing(content) and _references_unbound_room_context(content)
 
     pending_video_handled = False
-    pending_video = kf_context_memory.pending_video_sends(context)
+    pending_video = kf_context_memory.pending_video_sends(working_context)
     if (
         "send_video" in actions
         and _wants_continue_pending_video(content, understanding)
@@ -6136,7 +6143,7 @@ async def _execute_tools(
         )
         if (
             early_selected_indices
-            and not _candidate_rows(context)
+            and not _candidate_rows(working_context)
             and not selection_has_current_scope
             and not proof.get("wants_original_video")
         ):
@@ -6148,13 +6155,13 @@ async def _execute_tools(
                 "reason": "missing_current_candidate_set",
             }
         if proof.get("wants_utilities") and any(word in content for word in ("这几套", "这几间", "这些", "刚才", "上面")):
-            candidate_rows = _candidate_rows(context)
+            candidate_rows = _candidate_rows(working_context)
             if candidate_rows:
                 rows = candidate_rows[:10]
         if wants_bound_viewing_context:
-            candidate_rows = _candidate_rows(context)
+            candidate_rows = _candidate_rows(working_context)
             if not candidate_rows:
-                candidate_query = _last_candidate_query_from_memory(context)
+                candidate_query = _last_candidate_query_from_memory(working_context)
                 if candidate_query:
                     try:
                         candidate_rows, candidate_evidence = await _inventory_search_rows_for_context(
@@ -6173,35 +6180,37 @@ async def _execute_tools(
                         query_text=candidate_query,
                     )
                     if candidate_rows:
-                        context["last_candidate_set"] = {
-                            "intent": "inventory",
-                            "query": candidate_query,
-                            "candidates": candidate_rows[:10],
-                            "created_at": time.time(),
-                            "shown_count": min(len(candidate_rows), 10),
-                            "total_count": len(candidate_rows),
-                            "inventory_cache_meta": inventory_source_metadata,
-                        }
+                        _suggest_last_candidate_set_memory(
+                            evidence,
+                            working_context,
+                            intent="inventory",
+                            query=candidate_query,
+                            rows=candidate_rows,
+                            inventory_cache_meta=inventory_source_metadata,
+                        )
             if candidate_rows:
                 rows = candidate_rows[:10]
         evidence["inventory_rows"] = rows
         if rows and _should_remember_candidate_set(content=content, understanding=understanding, rows=rows):
-            context["last_candidate_set"] = {
-                "intent": _normalize_intent(understanding.get("intent"), "inventory"),
-                "query": effective_query,
-                "candidates": rows[:10],
-                "created_at": time.time(),
-                "shown_count": min(len(rows), 10),
-                "total_count": len(rows),
-                "inventory_cache_meta": inventory_source_metadata,
-            }
+            _suggest_last_candidate_set_memory(
+                evidence,
+                working_context,
+                intent=_normalize_intent(understanding.get("intent"), "inventory"),
+                query=effective_query,
+                rows=rows,
+                inventory_cache_meta=inventory_source_metadata,
+            )
         elif not rows and _should_clear_room_context_after_empty_inventory_search(
             content=content,
             understanding=understanding,
             actions=actions,
         ):
-            context.pop("last_candidate_set", None)
-            context.pop("confirmed_room", None)
+            _suggest_clear_room_context_memory(
+                evidence,
+                working_context,
+                reason="empty_new_scoped_inventory_search",
+                query=effective_query,
+            )
             evidence["candidate_context_cleared"] = {
                 "reason": "empty_new_scoped_inventory_search",
                 "query": effective_query,
@@ -6233,13 +6242,13 @@ async def _execute_tools(
     )
     target_selection_uses_candidates = bool(
         target_selection_indices
-        and _candidate_rows(context)
+        and _candidate_rows(working_context)
         and not _room_refs_from_text(original_room_text)
     )
     target_rows = (
         []
         if pending_video_handled or field_followup_requires_specific_room or media_target_error
-        else _target_rows_from_understanding(understanding, context, rows)
+        else _target_rows_from_understanding(understanding, working_context, rows)
     )
     if not target_selection_uses_candidates:
         target_rows = _enforce_target_rows_community_constraints(target_rows, rows, proof)
@@ -6250,7 +6259,7 @@ async def _execute_tools(
         and proof.get("wants_original_video")
     ):
         pending_rows = await _pending_video_label_rows(
-            context,
+            working_context,
             inventory_read_context=inventory_read_context,
         )
         if pending_rows:
@@ -6269,12 +6278,12 @@ async def _execute_tools(
         and _original_video_followup_without_explicit_target(content, understanding)
     )
     if not target_rows and not pending_video_handled and _has_bound_room_field_followup(content):
-        confirmed_row = _confirmed_row(context)
+        confirmed_row = _confirmed_row(working_context)
         if confirmed_row and not _has_explicit_candidate_selection(content):
             target_rows = [confirmed_row]
             target_rows = _enforce_target_rows_community_constraints(target_rows, rows, proof)
     selection_query_text = target_selection_query_text
-    candidate_rows_for_selection = _candidate_rows(context)
+    candidate_rows_for_selection = _candidate_rows(working_context)
     selected_indices = target_selection_indices
     current_selection_text = " ".join(
         str(part).strip()
@@ -6424,9 +6433,9 @@ async def _execute_tools(
         and not invalid_candidate_selection
         and not invalid_search_selection
     ):
-        candidate_rows = _candidate_rows(context)
+        candidate_rows = _candidate_rows(working_context)
         if not candidate_rows:
-            candidate_query = _last_candidate_query_from_memory(context)
+            candidate_query = _last_candidate_query_from_memory(working_context)
             if candidate_query:
                 try:
                     candidate_rows, candidate_evidence = await _inventory_search_rows_for_context(
@@ -6440,15 +6449,14 @@ async def _execute_tools(
                     inventory_read_turn.clear_fact_evidence(evidence, exc)
                     candidate_rows = []
             if candidate_rows:
-                context["last_candidate_set"] = {
-                    "intent": "inventory",
-                    "query": candidate_query,
-                    "candidates": candidate_rows[:10],
-                    "created_at": time.time(),
-                    "shown_count": min(len(candidate_rows), 10),
-                    "total_count": len(candidate_rows),
-                    "inventory_cache_meta": inventory_source_metadata,
-                }
+                _suggest_last_candidate_set_memory(
+                    evidence,
+                    working_context,
+                    intent="inventory",
+                    query=candidate_query,
+                    rows=candidate_rows,
+                    inventory_cache_meta=inventory_source_metadata,
+                )
         if candidate_rows:
             target_rows = candidate_rows[:10]
     explicit_room_refs = bool(proof.get("room_refs"))
@@ -6601,8 +6609,8 @@ async def _execute_tools(
                     "reason": "当前素材库只提供企业微信可发送视频，没有单独的原视频/高清下载链接证据。",
                 }
             if requested_count and len(paths) < requested_count:
-                context = kf_context_memory.remember_pending_video_sends(
-                    context,
+                _suggest_pending_video_memory(
+                    evidence,
                     paths=[],
                     labels=missing,
                     reason="missing_or_pending_video",
@@ -6639,15 +6647,14 @@ async def _execute_tools(
 
     if target_rows:
         first = target_rows[0]
-        context["confirmed_room"] = {
-            "row": first,
-            "label": _row_label(first),
-            "intent": _normalize_intent(understanding.get("intent")),
-            "created_at": time.time(),
-            "inventory_cache_meta": inventory_source_metadata,
-        }
+        _suggest_confirmed_room_memory(
+            evidence,
+            working_context,
+            row=first,
+            intent=_normalize_intent(understanding.get("intent")),
+            inventory_cache_meta=inventory_source_metadata,
+        )
 
-    context["active_query_state"] = dict(understanding.get("query_state") or {})
     return evidence
 
 
@@ -11332,34 +11339,6 @@ async def _send_videos_with_receipts(
     return sent, context
 
 
-def _candidate_state_summary(context: dict[str, Any]) -> dict[str, Any]:
-    candidate_set = kf_context_memory.normalize_last_candidate_set(context.get("last_candidate_set"))
-    confirmed = kf_context_memory.normalize_confirmed_room_context(context.get("confirmed_room"))
-    pending = kf_context_memory.normalize_pending_video_sends(context.get("pending_video_sends"))
-    summary: dict[str, Any] = {}
-    if candidate_set:
-        summary["candidate_set"] = {
-            "query": candidate_set.get("query", ""),
-            "shown_count": candidate_set.get("shown_count", 0),
-            "total_count": candidate_set.get("total_count", 0),
-        }
-    if confirmed:
-        summary["confirmed_room"] = {
-            "label": confirmed.get("label", ""),
-            "row": kf_context_memory.summarize_row(confirmed.get("row")),
-        }
-    if pending:
-        summary["pending_video_sends"] = {
-            "requested_count": pending.get("requested_count", 0),
-            "sent_count": pending.get("sent_count", 0),
-            "labels": pending.get("labels", []),
-        }
-    inventory_read_context = context.get("inventory_read_context")
-    if isinstance(inventory_read_context, dict):
-        summary["inventory_read_context"] = inventory_read_turn.context_summary(inventory_read_context)
-    return summary
-
-
 async def _send_final_actions(
     *,
     open_kfid: str,
@@ -11373,11 +11352,6 @@ async def _send_final_actions(
     final_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_reply)
     outbound_package = tool_evidence.get("outbound_package") or _build_outbound_package(final_reply, tool_evidence)
     suppress_actions = bool(tool_evidence.get("suppress_actions"))
-    context = _reconcile_last_candidate_set_with_visible_reply(
-        context,
-        final_reply,
-        tool_evidence,
-    )
     context, did_send_text, _receipt = await _send_text_with_receipt(
         open_kfid=open_kfid,
         external_userid=external_userid,
@@ -11391,13 +11365,6 @@ async def _send_final_actions(
         sent_actions.append({"type": "text", "count": 1})
 
     if suppress_actions:
-        for action in sent_actions:
-            context = kf_context_memory.record_structured_assistant_output(
-                context,
-                final_reply=final_reply if action.get("type") == "text" else "",
-                sent_action=action,
-                candidate_state=_candidate_state_summary(context),
-            ) or context
         return {"sent_actions": sent_actions, "context": context}
 
     inventory_explanation = str(outbound_package.get("inventory_explanation") or "").strip()
@@ -11465,13 +11432,6 @@ async def _send_final_actions(
     )
     sent_actions.extend(video_actions)
 
-    for action in sent_actions:
-        context = kf_context_memory.record_structured_assistant_output(
-            context,
-            final_reply=final_reply if action.get("type") == "text" else "",
-            sent_action=action,
-            candidate_state=_candidate_state_summary(context),
-        ) or context
     return {"sent_actions": sent_actions, "context": context}
 
 
@@ -11581,7 +11541,6 @@ async def _process_text_turn(
             },
             rewrite_result=understanding,
         )
-        context["active_query_state"] = dict(understanding.get("query_state") or {})
         _save_context(open_kfid, external_userid, context)
 
         if understanding.get("needs_clarification"):
@@ -11614,6 +11573,10 @@ async def _process_text_turn(
                 reply_result=clarification_result,
                 final_reply=reply,
             )
+            clarification_tool_evidence = {
+                "actions": ["clarification"],
+                "deterministic_reply_source": "rewrite_clarification",
+            }
             with timer.stage("send"):
                 context, did_send_clarification, _receipt = await _send_text_with_receipt(
                     open_kfid=open_kfid,
@@ -11624,15 +11587,19 @@ async def _process_text_turn(
                     text_role="clarification",
                     msgids=msgids,
                 )
-            if did_send_clarification:
-                context = kf_context_memory.append_dialog_message(context, role="assistant", content=reply) or context
-            context = kf_context_memory.record_structured_assistant_output(
+            context = kf_context_memory.reduce_turn_context(
                 context,
-                draft_reply=str(clarification_result.get("draft_reply") or reply),
-                final_reply=reply,
-                sent_action={"type": "text", "count": 1} if did_send_clarification else None,
-                candidate_state=_candidate_state_summary(context),
-            ) or context
+                understanding=understanding,
+                tool_evidence=clarification_tool_evidence,
+                send_result={
+                    "sent_actions": [{"type": "text", "count": 1}] if did_send_clarification else [],
+                    "context": context,
+                },
+                final_package={
+                    "draft_reply": str(clarification_result.get("draft_reply") or reply),
+                    "final_reply": reply,
+                },
+            )
             _save_context(open_kfid, external_userid, context)
             for msgid in msgids:
                 wecom_kf.state_store.mark_processed(msgid)
@@ -11672,7 +11639,6 @@ async def _process_text_turn(
                             inventory_read_context=inventory_read_context,
                         )
                     _raise_if_stale_kf_turn(conversation_key, generation)
-                    context["active_query_state"] = dict(understanding.get("query_state") or {})
                     context = kf_context_memory.update_structured_state(
                         context,
                         state=_state_from_understanding(understanding),
@@ -11710,6 +11676,10 @@ async def _process_text_turn(
                         reply_result=clarification_result,
                         final_reply=reply,
                     )
+                    clarification_tool_evidence = {
+                        "actions": ["clarification"],
+                        "deterministic_reply_source": "rewrite_clarification",
+                    }
                     with timer.stage("send"):
                         context, did_send_clarification, _receipt = await _send_text_with_receipt(
                             open_kfid=open_kfid,
@@ -11720,15 +11690,19 @@ async def _process_text_turn(
                             text_role="clarification",
                             msgids=msgids,
                         )
-                    if did_send_clarification:
-                        context = kf_context_memory.append_dialog_message(context, role="assistant", content=reply) or context
-                    context = kf_context_memory.record_structured_assistant_output(
+                    context = kf_context_memory.reduce_turn_context(
                         context,
-                        draft_reply=str(clarification_result.get("draft_reply") or reply),
-                        final_reply=reply,
-                        sent_action={"type": "text", "count": 1} if did_send_clarification else None,
-                        candidate_state=_candidate_state_summary(context),
-                    ) or context
+                        understanding=understanding,
+                        tool_evidence=clarification_tool_evidence,
+                        send_result={
+                            "sent_actions": [{"type": "text", "count": 1}] if did_send_clarification else [],
+                            "context": context,
+                        },
+                        final_package={
+                            "draft_reply": str(clarification_result.get("draft_reply") or reply),
+                            "final_reply": reply,
+                        },
+                    )
                     _save_context(open_kfid, external_userid, context)
                     for msgid in msgids:
                         wecom_kf.state_store.mark_processed(msgid)
@@ -11779,10 +11753,9 @@ async def _process_text_turn(
                         context=context,
                         signals=signals,
                         planner_feedback=planner_feedback,
-                        inventory_read_context=inventory_read_context,
-                    )
+                    inventory_read_context=inventory_read_context,
+                )
                 _raise_if_stale_kf_turn(conversation_key, generation)
-                context["active_query_state"] = dict(understanding.get("query_state") or {})
                 context = kf_context_memory.update_structured_state(
                     context,
                     state=_state_from_understanding(understanding),
@@ -11833,12 +11806,6 @@ async def _process_text_turn(
             reply_result=reply_result,
             final_reply=final_reply,
         )
-        context = kf_context_memory.record_structured_assistant_output(
-            context,
-            draft_reply=final_draft_reply,
-            final_reply=final_reply,
-            candidate_state=_candidate_state_summary(context),
-        ) or context
         _raise_if_stale_kf_turn(conversation_key, generation)
         with timer.stage("send"):
             send_result = await _send_final_actions(
@@ -11849,8 +11816,17 @@ async def _process_text_turn(
                 tool_evidence=tool_evidence,
                 msgids=msgids,
             )
-        context = send_result["context"]
-        context = kf_context_memory.append_dialog_message(context, role="assistant", content=final_reply) or context
+        context = kf_context_memory.reduce_turn_context(
+            send_result.get("context") or context,
+            understanding=understanding,
+            tool_evidence=tool_evidence,
+            send_result=send_result,
+            final_package={
+                "draft_reply": final_draft_reply,
+                "final_reply": final_reply,
+                "outbound_package": tool_evidence.get("outbound_package") or {},
+            },
+        )
         _save_context(open_kfid, external_userid, context)
         for msgid in msgids:
             wecom_kf.state_store.mark_processed(msgid)
