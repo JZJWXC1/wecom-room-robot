@@ -243,6 +243,38 @@ def normalize_pending_video_sends(
     }
 
 
+def normalize_pending_media_target(
+    value: Any,
+    *,
+    candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
+    now: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    media_kind = str(value.get("media_kind") or value.get("video_or_image") or value.get("kind") or "").strip().lower()
+    if media_kind not in {"video", "image"}:
+        return {}
+    rows = [
+        row
+        for row in (value.get("candidate_rows") or value.get("rows") or [])
+        if isinstance(row, dict)
+    ][:candidate_limit]
+    labels = [
+        str(item).strip()
+        for item in (value.get("candidate_labels") or value.get("labels") or [])
+        if str(item).strip()
+    ][:candidate_limit]
+    if not rows and not labels:
+        return {}
+    return {
+        "media_kind": media_kind,
+        "candidate_rows": rows,
+        "candidate_labels": labels,
+        "created_at": float(value.get("created_at") or now()),
+        "reason": str(value.get("reason") or "pending_media_target").strip(),
+    }
+
+
 def _clip_structured_text(value: Any, *, limit: int = MAX_STRUCTURED_TEXT_CHARS) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -591,6 +623,13 @@ def normalize_media_context(
     )
     if pending_videos:
         normalized["pending_video_sends"] = pending_videos
+    pending_media_target = normalize_pending_media_target(
+        context.get("pending_media_target"),
+        candidate_limit=candidate_limit,
+        now=now,
+    )
+    if pending_media_target:
+        normalized["pending_media_target"] = pending_media_target
     structured_memory = normalize_structured_memory(
         context.get("structured_memory"),
         now=now,
@@ -649,6 +688,21 @@ def sanitize_context_for_storage(
         binding["rows"] = summarize_rows(binding.get("rows") or [], limit=candidate_limit)
         normalized["active_context_binding"] = {
             key: value for key, value in binding.items() if value not in ("", None, [], {})
+        }
+
+    if "pending_media_target" in normalized:
+        pending_target = dict(normalized["pending_media_target"])
+        pending_target["candidate_labels"] = [
+            redact_sensitive_text(label)
+            for label in pending_target.get("candidate_labels") or []
+            if str(label).strip()
+        ][:candidate_limit]
+        pending_target["candidate_rows"] = summarize_rows(
+            pending_target.get("candidate_rows") or [],
+            limit=candidate_limit,
+        )
+        normalized["pending_media_target"] = {
+            key: value for key, value in pending_target.items() if value not in ("", None, [], {})
         }
 
     safe_context = redact_sensitive_value(_jsonable_structured_value(normalized))
@@ -746,6 +800,7 @@ def remember_media_context(
         "active_context_binding": current.get("active_context_binding", {}),
         "active_query_state": current.get("active_query_state", {}),
         "pending_video_sends": current.get("pending_video_sends", {}),
+        "pending_media_target": current.get("pending_media_target", {}),
         "structured_memory": current.get("structured_memory", {}),
         "recent_messages": list(current.get("recent_messages") or [])[-message_limit:],
         "updated_at": now(),
@@ -972,6 +1027,7 @@ def rewrite_memory_view(context: dict[str, Any] | None) -> dict[str, Any]:
     candidate_set = normalize_last_candidate_set(context.get("last_candidate_set"))
     confirmed = normalize_confirmed_room_context(context.get("confirmed_room"))
     pending = normalize_pending_video_sends(context.get("pending_video_sends"))
+    pending_media_target = normalize_pending_media_target(context.get("pending_media_target"))
     turn_records = list(memory.get("turn_records") or [])
     return {
         "raw_dialog_context": list(memory.get("raw_dialog_context") or [])[-DEFAULT_MESSAGE_LIMIT:],
@@ -997,6 +1053,11 @@ def rewrite_memory_view(context: dict[str, Any] | None) -> dict[str, Any]:
             "sent_count": pending.get("sent_count", 0),
             "attempts": pending.get("attempts", 0),
         } if pending else {},
+        "pending_media_target": {
+            "media_kind": pending_media_target.get("media_kind", ""),
+            "candidate_labels": pending_media_target.get("candidate_labels", []),
+            "reason": pending_media_target.get("reason", ""),
+        } if pending_media_target else {},
     }
 
 
@@ -1055,6 +1116,43 @@ def pending_video_sends(context: dict[str, Any] | None) -> dict[str, Any]:
     if not context:
         return {}
     return normalize_pending_video_sends(context.get("pending_video_sends"))
+
+
+def pending_media_target(context: dict[str, Any] | None) -> dict[str, Any]:
+    if not context:
+        return {}
+    return normalize_pending_media_target(context.get("pending_media_target"))
+
+
+def remember_pending_media_target(
+    context: dict[str, Any] | None,
+    *,
+    media_kind: str,
+    candidate_rows: list[dict[str, Any]] | None = None,
+    candidate_labels: list[str] | None = None,
+    reason: str = "pending_media_target",
+    now: Callable[[], float] = time.time,
+) -> dict[str, Any]:
+    current = context or empty_context(now=now)
+    normalized = normalize_pending_media_target(
+        {
+            "media_kind": media_kind,
+            "candidate_rows": candidate_rows or [],
+            "candidate_labels": candidate_labels or [],
+            "reason": reason,
+            "created_at": now(),
+        },
+        now=now,
+    )
+    current["pending_media_target"] = normalized
+    return current
+
+
+def clear_pending_media_target(context: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not context:
+        return None
+    context["pending_media_target"] = {}
+    return context
 
 
 def remember_pending_video_sends(
