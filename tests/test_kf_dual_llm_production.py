@@ -79,6 +79,137 @@ def test_llm2_production_ignores_llm_supplied_send_actions() -> None:
     asyncio.run(run_case())
 
 
+def test_llm2_production_empty_output_does_not_use_deterministic_reply() -> None:
+    async def run_case() -> None:
+        build = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "第1套视频",
+                "task_atoms": [{"task_id": "task-video", "task_type": "send_video"}],
+                "tool_plan": {"actions": ["send_video", "generate_reply"]},
+            },
+            content="第1套视频",
+            source_label="llm1_production",
+            mode="production",
+        )
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {}
+
+        package = await compose_production_outbound_package(
+            reply_generator=FakeReplyGenerator(),
+            task_packet=build.packet,
+            tool_evidence={
+                "actions": ["send_video", "generate_reply"],
+                "video_paths": ["C:/tmp/safe_fixture_video.mp4"],
+                "video_rows": [{"小区": "星河苑", "房号": "1-101", "listing_id": "lst-101"}],
+            },
+            draft_reply="这是星河苑1-101房间的视频。",
+            planner_result={"actions": ["send_video", "generate_reply"]},
+        )
+
+        assert not package_passed(package)
+        assert package.reply_text == ""
+        assert "llm2_production_empty_output" in package_retry_reason(package)
+
+    asyncio.run(run_case())
+
+
+def test_llm2_production_receives_controlled_evidence_not_local_fallback_text() -> None:
+    async def run_case() -> None:
+        build = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "第1套视频，房源表也发我，免押怎么弄",
+                "task_atoms": [
+                    {"task_id": "task-video", "task_type": "send_video"},
+                    {"task_id": "task-sheet", "task_type": "send_inventory_sheet"},
+                    {"task_id": "task-deposit", "task_type": "deposit_policy"},
+                ],
+                "tool_plan": {
+                    "actions": [
+                        "send_video",
+                        "send_inventory_sheet",
+                        "explain_missing_media",
+                        "send_deposit_policy",
+                        "generate_reply",
+                    ]
+                },
+            },
+            content="第1套视频，房源表也发我，免押怎么弄",
+            source_label="llm1_production",
+            mode="production",
+        )
+        captured: dict[str, dict] = {}
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                captured.update(kwargs)
+                return {
+                    "reply_text": "这是星河苑1-101房间的视频，房源表也一起发你。免押按支付宝无忧住评估。",
+                    "claims": [
+                        {
+                            "claim_id": "claim-deposit",
+                            "task_id": "task-deposit",
+                            "field": "deposit_policy",
+                            "value": "支付宝无忧住",
+                            "evidence_ref": "evd-rule-deposit-policy-1",
+                            "text": "免押按支付宝无忧住评估",
+                        }
+                    ],
+                    "action_captions": [
+                        {"action_id": "send-video-1", "text": "这是星河苑1-101房间的视频。"},
+                        {"action_id": "send-inventory_sheet-1", "text": "这是房源表。"},
+                    ],
+                    "self_review": {"status": "pass"},
+                }
+
+        package = await compose_production_outbound_package(
+            reply_generator=FakeReplyGenerator(),
+            task_packet=build.packet,
+            tool_evidence={
+                "actions": [
+                    "send_video",
+                    "send_inventory_sheet",
+                    "explain_missing_media",
+                    "send_deposit_policy",
+                    "generate_reply",
+                ],
+                "video_paths": ["C:/tmp/safe_fixture_video.mp4"],
+                "video_rows": [{"小区": "星河苑", "房号": "1-101", "listing_id": "lst-101"}],
+                "inventory_images": ["C:/tmp/sheet.png"],
+                "missing_media": ["星河苑1-102"],
+                "rule_evidence": {
+                    "deposit_policy": {
+                        "name": "支付宝无忧住信用免押",
+                        "service_fee": {"3个月": "免押金额5.5%", "6-12个月": "免押金额8%"},
+                    }
+                },
+            },
+            draft_reply="旧本地 fallback 不应进入 LLM2 prompt",
+            planner_result={
+                "actions": [
+                    "send_video",
+                    "send_inventory_sheet",
+                    "explain_missing_media",
+                    "send_deposit_policy",
+                    "generate_reply",
+                ]
+            },
+        )
+
+        evidence_bundle = captured["evidence_bundle"]
+        evidence_types = {item["evidence_type"] for item in evidence_bundle["evidence"]}
+        dumped_prompt_inputs = json.dumps(captured, ensure_ascii=False)
+
+        assert package_passed(package)
+        assert {"video", "inventory_sheet", "missing_media", "deposit_policy"} <= evidence_types
+        assert package.send_actions[0].listing_id == "lst-101"
+        assert package.send_actions[0].payload["community"] == "星河苑"
+        assert "旧本地 fallback" not in dumped_prompt_inputs
+
+    asyncio.run(run_case())
+
+
 def test_llm2_production_package_does_not_build_claim_legacy_reply() -> None:
     async def run_case() -> None:
         build = build_kf_task_packet_shadow(

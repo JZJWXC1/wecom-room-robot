@@ -475,6 +475,8 @@ def _evidence_bundle_from(
         )
     for kind, key in (("video", "video_paths"), ("image", "image_paths"), ("inventory_sheet", "inventory_image_paths")):
         for index, path in enumerate(_string_list(evidence.get(key)), start=1):
+            row = _media_row_for_index(evidence, kind, index)
+            listing_id = _row_text(row, "listing_id") if row else ""
             evidence_items.append(
                 EvidenceItem(
                     conversation_id=task_packet.conversation_id,
@@ -482,23 +484,24 @@ def _evidence_bundle_from(
                     case_id=task_packet.case_id,
                     inventory_snapshot_id=task_packet.inventory_snapshot_id,
                     candidate_set_id=task_packet.candidate_set_id,
+                    listing_id=listing_id,
                     evidence_id=f"evd-{kind}-{index}",
                     evidence_type=kind,
-                    summary=f"{kind} artifact {index}",
+                    summary=_media_evidence_summary(kind, index, row),
                     source_kind=str(evidence.get("source_kind") or ""),
                     source_record_id=_stable_hash(path),
-                    field_values={
-                        "kind": kind,
-                        "media_number": index,
-                    },
+                    field_values=_media_field_values(kind, index, row),
                     sensitivity="public",
                     fetched_at=str(evidence.get("fetched_at") or ""),
                     metadata={
                         "media_number": index,
                         "path_hash": _stable_hash(path),
+                        "candidate_number": index if kind in {"video", "image"} else None,
                     },
                 )
             )
+    evidence_items.extend(_rule_evidence_items(task_packet, evidence))
+    evidence_items.extend(_missing_media_evidence_items(task_packet, evidence))
     return ToolEvidenceBundle(
         conversation_id=task_packet.conversation_id,
         turn_id=task_packet.turn_id,
@@ -627,6 +630,9 @@ def _send_actions_from(
         ("inventory_sheet", "inventory_image_paths", "image"),
     ):
         for index, path in enumerate(_string_list(evidence.get(key)), start=1):
+            row = _media_row_for_index(evidence, kind, index)
+            listing_id = _row_text(row, "listing_id") if row else ""
+            room_label = _room_label(row) if row else ""
             result.append(
                 SendAction(
                     conversation_id=task_packet.conversation_id,
@@ -634,14 +640,17 @@ def _send_actions_from(
                     case_id=task_packet.case_id,
                     inventory_snapshot_id=task_packet.inventory_snapshot_id,
                     candidate_set_id=task_packet.candidate_set_id,
+                    listing_id=listing_id,
                     evidence_id=f"evd-{kind}-{index}",
                     action_id=f"send-{kind}-{index}",
                     action_type=action_type,
                     payload={
                         "media_number": index,
                         "path_hash": _stable_hash(path),
+                        "community": _row_text(row, "community") if row else "",
+                        "room_no": _row_text(row, "room_no") if row else "",
                     },
-                    metadata={"source": "program_evidence", "kind": kind},
+                    metadata={"source": "program_evidence", "kind": kind, "room_label": room_label},
                 )
             )
     return result
@@ -836,6 +845,143 @@ def _rows_from_evidence(evidence: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(candidate_set, dict):
         return [dict(row) for row in candidate_set.get("candidates") or [] if isinstance(row, dict)]
     return []
+
+
+def _media_row_for_index(evidence: dict[str, Any], kind: str, index: int) -> dict[str, Any]:
+    key = "video_rows" if kind == "video" else ("image_rows" if kind == "image" else "")
+    if key:
+        rows = [dict(row) for row in evidence.get(key) or [] if isinstance(row, dict)]
+        if 0 <= index - 1 < len(rows):
+            return rows[index - 1]
+    rows = _rows_from_evidence(evidence)
+    if kind in {"video", "image"} and len(rows) == 1:
+        return rows[0]
+    return {}
+
+
+def _room_label(row: dict[str, Any]) -> str:
+    community = _row_text(row, "community")
+    room_no = _row_text(row, "room_no")
+    if community and room_no:
+        return f"{community}{room_no}"
+    return community or room_no
+
+
+def _media_evidence_summary(kind: str, index: int, row: dict[str, Any]) -> str:
+    if kind == "inventory_sheet":
+        return "房源表 PNG 图片已由工具生成，可通过受控图片动作发送。"
+    label = _room_label(row)
+    media_name = "视频" if kind == "video" else "图片"
+    if label:
+        return f"{label}{media_name}素材已匹配，可通过受控{media_name}动作发送。"
+    return f"第 {index} 个{media_name}素材已匹配，可通过受控{media_name}动作发送。"
+
+
+def _media_field_values(kind: str, index: int, row: dict[str, Any]) -> dict[str, Any]:
+    values = {
+        "kind": kind,
+        "media_number": index,
+        "send_channel": "image" if kind in {"image", "inventory_sheet"} else "video",
+    }
+    if kind == "inventory_sheet":
+        values["artifact"] = "inventory_sheet_png"
+    if row:
+        values.update(_row_field_values(row))
+        values["room_label"] = _room_label(row)
+    return safe_artifact_payload(values)
+
+
+def _rule_evidence_items(task_packet: StructuredTaskPacket, evidence: dict[str, Any]) -> list[EvidenceItem]:
+    rule_evidence = evidence.get("rule_evidence")
+    if not isinstance(rule_evidence, dict):
+        return []
+    result: list[EvidenceItem] = []
+    deposit_policy = rule_evidence.get("deposit_policy")
+    if isinstance(deposit_policy, dict):
+        result.append(
+            EvidenceItem(
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                candidate_set_id=task_packet.candidate_set_id,
+                evidence_id="evd-rule-deposit-policy-1",
+                evidence_type="deposit_policy",
+                summary=(
+                    "免押是支付宝无忧住芝麻信用评估，不是免费免押；"
+                    "符合风控后需支付押金金额 5.5%-8% 的免押服务费。"
+                ),
+                source_kind="rule_evidence",
+                source_record_id=_stable_hash(deposit_policy),
+                field_values=safe_artifact_payload(deposit_policy),
+                sensitivity="public",
+                metadata={"controlled_fact_source": "deposit_policy"},
+            )
+        )
+    return result
+
+
+def _missing_media_kind(evidence: dict[str, Any]) -> str:
+    actions = set(_actions_from(evidence))
+    if {"send_video", "send_image"} <= actions:
+        return "video_and_image"
+    if "send_video" in actions:
+        return "video"
+    if "send_image" in actions:
+        return "image"
+    status = evidence.get("media_status")
+    if isinstance(status, dict):
+        if "video" in status and "image" in status:
+            return "video_and_image"
+        if "video" in status:
+            return "video"
+        if "image" in status:
+            return "image"
+    return "media"
+
+
+def _missing_media_label(kind: str) -> str:
+    if kind == "video":
+        return "视频"
+    if kind == "image":
+        return "图片"
+    if kind == "video_and_image":
+        return "视频或图片"
+    return "素材"
+
+
+def _missing_media_evidence_items(task_packet: StructuredTaskPacket, evidence: dict[str, Any]) -> list[EvidenceItem]:
+    missing = _string_list(evidence.get("missing_media"))
+    if not missing and not evidence.get("media_status"):
+        return []
+    media_kind = _missing_media_kind(evidence)
+    labels = missing or ["未匹配到可发送素材"]
+    result: list[EvidenceItem] = []
+    for index, label in enumerate(labels, start=1):
+        result.append(
+            EvidenceItem(
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                candidate_set_id=task_packet.candidate_set_id,
+                evidence_id=f"evd-missing-media-{index}",
+                evidence_type="missing_media",
+                summary=f"{label} 暂未找到可发送{_missing_media_label(media_kind)}。",
+                source_kind="media_store",
+                source_record_id=_stable_hash({"missing": label, "kind": media_kind}),
+                field_values={
+                    "error_code": "missing_media",
+                    "media_kind": media_kind,
+                    "label": label,
+                    "has_sendable_video": bool(evidence.get("video_paths")),
+                    "has_sendable_image": bool(evidence.get("image_paths")),
+                },
+                sensitivity="public",
+                metadata={"controlled_error_code": "missing_media"},
+            )
+        )
+    return result
 
 
 def _row_summary(row: dict[str, Any], index: int) -> str:

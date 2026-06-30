@@ -94,6 +94,7 @@ def compose_kf_outbound(
     prompt_version: str = LLM2_OUTBOUND_PROMPT_VERSION,
     selfcheck_profile: str = LLM2_OUTBOUND_SELFCHECK_PROFILE,
     reply_source: str = "kf_llm2_outbound_shadow",
+    allow_deterministic_fallback: bool = True,
 ) -> PreparedOutboundPackage:
     """Validate LLM2 shadow wording into a safe PreparedOutboundPackage.
 
@@ -106,7 +107,20 @@ def compose_kf_outbound(
     trusted_actions = _coerce_send_actions(send_actions) if send_actions is not None else _send_actions_from_bundle(packet, bundle)
     output = dict(llm_output or {})
     if not output:
-        output = _deterministic_llm2_shadow_output(packet, bundle, trusted_actions)
+        if allow_deterministic_fallback:
+            output = _deterministic_llm2_shadow_output(packet, bundle, trusted_actions)
+        else:
+            output = {
+                "reply_text": "",
+                "self_review": {
+                    "status": "retry",
+                    "reason": "LLM2 production returned empty output.",
+                    "retry_reason": "llm2_production_empty_output",
+                    "rewrite_retry_reason": "llm2_production_empty_output",
+                    "llm2_decides_media_targets": False,
+                },
+                "source": "llm2_production_empty_output",
+            }
 
     ignored_llm_send_actions = bool(output.get("send_actions"))
     reply_text = str(output.get("reply_text") or "")
