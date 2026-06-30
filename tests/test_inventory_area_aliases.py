@@ -51,6 +51,38 @@ ALLOWED_LLM_RAG_V2_ENTITY_HINTS = (
 )
 
 
+ALLOWED_LLM_PROMPT_OWNERSHIP_REPLACEMENTS = (
+    ("本阶段不生成客户可见回复，只输出内部澄清需求、结构化任务和工具计划。", "本阶段不生成客户可见回复，只输出追问、结构化任务和工具计划。"),
+    ("Validator / Tool Resolver 回流证据", "Planner 回流证据"),
+    ("Validator 或 Tool Resolver 回传缺失证据", "Planner 回传缺失证据"),
+    ("回流证据不是客户可见内容", "Planner 反馈不是客户可见内容"),
+    ("Validator / Tool Resolver 回传的内部缺失证据", "Planner 回传的内部缺失证据"),
+    ("内部澄清需求摘要，不得写客户可见追问句", "需要澄清时给用户的一句话"),
+    ("最终客户可见话术只能由 LLM2 在工具取证后生成", "最终话术只能在工具执行后生成"),
+    ("LLM1 只给出工具计划，具体目标绑定由 Tool Resolver 基于候选和证据完成", "Planner 只负责后续工具规划"),
+    ("Validator 或 Tool Resolver 回传 need_rewrite_clarification", "Planner 回传 need_rewrite_clarification"),
+    ("并只标记当前缺少的真实字段", "并只追问当前缺少的真实字段"),
+    ("不替 LLM1、Tool Resolver 或 LLM2 生成客户可见回答；不通过时按失败层级生成回流证据", "不替 Planner 生成客户可见回答；不通过时给 Planner 重规划证据"),
+    ("检查 LLM1 工具计划与 Tool Resolver 动作是否完成结构化任务", "检查 Planner/工具动作是否完成结构化任务"),
+    ("用于校验 LLM1 工具计划和 Tool Resolver 动作有没有跑偏", "用于校验 Planner 和动作有没有跑偏"),
+    ("LLM1 工具计划和 Tool Resolver 必须按区域和预算执行", "Planner/工具必须按区域和预算执行"),
+    ("给 LLM1 / Tool Resolver 的重规划说明", "给 Planner 的重规划说明"),
+    ("LLM1 工具计划或 Tool Resolver 动作不满足 StructuredTask", "Planner 动作不满足 StructuredTask"),
+    ("先看 LLM1 工具计划、Tool Resolver 动作和文本是否已经满足问题重写后的真实需求", "先看 Planner/工具动作和文本是否已经满足问题重写后的真实需求"),
+    ("重规划说明要写清楚证据", "planner_retry_reason 要写清楚证据"),
+)
+
+
+def normalize_allowed_llm_prompt_ownership_replacements(lines: list[str]) -> list[str]:
+    result: list[str] = []
+    for line in lines:
+        normalized = line
+        for current_fragment, baseline_fragment in ALLOWED_LLM_PROMPT_OWNERSHIP_REPLACEMENTS:
+            normalized = normalized.replace(current_fragment, baseline_fragment)
+        result.append(normalized)
+    return result
+
+
 def strip_llm_shadow_only_blocks(lines: list[str]) -> list[str]:
     result: list[str] = []
     skip_until: str | None = None
@@ -121,8 +153,9 @@ def test_llm_customer_chain_matches_fix1_except_rag_v2_entity_hints_and_v1_prune
 
     current_lines = strip_removed_legacy_plan_reply(strip_llm_shadow_only_blocks(current_lines))
     baseline = strip_removed_legacy_plan_reply(baseline)
+    normalized_current = normalize_allowed_llm_prompt_ownership_replacements(current_lines)
     filtered_current = [
-        line for line in current_lines
+        line for line in normalized_current
         if not any(hint in line for hint in ALLOWED_LLM_RAG_V2_ENTITY_HINTS)
     ]
     current_text = "\n".join(current_lines)
@@ -130,6 +163,8 @@ def test_llm_customer_chain_matches_fix1_except_rag_v2_entity_hints_and_v1_prune
     assert filtered_current == baseline
     for hint in ALLOWED_LLM_RAG_V2_ENTITY_HINTS:
         assert hint in current_text
+    for current_fragment, _baseline_fragment in ALLOWED_LLM_PROMPT_OWNERSHIP_REPLACEMENTS:
+        assert current_fragment in current_text
 
 
 def rows_with_viewing(password: str = "1234#") -> list[dict[str, Any]]:
