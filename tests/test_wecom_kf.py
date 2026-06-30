@@ -788,7 +788,7 @@ def test_controlled_password_reply_stays_out_of_internal_artifacts_and_final_llm
         class FakeReplyGenerator:
             async def compose_kf_outbound_production(self, **kwargs):
                 return {
-                    "reply_text": "",
+                    "reply_text": "这套看房方式我发你，密码按下面这条为准。",
                     "claims": [],
                     "action_captions": [],
                     "self_review": {"status": "pass"},
@@ -852,6 +852,7 @@ def test_controlled_password_reply_stays_out_of_internal_artifacts_and_final_llm
             main.settings.kf_dual_llm_mode = original_mode
 
         assert result["reply"].strip()
+        assert result["reply"].startswith("这套看房方式我发你，密码按下面这条为准。")
         assert password_canary in result["reply"]
         assert result["selfcheck"]["llm"]["source"] == "llm_selfcheck_skipped_by_kf_outbound_validation"
         assert tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]["status"] == "pass"
@@ -862,6 +863,90 @@ def test_controlled_password_reply_stays_out_of_internal_artifacts_and_final_llm
         ):
             dumped = json.dumps(payload, ensure_ascii=False, default=str)
             assert password_canary not in dumped
+
+    asyncio.run(run_case())
+
+
+def test_controlled_password_empty_llm2_reply_is_blocked(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "石桥铭苑6-1102密码多少",
+                "task_atoms": [
+                    {
+                        "task_id": "task-password",
+                        "task_type": "viewing_guidance",
+                        "user_text": "石桥铭苑6-1102密码多少",
+                    }
+                ],
+                "tool_plan": {"actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"]},
+            },
+            content="石桥铭苑6-1102密码多少",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                return SimpleNamespace(status="pass", action="pass", reason="", fallback_text="")
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+        original_mode = main.settings.kf_dual_llm_mode
+        tool_evidence = {
+            "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
+            "target_rows": [{"小区": "石桥铭苑", "房号": "6-1102", "看房方式密码": "101004# 看房提前联系"}],
+            "inventory_rows": [{"小区": "石桥铭苑", "房号": "6-1102", "看房方式密码": "101004# 看房提前联系"}],
+            "rule_evidence": {
+                "viewing": {
+                    "rooms": [
+                        {
+                            "room": "石桥铭苑6-1102",
+                            "viewing": "101004# 看房提前联系",
+                            "has_password": True,
+                            "needs_contact": True,
+                            "listing_id": "listing-viewing-canary",
+                            "evidence_id": "evd-viewing-source-canary",
+                        }
+                    ],
+                    "contact_numbers": list(main.CONTACT_NUMBERS),
+                }
+            },
+        }
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._generate_reply_result(
+                content="石桥铭苑6-1102密码多少",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "viewing",
+                    "effective_query": "石桥铭苑6-1102密码多少",
+                    "structured_task": {"intent": "viewing", "tool_requirements": {}},
+                    "constraint_proof": {},
+                    "llm1_task_packet": task_packet,
+                },
+                tool_evidence=tool_evidence,
+                planner_result={"actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"]},
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert result["reply"] == ""
+        assert result["needs_planner_retry"] is True
+        assert "outbound_package" not in tool_evidence
+        assert tool_evidence.get("controlled_slot_appendix_used") is not True
 
     asyncio.run(run_case())
 
@@ -878,6 +963,11 @@ def test_production_controlled_channels_cover_contract_password_deposit_and_view
         class FakeReplyGenerator:
             async def compose_kf_outbound_production(self, **kwargs):
                 task_types = {str(task.get("task_type") or "") for task in (kwargs.get("task_packet") or {}).get("tasks") or []}
+                task_text = " ".join(
+                    str(task.get("user_text") or "")
+                    for task in (kwargs.get("task_packet") or {}).get("tasks") or []
+                    if isinstance(task, dict)
+                )
                 if "contract_contact" in task_types:
                     return {
                         "reply_text": "这单可以直接走定房和电子合同。",
@@ -891,6 +981,20 @@ def test_production_controlled_channels_cover_contract_password_deposit_and_view
                             "免押走支付宝无忧住芝麻信用评估，不是免费免押；"
                             "服务费按租期一般是5.5%-8%。水电要按具体房源备注查，你把小区+房号发我，我再按那套确认。"
                         ),
+                        "claims": [],
+                        "action_captions": [],
+                        "self_review": {"status": "pass"},
+                    }
+                if "viewing_guidance" in task_types and "密码" in task_text:
+                    return {
+                        "reply_text": "这套看房方式我发你。",
+                        "claims": [],
+                        "action_captions": [],
+                        "self_review": {"status": "pass"},
+                    }
+                if "viewing_guidance" in task_types:
+                    return {
+                        "reply_text": "这套看房需要提前确认。",
                         "claims": [],
                         "action_captions": [],
                         "self_review": {"status": "pass"},
@@ -1042,10 +1146,11 @@ def test_production_controlled_channels_cover_contract_password_deposit_and_view
             assert "稍后给您准确回复" not in result["reply"]
 
         assert "18758141785" in contract_result["reply"]
-        assert contract_result["reply"].startswith("客户看中了可以联系")
+        assert contract_result["reply"].startswith("这单可以直接走定房和电子合同。")
         assert "电子合同" in contract_result["reply"]
-        assert "定金" in contract_result["reply"]
+        assert "联系方式：" in contract_result["reply"]
         assert "101004#" in password_result["reply"]
+        assert password_result["reply"].startswith("这套看房方式我发你。")
         assert "18758141785" in password_result["reply"]
         assert "支付宝无忧住" in deposit_result["reply"]
         assert "5.5%-8%" in deposit_result["reply"]

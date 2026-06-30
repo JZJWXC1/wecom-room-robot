@@ -7855,7 +7855,7 @@ def _attach_controlled_outbound_channels(
         tool_evidence["inventory_listing_evidence"] = evidence_items
 
 
-def _controlled_reply_from_outbound_package(package: Any) -> str:
+def _controlled_slot_appendix_from_outbound_package(package: Any) -> str:
     lines: list[str] = []
     for action in getattr(package, "send_actions", []) or []:
         action_type = str(getattr(action, "action_type", "") or "")
@@ -7865,25 +7865,30 @@ def _controlled_reply_from_outbound_package(package: Any) -> str:
         if action_type == "contract_contact":
             contacts = [str(number) for number in sensitive_payload.get("contact_numbers") or [] if str(number).strip()]
             if contacts:
-                lines.append(
-                    f"客户看中了可以联系 {' / '.join(contacts)} 定房和签电子合同。"
-                    "联系时带上小区+房号，方便确认房态和定金。"
-                )
+                lines.append(f"联系方式：{' / '.join(contacts)}")
         elif action_type == "viewing_password":
             room = str(sensitive_payload.get("room") or "这套房").strip()
             viewing_text = str(sensitive_payload.get("viewing_password") or "").strip()
             contacts = [str(number) for number in sensitive_payload.get("contact_numbers") or [] if str(number).strip()]
             if viewing_text:
-                sentence = f"{room}的看房方式/密码是 {viewing_text}。"
+                sentence = f"{room}看房方式/密码：{viewing_text}"
                 if contacts:
-                    sentence += f"密码不对、打不开门或者还没空出，就联系 {' / '.join(contacts)} 确认。"
+                    sentence += f"\n打不开门或还没空出联系：{' / '.join(contacts)}"
                 lines.append(sentence)
         elif action_type == "viewing_contact":
             room = str(sensitive_payload.get("room") or "这套房").strip()
             contacts = [str(number) for number in sensitive_payload.get("contact_numbers") or [] if str(number).strip()]
             if contacts:
-                lines.append(f"{room}看房需要提前联系 {' / '.join(contacts)} 确认时间。")
+                lines.append(f"{room}看房提前联系：{' / '.join(contacts)}")
     return "\n".join(dict.fromkeys(line for line in lines if line)).strip()
+
+
+def _append_controlled_slot_appendix(reply_text: str, appendix: str) -> str:
+    reply = str(reply_text or "").strip()
+    slot_text = str(appendix or "").strip()
+    if not reply or not slot_text:
+        return reply
+    return f"{reply}\n{slot_text}".strip()
 
 
 def _reply_for_missing_media(understanding: dict[str, Any], tool_evidence: dict[str, Any]) -> str:
@@ -8945,7 +8950,7 @@ def _needs_llm_final_selfcheck(
         return False
     if deterministic_reply_source in {
         "kf_llm2_outbound_production",
-        "kf_llm2_outbound_production_controlled",
+        "kf_llm2_outbound_production_controlled_slots",
     }:
         return False
     proof = dict(understanding.get("constraint_proof") or {})
@@ -9596,7 +9601,8 @@ async def _generate_reply_result(
                     )
                     attempt_payload = kf_dual_llm_production.package_log_payload(production_package)
                     attempt_payload["attempt"] = attempt_name
-                    controlled_production_reply = _controlled_reply_from_outbound_package(production_package)
+                    controlled_slot_appendix = _controlled_slot_appendix_from_outbound_package(production_package)
+                    production_reply_text = str(production_package.reply_text or "").strip()
                     outbound_validation = kf_dual_llm_production.validate_production_outbound_package(
                         production_package,
                         task_packet=task_packet,
@@ -9610,17 +9616,27 @@ async def _generate_reply_result(
                     if (
                         kf_dual_llm_production.package_passed(production_package)
                         and outbound_validation.passed
-                        and (str(production_package.reply_text or "").strip() or controlled_production_reply)
+                        and production_reply_text
                     ):
                         draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
-                            controlled_production_reply or str(production_package.reply_text or "")
+                            _append_controlled_slot_appendix(
+                                production_reply_text,
+                                controlled_slot_appendix,
+                            )
                         )
                         deterministic_reply_source = (
-                            "kf_llm2_outbound_production_controlled"
-                            if controlled_production_reply
+                            "kf_llm2_outbound_production_controlled_slots"
+                            if controlled_slot_appendix
                             else "kf_llm2_outbound_production"
                         )
                         tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+                        if controlled_slot_appendix:
+                            tool_evidence["controlled_slot_appendix_used"] = True
+                            tool_evidence["controlled_slot_appendix_action_types"] = [
+                                str(getattr(action, "action_type", "") or "")
+                                for action in getattr(production_package, "send_actions", []) or []
+                                if str(getattr(action, "action_type", "") or "") in {"contract_contact", "viewing_password", "viewing_contact"}
+                            ]
                         tool_evidence["llm2_production_outbound_package"] = production_package.to_legacy_dict()
                         tool_evidence["llm2_production_outbound_validation"] = validation_payload
                         llm2_retry_reason = ""
