@@ -1205,6 +1205,105 @@ def test_plan_actions_production_llm1_retry_blocks_deposit_fallback(monkeypatch)
     asyncio.run(run_case())
 
 
+def test_plan_actions_production_keeps_llm1_legal_actions_exactly(monkeypatch) -> None:
+    async def run_case() -> None:
+        original_mode = main.settings.kf_dual_llm_mode
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            planner = await main._plan_actions(
+                content="房源表发一下",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory_sheet",
+                    "tool_plan": {
+                        "actions": ["send_inventory_sheet"],
+                        "source": "llm1_production",
+                    },
+                    "dual_llm_production": {"llm1": {"status": "pass", "source": "llm1_production"}},
+                },
+                signals={"wants_inventory_sheet": True},
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert planner["actions"] == ["send_inventory_sheet"]
+        assert planner.get("need_rewrite_clarification") is not True
+        assert planner["reply_text"] == ""
+
+    asyncio.run(run_case())
+
+
+def test_plan_actions_production_does_not_complete_actions_from_keywords(monkeypatch) -> None:
+    async def run_case() -> None:
+        original_mode = main.settings.kf_dual_llm_mode
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            planner = await main._plan_actions(
+                content="房源表、免押、视频都发我一下",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "tool_plan": {
+                        "actions": ["generate_reply"],
+                        "source": "llm1_production",
+                    },
+                    "dual_llm_production": {"llm1": {"status": "pass", "source": "llm1_production"}},
+                },
+                signals={
+                    "wants_inventory_sheet": True,
+                    "wants_deposit": True,
+                    "wants_video": True,
+                },
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert planner["actions"] == ["generate_reply"]
+        assert "send_inventory_sheet" not in planner["actions"]
+        assert "send_deposit_policy" not in planner["actions"]
+        assert "send_video" not in planner["actions"]
+
+    asyncio.run(run_case())
+
+
+def test_generate_reply_result_production_missing_task_packet_retries_without_planner_text(monkeypatch) -> None:
+    async def run_case() -> None:
+        async def fake_retrieve_for_reply(**kwargs):
+            return SimpleNamespace(context_text="")
+
+        async def fake_snapshot(*args, **kwargs):
+            return ""
+
+        original_mode = main.settings.kf_dual_llm_mode
+        monkeypatch.setattr(main.agentic_rag, "retrieve_for_reply", fake_retrieve_for_reply)
+        monkeypatch.setattr(main.inventory, "snapshot", fake_snapshot)
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = await main._generate_reply_result(
+                content="房源表发一下",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory_sheet",
+                    "tool_plan": {"actions": ["send_inventory_sheet"], "source": "llm1_production"},
+                },
+                tool_evidence={"actions": ["send_inventory_sheet"]},
+                planner_result={
+                    "actions": ["send_inventory_sheet"],
+                    "reply_text": "这句 planner 文本不能直接发给客户。",
+                },
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert result["needs_planner_retry"] is True
+        assert result["reply"] == ""
+        assert result["draft_reply"] == ""
+        assert "LLM1 production task packet is missing" in result["planner_retry_reason"]
+        assert "planner 文本" not in result["reply"]
+
+    asyncio.run(run_case())
+
+
 def test_collect_room_media_production_uses_manifest_exact_listing(monkeypatch) -> None:
     async def run_case() -> None:
         with tempfile.TemporaryDirectory() as directory:
