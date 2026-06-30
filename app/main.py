@@ -11611,6 +11611,23 @@ async def _process_text_turn(
                 final_reply = str(understanding.get("clarification_text") or settings.default_fallback_reply)
                 final_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_reply)
                 tool_evidence = {"actions": [], "planner_missing_evidence": retry_reason}
+                if _dual_llm_production_enabled():
+                    final_reply = ""
+                    final_draft_reply = ""
+                    tool_evidence["suppress_actions"] = True
+                    reply_result = {
+                        "reply": "",
+                        "draft_reply": "",
+                        "context": context,
+                        "selfcheck": {
+                            "status": "retry",
+                            "source": "llm1_production_retry_gate",
+                            "reason": retry_reason,
+                        },
+                        "needs_planner_retry": False,
+                        "planner_retry_reason": "",
+                        "send_blocked": True,
+                    }
                 break
 
             actions = _safe_action_list(planner_result)
@@ -11692,6 +11709,19 @@ async def _process_text_turn(
                 final_reply = ""
                 final_draft_reply = str(reply_result.get("draft_reply") or "")
                 tool_evidence["suppress_actions"] = True
+                break
+            if _dual_llm_production_enabled() and not str(reply_result.get("reply") or "").strip():
+                final_reply = ""
+                final_draft_reply = str(reply_result.get("draft_reply") or "")
+                tool_evidence["suppress_actions"] = True
+                reply_result = {
+                    **reply_result,
+                    "reply": "",
+                    "draft_reply": final_draft_reply,
+                    "send_blocked": True,
+                    "needs_planner_retry": False,
+                    "planner_retry_reason": "",
+                }
                 break
             final_reply = str(reply_result.get("reply") or settings.default_fallback_reply)
             final_draft_reply = str(reply_result.get("draft_reply") or final_reply)

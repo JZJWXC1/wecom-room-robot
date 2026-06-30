@@ -1304,6 +1304,106 @@ def test_generate_reply_result_production_missing_task_packet_retries_without_pl
     asyncio.run(run_case())
 
 
+def test_process_text_turn_production_retry_gate_does_not_send_default_fallback(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeStateStore:
+            def __init__(self) -> None:
+                self.processed: set[str] = set()
+
+            def mark_processed(self, msgid: str) -> None:
+                self.processed.add(msgid)
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
+
+        class FakeContextStore:
+            def __init__(self) -> None:
+                self.data: dict[str, dict] = {}
+
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
+
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        async def fake_understand_message(**kwargs):
+            return {
+                "intent": "production_llm1",
+                "effective_query": kwargs["content"],
+                "needs_clarification": False,
+                "structured_task": {"source": "llm1_production_minimal_bootstrap"},
+                "tool_plan": {
+                    "actions": [],
+                    "need_rewrite_clarification": True,
+                    "source": "llm1_production_error_gate",
+                },
+            }
+
+        async def fake_plan_actions(**kwargs):
+            return {
+                "actions": [],
+                "need_rewrite_clarification": True,
+                "missing_evidence": "LLM1 production failed",
+                "source": "llm1_production_error_gate",
+                "reply_text": "",
+            }
+
+        sent_calls: list[dict] = []
+        artifacts: list[dict] = []
+
+        async def fake_send_final_actions(**kwargs):
+            sent_calls.append(kwargs)
+            raise AssertionError("production retry gate must not send default fallback")
+
+        fake_wecom = FakeWeComKf()
+        fake_store = FakeContextStore()
+        originals = {
+            "wecom_kf": main.wecom_kf,
+            "wecom_kf_context_store": main.wecom_kf_context_store,
+            "_understand_message": main._understand_message,
+            "_plan_actions": main._plan_actions,
+            "_send_final_actions": main._send_final_actions,
+            "_build_orchestrator_shadow_artifact": main._build_orchestrator_shadow_artifact,
+            "kf_turn_generations": dict(main.kf_turn_generations),
+            "mode": main.settings.kf_dual_llm_mode,
+        }
+        main.wecom_kf = fake_wecom
+        main.wecom_kf_context_store = fake_store
+        main._understand_message = fake_understand_message
+        main._plan_actions = fake_plan_actions
+        main._send_final_actions = fake_send_final_actions
+        main._build_orchestrator_shadow_artifact = lambda **kwargs: artifacts.append(kwargs)
+        main.settings.kf_dual_llm_mode = "production"
+        main.kf_turn_generations[main._conversation_key("kf", "wm-prod-empty")] = 0
+        try:
+            await main._process_text_turn(
+                open_kfid="kf",
+                external_userid="wm-prod-empty",
+                pending_items=[{"msgid": "msg-prod-empty", "content": "房源表发一下"}],
+                generation=0,
+            )
+        finally:
+            main.wecom_kf = originals["wecom_kf"]
+            main.wecom_kf_context_store = originals["wecom_kf_context_store"]
+            main._understand_message = originals["_understand_message"]
+            main._plan_actions = originals["_plan_actions"]
+            main._send_final_actions = originals["_send_final_actions"]
+            main._build_orchestrator_shadow_artifact = originals["_build_orchestrator_shadow_artifact"]
+            main.settings.kf_dual_llm_mode = originals["mode"]
+            main.kf_turn_generations.clear()
+            main.kf_turn_generations.update(originals["kf_turn_generations"])
+
+        assert sent_calls == []
+        assert fake_wecom.state_store.processed == {"msg-prod-empty"}
+        assert artifacts and artifacts[-1]["final_reply"] == ""
+        saved_dump = json.dumps(fake_store.data, ensure_ascii=False, default=str)
+        assert main.settings.default_fallback_reply not in saved_dump
+        assert "我先帮您确认一下最新房态" not in saved_dump
+
+    asyncio.run(run_case())
+
+
 def test_collect_room_media_production_uses_manifest_exact_listing(monkeypatch) -> None:
     async def run_case() -> None:
         with tempfile.TemporaryDirectory() as directory:
