@@ -37,7 +37,7 @@ def test_build_kf_task_packet_production_prompt_excludes_legacy_summary(monkeypa
                         message=SimpleNamespace(
                             content=(
                                 '{"rewritten_query":"你好",'
-                                '"task_atoms":[{"task_id":"task-1-reply","task_type":"reply_text"}],'
+                                '"task_atoms":[{"task_id":"task-1-reply","task_type":"reply_compose_signal"}],'
                                 '"tool_plan":{"actions":["generate_reply"]}}'
                             )
                         )
@@ -64,6 +64,9 @@ def test_build_kf_task_packet_production_prompt_excludes_legacy_summary(monkeypa
     assert "legacy_planner_summary" not in prompt
     assert "LEGACY_ONLY_REWRITE" not in prompt
     assert "LEGACY_ONLY_PLAN" not in prompt
+    assert "reply_compose_signal" in prompt
+    assert "clarification|reply_text" not in prompt
+    assert "Planner 回流证据" not in prompt
 
 
 def test_rewrite_kf_message_returns_orchestrator_tool_plan_contract(monkeypatch) -> None:
@@ -101,7 +104,7 @@ def test_rewrite_kf_message_returns_orchestrator_tool_plan_contract(monkeypatch)
     system_prompt = captured["messages"][0]["content"]
     assert "tool_plan" in prompt
     assert "工具前阶段" in system_prompt
-    assert "最终话术只能在工具执行后生成" in prompt
+    assert "最终客户可见话术只能由 LLM2 在工具取证后生成" in prompt
     assert "15-2-801B 不能生成 801预算" in system_prompt
     assert "不能输出“又问杨家新雅苑”" in prompt
 
@@ -206,8 +209,8 @@ def test_compose_kf_outbound_shadow_prompt_requires_oralized_media_tense(monkeyp
     assert captured["model"] == "reply-model"
     assert "话术要像真实租房客服" in system_prompt
     assert "不要说“稍后发、等下发、会发你、素材已准备好”" in system_prompt
-    assert "本地 inventory/media/deposit/contract fallback 只会作为 evidence 或 error code" in system_prompt
-    assert "受控渲染边界" in system_prompt
+    assert "确定性 inventory/media/deposit/contract fallback 只允许进入 ToolEvidenceBundle 或 error code" in system_prompt
+    assert "Sender 只执行已验证 send action 和授权槽位追加，不生成客服话术" in system_prompt
     assert "客户可见话术必须口语化" in user_prompt
     assert "已有媒体 send action" in user_prompt
     assert "evidence_type=missing_media" in user_prompt

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 from app.config import settings
@@ -122,6 +123,30 @@ def test_builtin_rule_cards_do_not_restore_legacy_planner_stage() -> None:
     )
 
     assert not any(card.id in {"reply_tool_grounded", "planner_tool_mapping"} for card in cards)
+
+
+def test_builtin_rule_cards_do_not_contain_legacy_planner_or_template_authority() -> None:
+    rules_dir = Path(__file__).resolve().parents[1] / "knowledge" / "kf" / "rules"
+    rules_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(rules_dir.rglob("*.md"))
+    )
+
+    assert (
+        "production 链路固定为 LLM1 工具计划 -> Tool Resolver -> LLM2 客户可见回复 -> Validator -> Sender -> Memory Reducer"
+        in rules_text
+    )
+    for banned in (
+        "Planner 第二阶段生成 reply_text",
+        "独立 Planner 智能层",
+        "LLM2 做选房",
+        "LLM2 做动作判断",
+        "本地模板",
+        "模板负责",
+        "受控渲染边界",
+        "发送阶段或兜底逻辑补话术",
+    ):
+        assert banned not in rules_text
 
 
 def test_rewrite_prompt_includes_stage_rule_cards_without_full_context(monkeypatch, tmp_path) -> None:

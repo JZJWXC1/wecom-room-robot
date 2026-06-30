@@ -129,7 +129,7 @@ class ReplyGenerator:
 脱敏 {llm1_mode_label} 输入：
 {json.dumps(prompt_artifact, ensure_ascii=False, default=str)}
 
-Planner 回流证据：
+Validator / Tool Resolver 回流证据：
 {json.dumps(safe_planner_feedback, ensure_ascii=False, default=str)}
 
 问题重写规则卡片：
@@ -148,7 +148,7 @@ Planner 回流证据：
   "task_atoms": [
     {{
       "task_id": "task-1-search",
-      "task_type": "inventory_search|send_video|send_image|send_inventory_sheet|deposit_policy|contract_contact|viewing_guidance|clarification|reply_text",
+      "task_type": "inventory_search|send_video|send_image|send_inventory_sheet|deposit_policy|contract_contact|viewing_guidance|clarification|reply_compose_signal",
       "user_text": "脱敏后的用户本轮需求",
       "constraint_operation": "inherit|replace|exclude|clear",
       "constraints": {{}},
@@ -225,10 +225,10 @@ Planner 回流证据：
         )
         system_prompt = (
             "你是租房客服 Agentic RAG Orchestrator 的工具前阶段。你要合并完成问题重写、意图分析、目标是否明确、结构化任务包和工具计划。"
-            "本阶段不生成客户可见回复，只输出追问、结构化任务和工具计划。"
+            "本阶段不生成客户可见回复，只输出内部澄清需求、结构化任务和工具计划。"
             "业务域固定为杭州当前房源表，不处理全国城市查询。"
             "已知区域别名必须直接归一：万达=拱墅万达/北部软件园/城北万象城，不得追问“哪个城市的万达”或“哪个万达广场”。"
-            "你只能读取当前原始消息、黑匣子最小记忆、最新房源表事实索引和 Planner 回流证据。"
+            "你只能读取当前原始消息、黑匣子最小记忆、最新房源表事实索引和 Validator / Tool Resolver 回流证据。"
             "你还必须读取最新房源表事实索引；小区、区域、房号、可查询字段、是否需要追问，只能基于这个索引和上下文判断。"
             "事实索引里的 exact_community_hits 只代表客户明确命中的小区；area_related_communities 只是区域下的小区示例，不能当成客户已经指定的小区。"
             "房源字段语义固定：押一付一/押二付一是不同付款方式下的月租价格；备注是水电费；户型描述是详细户型介绍和特点；看房方式密码是密码、空出时间、提前联系等看房方式。"
@@ -253,9 +253,9 @@ Planner 回流证据：
             "如果用户说错小区或房号但不唯一，必须标记需要澄清。"
             "模糊确认只针对房源表内不唯一的小区或房号；命中已知区域别名时直接归一。"
             "你还要判断最可能的意图和置信度；意图不明确时返回 intent=unclear、低置信度，并给一句自然追问。"
-            "如果 Planner 回传缺失证据，你必须重新读取用户原话、上下文、候选、已确认房源和结构化记忆，"
+            "如果 Validator 或 Tool Resolver 回传缺失证据，你必须重新读取用户原话、上下文、候选、已确认房源和结构化记忆，"
             "决定是补出更明确的任务，还是生成基于真实房源/素材索引的追问。"
-            "Planner 反馈不是客户可见内容，不能原样发给客户。"
+            "回流证据不是客户可见内容，不能原样发给客户。"
             "只返回 JSON，不要 Markdown。"
         )
         user_prompt = f"""
@@ -268,7 +268,7 @@ Planner 回流证据：
 最新房源表事实索引：
 {json.dumps(inventory_index or {}, ensure_ascii=False, default=str)}
 
-Planner 回传的内部缺失证据：
+Validator / Tool Resolver 回传的内部缺失证据：
 {json.dumps(planner_feedback or {}, ensure_ascii=False, default=str)}
 
 问题重写相关规则卡片：
@@ -284,7 +284,7 @@ Planner 回传的内部缺失证据：
   "candidate_action": "remainder|select|none",
   "selected_indices": [候选编号，1 开始],
   "needs_clarification": true 或 false,
-  "clarification_text": "需要澄清时给用户的一句话",
+  "clarification_text": "内部澄清需求摘要，不得写客户可见追问句",
   "tool_plan": {{
     "actions": ["按执行顺序排列的工具动作"],
     "confidence": 0.0 到 1.0,
@@ -296,7 +296,7 @@ Planner 回传的内部缺失证据：
 
 规则：
 - tool_plan 是给确定性工具执行层的唯一工具前计划；目标明确时必须给出 actions，目标不明确时 tool_plan.need_rewrite_clarification=true 且 actions=[]。
-- tool_plan 不能包含客户可见 reply_text；最终话术只能在工具执行后生成。
+- tool_plan 不能包含客户可见 reply_text；最终客户可见话术只能由 LLM2 在工具取证后生成。
 - 可用工具动作包括 search_inventory、compact_listing、context_tools、send_video、send_image、send_inventory_sheet、send_deposit_policy、send_contract_contact、explain_missing_media、explain_unavailable_viewing、generate_reply。
 - 需要查房源、价格、房态、预算、户型时，tool_plan 必须包含 search_inventory 和 generate_reply；多套列表加 compact_listing。
 - 需要视频/图片时，tool_plan 必须包含 search_inventory、context_tools、send_video/send_image、explain_missing_media、generate_reply。
@@ -316,9 +316,9 @@ Planner 回传的内部缺失证据：
 - 如果客户同时问视频/图片/密码/看房，intent 要按真实动作返回，不要只返回 inventory。
 - 如果客户要原视频/高清版/可保存转发的视频，query_state 必须同时设置 wants_video=true 和 wants_original_video=true。
 - 如果客户问“价格多少/多少钱/租金多少”，query_state 或 StructuredTask 要保留同时回答押一付一、押二付一的需求；不要窄化成只查押一付一。
-- “这三套视频/前两套视频/1和3视频/都发视频”要在 query_state 中保留数量、序号或全部发送意图，Planner 只负责后续工具规划。
+- “这三套视频/前两套视频/1和3视频/都发视频”要在 query_state 中保留数量、序号或全部发送意图，LLM1 只给出工具计划，具体目标绑定由 Tool Resolver 基于候选和证据完成。
 - 有 pending_video_sends 时，新问题优先按新问题重写；只有明确继续补发才 pending_video_action=continue。
-- 如果 Planner 回传 need_rewrite_clarification，必须结合真实上下文重写出更明确的任务；仍无法唯一绑定时，needs_clarification=true，并只追问当前缺少的真实字段。
+- 如果 Validator 或 Tool Resolver 回传 need_rewrite_clarification，必须结合真实上下文重写出更明确的任务；仍无法唯一绑定时，needs_clarification=true，并只标记当前缺少的真实字段。
 - 如果客户原话看不出要查什么，或者上下文无法绑定，intent=unclear，needs_clarification=true。
 - 不能选择候选列表外的房源。
 - 不确定就 needs_clarification=true，不要强行猜。
@@ -367,15 +367,15 @@ Planner 回传的内部缺失证据：
         system_prompt = (
             f"你是租房客服 Agentic RAG 的 LLM2 outbound {mode_label}，只负责怎么说。"
             "你必须基于 StructuredTaskPacket、ToolEvidenceBundle 和 ResponseStrategy 生成 PreparedOutboundPackage 的文本字段。"
-            "production 模式下，客户可见自然回复只能来自你生成的 reply_text/action_captions 加受控渲染边界；"
-            "本地 inventory/media/deposit/contract fallback 只会作为 evidence 或 error code，不会替你改写最终话术。"
+            "production 模式下，客户可见自然话术只能来自你生成的 reply_text/action_captions；Sender 只执行已验证 send action 和授权槽位追加，不生成客服话术。"
+            "确定性 inventory/media/deposit/contract fallback 只允许进入 ToolEvidenceBundle 或 error code，不会替 LLM2 生成或改写最终话术。"
             "不得决定发哪套房、发什么素材、改 candidate_number、改 listing_id、改 send action。"
             "价格、房态、密码、链接、素材目标只能来自 ToolEvidenceBundle；证据没有返回就不能写。"
             "房源表、缺素材、免押政策、合同联系、看房联系/密码都会以 evidence_type 或受控 send action 形式提供，"
             "你只能引用这些证据来组织客户可见表达。"
             "朝南、有电梯、已空出、可养猫、近地铁等普通事实也必须来自 ToolEvidenceBundle，并写入 claims。"
-            "密码和链接属于高风险内容：不要抄写真值，只引用 evidence_id/slot 让受控发送边界处理。"
-            "合同联系电话和看房密码如出现在受控 send action，只写 action_captions 或留给发送边界渲染，不要在 reply_text 里输出手机号或密码真值。"
+            "密码和链接属于高风险内容：不要抄写真值，只引用 evidence_id/slot 让 Sender 按已验证 action 处理。"
+            "合同联系电话和看房密码如出现在受控 send action，只写 action_captions 或交给 Sender 按已验证 action 追加授权槽位，不要在 reply_text 里输出手机号或密码真值。"
             "话术要像真实租房客服，短句、自然、直接；不要暴露 listing_id、evidence_id、ToolEvidence、send action 等内部名。"
             "已有媒体 send action 时，用“这是某某房间的视频/图片。”这类当前动作说明，"
             "不要说“稍后发、等下发、会发你、素材已准备好”。"
@@ -422,7 +422,7 @@ ResponseStrategy：
 - 合同联系电话、看房密码必须通过受控 action/evidence slot 表达；LLM2 不能自己写手机号或密码真值。
 - evidence_type=deposit_policy 时可以回答免押条件/服务费；evidence_type=missing_media 时只能说明对应素材缺失，不能承诺稍后补发。
 - evidence_type=inventory_sheet 或已有 send_inventory_sheet 动作时，只说明房源表图片会由动作发送，不要改成纯文字房源表。
-- 受控合同/看房 action 存在时，reply_text 写自然引导，真实手机号/密码由受控边界追加；你不得直接生成这些真值。
+- 受控合同/看房 action 存在时，reply_text 写自然引导，真实手机号/密码由 Sender 按已验证 action 追加授权槽位；你不得直接生成这些真值。
 - 不要把房号数字当价格，不要新增工具证据外的价格、房态、朝南、有电梯、已空出、可养猫、近地铁等事实。
 - 客户可见话术必须口语化、短句，不出现内部字段名或工具名。
 - 已有媒体 send action 时，reply_text/action_captions 用“这是某某房间的视频/图片。”，不要写稍后、等下、会发你或素材已准备好。
@@ -499,14 +499,14 @@ ResponseStrategy：
         )
         system_prompt = (
             "你是租房客服 Agentic RAG 的最终回复自检 LLM。"
-            "你只做质检，不重新解释客户意图，不替问题重写层新增需求，不替 Planner 生成客户可见回答；不通过时给 Planner 重规划证据。"
-            "你的职责只有四件事：检查 Planner/工具动作是否完成结构化任务、回复是否匹配问题重写意图、上下文是否连贯、口吻是否像真人客服。"
+            "你只做质检，不重新解释客户意图，不替问题重写层新增需求，不替 LLM1、Tool Resolver 或 LLM2 生成客户可见回答；不通过时按失败层级生成回流证据。"
+            "你的职责只有四件事：检查 LLM1 工具计划与 Tool Resolver 动作是否完成结构化任务、回复是否匹配问题重写意图、上下文是否连贯、口吻是否像真人客服。"
             "还必须检查完整待发送包：文本、图片、视频、房源表动作是否一致；动作说明是否包含标准小区名和房号。"
-            "ConstraintProof 里的区域、预算、户型、小区、房号、候选编号用于校验 Planner 和动作有没有跑偏；"
+            "ConstraintProof 里的区域、预算、户型、小区、房号、候选编号用于校验 LLM1 工具计划和 Tool Resolver 动作有没有跑偏；"
             "不要要求每个约束都逐字出现在客户可见文本里，除非客户要的是文字查询结果或文本本身会让人误解。"
             "房源字段语义固定：押一付一/押二付一是不同付款方式下的月租价格，备注是水电费，户型描述是详细特点，看房方式密码才是密码/空出/提前联系。"
             "如果用户问房源表，回复不能追问小区/价位；如果用户问免押，回复不能发房间图片；"
-            "如果用户问区域和预算，Planner/工具必须按区域和预算执行；文字列表回复要让客户看得出筛选条件，动作型回复不能和动作相矛盾。"
+            "如果用户问区域和预算，LLM1 工具计划和 Tool Resolver 必须按区域和预算执行；文字列表回复要让客户看得出筛选条件，动作型回复不能和动作相矛盾。"
             "如果有明确工具结果，不能让用户重复已经给过的信息。"
             "客服机器人不能声称自己会给客户打电话或电话核对；只能让客户/中介联系指定号码，或请对方补充具体小区房号后继续查。"
             "如果 PreparedOutboundPackage.reply_source 表示硬规则或工具证据生成的确定性回复，且规则自检已通过，"
@@ -547,7 +547,7 @@ ResponseStrategy：
 {{
   "status": "pass|retry|fallback",
   "reason": "不通过原因；通过则为空",
-  "planner_retry_reason": "给 Planner 的重规划说明，必须包含缺什么工具证据或应纠正什么动作",
+  "planner_retry_reason": "给 LLM1 / Tool Resolver 的重规划说明，必须包含缺什么工具证据或应纠正什么动作",
   "fallback_reply": "连续失败时可发给客户的安全回复",
   "human_score": 0 到 100,
   "fact_score": 0 到 100,
@@ -557,13 +557,13 @@ ResponseStrategy：
         判断规则：
         - 通过才 status=pass。
         - 如果待发送草稿回复为空，必须 status=retry；最终自检不能生成回复，也不能把空回复改成安全兜底。
-        - 事实不一致、Planner 动作不满足 StructuredTask、文本答非所问、上下文断裂、动作与文本矛盾、语气不自然到影响使用，才 status=retry。
-        - 不要因为回复没有逐字复述区域/预算/户型就 retry；先看 Planner/工具动作和文本是否已经满足问题重写后的真实需求。
+        - 事实不一致、LLM1 工具计划或 Tool Resolver 动作不满足 StructuredTask、文本答非所问、上下文断裂、动作与文本矛盾、语气不自然到影响使用，才 status=retry。
+        - 不要因为回复没有逐字复述区域/预算/户型就 retry；先看 LLM1 工具计划、Tool Resolver 动作和文本是否已经满足问题重写后的真实需求。
         - 如果待发送包里有视频/图片/房源表，客户可见文本或动作说明必须自然说明“这是某某小区+房号的视频/图片”或“房源表发你了”。
         - 如果文本和动作矛盾，例如动作有房源表但文本说发不了，必须 retry。
 - 如果字段语义误读，例如把押一付一说成押金金额、把备注当普通备注、从备注猜密码，必须 retry。
 - 如果无法通过重规划修复，才 status=fallback，并给安全兜底回复。
-- planner_retry_reason 要写清楚证据：用户真实需求、草稿问题、需要重新调用或补充的工具。
+- 重规划说明要写清楚证据：用户真实需求、草稿问题、需要重新调用或补充的工具。
 """
         response = await self._client_for_stage("selfcheck").chat.completions.create(
             model=self._stage_model("selfcheck"),
