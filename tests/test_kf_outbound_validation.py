@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.services.kf_contracts import (
+    ActionCaption,
     CandidateItem,
     CandidateSet,
     Claim,
@@ -140,6 +141,22 @@ def test_l0_flags_schema_refs_duplicate_actions_and_bad_candidate_ref_type() -> 
     }.issubset(_codes(result))
 
 
+def test_l0_flags_action_caption_unknown_action_and_type_mismatch() -> None:
+    package = _base_package()
+    package.send_actions = [SendAction(action_id="send-video", action_type="video", evidence_id="evd-1")]
+    package.action_captions = [
+        ActionCaption(action_id="send-missing", action_type="video", text="这是星河苑1-101的视频。"),
+        ActionCaption(action_id="send-video", action_type="image", text="这是星河苑1-101的视频。"),
+    ]
+
+    result = validate_prepared_outbound_package(package)
+
+    assert {
+        "l0.unknown_action_ref",
+        "l0.action_caption_type_mismatch",
+    }.issubset(_codes(result))
+
+
 def test_l1_checks_claim_value_listing_snapshot_and_sensitive_slots() -> None:
     candidate_set = _candidate_set()
     package = PreparedOutboundPackage(
@@ -244,6 +261,23 @@ def test_l3_returns_rewrite_reasons_without_mutating_facts() -> None:
         "l3.action_tense_error",
     }.issubset(_codes(result))
     assert package.reply_text == "listing_id=lst-1，XX小区我稍后发你视频，你预算多少？"
+
+
+def test_l3_checks_action_caption_tense_and_internal_words_without_blocking_facts() -> None:
+    package = _base_package()
+    package.send_actions = [SendAction(action_id="send-video", action_type="video", evidence_id="evd-1")]
+    package.action_captions = [
+        ActionCaption(action_id="send-video", action_type="video", text="listing_id=lst-1，稍后发你视频。"),
+    ]
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.REWRITE_REQUIRED
+    assert result.facts_passed is True
+    assert {
+        "l3.internal_name_leak",
+        "l3.action_tense_error",
+    }.issubset(_codes(result))
 
 
 def test_legacy_claim_without_structured_value_still_uses_evidence_refs() -> None:

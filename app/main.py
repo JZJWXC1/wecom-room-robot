@@ -6626,6 +6626,27 @@ def _llm2_production_retry_reason_payload(
     return json.dumps(safe_artifact_payload(payload), ensure_ascii=False, default=str)
 
 
+def _llm2_production_rewrite_reason_payload(
+    *,
+    understanding: dict[str, Any],
+    tool_evidence: dict[str, Any],
+    rule_selfcheck: dict[str, Any],
+    reason: str,
+) -> str:
+    raw_payload = json.loads(
+        _llm2_production_retry_reason_payload(
+            understanding=understanding,
+            tool_evidence=tool_evidence,
+            rule_selfcheck=rule_selfcheck,
+            llm_selfcheck={"status": "skipped", "source": "llm2_rewrite_only"},
+            reason=reason,
+        )
+    )
+    raw_payload["source"] = "llm2_production_safe_rewrite_payload"
+    raw_payload["retry_target"] = "llm2"
+    return json.dumps(safe_artifact_payload(raw_payload), ensure_ascii=False, default=str)
+
+
 def _reply_mentions_any(reply_text: str, values: list[str]) -> bool:
     normalized_reply = normalize_search_text(reply_text)
     for value in values:
@@ -7726,46 +7747,6 @@ def _controlled_reply_from_outbound_package(package: Any) -> str:
     return "\n".join(dict.fromkeys(line for line in lines if line)).strip()
 
 
-def _caption_reply_from_outbound_package(package: Any) -> str:
-    lines: list[str] = []
-    for caption in getattr(package, "action_captions", []) or []:
-        action_type = str(getattr(caption, "action_type", "") or "")
-        if action_type in {"contract_contact", "viewing_password", "viewing_contact"}:
-            continue
-        text = str(getattr(caption, "text", "") or "").strip()
-        if text:
-            lines.append(text)
-    return "\n".join(dict.fromkeys(lines)).strip()
-
-
-def _customer_visible_reply_from_outbound_package(package: Any) -> str:
-    llm_text = str(getattr(package, "reply_text", "") or "").strip()
-    controlled_text = _controlled_reply_from_outbound_package(package)
-    return "\n".join(dict.fromkeys(part for part in (llm_text, controlled_text) if part)).strip()
-
-
-def _llm2_production_safe_fallback_reply(
-    *,
-    package: Any,
-    understanding: dict[str, Any],
-    tool_evidence: dict[str, Any],
-) -> str:
-    caption_text = _caption_reply_from_outbound_package(package)
-    controlled_text = _controlled_reply_from_outbound_package(package)
-    combined = "\n".join(dict.fromkeys(part for part in (caption_text, controlled_text) if part)).strip()
-    if combined:
-        return combined
-    actions = {str(action) for action in tool_evidence.get("actions") or []}
-    if "send_inventory_sheet" in actions or tool_evidence.get("inventory_images"):
-        return "房源表发你了，你可以让客户先整体看一下。"
-    if tool_evidence.get("missing_media"):
-        return "这次没有稳定匹配到可发送素材，我先不乱发。你回小区+房号，我再按那套重新查。"
-    intent = _normalize_intent(understanding.get("intent"))
-    if intent == "deposit":
-        return "免押需要按支付宝无忧住页面的芝麻信用评估结果确认，我这边先不展开没有证据的金额。"
-    return "我这边先不乱说。你把小区、房号或想确认的信息再发我，我按最新房源表重新核对。"
-
-
 def _reply_for_missing_media(understanding: dict[str, Any], tool_evidence: dict[str, Any]) -> str:
     proof = dict(understanding.get("constraint_proof") or {})
     missing = [str(item) for item in tool_evidence.get("missing_media") or [] if str(item).strip()]
@@ -8500,7 +8481,14 @@ def _outbound_package_selfcheck(
 ) -> dict[str, Any]:
     fail_reasons: list[str] = []
     text = str(draft_reply or "")
-    forbidden = ("此处触发", "动作证据", "真实匹配项", "列出真实", "系统生成房源表图片时出现", "[发送房源表图片]")
+    forbidden = (
+        "此处触发",
+        "动作证据",
+        "真实匹配项",
+        "列出真实",
+        "系统生成房源表图片时出现",
+        "[发送房源表图片]",
+    )
     if any(word in text for word in forbidden):
         fail_reasons.append("回复泄漏了内部模板词或动作说明")
     placeholder_room_words = (
@@ -8528,278 +8516,11 @@ def _outbound_package_selfcheck(
         fail_reasons.append("图片动作包含不存在的本地文件")
     if missing_inventory_images:
         fail_reasons.append("房源表动作包含不存在的本地图片")
-    if outbound_package.get("inventory_images"):
-        if any(
-            word in text
-            for word in (
-                "没法直接发",
-                "无法直接发送",
-                "暂时无法生成",
-                "不能发房源表",
-                "暂时没查到",
-                "暂未查到",
-                "没查到",
-                "房源表暂未更新",
-                "暂未更新",
-                "没生成成功",
-                "暂时没生成成功",
-                "暂时无法发送",
-                "稍后再试",
-                "记录需求",
-                "第一时间发",
-                "有新房源会",
-                "先不乱发",
-            )
-        ):
-            fail_reasons.append("房源表图片动作存在，但文本说不能发送房源表")
-        if not outbound_package.get("inventory_explanation"):
-            fail_reasons.append("房源表动作缺少客户可见解释")
-    if outbound_package.get("image_paths") and not outbound_package.get("image_explanations"):
-        fail_reasons.append("图片动作缺少小区+房号解释")
-    if outbound_package.get("video_paths") and not outbound_package.get("video_explanations"):
-        fail_reasons.append("视频动作缺少小区+房号解释")
-    if outbound_package.get("video_paths") and not outbound_package.get("missing_media"):
-        if any(
-            phrase in text
-            for phrase in (
-                "视频暂时没同步",
-                "视频还没同步",
-                "暂时没找到视频",
-                "没找到视频",
-                "暂无视频",
-                "没有视频",
-                "暂时没有视频",
-                "暂无其他视频素材",
-                "正在补同步",
-                "稍后会发",
-                "稍后发您",
-                "稍后发你",
-                "等补全后",
-                "补全后我再发",
-            )
-        ):
-            fail_reasons.append("视频已准备发送时，回复不能再暗示该视频未同步或稍后再发")
-    if outbound_package.get("image_paths") and not outbound_package.get("missing_media"):
-        if any(
-            phrase in text
-            for phrase in (
-                "图片暂时没同步",
-                "图片还没同步",
-                "照片暂时没同步",
-                "暂时没找到图片",
-                "暂时没找到照片",
-                "没找到图片",
-                "没找到照片",
-                "暂无图片",
-                "暂无照片",
-                "没有图片",
-                "没有照片",
-                "暂时没有图片",
-                "暂时没有照片",
-                "暂无其他图片素材",
-                "暂无其他照片素材",
-                "正在补同步",
-                "稍后会发",
-                "稍后发您",
-                "稍后发你",
-                "等补全后",
-                "补全后我再发",
-            )
-        ):
-            fail_reasons.append("图片已准备发送时，回复不能再暗示该图片未同步或稍后再发")
-    if outbound_package.get("missing_media") and not any(word in text for word in ("没找到", "暂无", "暂时没有", "只找到", "缺", "补素材", "正在")):
-        fail_reasons.append("素材缺失时回复没有说明缺哪类素材或下一步")
-    missing_labels: list[str] = []
-    for item in outbound_package.get("missing_media") or []:
-        label = str(item).split(":", 1)[0].strip()
-        if label and label not in missing_labels:
-            missing_labels.append(label)
-    if missing_labels and not _reply_mentions_any(text, missing_labels[:5]):
-        fail_reasons.append("素材缺失时回复必须点名缺素材的小区+房号，不能只说有些房源缺素材")
-    sent_video_labels: list[str] = []
-    for row in tool_evidence.get("video_rows") or []:
-        if isinstance(row, dict):
-            label = _row_label(row)
-            if label and label not in sent_video_labels:
-                sent_video_labels.append(label)
-    if not sent_video_labels:
-        for explanation in outbound_package.get("video_explanations") or []:
-            label = str(explanation).strip()
-            label = label.removeprefix("这是").removesuffix("的视频。").removesuffix("的视频")
-            if label and label not in sent_video_labels:
-                sent_video_labels.append(label)
-    sent_image_labels: list[str] = []
-    for row in tool_evidence.get("image_rows") or []:
-        if isinstance(row, dict):
-            label = _row_label(row)
-            if label and label not in sent_image_labels:
-                sent_image_labels.append(label)
-    if not sent_image_labels:
-        for explanation in outbound_package.get("image_explanations") or []:
-            label = str(explanation).strip()
-            label = label.removeprefix("这是").removesuffix("的图片。").removesuffix("的图片")
-            if label and label not in sent_image_labels:
-                sent_image_labels.append(label)
-    duplicate_video_missing = [label for label in sent_video_labels if label in missing_labels]
-    duplicate_image_missing = [label for label in sent_image_labels if label in missing_labels]
-    if duplicate_video_missing:
-        fail_reasons.append("同一房源既准备发送视频，又被标记为缺视频素材")
-    if duplicate_image_missing:
-        fail_reasons.append("同一房源既准备发送图片，又被标记为缺图片素材")
-    def label_local_segment_at(label: str, label_index: int, labels: list[str]) -> str:
-        if label_index < 0:
-            return ""
-        end_index = len(text)
-        for other in labels:
-            if other == label:
-                continue
-            other_index = text.find(other, label_index + len(label))
-            if other_index >= 0:
-                end_index = min(end_index, other_index)
-        punctuation_indexes = [
-            index
-            for index in (text.find(mark, label_index + len(label)) for mark in ("。", "；", ";", "\n"))
-            if index >= 0
-        ]
-        if punctuation_indexes:
-            end_index = min(end_index, min(punctuation_indexes))
-        return text[label_index:end_index]
-
-    def label_local_segments(label: str, labels: list[str]) -> list[str]:
-        return [
-            label_local_segment_at(label, match.start(), labels)
-            for match in re.finditer(re.escape(label), text)
-        ]
-
-    if len(sent_video_labels) >= 2:
-        for label in sent_video_labels:
-            label_index = text.find(label)
-            if label_index < 0:
-                fail_reasons.append("多套视频动作回复必须逐套点名小区+房号")
-                break
-            if not any("视频" in segment for segment in label_local_segments(label, sent_video_labels)):
-                fail_reasons.append("多套视频动作回复必须逐套说明“这是小区+房号的视频”")
-                break
-    if len(sent_image_labels) >= 2:
-        for label in sent_image_labels:
-            label_index = text.find(label)
-            if label_index < 0:
-                fail_reasons.append("多套图片动作回复必须逐套点名小区+房号")
-                break
-            if not any(
-                any(word in segment for word in ("图片", "照片"))
-                for segment in label_local_segments(label, sent_image_labels)
-            ):
-                fail_reasons.append("多套图片动作回复必须逐套说明“这是小区+房号的图片”")
-                break
-    negative_video_phrases = ("暂时没找到视频", "没找到视频", "暂无视频", "没有视频", "暂时没有视频")
-    negative_image_phrases = ("暂时没找到图片", "暂时没找到照片", "没找到图片", "没找到照片", "暂无图片", "暂无照片", "没有图片", "没有照片", "暂时没有图片", "暂时没有照片")
-    for label in sent_video_labels:
-        label_index = text.find(label)
-        if label_index < 0:
-            continue
-        window = text[max(0, label_index - 24) : min(len(text), label_index + len(label) + 24)]
-        if any(phrase in window for phrase in negative_video_phrases):
-            fail_reasons.append("视频动作已准备发送，但文本说同一房源没有视频")
-            break
-    for label in sent_image_labels:
-        label_index = text.find(label)
-        if label_index < 0:
-            continue
-        window = text[max(0, label_index - 24) : min(len(text), label_index + len(label) + 24)]
-        if any(phrase in window for phrase in negative_image_phrases):
-            fail_reasons.append("图片动作已准备发送，但文本说同一房源没有图片")
-            break
-    if not video_paths and not image_paths and any(phrase in text for phrase in ("前面已经有的素材", "先看前面已经有", "先看前面已发")):
-        fail_reasons.append("没有待发送图片/视频动作时，回复不能让客户先看前面素材")
-    rule_evidence = dict(tool_evidence.get("rule_evidence") or {})
-    if rule_evidence.get("contract_contact") and not _reply_mentions_any(text, list(CONTACT_NUMBERS)):
-        fail_reasons.append("定房/合同链路回复遗漏联系电话")
-    if rule_evidence.get("viewing_contact") and not _reply_mentions_any(text, list(CONTACT_NUMBERS)):
-        fail_reasons.append("看房密码/预约异常回复遗漏联系电话")
-    if rule_evidence.get("deposit_policy"):
-        if "芝麻" not in text or not any(token in text for token in ("5.5", "7%", "8%", "服务费")):
-            fail_reasons.append("免押链路回复遗漏芝麻信用或服务费规则")
-    if any(word in text for word in ("押一付一押金", "押二付一押金", "押一付一的押金", "押二付一的押金")):
-        fail_reasons.append("把押一付一/押二付一误说成押金金额")
-    if any(
-        phrase in text
-        for phrase in (
-            "我这边直接电话",
-            "我直接电话",
-            "我给你打电话",
-            "我给您打电话",
-            "电话跟你核对",
-            "电话跟您核对",
-            "直接电话跟",
-            "电话我",
-            "打我电话",
-            "直接打我",
-            "可以电话我",
-        )
-    ):
-        fail_reasons.append("客服机器人不能声称自己会打电话核对，只能让用户联系号码或提供具体房号继续查")
-    actions = [str(action) for action in tool_evidence.get("actions") or []]
-    media_request = dict(tool_evidence.get("media_request") or {})
-    original_video_request = dict(tool_evidence.get("original_video_request") or {})
-    if original_video_request.get("requested"):
-        has_original_source = bool(
-            original_video_request.get("has_original_source")
-            or outbound_package.get("original_video_urls")
-            or outbound_package.get("material_page_urls")
-        )
-        original_claim_words = ("原视频已发", "原片已发", "高清已发", "高清版已发", "源文件已发")
-        if not has_original_source and any(word in text for word in original_claim_words):
-            fail_reasons.append("客户要原视频/高清时，没有原片证据不能声称已发送原视频")
-        if outbound_package.get("video_paths") and not has_original_source:
-            if not any(word in text for word in ("压缩", "原视频", "高清", "源文件", "下载链接", "素材页")):
-                fail_reasons.append("客户要原视频/高清时，普通视频动作必须说明企微视频可能压缩或没有原素材下载链接")
-        if not outbound_package.get("video_paths") and not has_original_source:
-            if not any(word in text for word in ("原视频", "高清", "源文件", "下载链接", "没找到", "暂无", "暂时没有", "不乱发")):
-                fail_reasons.append("客户要原视频/高清但没有视频动作时，回复必须说明没有稳定找到原素材或普通视频")
-    if media_request.get("wants_video") and not outbound_package.get("video_paths"):
-        if not any(
-            word in text
-            for word in (
-                "没找到",
-                "没匹配到",
-                "暂无",
-                "暂时没有",
-                "还没稳定绑定",
-                "回我序号",
-                "小区名+房号",
-                "小区+房号",
-                "具体房源",
-            )
-        ):
-            fail_reasons.append("视频请求没有发出视频时，回复没有说明缺视频或目标未绑定")
-    if "视频" in text and not outbound_package.get("video_paths"):
-        claimed_video_send = False
-        for match in re.finditer("视频", text):
-            window = text[max(0, match.start() - 20) : min(len(text), match.end() + 20)]
-            if any(word in window for word in ("没找到", "没匹配到", "暂无", "暂时没有", "不能发", "无法发")):
-                continue
-            if any(word in window for word in ("已找到", "已发", "发出", "发你", "发您", "发给", "稍后发", "马上发", "补发")):
-                claimed_video_send = True
-                break
-        if claimed_video_send:
-            fail_reasons.append("回复声称发送或即将发送视频，但待发送包没有视频动作")
-    if media_request.get("wants_image") and not outbound_package.get("image_paths"):
-        if not any(word in text for word in ("没找到", "暂无", "暂时没有", "还没稳定绑定", "回我序号", "小区名+房号")):
-            fail_reasons.append("图片请求没有发出图片时，回复没有说明缺图片或目标未绑定")
-    if any(word in text for word in ("图片", "照片")) and not outbound_package.get("image_paths") and not outbound_package.get("inventory_images"):
-        if any(word in text for word in ("已找到", "已发", "发出", "发你", "发您", "发给", "稍后发", "马上发", "补发")):
-            fail_reasons.append("回复声称发送或即将发送图片，但待发送包没有图片动作")
-    if "send_inventory_sheet" in actions and not outbound_package.get("inventory_images"):
-        if "房源表" in text and any(word in text for word in ("发你", "发给你", "查收", "发送")):
-            fail_reasons.append("房源表图片未准备好，但回复说已经发送或即将发送")
     if fail_reasons:
         return {
             "status": "retry",
             "action": "retry",
             "reason": "；".join(fail_reasons),
-            "fallback_text": "",
-            "fallback_reply": "",
             "source": "outbound_package_selfcheck",
         }
     return {"status": "pass", "source": "outbound_package_selfcheck"}
@@ -8818,188 +8539,36 @@ def _local_human_context_selfcheck(
         fail_reasons.append("Planner 没有输出 reply_text，不能进入发送阶段")
     if not text:
         fail_reasons.append("回复为空")
-    if len(text) > 900 and not tool_evidence.get("inventory_images"):
-        fail_reasons.append("回复过长，不适合企业微信客服即时对话")
-    if text.count("请问") >= 2 and any(word in content for word in ("视频", "图片", "密码", "房源表", "有没有", "还有")):
-        fail_reasons.append("回复连续追问，未贴着客户当前需求接话")
-    if any(word in text for word in ("作为AI", "作为一个AI", "根据上下文", "系统显示", "无法完成该请求")):
-        fail_reasons.append("回复有系统模板感，不像真人客服")
-    if any(
-        word in text
-        for word in (
-            "马上通知你",
-            "马上通知您",
-            "有合适的马上通知",
-            "帮你留意着",
-            "帮您留意着",
-            "后面通知你",
-            "后面通知您",
-            "稍后会通知",
-            "稍后通知",
-            "稍后会发",
-            "后面会发",
-            "补同步中，稍后",
-            "补齐后发",
-            "后面素材补齐",
-            "素材补齐再处理",
-            "素材补齐后",
-            "稍后发你",
-            "稍后发您",
-            "有新资源会第一时间通知",
-            "有新房源会第一时间通知",
-            "有新资源第一时间通知",
-            "有新房源第一时间通知",
-            "持续更新房源信息",
-            "持续更新房源",
-            "稍后会为您推送",
-            "稍后会为你推送",
-            "为您推送最新",
-            "为你推送最新",
-            "推送最新信息",
-        )
-    ):
-        fail_reasons.append("机器人不能承诺后续主动通知客户，只能说明可继续按条件查询或让客户再发需求")
-    generic_waiting_phrases = (
-        "我先帮您确认一下最新房态",
-        "稍后给您准确回复",
-        "稍后确认",
-        "我查一下",
-        "我先查一下",
-        "我这边查一下",
-        "帮你查一下",
-        "帮您查一下",
-        "我帮你查一下",
-        "我帮您查一下",
-        "稍等",
-        "稍等一下",
-        "马上查",
-        "我马上查",
-        "马上给你查",
-        "马上给您查",
-        "马上列出来",
-        "马上给你列",
-        "马上给您列",
-        "列出来给你",
-        "列出来给您",
+    hard_forbidden_phrases = (
+        "作为AI",
+        "作为一个AI",
+        "系统显示",
+        "根据上下文",
+        "无法完成该请求",
+        "马上通知你",
+        "马上通知您",
+        "稍后通知你",
+        "稍后通知您",
+        "稍后会通知你",
+        "稍后会通知您",
+        "稍后会为你推送",
+        "稍后会为您推送",
+        "有新房源会第一时间通知",
+        "有新资源会第一时间通知",
     )
-    has_tool_evidence = bool(
-        tool_evidence.get("inventory_rows")
-        or tool_evidence.get("target_rows")
-        or tool_evidence.get("image_paths")
-        or tool_evidence.get("video_paths")
-        or tool_evidence.get("inventory_images")
-        or tool_evidence.get("rule_evidence")
-    )
-    if any(word in text for word in generic_waiting_phrases):
-        if any(word in content for word in ("有没有", "还有", "有", "还在", "在不在", "价格", "多少钱", "视频", "图片", "密码", "看房", "房源表", "哪些")):
-            fail_reasons.append("客户问明确房源/素材/看房问题时，不能只回复稍后确认")
-    asks_list_or_area_inventory = any(word in content for word in ("有哪些", "哪几套", "几套", "附近", "这边有没有", "有没有")) and not any(
-        word in content for word in ("还在", "在不在")
-    )
-    first_sentence = re.split(r"[。！？\n]", text, maxsplit=1)[0]
-    if asks_list_or_area_inventory and (
-        re.match(r"^\s*(在的|还在|还在的)", text)
-        or (first_sentence.strip().startswith("在") and "还在" in first_sentence)
-    ):
-        fail_reasons.append("列表/区域查询要先说有的或暂时没查到，不能用还在/在的开头")
-    asks_viewing_or_password = _content_wants_viewing(content) or any(
-        word in content
-        for word in (
-            "能看",
-            "自助",
-            "怎么去",
-            "预约",
-            "门",
-            "打不通",
-        )
-    )
-    if not asks_viewing_or_password and ("密码" in text or re.search(r"\b\d{4,8}#", text)):
-        fail_reasons.append("客户没有问看房或密码时，回复不能主动给看房密码")
-    needs_contact_in_reply = any(
-        word in text
-        for word in (
-            "提前联系",
-            "提前预约",
-            "预约看房",
-            "安排看房",
-            "确认时间",
-            "看房需联系",
-            "需要联系",
-            "未空出",
-            "没空出",
-            "还没空出",
-            "不能直接看",
-            "暂时不能看",
-        )
-    )
-    if needs_contact_in_reply and not any(number in text for number in CONTACT_NUMBERS):
-        fail_reasons.append("看房需要提前联系、预约或未空出时，必须给三个联系电话")
-    media_request = dict(tool_evidence.get("media_request") or {})
-    asks_video_or_image = (
-        any(word in content for word in ("视频", "图片", "照片", "素材", "实拍"))
-        or bool(media_request.get("wants_video") or media_request.get("wants_image"))
-        or deterministic_reply_source in {"prepared_media_reply", "missing_media_reply"}
-    )
-    asks_inventory_sheet = "房源表" in content or "表格" in content or re.search(r"(^|[，。；\s])表(发|给|看|来|传)", content)
-    if not asks_video_or_image and (
-        any(
-            word in text
-            for word in (
-                "视频素材",
-                "图片素材",
-                "照片素材",
-                "暂时没找到视频",
-                "暂时没匹配到可直接发视频",
-                "暂未匹配到可直接发视频",
-                "暂未匹配到可直接发送视频",
-                "暂未查到可直接发视频",
-                "暂未查到可直接发送视频",
-                "暂时没查到可直接发视频",
-                "暂时没查到可直接发送视频",
-                "没匹配到可直接发送视频",
-                "没查到可直接发视频",
-                "没查到可直接发送视频",
-                "暂未匹配到可直接发送视频或图片",
-                "暂未查到可直接发送视频或图片",
-                "暂未匹配到可直接发视频或图片",
-                "暂未查到可直接发视频或图片",
-                "没匹配到可直接发视频",
-                "没匹配到可直接发送视频或图片",
-                "暂时没找到图片",
-                "暂时没找到照片",
-                "视频暂未找到",
-                "图片暂未找到",
-                "照片暂未找到",
-                "视频和图片暂未找到",
-            )
-        )
-        or re.search(r"(视频|图片|照片)[^。；\n]{0,12}(暂未|暂无|没找到|未找到|没匹配到)", text)
-        or re.search(r"(暂未|暂无|没找到|未找到|没匹配到|没查到|暂时没查到)[^。；\n]{0,18}(视频|图片|照片)", text)
-    ):
-        fail_reasons.append("客户没有问图片/视频时，回复不能主动提素材缺失")
-    if not asks_inventory_sheet and "房源表" in text and any(word in text for word in ("可以先看", "先看", "发你", "发您")):
-        fail_reasons.append("客户没有要房源表时，回复不能主动让客户看房源表")
-    if "回复序号" in text:
-        numbered = bool(re.search(r"(?:^|\n)\s*[1-9][0-9]?[.、]", text))
-        if not numbered:
-            fail_reasons.append("回复要求客户回序号，但正文没有编号候选")
-    if deterministic_reply_source and deterministic_reply_source.endswith("_hard_rule"):
-        if any(word in text for word in ("我帮您", "我帮你", "我这边", "发你", "联系", "看房", "客户", "这套", "这几套")):
-            pass
-        elif not tool_evidence.get("inventory_images"):
-            fail_reasons.append("确定性规则回复口吻过硬，缺少客服接话感")
+    if any(word in text for word in hard_forbidden_phrases):
+        fail_reasons.append("回复包含硬禁语或系统模板感")
     if fail_reasons:
         return {
             "status": "retry",
             "action": "retry",
             "reason": "；".join(fail_reasons),
             "source": "local_human_context_selfcheck",
-            "fallback_reply": "",
         }
     return {
         "status": "pass",
         "source": "local_human_context_selfcheck",
-        "checked": ["context_fit", "human_tone_baseline"],
+        "checked": ["hard_forbidden_phrases"],
     }
 
 
@@ -9029,7 +8598,6 @@ def _needs_llm_final_selfcheck(
     if deterministic_reply_source in {
         "kf_llm2_outbound_production",
         "kf_llm2_outbound_production_controlled",
-        "llm2_production_l3_safe_fallback",
     }:
         return False
     proof = dict(understanding.get("constraint_proof") or {})
@@ -9593,9 +9161,10 @@ async def _generate_reply_result(
         tool_evidence["deterministic_reply_source"] = deterministic_reply_source
     if _dual_llm_production_enabled():
         llm2_retry_reason = ""
-        llm2_safe_fallback_reason = ""
+        llm2_rewrite_reason = ""
         task_packet = understanding.get("llm1_task_packet")
         production_package_payload: dict[str, Any] = {}
+        production_attempt_payloads: list[dict[str, Any]] = []
         if not isinstance(task_packet, dict) or not task_packet:
             llm2_retry_reason = "LLM1 production task packet is missing; LLM2 production cannot compose customer reply."
             production_package_payload = {
@@ -9604,190 +9173,115 @@ async def _generate_reply_result(
             }
         else:
             timeout_seconds = _llm2_production_timeout_seconds()
-            started_at = time.monotonic()
-            try:
-                production_package = await asyncio.wait_for(
-                    kf_dual_llm_production.compose_production_outbound_package(
-                        reply_generator=reply_generator,
-                        task_packet=task_packet,
-                        tool_evidence=tool_evidence,
-                        draft_reply=draft_reply,
-                        planner_result=planner_result or {},
-                        reply_result={"reply": draft_reply, "reply_source": deterministic_reply_source},
-                        retry_reason=retry_reason,
-                    ),
-                    timeout=timeout_seconds,
-                )
-                production_package_payload = kf_dual_llm_production.package_log_payload(production_package)
-                production_visible_reply = _customer_visible_reply_from_outbound_package(production_package)
-                outbound_validation = kf_dual_llm_production.validate_production_outbound_package(
-                    production_package,
-                    task_packet=task_packet,
-                    user_asked_password=_user_explicitly_asked_password_for_controlled_channel(content, understanding),
-                    known_constraints=dict(understanding.get("constraint_proof") or {}),
-                )
-                validation_payload = outbound_validation.to_dict()
-                production_package_payload["outbound_validation"] = validation_payload
-                if (
-                    kf_dual_llm_production.package_passed(production_package)
-                    and outbound_validation.passed
-                    and production_visible_reply
-                ):
-                    draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
-                        production_visible_reply
-                    )
-                    deterministic_reply_source = (
-                        "kf_llm2_outbound_production_controlled"
-                        if _controlled_reply_from_outbound_package(production_package)
-                        else "kf_llm2_outbound_production"
-                    )
-                    tool_evidence["deterministic_reply_source"] = deterministic_reply_source
-                    outbound_dict = production_package.to_legacy_dict()
-                    tool_evidence["llm2_production_outbound_package"] = outbound_dict
-                elif (
-                    kf_dual_llm_production.package_passed(production_package)
-                    and outbound_validation.requires_rewrite
-                    and not outbound_validation.blocking_issues
-                ):
-                    l3_retry_reason = kf_dual_llm_production.outbound_validation_retry_reason(outbound_validation)
-                    initial_l3_payload = dict(production_package_payload)
-                    retry_started_at = time.monotonic()
-                    try:
-                        retry_package = await asyncio.wait_for(
-                            kf_dual_llm_production.compose_production_outbound_package(
-                                reply_generator=reply_generator,
-                                task_packet=task_packet,
-                                tool_evidence=tool_evidence,
-                                draft_reply="",
-                                planner_result=planner_result or {},
-                                reply_result={"reply": "", "reply_source": "llm2_l3_retry"},
-                                retry_reason=l3_retry_reason,
-                            ),
-                            timeout=timeout_seconds,
-                        )
-                        retry_payload = kf_dual_llm_production.package_log_payload(retry_package)
-                        retry_validation = kf_dual_llm_production.validate_production_outbound_package(
-                            retry_package,
+            user_asked_password = _user_explicitly_asked_password_for_controlled_channel(content, understanding)
+            known_constraints = dict(understanding.get("constraint_proof") or {})
+
+            async def compose_and_validate_llm2(attempt_name: str, attempt_retry_reason: str) -> bool:
+                nonlocal draft_reply
+                nonlocal deterministic_reply_source
+                nonlocal llm2_retry_reason
+                nonlocal llm2_rewrite_reason
+                nonlocal production_package_payload
+
+                started_at = time.monotonic()
+                try:
+                    production_package = await asyncio.wait_for(
+                        kf_dual_llm_production.compose_production_outbound_package(
+                            reply_generator=reply_generator,
                             task_packet=task_packet,
-                            user_asked_password=_user_explicitly_asked_password_for_controlled_channel(content, understanding),
-                            known_constraints=dict(understanding.get("constraint_proof") or {}),
-                        )
-                        retry_payload["outbound_validation"] = retry_validation.to_dict()
-                        production_package_payload["l3_retry"] = retry_payload
-                        retry_visible_reply = _customer_visible_reply_from_outbound_package(retry_package)
-                        if (
-                            kf_dual_llm_production.package_passed(retry_package)
-                            and retry_validation.passed
-                            and retry_visible_reply
-                        ):
-                            production_package_payload = {
-                                **retry_payload,
-                                "selected_attempt": "l3_retry",
-                                "l3_initial": initial_l3_payload,
-                            }
-                            draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
-                                retry_visible_reply
-                            )
-                            deterministic_reply_source = (
-                                "kf_llm2_outbound_production_controlled"
-                                if _controlled_reply_from_outbound_package(retry_package)
-                                else "kf_llm2_outbound_production"
-                            )
-                            tool_evidence["deterministic_reply_source"] = deterministic_reply_source
-                            outbound_dict = retry_package.to_legacy_dict()
-                            tool_evidence["llm2_production_outbound_package"] = outbound_dict
-                        elif (
-                            kf_dual_llm_production.package_passed(retry_package)
-                            and retry_validation.requires_rewrite
-                            and not retry_validation.blocking_issues
-                        ):
-                            fallback_reply = _llm2_production_safe_fallback_reply(
-                                package=retry_package,
-                                understanding=understanding,
-                                tool_evidence=tool_evidence,
-                            )
-                            draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(fallback_reply)
-                            deterministic_reply_source = "llm2_production_l3_safe_fallback"
-                            tool_evidence["deterministic_reply_source"] = deterministic_reply_source
-                            llm2_safe_fallback_reason = (
-                                kf_dual_llm_production.outbound_validation_retry_reason(retry_validation)
-                                or l3_retry_reason
-                            )
-                            production_package_payload["selected_attempt"] = "l3_safe_fallback"
-                            production_package_payload["l3_safe_fallback"] = {
-                                "source": "llm2_production_l3_safe_fallback",
-                                "reason": _llm2_production_safe_retry_reason(llm2_safe_fallback_reason),
-                                "reply_text_present": bool(draft_reply),
-                            }
-                        else:
-                            llm2_retry_reason = (
-                                kf_dual_llm_production.outbound_validation_retry_reason(retry_validation)
-                                or kf_dual_llm_production.package_retry_reason(retry_package)
-                            )
-                    except Exception as exc:
-                        logger.warning("KF LLM2 production L3 retry failed: error_type=%s", type(exc).__name__)
-                        fallback_reply = _llm2_production_safe_fallback_reply(
-                            package=production_package,
-                            understanding=understanding,
                             tool_evidence=tool_evidence,
-                        )
-                        draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(fallback_reply)
-                        deterministic_reply_source = "llm2_production_l3_safe_fallback"
-                        tool_evidence["deterministic_reply_source"] = deterministic_reply_source
-                        llm2_safe_fallback_reason = l3_retry_reason or "kf_outbound_validation L3 rewrite required"
-                        production_package_payload["selected_attempt"] = "l3_safe_fallback"
-                        production_package_payload["l3_retry"] = {
-                            **_dual_llm_production_failure_metadata(
-                                stage="llm2",
-                                timeout_seconds=timeout_seconds,
-                                started_at=retry_started_at,
-                                exc=exc,
-                            ),
-                            "self_review": {
-                                "status": "retry",
-                                "source": "llm2_production_l3_retry_error",
-                            },
-                        }
-                        production_package_payload["l3_safe_fallback"] = {
-                            "source": "llm2_production_l3_safe_fallback",
-                            "reason": _llm2_production_safe_retry_reason(llm2_safe_fallback_reason),
-                            "reply_text_present": bool(draft_reply),
-                        }
-                else:
-                    llm2_retry_reason = (
-                        kf_dual_llm_production.outbound_validation_retry_reason(outbound_validation)
-                        or kf_dual_llm_production.package_retry_reason(production_package)
+                            draft_reply=draft_reply,
+                            planner_result=planner_result or {},
+                            reply_result={"reply": draft_reply, "reply_source": deterministic_reply_source},
+                            retry_reason=attempt_retry_reason,
+                        ),
+                        timeout=timeout_seconds,
                     )
-            except Exception as exc:
-                logger.warning("KF LLM2 production outbound failed: error_type=%s", type(exc).__name__)
-                llm2_retry_reason = "LLM2 production outbound failed; do not continue with customer-visible facts."
-                failure_metadata = _dual_llm_production_failure_metadata(
-                    stage="llm2",
-                    timeout_seconds=timeout_seconds,
-                    started_at=started_at,
-                    exc=exc,
-                )
-                production_package_payload = {
-                    **failure_metadata,
-                    "self_review": {
-                        "status": "retry",
-                        "source": "llm2_production_error_gate",
-                        "error_type": failure_metadata["error_type"],
-                    },
-                    "reply_text_present": False,
-                }
+                    attempt_payload = kf_dual_llm_production.package_log_payload(production_package)
+                    attempt_payload["attempt"] = attempt_name
+                    controlled_production_reply = _controlled_reply_from_outbound_package(production_package)
+                    outbound_validation = kf_dual_llm_production.validate_production_outbound_package(
+                        production_package,
+                        task_packet=task_packet,
+                        user_asked_password=user_asked_password,
+                        known_constraints=known_constraints,
+                    )
+                    validation_payload = outbound_validation.to_dict()
+                    attempt_payload["outbound_validation"] = validation_payload
+                    production_attempt_payloads.append(attempt_payload)
+                    production_package_payload = attempt_payload
+                    if (
+                        kf_dual_llm_production.package_passed(production_package)
+                        and outbound_validation.passed
+                        and (str(production_package.reply_text or "").strip() or controlled_production_reply)
+                    ):
+                        draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
+                            controlled_production_reply or str(production_package.reply_text or "")
+                        )
+                        deterministic_reply_source = (
+                            "kf_llm2_outbound_production_controlled"
+                            if controlled_production_reply
+                            else "kf_llm2_outbound_production"
+                        )
+                        tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+                        tool_evidence["llm2_production_outbound_package"] = production_package.to_legacy_dict()
+                        tool_evidence["llm2_production_outbound_validation"] = validation_payload
+                        llm2_retry_reason = ""
+                        llm2_rewrite_reason = ""
+                        return True
+                    if outbound_validation.blocking_issues:
+                        llm2_retry_reason = kf_dual_llm_production.outbound_validation_retry_reason(outbound_validation)
+                        llm2_rewrite_reason = ""
+                    elif outbound_validation.requires_rewrite:
+                        llm2_rewrite_reason = kf_dual_llm_production.outbound_validation_retry_reason(outbound_validation)
+                        llm2_retry_reason = ""
+                    else:
+                        llm2_retry_reason = kf_dual_llm_production.package_retry_reason(production_package)
+                        llm2_rewrite_reason = ""
+                    return False
+                except Exception as exc:
+                    logger.warning("KF LLM2 production outbound failed: error_type=%s", type(exc).__name__)
+                    llm2_retry_reason = "LLM2 production outbound failed; do not continue with customer-visible facts."
+                    llm2_rewrite_reason = ""
+                    failure_metadata = _dual_llm_production_failure_metadata(
+                        stage="llm2",
+                        timeout_seconds=timeout_seconds,
+                        started_at=started_at,
+                        exc=exc,
+                    )
+                    attempt_payload = {
+                        **failure_metadata,
+                        "attempt": attempt_name,
+                        "self_review": {
+                            "status": "retry",
+                            "source": "llm2_production_error_gate",
+                            "error_type": failure_metadata["error_type"],
+                        },
+                        "reply_text_present": False,
+                    }
+                    production_attempt_payloads.append(attempt_payload)
+                    production_package_payload = attempt_payload
+                    return False
+
+            accepted_llm2_package = await compose_and_validate_llm2("initial", retry_reason)
+            if not accepted_llm2_package and llm2_rewrite_reason and not llm2_retry_reason:
+                rewrite_reason = llm2_rewrite_reason
+                llm2_rewrite_reason = ""
+                accepted_llm2_package = await compose_and_validate_llm2("l3_rewrite", rewrite_reason)
+                if accepted_llm2_package:
+                    tool_evidence["llm2_production_rewrite_reason"] = rewrite_reason
         dual_meta = dict(tool_evidence.get("dual_llm_production") or understanding.get("dual_llm_production") or {})
-        dual_meta["llm2"] = production_package_payload
+        production_summary = dict(production_package_payload)
+        if len(production_attempt_payloads) > 1:
+            production_summary["attempts"] = [dict(item) for item in production_attempt_payloads]
+        dual_meta["llm2"] = production_summary
         tool_evidence["dual_llm_production"] = safe_artifact_payload(dual_meta)
-        if llm2_safe_fallback_reason:
-            tool_evidence["llm2_production_l3_safe_fallback_reason"] = _llm2_production_safe_retry_reason(
-                llm2_safe_fallback_reason
-            )
         if llm2_retry_reason and not retry_reason:
             gate_selfcheck = {
                 "status": "retry",
                 "source": "llm2_production_output_gate",
                 "reason": llm2_retry_reason,
+                "retry_target": "llm1_tools",
             }
             retry_payload = _llm2_production_retry_reason_payload(
                 understanding=understanding,
@@ -9810,84 +9304,162 @@ async def _generate_reply_result(
                 "planner_retry_reason": retry_payload,
             }
         if llm2_retry_reason:
-            draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
-                _safe_fallback_for_intent(understanding, settings.default_fallback_reply)
-            )
-            deterministic_reply_source = "llm2_production_safe_fallback"
-            tool_evidence["deterministic_reply_source"] = deterministic_reply_source
-            tool_evidence["suppress_actions"] = True
+            gate_selfcheck = {
+                "status": "retry",
+                "source": "llm2_production_output_gate",
+                "reason": llm2_retry_reason,
+                "retry_target": "llm1_tools",
+            }
+            return {
+                "reply": "",
+                "draft_reply": draft_reply,
+                "planner_reply_result": planner_reply_result,
+                "context": context,
+                "selfcheck": {
+                    "status": "retry",
+                    "rule": gate_selfcheck,
+                    "llm": production_summary.get("self_review") or gate_selfcheck,
+                },
+                "needs_planner_retry": False,
+                "planner_retry_reason": _llm2_production_retry_reason_payload(
+                    understanding=understanding,
+                    tool_evidence=tool_evidence,
+                    rule_selfcheck=gate_selfcheck,
+                    llm_selfcheck=production_summary.get("self_review") or gate_selfcheck,
+                    reason=llm2_retry_reason,
+                ),
+                "send_blocked": True,
+            }
+        if llm2_rewrite_reason:
+            gate_selfcheck = {
+                "status": "rewrite_required",
+                "source": "llm2_production_output_gate",
+                "reason": llm2_rewrite_reason,
+                "retry_target": "llm2",
+            }
+            return {
+                "reply": "",
+                "draft_reply": draft_reply,
+                "planner_reply_result": planner_reply_result,
+                "context": context,
+                "selfcheck": {
+                    "status": "rewrite_required",
+                    "rule": gate_selfcheck,
+                    "llm": production_summary.get("self_review") or gate_selfcheck,
+                },
+                "needs_planner_retry": False,
+                "planner_retry_reason": "",
+                "needs_llm2_rewrite": True,
+                "llm2_rewrite_reason": _llm2_production_rewrite_reason_payload(
+                    understanding=understanding,
+                    tool_evidence=tool_evidence,
+                    rule_selfcheck=gate_selfcheck,
+                    reason=llm2_rewrite_reason,
+                ),
+                "send_blocked": True,
+            }
     outbound_package = _build_outbound_package(draft_reply, tool_evidence)
     tool_evidence["outbound_package"] = outbound_package
     selfcheck_stage = timer.stage("final_selfcheck") if timer else nullcontext()
     with selfcheck_stage:
-        assessment = agentic_rag.assess_reply(
-            content=effective_query,
-            reply_text=draft_reply,
-            rag_result=rag_result,
-            retry_attempted=bool(retry_reason),
-        )
-        rule_selfcheck = _assessment_to_dict(assessment)
-        rule_selfcheck = _sanitize_rule_selfcheck_for_intent(
-            rule_selfcheck,
-            content=content,
-            understanding=understanding,
-        )
-        constraint_selfcheck = _constraint_consistency_selfcheck(
-            content=content,
-            draft_reply=draft_reply,
-            understanding=understanding,
-            tool_evidence=tool_evidence,
-        )
-        if str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower() == "pass" and constraint_selfcheck.get("status") != "pass":
-            rule_selfcheck = constraint_selfcheck
-        package_selfcheck = _outbound_package_selfcheck(
-            draft_reply=draft_reply,
-            tool_evidence=tool_evidence,
-            outbound_package=outbound_package,
-        )
-        if str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower() == "pass" and package_selfcheck.get("status") != "pass":
-            rule_selfcheck = package_selfcheck
-        human_context_selfcheck = _local_human_context_selfcheck(
-            content=content,
-            draft_reply=draft_reply,
-            tool_evidence=tool_evidence,
-            deterministic_reply_source=deterministic_reply_source,
-        )
-        if str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower() == "pass" and human_context_selfcheck.get("status") != "pass":
-            rule_selfcheck = human_context_selfcheck
-        rule_status = str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower()
-        if _needs_llm_final_selfcheck(
-            content=content,
-            understanding=understanding,
-            tool_evidence=tool_evidence,
-            draft_reply=draft_reply,
-            rule_selfcheck=rule_selfcheck,
-            deterministic_reply_source=deterministic_reply_source,
-            retry_reason=retry_reason,
-        ):
-            try:
-                llm_selfcheck = await asyncio.wait_for(
-                    reply_generator.assess_kf_final_reply(
-                        content=content,
-                        raw_dialog_context=kf_context_memory.selfcheck_memory_view(context).get("raw_dialog_context", []),
-                        structured_task=understanding.get("structured_task") or {},
-                        constraint_proof=understanding.get("constraint_proof") or {},
-                        tool_evidence=_tool_evidence_summary(tool_evidence),
-                        outbound_package=outbound_package,
-                        draft_reply=draft_reply,
-                        rule_selfcheck=rule_selfcheck,
-                    ),
-                    timeout=3,
-                )
-            except Exception as exc:
-                logger.exception("KF final LLM selfcheck failed: %s", exc)
-                llm_selfcheck = {"status": "pass", "source": "llm_selfcheck_error_or_timeout", "error": str(exc)}
-        else:
+        if _dual_llm_production_enabled():
+            validation_payload = (
+                tool_evidence.get("llm2_production_outbound_validation")
+                or (tool_evidence.get("dual_llm_production") or {}).get("llm2", {}).get("outbound_validation")
+                or {}
+            )
+            rule_selfcheck = {
+                "status": "pass",
+                "source": "kf_outbound_validation",
+                "outbound_validation_status": validation_payload.get("status") if isinstance(validation_payload, dict) else "pass",
+            }
+            human_context_selfcheck = _local_human_context_selfcheck(
+                content=content,
+                draft_reply=draft_reply,
+                tool_evidence=tool_evidence,
+                deterministic_reply_source=deterministic_reply_source,
+            )
+            if str(human_context_selfcheck.get("status") or human_context_selfcheck.get("action") or "pass").lower() != "pass":
+                rule_selfcheck = {
+                    **human_context_selfcheck,
+                    "status": "rewrite_required",
+                    "retry_target": "llm2",
+                }
+            rule_status = str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower()
             llm_selfcheck = {
                 "status": "pass",
-                "source": "llm_selfcheck_skipped_by_tiered_final_selfcheck",
-                "reason": "已完成本地事实一致、动作一致、上下文连贯和拟人化基线自检；该回复无需阻塞式 LLM 终检。",
+                "source": "llm_selfcheck_skipped_by_kf_outbound_validation",
+                "reason": "production 发送前事实和动作只由 validate_prepared_outbound_package 校验；最终 LLM selfcheck 不再抢业务判断。",
             }
+        else:
+            assessment = agentic_rag.assess_reply(
+                content=effective_query,
+                reply_text=draft_reply,
+                rag_result=rag_result,
+                retry_attempted=bool(retry_reason),
+            )
+            rule_selfcheck = _assessment_to_dict(assessment)
+            rule_selfcheck = _sanitize_rule_selfcheck_for_intent(
+                rule_selfcheck,
+                content=content,
+                understanding=understanding,
+            )
+            constraint_selfcheck = _constraint_consistency_selfcheck(
+                content=content,
+                draft_reply=draft_reply,
+                understanding=understanding,
+                tool_evidence=tool_evidence,
+            )
+            if str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower() == "pass" and constraint_selfcheck.get("status") != "pass":
+                rule_selfcheck = constraint_selfcheck
+            package_selfcheck = _outbound_package_selfcheck(
+                draft_reply=draft_reply,
+                tool_evidence=tool_evidence,
+                outbound_package=outbound_package,
+            )
+            if str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower() == "pass" and package_selfcheck.get("status") != "pass":
+                rule_selfcheck = package_selfcheck
+            human_context_selfcheck = _local_human_context_selfcheck(
+                content=content,
+                draft_reply=draft_reply,
+                tool_evidence=tool_evidence,
+                deterministic_reply_source=deterministic_reply_source,
+            )
+            if str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower() == "pass" and human_context_selfcheck.get("status") != "pass":
+                rule_selfcheck = human_context_selfcheck
+            rule_status = str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower()
+            if _needs_llm_final_selfcheck(
+                content=content,
+                understanding=understanding,
+                tool_evidence=tool_evidence,
+                draft_reply=draft_reply,
+                rule_selfcheck=rule_selfcheck,
+                deterministic_reply_source=deterministic_reply_source,
+                retry_reason=retry_reason,
+            ):
+                try:
+                    llm_selfcheck = await asyncio.wait_for(
+                        reply_generator.assess_kf_final_reply(
+                            content=content,
+                            raw_dialog_context=kf_context_memory.selfcheck_memory_view(context).get("raw_dialog_context", []),
+                            structured_task=understanding.get("structured_task") or {},
+                            constraint_proof=understanding.get("constraint_proof") or {},
+                            tool_evidence=_tool_evidence_summary(tool_evidence),
+                            outbound_package=outbound_package,
+                            draft_reply=draft_reply,
+                            rule_selfcheck=rule_selfcheck,
+                        ),
+                        timeout=3,
+                    )
+                except Exception as exc:
+                    logger.exception("KF final LLM selfcheck failed: %s", exc)
+                    llm_selfcheck = {"status": "pass", "source": "llm_selfcheck_error_or_timeout", "error": str(exc)}
+            else:
+                llm_selfcheck = {
+                    "status": "pass",
+                    "source": "llm_selfcheck_skipped_by_tiered_final_selfcheck",
+                    "reason": "已完成本地事实一致、动作一致、上下文连贯和拟人化基线自检；该回复无需阻塞式 LLM 终检。",
+                }
     llm_status = str(llm_selfcheck.get("status") or "pass").lower()
     final_status = rule_status if rule_status != "pass" else llm_status
     reason = str(
@@ -9896,6 +9468,28 @@ async def _generate_reply_result(
         or llm_selfcheck.get("planner_retry_reason")
         or "final_selfcheck_failed"
     )
+    if (
+        final_status != "pass"
+        and _dual_llm_production_enabled()
+        and str(rule_selfcheck.get("retry_target") or "") == "llm2"
+    ):
+        return {
+            "reply": "",
+            "draft_reply": draft_reply,
+            "planner_reply_result": planner_reply_result,
+            "context": context,
+            "selfcheck": {"status": final_status, "rule": rule_selfcheck, "llm": llm_selfcheck},
+            "needs_planner_retry": False,
+            "planner_retry_reason": "",
+            "needs_llm2_rewrite": True,
+            "llm2_rewrite_reason": _llm2_production_rewrite_reason_payload(
+                understanding=understanding,
+                tool_evidence=tool_evidence,
+                rule_selfcheck=rule_selfcheck,
+                reason=reason,
+            ),
+            "send_blocked": True,
+        }
     planner_retry_reason = ""
     if final_status != "pass":
         planner_retry_reason = _planner_retry_reason_payload(
@@ -11574,6 +11168,11 @@ async def _process_text_turn(
                     reply_result = clarification_result
                     break
                 continue
+            if reply_result.get("send_blocked") and not str(reply_result.get("reply") or "").strip():
+                final_reply = ""
+                final_draft_reply = str(reply_result.get("draft_reply") or "")
+                tool_evidence["suppress_actions"] = True
+                break
             final_reply = str(reply_result.get("reply") or settings.default_fallback_reply)
             final_draft_reply = str(reply_result.get("draft_reply") or final_reply)
             final_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_reply)
@@ -11593,6 +11192,17 @@ async def _process_text_turn(
             reply_result=reply_result,
             final_reply=final_reply,
         )
+        if reply_result.get("send_blocked") and not final_reply:
+            context = kf_context_memory.record_structured_assistant_output(
+                context,
+                draft_reply=final_draft_reply,
+                final_reply="",
+                candidate_state=_candidate_state_summary(context),
+            ) or context
+            _save_context(open_kfid, external_userid, context)
+            for msgid in msgids:
+                wecom_kf.state_store.mark_processed(msgid)
+            return
         context = kf_context_memory.record_structured_assistant_output(
             context,
             draft_reply=final_draft_reply,
