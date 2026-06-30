@@ -28,6 +28,8 @@ SERVICE_NAMES = [
     "wecom-room-robot-rag-cache-sync.timer",
 ]
 
+PRODUCTION_MODE_VALUES = {"production", "prod"}
+
 
 def _parse_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
@@ -99,6 +101,65 @@ def _health_payload_status(payload_text: str) -> str:
     return "ok"
 
 
+def _systemd_environment_value(service_name: str, key: str) -> str:
+    service_path = Path("/etc/systemd/system") / service_name
+    if not service_path.exists():
+        return ""
+    try:
+        lines = service_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    prefix = f"{key}="
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line.startswith("Environment="):
+            continue
+        value = line.split("=", 1)[1].strip().strip('"').strip("'")
+        if value.startswith(prefix):
+            return value[len(prefix) :].strip().strip('"').strip("'")
+    return ""
+
+
+def _dual_llm_mode(env_values: dict[str, str]) -> str:
+    return (
+        env_values.get("KF_DUAL_LLM_MODE")
+        or os.environ.get("KF_DUAL_LLM_MODE", "")
+        or _systemd_environment_value("wecom-room-robot.service", "KF_DUAL_LLM_MODE")
+    ).strip().lower()
+
+
+def _manifest_status(project_dir: Path, env_values: dict[str, str]) -> str:
+    configured_root = env_values.get("ROOM_DATABASE_PATH") or os.environ.get("ROOM_DATABASE_PATH") or "room_database"
+    root = Path(configured_root)
+    if not root.is_absolute():
+        root = project_dir / root
+    manifest_path = root / "media_manifest.json"
+    if not manifest_path.exists():
+        return "missing"
+    try:
+        if str(project_dir) not in sys.path:
+            sys.path.insert(0, str(project_dir))
+        from app.services.media_manifest import MediaManifest, MediaManifestProductionAdapter
+
+        manifest = MediaManifest.read_json(manifest_path)
+    except Exception as exc:
+        return f"invalid:{exc.__class__.__name__}"
+    if not manifest.items:
+        return "empty"
+    production = MediaManifestProductionAdapter(manifest, local_root=root)
+    evidence = []
+    for listing_id in manifest.listing_ids:
+        evidence.extend(production.evidence_for_listing(listing_id))
+    if not evidence:
+        return "no_send_ready_evidence"
+    video_count = sum(1 for item in evidence if item.media_type == "video")
+    image_count = sum(1 for item in evidence if item.media_type == "image")
+    return (
+        f"ok:items={len(manifest.items)},send_ready={len(evidence)},"
+        f"videos={video_count},images={image_count}"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check unattended runtime readiness without printing secrets.")
     parser.add_argument("--project-dir", default=os.getcwd())
@@ -125,6 +186,13 @@ def main() -> int:
     for relative in ("room_database", "media", "data", "knowledge/kf"):
         path = project_dir / relative
         print(f"path:{relative}=exists:{path.exists()}")
+
+    dual_llm_mode = _dual_llm_mode(env_values)
+    manifest_status = _manifest_status(project_dir, env_values)
+    print(f"dual_llm_mode={dual_llm_mode or 'unset'}")
+    print(f"media_manifest={manifest_status}")
+    if dual_llm_mode in PRODUCTION_MODE_VALUES and not manifest_status.startswith("ok:"):
+        problems.append(f"media_manifest:{manifest_status}")
 
     if not args.skip_systemd:
         for service in SERVICE_NAMES:

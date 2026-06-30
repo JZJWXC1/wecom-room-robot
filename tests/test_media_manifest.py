@@ -325,7 +325,7 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
         listing_id = generate_listing_id("测试花园", "1-101A")
         payloads = {"video-token": b"orphan-video"}
         tree = {
-            "root": [folder("测试花园1-101A", "fuzzy-folder")],
+            "root": [folder("测试花园1-101A附近素材", "fuzzy-folder")],
             "fuzzy-folder": [file_item("介绍视频.mp4", "video-token", payloads)],
         }
 
@@ -356,6 +356,123 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
                 MediaManifestShadowAdapter(manifest, local_root=Path(directory)).evidence_for_listing(listing_id),
                 [],
             )
+
+    async def test_exact_listing_label_folder_binds_to_listing_id_evidence(self) -> None:
+        listing_id = generate_listing_id("长浜龙吟轩", "11-1603")
+        payloads = {
+            "video-token": b"longham-video",
+            "image-token": b"longham-image",
+        }
+        tree = {
+            "root": [folder("东新园 杭氧 新天地", "area-folder")],
+            "area-folder": [folder("长浜龙吟轩11-1603", "room-folder")],
+            "room-folder": [
+                file_item("lv_0_20260627144514.mp4", "video-token", payloads),
+                file_item("长浜龙吟轩11-1603-图片05.jpg", "image-token", payloads),
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            target_root = Path(directory) / "room_database"
+            manifest_path = target_root / "media_manifest.json"
+            adapter = FeishuDriveMediaManifestAdapter(
+                client=FakeDriveClient(tree, payloads),
+                listing_ids=[listing_id],
+                listing_labels={listing_id: "长浜龙吟轩11-1603"},
+                target_root=target_root,
+            )
+
+            manifest, report = await adapter.sync_from_drive(
+                root_folder_token="root",
+                manifest_path=manifest_path,
+            )
+            production = MediaManifestProductionAdapter(manifest, local_root=target_root)
+            evidence = production.evidence_for_listing(listing_id)
+
+            self.assertEqual(report.fuzzy_candidates, [])
+            self.assertEqual(report.orphan_items, [])
+            self.assertEqual(len(manifest.videos_for_listing(listing_id)), 1)
+            self.assertEqual(len(manifest.images_for_listing(listing_id)), 1)
+            self.assertEqual({item.media_type for item in evidence}, {MEDIA_KIND_IMAGE, MEDIA_KIND_VIDEO})
+            self.assertEqual(report.bound_items[0]["binding_source"], "exact_listing_label")
+            self.assertEqual(report.bound_items[1]["binding_source"], "exact_listing_label")
+            for item in evidence:
+                self.assertEqual(item.listing_id, listing_id)
+                self.assertEqual(item.binding_method, BINDING_METHOD_LISTING_ID)
+                self.assertFalse(item.ambiguity)
+                self.assertFalse(item.candidate_only)
+                self.assertTrue(item.send_ready)
+                self.assertTrue(Path(item.local_path).is_file())
+            self.assertTrue(MediaManifest.read_json(manifest_path).has_wecom_sendable_video(listing_id))
+
+    async def test_duplicate_listing_label_folder_does_not_bind_send_ready_media(self) -> None:
+        first_listing = generate_listing_id("重复花园", "1-101A")
+        second_listing = generate_listing_id("重复花园", "1-102A")
+        payloads = {"video-token": b"ambiguous-label-video"}
+        tree = {
+            "root": [folder("重复花园", "ambiguous-label-folder")],
+            "ambiguous-label-folder": [file_item("介绍视频.mp4", "video-token", payloads)],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FeishuDriveMediaManifestAdapter(
+                client=FakeDriveClient(tree, payloads),
+                listing_ids=[first_listing, second_listing],
+                listing_labels={first_listing: "重复花园", second_listing: "重复花园"},
+                target_root=Path(directory),
+            )
+
+            manifest, report = await adapter.sync_from_drive(root_folder_token="root")
+
+            self.assertEqual(manifest.videos_for_listing(first_listing), [])
+            self.assertEqual(manifest.videos_for_listing(second_listing), [])
+            self.assertEqual(len(report.orphan_items), 1)
+            self.assertTrue(report.orphan_items[0]["candidate_only"])
+            self.assertFalse(report.orphan_items[0]["send_ready"])
+
+    async def test_non_specific_listing_label_folder_does_not_bind_area_media(self) -> None:
+        listing_id = generate_listing_id("东新园", "unknown")
+        payloads = {"video-token": b"area-video"}
+        tree = {
+            "root": [folder("东新园", "area-folder")],
+            "area-folder": [file_item("公共介绍视频.mp4", "video-token", payloads)],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FeishuDriveMediaManifestAdapter(
+                client=FakeDriveClient(tree, payloads),
+                listing_ids=[listing_id],
+                listing_labels={listing_id: "东新园"},
+                target_root=Path(directory),
+            )
+
+            manifest, report = await adapter.sync_from_drive(root_folder_token="root")
+
+            self.assertEqual(manifest.videos_for_listing(listing_id), [])
+            self.assertEqual(len(report.orphan_items), 1)
+            self.assertEqual(report.bound_items, [])
+
+    async def test_room_only_listing_label_does_not_bind_send_ready_media(self) -> None:
+        listing_id = generate_listing_id("长浜龙吟轩", "11-1603")
+        payloads = {"video-token": b"room-only-video"}
+        tree = {
+            "root": [folder("11-1603", "room-folder")],
+            "room-folder": [file_item("介绍视频.mp4", "video-token", payloads)],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = FeishuDriveMediaManifestAdapter(
+                client=FakeDriveClient(tree, payloads),
+                listing_ids=[listing_id],
+                listing_labels={listing_id: "11-1603"},
+                target_root=Path(directory),
+            )
+
+            manifest, report = await adapter.sync_from_drive(root_folder_token="root")
+
+            self.assertEqual(manifest.videos_for_listing(listing_id), [])
+            self.assertEqual(len(report.orphan_items), 1)
+            self.assertEqual(report.bound_items, [])
 
     async def test_original_video_link_exists_without_wecom_sendable_video(self) -> None:
         listing_with_original = generate_listing_id("测试花园", "1-101A")

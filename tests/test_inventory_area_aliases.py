@@ -174,10 +174,12 @@ def test_main_customer_chain_keeps_m1d2a_inventory_read_router_gate() -> None:
     "path",
     [
         "scripts/refresh_rag_inventory_cache.py",
-        "scripts/sync_feishu_region_inventory.py",
     ],
 )
 def test_sync_scripts_match_fix1(path: str) -> None:
+    # The region sync script intentionally diverges after FIX1 to publish the
+    # production media manifest from the synced target drive. Keep the cache-only
+    # script pinned to FIX1 so area alias behavior cannot drift silently there.
     assert_matches_fix1(path)
 
 

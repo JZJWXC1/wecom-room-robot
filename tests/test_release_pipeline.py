@@ -528,3 +528,46 @@ def test_unattended_health_payload_parser_requires_ok_service() -> None:
     assert check_unattended_runtime._health_payload_status('{"ok": true, "service": "wecom-room-robot-agentic-rag"}') == "ok"
     assert check_unattended_runtime._health_payload_status('{"ok": false, "service": "wecom-room-robot-agentic-rag"}') == "unhealthy:ok_false"
     assert check_unattended_runtime._health_payload_status("not json").startswith("invalid_json:")
+
+
+def test_unattended_check_requires_media_manifest_in_production(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("KF_DUAL_LLM_MODE", "production")
+    monkeypatch.delenv("ROOM_DATABASE_PATH", raising=False)
+
+    assert check_unattended_runtime._dual_llm_mode({}) == "production"
+    assert check_unattended_runtime._manifest_status(tmp_path, {}) == "missing"
+
+    monkeypatch.setenv("KF_DUAL_LLM_MODE", "shadow")
+    assert check_unattended_runtime._dual_llm_mode({}) == "shadow"
+
+
+def test_unattended_manifest_status_requires_send_ready_evidence(tmp_path: Path) -> None:
+    from app.services.inventory_snapshot_models import generate_listing_id
+    from app.services.media_manifest import BINDING_METHOD_LISTING_ID, MEDIA_KIND_VIDEO, MediaItem, MediaManifest
+
+    listing_id = generate_listing_id("长浜龙吟轩", "11-1603")
+    room_database = tmp_path / "room_database"
+    manifest_path = room_database / "media_manifest.json"
+    manifest = MediaManifest.build(
+        listing_ids=[listing_id],
+        items=[
+            MediaItem(
+                listing_id=listing_id,
+                kind=MEDIA_KIND_VIDEO,
+                file_name="missing.mp4",
+                relative_path=f"video/{listing_id}/missing.mp4",
+                sha256="0" * 64,
+                binding_method=BINDING_METHOD_LISTING_ID,
+                access_verified=True,
+            )
+        ],
+    )
+    manifest.write_json(manifest_path)
+
+    assert (
+        check_unattended_runtime._manifest_status(
+            tmp_path,
+            {"ROOM_DATABASE_PATH": str(room_database)},
+        )
+        == "no_send_ready_evidence"
+    )
