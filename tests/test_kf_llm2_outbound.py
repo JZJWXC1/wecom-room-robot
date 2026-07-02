@@ -142,6 +142,48 @@ def test_production_contract_retries_when_llm2_omits_visible_reply_for_evidence(
     assert [action.action_id for action in package.send_actions] == ["send-video-1"]
 
 
+def test_deterministic_fallback_replies_to_short_acknowledgement_signal() -> None:
+    packet = StructuredTaskPacket(
+        conversation_id="conv-ack",
+        turn_id="turn-ack",
+        case_id="case-ack",
+        inventory_snapshot_id="snap-ack",
+        candidate_set_id="",
+        response_strategy=ResponseStrategy.ANSWER,
+        rewritten_query="好的",
+        tasks=[
+            TaskAtom(
+                task_id="task-ack",
+                task_type="reply_compose_signal",
+                user_text="好的",
+                required_tools=["reply.compose"],
+            )
+        ],
+    )
+    bundle = ToolEvidenceBundle(
+        conversation_id="conv-ack",
+        turn_id="turn-ack",
+        case_id="case-ack",
+        inventory_snapshot_id="snap-ack",
+        candidate_set_id="",
+        tool_name="llm2.test.ack",
+        evidence=[],
+    )
+
+    package = compose_kf_outbound(
+        packet,
+        bundle,
+        ResponseStrategy.ANSWER,
+        llm_output={},
+        allow_deterministic_fallback=True,
+    )
+
+    assert package.reply_text.startswith("好的")
+    assert "房源表" in package.reply_text
+    assert package.response_strategy == ResponseStrategy.ANSWER
+    assert package.self_review["status"] == "pass"
+
+
 def test_inventory_sheet_only_reply_text_is_normalized_when_llm2_calls_it_image() -> None:
     packet = StructuredTaskPacket(
         conversation_id="conv-sheet",

@@ -354,6 +354,28 @@ def _is_literal_greeting_text(text: str) -> bool:
     }
 
 
+def _is_short_acknowledgement_text(text: str) -> bool:
+    normalized = re.sub(r"[\s,，。.!！?？~～、]+", "", str(text or "").strip().lower())
+    normalized = re.sub(r"(啦|哈|呀|喔|哦)+$", "", normalized)
+    if not normalized:
+        return False
+    tokens = ("okay", "ok", "好的", "好滴", "嗯嗯", "谢谢", "辛苦", "收到", "可以", "好", "嗯", "行")
+    if normalized in set(tokens):
+        return True
+    if len(normalized) > 12:
+        return False
+
+    def can_segment(offset: int) -> bool:
+        if offset == len(normalized):
+            return True
+        return any(
+            normalized.startswith(token, offset) and can_segment(offset + len(token))
+            for token in tokens
+        )
+
+    return can_segment(0)
+
+
 def _has_greeting_reply_compose_signal(packet: StructuredTaskPacket) -> bool:
     for task in packet.tasks or []:
         task_type = str(getattr(task, "task_type", "") or "").strip()
@@ -362,6 +384,16 @@ def _has_greeting_reply_compose_signal(packet: StructuredTaskPacket) -> bool:
         if _is_literal_greeting_text(getattr(task, "user_text", "")):
             return True
     return _is_literal_greeting_text(getattr(packet, "rewritten_query", ""))
+
+
+def _has_acknowledgement_reply_compose_signal(packet: StructuredTaskPacket) -> bool:
+    for task in packet.tasks or []:
+        task_type = str(getattr(task, "task_type", "") or "").strip()
+        if task_type != "reply_compose_signal":
+            continue
+        if _is_short_acknowledgement_text(getattr(task, "user_text", "")):
+            return True
+    return _is_short_acknowledgement_text(getattr(packet, "rewritten_query", ""))
 
 
 def _default_reply_text(
@@ -385,6 +417,8 @@ def _default_reply_text(
         return "这是这批对应的素材。"
     if _has_greeting_reply_compose_signal(packet):
         return "你好，在的。你直接发小区、房号、预算、房源表、图片或视频需求，我马上帮你查。"
+    if _has_acknowledgement_reply_compose_signal(packet):
+        return "好的，有需要你直接发小区、房号、预算、图片、视频或房源表，我继续帮你查。"
     prioritized = _priority_evidence_reply_text(packet, bundle)
     if prioritized:
         return prioritized

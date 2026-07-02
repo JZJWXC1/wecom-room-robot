@@ -305,3 +305,14 @@ def test_llm1_contract_rejects_field_questions_with_media_actions(content: str) 
     assert "must not include" in reason
     assert "send_video" in reason
     assert "explain_missing_media" in reason
+
+
+def test_llm1_contract_rejects_short_ack_inventory_search_actions() -> None:
+    needs_retry, reason = main._llm1_tool_plan_needs_contract_retry(
+        "好的",
+        {"actions": ["search_inventory", "generate_reply"]},
+    )
+
+    assert needs_retry
+    assert "Short acknowledgement" in reason
+    assert "without inventory" in reason

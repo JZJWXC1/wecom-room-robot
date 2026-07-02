@@ -1191,6 +1191,9 @@ def _llm1_tool_plan_needs_contract_retry(
     if _content_wants_inventory_search(content) and "search_inventory" not in actions:
         return True, "User asks for available inventory with a concrete scope such as community, budget, layout or room. LLM1 production tool_plan must include search_inventory and generate_reply before any visible reply."
     if _is_short_acknowledgement(content):
+        allowed_ack_actions = {"generate_reply"}
+        if not actions or actions - allowed_ack_actions:
+            return True, "Short acknowledgement should only compose a lightweight acknowledgement without inventory, media, policy or viewing tool actions."
         inherited_send_actions = {
             "send_inventory_sheet",
             "send_image",
