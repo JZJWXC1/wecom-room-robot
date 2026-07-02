@@ -153,6 +153,34 @@ class Settings(BaseSettings):
         default="kf-langgraph-smoke",
         alias="KF_LANGGRAPH_SMOKE_THREAD_ID",
     )
+    kf_humanized_reply_enabled: bool = Field(
+        default=False,
+        alias="KF_HUMANIZED_REPLY_ENABLED",
+    )
+    kf_humanized_reply_max_bubbles: int = Field(
+        default=3,
+        alias="KF_HUMANIZED_REPLY_MAX_BUBBLES",
+    )
+    kf_humanized_reply_max_chars: int = Field(
+        default=90,
+        alias="KF_HUMANIZED_REPLY_MAX_CHARS",
+    )
+    kf_humanized_typing_delay_enabled: bool = Field(
+        default=False,
+        alias="KF_HUMANIZED_TYPING_DELAY_ENABLED",
+    )
+    kf_humanized_typing_delay_base_seconds: float = Field(
+        default=0.6,
+        alias="KF_HUMANIZED_TYPING_DELAY_BASE_SECONDS",
+    )
+    kf_humanized_typing_delay_per_char_seconds: float = Field(
+        default=0.05,
+        alias="KF_HUMANIZED_TYPING_DELAY_PER_CHAR_SECONDS",
+    )
+    kf_humanized_typing_delay_cap_seconds: float = Field(
+        default=3.5,
+        alias="KF_HUMANIZED_TYPING_DELAY_CAP_SECONDS",
+    )
 
     dashscope_api_key: str = Field(default="", alias="DASHSCOPE_API_KEY")
     dashscope_base_url: str = Field(

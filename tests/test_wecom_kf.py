@@ -15617,6 +15617,73 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.videos, [])
         self.assertEqual(result["sent_actions"], [{"type": "text", "count": 1}])
 
+    async def test_send_final_actions_keeps_single_text_when_humanize_disabled(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        original_enabled = main.settings.kf_humanized_reply_enabled
+        main.wecom_kf = fake
+        main.settings.kf_humanized_reply_enabled = False
+        try:
+            result = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm-humanize-disabled",
+                context=kf_context_memory.empty_context(),
+                final_reply="第一条|||第二条",
+                tool_evidence={"suppress_actions": True},
+            )
+        finally:
+            main.wecom_kf = original_wecom
+            main.settings.kf_humanized_reply_enabled = original_enabled
+
+        self.assertEqual(fake.texts, ["第一条|||第二条"])
+        self.assertEqual(result["sent_actions"], [{"type": "text", "count": 1}])
+
+    async def test_send_final_actions_splits_final_reply_when_humanize_enabled(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        original_enabled = main.settings.kf_humanized_reply_enabled
+        original_delay_enabled = main.settings.kf_humanized_typing_delay_enabled
+        original_max_bubbles = main.settings.kf_humanized_reply_max_bubbles
+        original_max_chars = main.settings.kf_humanized_reply_max_chars
+        main.wecom_kf = fake
+        main.settings.kf_humanized_reply_enabled = True
+        main.settings.kf_humanized_typing_delay_enabled = False
+        main.settings.kf_humanized_reply_max_bubbles = 3
+        main.settings.kf_humanized_reply_max_chars = 90
+        try:
+            result = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm-humanize-enabled",
+                context=kf_context_memory.empty_context(),
+                final_reply="长浜龙吟轩11-1603在的|||押二付一3800，整租两室",
+                tool_evidence={"suppress_actions": True},
+            )
+        finally:
+            main.wecom_kf = original_wecom
+            main.settings.kf_humanized_reply_enabled = original_enabled
+            main.settings.kf_humanized_typing_delay_enabled = original_delay_enabled
+            main.settings.kf_humanized_reply_max_bubbles = original_max_bubbles
+            main.settings.kf_humanized_reply_max_chars = original_max_chars
+
+        self.assertEqual(fake.texts, ["长浜龙吟轩11-1603在的", "押二付一3800，整租两室"])
+        self.assertEqual(result["sent_actions"], [{"type": "text", "count": 2}])
+
     async def test_send_final_actions_production_blocks_direct_media_without_prepared_package(self) -> None:
         class FakeWeComKf:
             def __init__(self) -> None:

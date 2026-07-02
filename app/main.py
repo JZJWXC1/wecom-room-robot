@@ -26,6 +26,7 @@ from app.services import (
     kf_context_memory,
     kf_dual_llm_production,
     kf_entry_graph,
+    kf_humanize,
     kf_langgraph_flow,
     kf_media_binding_graph,
     kf_orchestrator_flow,
@@ -11283,6 +11284,110 @@ async def _send_text_with_receipt(
     )
 
 
+def _humanized_reply_enabled() -> bool:
+    return bool(getattr(settings, "kf_humanized_reply_enabled", False))
+
+
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
+def _non_negative_float(value: Any, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number >= 0 else default
+
+
+async def _send_final_reply_text_with_receipts(
+    *,
+    open_kfid: str,
+    external_userid: str,
+    context: dict[str, Any],
+    text: str,
+    action_id: str,
+    text_role: str,
+    msgids: list[str] | None = None,
+    stale_guard: Callable[[], None] | None = None,
+) -> tuple[dict[str, Any], int, dict[str, Any]]:
+    text = text.strip()
+    if not text:
+        return context, 0, {}
+    if not _humanized_reply_enabled():
+        context, did_send, receipt = await _send_text_with_receipt(
+            open_kfid=open_kfid,
+            external_userid=external_userid,
+            context=context,
+            text=text,
+            action_id=action_id,
+            text_role=text_role,
+            msgids=msgids,
+            stale_guard=stale_guard,
+        )
+        return context, 1 if did_send else 0, receipt
+
+    bubbles = kf_humanize.split_bubbles(
+        text,
+        max_bubbles=_positive_int(getattr(settings, "kf_humanized_reply_max_bubbles", 3), 3),
+        max_chars=_positive_int(getattr(settings, "kf_humanized_reply_max_chars", 90), 90),
+    )
+    sent_count = 0
+    last_receipt: dict[str, Any] = {}
+    bubble_count = len(bubbles)
+    for index, bubble in enumerate(bubbles, start=1):
+        if stale_guard is not None:
+            stale_guard()
+        if bool(getattr(settings, "kf_humanized_typing_delay_enabled", False)):
+            delay = kf_humanize.typing_delay_seconds(
+                bubble,
+                index=index - 1,
+                base=_non_negative_float(
+                    getattr(settings, "kf_humanized_typing_delay_base_seconds", 0.6),
+                    0.6,
+                ),
+                per_char=_non_negative_float(
+                    getattr(settings, "kf_humanized_typing_delay_per_char_seconds", 0.05),
+                    0.05,
+                ),
+                cap=_non_negative_float(
+                    getattr(settings, "kf_humanized_typing_delay_cap_seconds", 3.5),
+                    3.5,
+                ),
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+        bubble_action_id = action_id if bubble_count == 1 else f"{action_id}-bubble-{index}"
+        context, did_send, receipt = await _send_text_with_receipt(
+            open_kfid=open_kfid,
+            external_userid=external_userid,
+            context=context,
+            text=bubble,
+            action_id=bubble_action_id,
+            text_role=text_role,
+            msgids=msgids,
+            extra_payload={
+                "humanized_reply": True,
+                "bubble_index": index,
+                "bubble_count": bubble_count,
+            },
+            extra_metadata={
+                "humanized_reply": True,
+                "bubble_index": index,
+                "bubble_count": bubble_count,
+            },
+            stale_guard=stale_guard,
+        )
+        if did_send:
+            sent_count += 1
+            last_receipt = dict(receipt or {})
+    return context, sent_count, last_receipt
+
+
 def _build_orchestrator_shadow_artifact(
     *,
     content: str,
@@ -12050,7 +12155,7 @@ async def _send_final_actions(
         final_reply = str(outbound_package.get("text") or "")
     final_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_reply)
     suppress_actions = bool(tool_evidence.get("suppress_actions"))
-    context, did_send_text, _receipt = await _send_text_with_receipt(
+    context, sent_text_count, _receipt = await _send_final_reply_text_with_receipts(
         open_kfid=open_kfid,
         external_userid=external_userid,
         context=context,
@@ -12060,8 +12165,8 @@ async def _send_final_actions(
         msgids=msgids,
         stale_guard=stale_guard,
     )
-    if final_reply and did_send_text:
-        sent_actions.append({"type": "text", "count": 1})
+    if final_reply and sent_text_count:
+        sent_actions.append({"type": "text", "count": sent_text_count})
 
     if suppress_actions:
         return {"sent_actions": sent_actions, "context": context}
