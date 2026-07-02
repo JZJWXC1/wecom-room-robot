@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import re
@@ -39,6 +40,15 @@ EXCLUDED_RELEASE_PREFIXES = (
     "room_database/",
     "server_snapshots/",
     "qa_artifacts/",
+)
+UNTRACKED_RELEASE_SOURCE_PREFIXES = (
+    "AGENTS.md",
+    "app/",
+    "docs/",
+    "infra/",
+    "requirements.txt",
+    "scripts/",
+    "tests/",
 )
 
 
@@ -101,8 +111,52 @@ def rehearse_release_pipeline(project_dir: Path, rehearsal_root: Path, *, versio
     return result
 
 
+def run_release_preflight_graph_pipeline(
+    project_dir: Path,
+    rehearsal_root: Path,
+    *,
+    version: str = "",
+    fail_fast: bool = True,
+    local_tests_command: list[str] | None = None,
+    random_guard_command: list[str] | None = None,
+    timeout_seconds: int = 600,
+) -> dict[str, Any]:
+    from app.services import release_preflight_graph
+
+    deps = release_preflight_graph.build_local_release_preflight_deps(
+        local_tests_command=local_tests_command,
+        random_guard_command=random_guard_command,
+        timeout_seconds=timeout_seconds,
+    )
+    state = asyncio.run(
+        release_preflight_graph.run_release_preflight_graph(
+            deps,
+            project_dir=project_dir,
+            rehearsal_root=rehearsal_root,
+            version=version,
+            fail_fast=fail_fast,
+            conversation_id=f"release-preflight:{version or 'local'}",
+        )
+    )
+    return {
+        "schema_version": "rag_v2_release_preflight_graph_cli.v1",
+        "ok": state.get("status") == "passed",
+        "status": state.get("status") or "",
+        "blocked_stage": state.get("blocked_stage") or "",
+        "failures": list(state.get("failures") or []),
+        "trace": list(state.get("trace") or []),
+        "report": dict(state.get("report") or {}),
+        "local_tests": dict(state.get("local_tests") or {}),
+        "random_guard": dict(state.get("random_guard") or {}),
+        "config_status": dict(state.get("config_status") or {}),
+        "release_rehearsal": dict(state.get("release_rehearsal") or {}),
+    }
+
+
 def build_release_manifest(project_dir: Path, *, version: str, git_head: str) -> dict[str, Any]:
-    files = _tracked_files(project_dir)
+    tracked_files = _tracked_files(project_dir)
+    untracked_source_files = _untracked_release_source_files(project_dir)
+    files = sorted(set(tracked_files + untracked_source_files))
     release_files = [path for path in files if not _is_excluded_release_path(path)]
     required = {path: (project_dir / path).exists() for path in REQUIRED_RELEASE_PATHS}
     excluded_present = [path for path in release_files if _is_excluded_release_path(path)]
@@ -114,6 +168,9 @@ def build_release_manifest(project_dir: Path, *, version: str, git_head: str) ->
         "files_sha256": _sha256_text("\n".join(release_files)),
         "required_paths": required,
         "excluded_runtime_paths_present_in_manifest": excluded_present,
+        "untracked_release_source_paths_in_manifest": [
+            path for path in untracked_source_files if path in release_files
+        ],
     }
 
 
@@ -269,6 +326,26 @@ def _tracked_files(project_dir: Path) -> list[str]:
     return sorted(path.replace("\\", "/") for path in output.splitlines() if path.strip())
 
 
+def _untracked_release_source_files(project_dir: Path) -> list[str]:
+    output = _git_output(project_dir, ["ls-files", "--others", "--exclude-standard"])
+    if not output:
+        return []
+    paths = [path.replace("\\", "/") for path in output.splitlines() if path.strip()]
+    return sorted(
+        path
+        for path in paths
+        if _is_release_source_path(path) and not _is_excluded_release_path(path) and (project_dir / path).is_file()
+    )
+
+
+def _is_release_source_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return any(
+        normalized == prefix.rstrip("/") or normalized.startswith(prefix)
+        for prefix in UNTRACKED_RELEASE_SOURCE_PREFIXES
+    )
+
+
 def _is_excluded_release_path(path: str) -> bool:
     normalized = path.replace("\\", "/")
     return any(normalized == prefix.rstrip("/") or normalized.startswith(prefix) for prefix in EXCLUDED_RELEASE_PREFIXES)
@@ -308,9 +385,41 @@ def main() -> int:
     parser.add_argument("--project-dir", type=Path, default=Path.cwd())
     parser.add_argument("--rehearsal-root", type=Path, required=True)
     parser.add_argument("--version", default="")
+    parser.add_argument(
+        "--graph-preflight",
+        action="store_true",
+        help="Run the full local StateGraph preflight. This is the default; the flag is kept for old scripts.",
+    )
+    parser.add_argument(
+        "--legacy-rehearsal",
+        action="store_true",
+        help="Run only the legacy release rehearsal, skipping the StateGraph preflight.",
+    )
+    parser.add_argument(
+        "--no-fail-fast",
+        action="store_true",
+        help="With the StateGraph preflight, continue later local preflight stages after a failure.",
+    )
+    parser.add_argument(
+        "--preflight-timeout-seconds",
+        type=int,
+        default=600,
+        help="Per-command timeout for StateGraph local test and random QA stages.",
+    )
     args = parser.parse_args()
+    if args.graph_preflight and args.legacy_rehearsal:
+        parser.error("--graph-preflight and --legacy-rehearsal cannot be used together")
 
-    result = rehearse_release_pipeline(args.project_dir, args.rehearsal_root, version=args.version)
+    if not args.legacy_rehearsal:
+        result = run_release_preflight_graph_pipeline(
+            args.project_dir,
+            args.rehearsal_root,
+            version=args.version,
+            fail_fast=not args.no_fail_fast,
+            timeout_seconds=args.preflight_timeout_seconds,
+        )
+    else:
+        result = rehearse_release_pipeline(args.project_dir, args.rehearsal_root, version=args.version)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result["ok"] else 1
 

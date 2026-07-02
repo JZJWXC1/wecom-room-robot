@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import random
 import re
 import time
@@ -16,9 +17,12 @@ activate_offline_test_mode()
 from app.services.rewrite_inventory_index import load_rewrite_inventory_index
 from qa_artifacts.run_rag_10windows_10turns_utf8 import (
     ArtifactWriteError,
+    build_machine_summary,
+    canonical_result_hash,
     chinese_integrity_report,
     print_summary,
     run_all,
+    _write_json_atomic,
 )
 
 
@@ -128,6 +132,22 @@ REQUIRED_CATEGORIES = {
     "定房": ("定", "合同"),
     "原视频": ("原视频", "高清", "保存转发"),
     "上下文接话": ("这套", "上一个", "还是这个区域"),
+}
+
+RANDOM_GUARD_WINDOW_COUNT = 20
+RANDOM_GUARD_TURNS_PER_WINDOW = 10
+
+TOOL_INVOCATION_CATEGORIES = {
+    "房源查询": "房源推荐、在租、候选绑定必须经过房源表/工具证据。",
+    "房源表图片": "客户要房源表时必须触发房源表图片或房源表证据。",
+    "房间视频": "视频咨询必须触发视频素材检索或发送。",
+    "房间图片": "图片咨询必须触发图片素材检索或发送。",
+    "原视频或缺素材": "原视频/高清视频/缺素材咨询必须留下素材状态证据。",
+    "价格水电": "价格、水电、押一付一/押二付一必须由房源工具证据承接。",
+    "看房密码": "看房、密码、门锁必须由看房/房源工具证据承接。",
+    "未空出约看": "未空出、约看必须由房态/看房规则证据承接。",
+    "合同定房": "合同、定房、订房必须由业务规则或知识库证据承接。",
+    "免押政策": "免押、芝麻信用、服务费必须由规则或知识库证据承接。",
 }
 
 
@@ -304,7 +324,7 @@ def generate_fact_based_guard_windows(
     index: dict[str, Any],
     *,
     seed: int | None = None,
-    count: int = 10,
+    count: int = RANDOM_GUARD_WINDOW_COUNT,
 ) -> list[dict[str, Any]]:
     rooms = _usable_index_rooms(index)
     if len(rooms) < 3:
@@ -340,7 +360,11 @@ def generate_fact_based_guard_windows(
     return windows
 
 
-def generate_random_guard_windows(*, seed: int | None = None, count: int = 10) -> list[dict[str, Any]]:
+def generate_random_guard_windows(
+    *,
+    seed: int | None = None,
+    count: int = RANDOM_GUARD_WINDOW_COUNT,
+) -> list[dict[str, Any]]:
     fact_windows = generate_fact_based_guard_windows(
         load_rewrite_inventory_index(),
         seed=seed,
@@ -376,8 +400,19 @@ def generate_random_guard_windows(*, seed: int | None = None, count: int = 10) -
     return windows
 
 
-def coverage_report(windows: list[dict[str, Any]]) -> dict[str, Any]:
+def coverage_report(
+    windows: list[dict[str, Any]],
+    *,
+    expected_window_count: int = RANDOM_GUARD_WINDOW_COUNT,
+    expected_turns_per_window: int = RANDOM_GUARD_TURNS_PER_WINDOW,
+) -> dict[str, Any]:
     text = "\n".join(turn for window in windows for turn in window["turns"])
+    turn_counts = [len(window.get("turns") or []) for window in windows]
+    unexpected_turn_windows = [
+        window.get("id")
+        for window, turn_count in zip(windows, turn_counts)
+        if turn_count != expected_turns_per_window
+    ]
     missing = [
         name
         for name, tokens in REQUIRED_CATEGORIES.items()
@@ -385,27 +420,213 @@ def coverage_report(windows: list[dict[str, Any]]) -> dict[str, Any]:
     ]
     return {
         "window_count": len(windows),
-        "turn_count": sum(len(window["turns"]) for window in windows),
+        "expected_window_count": expected_window_count,
+        "expected_turns_per_window": expected_turns_per_window,
+        "turn_count": sum(turn_counts),
+        "unexpected_turn_windows": unexpected_turn_windows,
         "missing_categories": missing,
-        "passed": len(windows) == 10 and not missing,
+        "passed": (
+            len(windows) == expected_window_count
+            and not unexpected_turn_windows
+            and not missing
+        ),
     }
+
+
+def _as_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except TypeError:
+        return str(value)
+
+
+def _as_int(value: Any) -> int:
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _turn_user_text(turn: dict[str, Any]) -> str:
+    return str(turn.get("user") or "")
+
+
+def _turn_all_text(turn: dict[str, Any]) -> str:
+    bot_text = "\n".join(str(item) for item in (turn.get("bot") or {}).get("texts") or [])
+    return "\n".join([_turn_user_text(turn), bot_text, _as_text(turn.get("tool")), _as_text(turn.get("send"))])
+
+
+def _has_any(text: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in text for token in tokens)
+
+
+def _tool_count(tool: dict[str, Any], *keys: str) -> int:
+    return sum(_as_int(tool.get(key)) for key in keys)
+
+
+def _rule_or_knowledge_evidence(turn: dict[str, Any]) -> bool:
+    tool = turn.get("tool") or {}
+    if tool.get("rule_evidence") or tool.get("business_knowledge"):
+        return True
+    source = str(tool.get("deterministic_reply_source") or "")
+    return "business_knowledge" in source or "rule" in source
+
+
+def _missing_media_has(tool: dict[str, Any], kind: str) -> bool:
+    suffix = f":{kind}"
+    return any(str(item).endswith(suffix) for item in tool.get("missing_media") or [])
+
+
+def _media_status_has(tool: dict[str, Any], kind: str) -> bool:
+    status = tool.get("media_status")
+    return isinstance(status, dict) and isinstance(status.get(kind), dict)
+
+
+def _tool_category_hits(turn: dict[str, Any]) -> set[str]:
+    user_text = _turn_user_text(turn)
+    all_text = _turn_all_text(turn)
+    tool = turn.get("tool") if isinstance(turn.get("tool"), dict) else {}
+    has_inventory_rows = _tool_count(tool, "inventory_row_count", "target_row_count", "inventory_rows", "target_rows") > 0
+    has_rule_or_knowledge = _rule_or_knowledge_evidence(turn)
+    hits: set[str] = set()
+
+    if has_inventory_rows:
+        hits.add("房源查询")
+    if _tool_count(tool, "inventory_image_count", "inventory_sheet_artifact_evidence_count", "inventory_images") > 0:
+        hits.add("房源表图片")
+    if (
+        _tool_count(tool, "video_count", "video_media_manifest_evidence_count", "video_paths", "video_rows") > 0
+        or _missing_media_has(tool, "视频")
+        or _media_status_has(tool, "video")
+    ):
+        hits.add("房间视频")
+    if (
+        _tool_count(tool, "image_count", "image_media_manifest_evidence_count", "image_paths", "image_rows") > 0
+        or _missing_media_has(tool, "图片")
+        or _media_status_has(tool, "image")
+    ):
+        hits.add("房间图片")
+    if (
+        tool.get("original_video_request")
+        or _tool_count(tool, "original_video_url_count", "material_page_url_count", "original_video_media_manifest_evidence_count") > 0
+        or tool.get("missing_media")
+        or tool.get("media_status")
+    ):
+        hits.add("原视频或缺素材")
+    if _has_any(user_text, ("价格", "多少钱", "水电", "押一付一", "押二付一", "租金")) and (
+        has_inventory_rows
+    ):
+        hits.add("价格水电")
+    if _has_any(user_text, ("看房", "密码", "门锁", "门禁", "自己看", "怎么看房")) and (
+        has_inventory_rows
+        or _tool_count(tool, "viewing_instruction_evidence_count") > 0
+    ):
+        hits.add("看房密码")
+    if _has_any(user_text, ("还没空", "空出来", "约看", "安排客户看", "什么时候空")) and (
+        has_inventory_rows
+        or _tool_count(tool, "viewing_instruction_evidence_count") > 0
+    ):
+        hits.add("未空出约看")
+    if _has_any(user_text, ("合同", "定房", "订房", "看中了", "怎么定")) and (
+        has_rule_or_knowledge
+        or _has_any(all_text, ("18758141785", "13282125992", "19941091943"))
+    ):
+        hits.add("合同定房")
+    if _has_any(user_text, ("免押", "芝麻", "服务费", "无忧住")) and (
+        has_rule_or_knowledge
+        or _has_any(all_text, ("无忧住", "5.5%", "8%", "芝麻信用"))
+    ):
+        hits.add("免押政策")
+    return hits
+
+
+def tool_invocation_coverage_report(windows: list[dict[str, Any]]) -> dict[str, Any]:
+    hits = {name: [] for name in TOOL_INVOCATION_CATEGORIES}
+    for window in windows:
+        window_id = str(window.get("window_id") or window.get("id") or "")
+        for turn in window.get("turns") or []:
+            if not isinstance(turn, dict):
+                continue
+            for category in _tool_category_hits(turn):
+                if category in hits:
+                    hits[category].append(
+                        {
+                            "window_id": window_id,
+                            "turn": turn.get("turn"),
+                            "user": turn.get("user"),
+                        }
+                    )
+    missing = [name for name, items in hits.items() if not items]
+    return {
+        "schema": "rag_random_guard_tool_coverage.v1",
+        "required_categories": TOOL_INVOCATION_CATEGORIES,
+        "covered_categories": [name for name, items in hits.items() if items],
+        "missing_categories": missing,
+        "hits": hits,
+        "passed": not missing,
+    }
+
+
+def _apply_tool_coverage_gate(artifact_path: Path) -> Path:
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    coverage = tool_invocation_coverage_report(payload.get("windows") or [])
+    payload["random_guard_tool_coverage"] = coverage
+    quality = dict(payload.get("quality_status") or {})
+    if bool(quality.get("passed")) and not coverage["passed"]:
+        failures = list(quality.get("business_failures") or [])
+        failures.append(
+            {
+                "stage": "random_guard_tool_coverage",
+                "severity": "high",
+                "reason": "随机保底 QA 未覆盖全部中介工具调用类目。",
+                "missing_categories": coverage["missing_categories"],
+            }
+        )
+        quality.update(
+            {
+                "passed": False,
+                "business_failure": True,
+                "exit_code": 4,
+                "business_failures": failures,
+            }
+        )
+        payload["quality_status"] = quality
+    payload["summary"] = build_machine_summary(payload)
+    payload["canonical_result_hash"] = canonical_result_hash(payload)
+    _write_json_atomic(artifact_path, payload)
+    return artifact_path
 
 
 async def run_random_guard(*, seed: int | None = None, turn_timeout: float = 90) -> Path:
     windows = generate_random_guard_windows(seed=seed)
     coverage = coverage_report(windows)
-    integrity = chinese_integrity_report(windows, required_tokens=())
+    integrity = chinese_integrity_report(
+        windows,
+        required_tokens=(),
+        expected_window_count=RANDOM_GUARD_WINDOW_COUNT,
+        min_turn_count=RANDOM_GUARD_WINDOW_COUNT * RANDOM_GUARD_TURNS_PER_WINDOW,
+    )
     if not coverage["passed"]:
         raise RuntimeError(f"随机保底QA覆盖不完整：{coverage}")
     if not integrity["passed"]:
         raise RuntimeError(f"随机保底QA输入UTF-8异常：{integrity}")
-    return await run_all(
+    artifact_path = await run_all(
         turn_timeout=turn_timeout,
         windows=windows,
         artifact_prefix="rag_random_guard_utf8",
         conversation_prefix="conv_random_guard",
         required_tokens=(),
+        expected_window_count=RANDOM_GUARD_WINDOW_COUNT,
+        min_turn_count=RANDOM_GUARD_WINDOW_COUNT * RANDOM_GUARD_TURNS_PER_WINDOW,
+        fail_fast_on_problem=True,
     )
+    return _apply_tool_coverage_gate(artifact_path)
 
 
 def parse_args() -> argparse.Namespace:

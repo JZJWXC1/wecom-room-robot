@@ -20,6 +20,7 @@ from app.services.kf_contracts import (
 
 LLM2_OUTBOUND_PROMPT_VERSION = "kf_llm2_outbound.shadow.v1"
 LLM2_OUTBOUND_SELFCHECK_PROFILE = "kf_llm2_outbound.guard.v1"
+CONTROLLED_SLOT_ACTION_TYPES = {"contract_contact", "viewing_password", "viewing_contact"}
 
 _URL_RE = re.compile(r"https?://[^\s，。；；、)）]+", re.I)
 _PHONE_RE = re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")
@@ -138,11 +139,14 @@ def compose_kf_outbound(
     if explicit_status in {"retry", "fallback"} or bool(output.get("need_rewrite_clarification")):
         guard_reasons.append(retry_reason or f"llm2_shadow_status_{explicit_status}")
 
-    guard_reasons.extend(_unsupported_high_risk_values(output, bundle))
+    guard_reasons.extend(_unsupported_high_risk_values(output, packet, bundle))
     evidence_by_id = _evidence_by_id(bundle)
     claim_result = _claims_from_output(packet, bundle, output.get("claims"), evidence_by_id)
     caption_result = _action_captions_from_output(packet, trusted_actions, output.get("action_captions"), evidence_by_id)
-    guard_reasons.extend(claim_result.errors)
+    controlled_slot_only = _only_controlled_slot_actions(trusted_actions)
+    claim_errors = [] if controlled_slot_only else list(claim_result.errors)
+    claim_items = [] if controlled_slot_only else list(claim_result.items)
+    guard_reasons.extend(claim_errors)
     guard_reasons.extend(caption_result.errors)
     if not allow_deterministic_fallback:
         guard_reasons.extend(
@@ -151,7 +155,13 @@ def compose_kf_outbound(
                 caption_result.items,
             )
         )
-    guard_reasons.extend(_unsupported_plain_facts_in_reply(reply_text, bundle, claim_result.items))
+    guard_reasons.extend(_unsupported_plain_facts_in_reply(reply_text, bundle, claim_items))
+    if (
+        not allow_deterministic_fallback
+        and not reply_text.strip()
+        and (trusted_actions or claim_result.items or bundle.evidence)
+    ):
+        guard_reasons.append("llm2_output_missing_visible_reply")
 
     if guard_reasons:
         return _failure_package(
@@ -166,8 +176,9 @@ def compose_kf_outbound(
             ignored_llm_send_actions=ignored_llm_send_actions,
         )
 
-    claims = claim_result.items or _default_claims(packet, bundle)
+    claims = claim_items or _default_claims(packet, bundle)
     action_captions = caption_result.items or _default_action_captions(packet, trusted_actions, evidence_by_id, _candidate_labels_by_listing(bundle))
+    reply_text = _normalize_inventory_sheet_only_reply_text(reply_text, trusted_actions, evidence_by_id)
     answered_task_ids = _answered_task_ids(packet, output.get("answered_task_ids"), claims, trusted_actions, bool(reply_text))
     self_review = _success_review(
         output_review,
@@ -235,6 +246,39 @@ def _coerce_send_actions(values: list[SendAction | dict[str, Any]]) -> list[Send
     return result
 
 
+def _only_controlled_slot_actions(actions: list[SendAction]) -> bool:
+    return bool(actions) and all(action.action_type in CONTROLLED_SLOT_ACTION_TYPES for action in actions)
+
+
+def _is_inventory_sheet_action(action: SendAction, evidence_by_id: dict[str, EvidenceItem]) -> bool:
+    evidence = evidence_by_id.get(action.evidence_id)
+    metadata = dict(action.metadata or {})
+    return (
+        action.action_type in {"inventory_sheet", "image", "send_inventory_sheet"}
+        and (
+            (evidence is not None and evidence.evidence_type == "inventory_sheet")
+            or metadata.get("evidence_type") == "inventory_sheet"
+        )
+    )
+
+
+def _only_inventory_sheet_actions(actions: list[SendAction], evidence_by_id: dict[str, EvidenceItem]) -> bool:
+    return bool(actions) and all(_is_inventory_sheet_action(action, evidence_by_id) for action in actions)
+
+
+def _normalize_inventory_sheet_only_reply_text(
+    reply_text: str,
+    actions: list[SendAction],
+    evidence_by_id: dict[str, EvidenceItem],
+) -> str:
+    text = str(reply_text or "").strip()
+    if not text or not _only_inventory_sheet_actions(actions, evidence_by_id):
+        return reply_text
+    if "房源表" in text or "空房表" in text or "库存表" in text:
+        return reply_text
+    return "房源表图片发你了，你可以让客户先整体看一下。"
+
+
 def _send_actions_from_bundle(packet: StructuredTaskPacket, bundle: ToolEvidenceBundle) -> list[SendAction]:
     result: list[SendAction] = []
     counters: dict[str, int] = {}
@@ -281,9 +325,10 @@ def _deterministic_llm2_shadow_output(
 ) -> dict[str, Any]:
     captions = _default_action_captions(packet, send_actions, _evidence_by_id(bundle), _candidate_labels_by_listing(bundle))
     claims = _default_claims(packet, bundle)
+    reply_text = _default_reply_text(packet, bundle, send_actions)
     return {
-        "reply_text": _default_reply_text(bundle, send_actions),
-        "answered_task_ids": _answered_task_ids(packet, [], claims, send_actions, bool(claims or send_actions)),
+        "reply_text": reply_text,
+        "answered_task_ids": _answered_task_ids(packet, [], claims, send_actions, bool(reply_text or claims or send_actions)),
         "claims": [claim.to_legacy_dict() for claim in claims],
         "action_captions": [caption.to_legacy_dict() for caption in captions],
         "self_review": {
@@ -294,7 +339,36 @@ def _deterministic_llm2_shadow_output(
     }
 
 
-def _default_reply_text(bundle: ToolEvidenceBundle, send_actions: list[SendAction]) -> str:
+def _is_literal_greeting_text(text: str) -> bool:
+    normalized = re.sub(r"[\s,，。.!！?？~～、]+", "", str(text or "").strip())
+    return normalized in {
+        "你好",
+        "您好",
+        "在吗",
+        "在不在",
+        "有人吗",
+        "你好在吗",
+        "您好在吗",
+        "在吗你好",
+        "在吗您好",
+    }
+
+
+def _has_greeting_reply_compose_signal(packet: StructuredTaskPacket) -> bool:
+    for task in packet.tasks or []:
+        task_type = str(getattr(task, "task_type", "") or "").strip()
+        if task_type != "reply_compose_signal":
+            continue
+        if _is_literal_greeting_text(getattr(task, "user_text", "")):
+            return True
+    return _is_literal_greeting_text(getattr(packet, "rewritten_query", ""))
+
+
+def _default_reply_text(
+    packet: StructuredTaskPacket,
+    bundle: ToolEvidenceBundle,
+    send_actions: list[SendAction],
+) -> str:
     if send_actions:
         evidence_by_id = _evidence_by_id(bundle)
         candidate_labels = _candidate_labels_by_listing(bundle)
@@ -309,13 +383,63 @@ def _default_reply_text(bundle: ToolEvidenceBundle, send_actions: list[SendActio
         if image_count and not video_count:
             return f"这是这{_listing_count_label(image_count)}对应的图片。"
         return "这是这批对应的素材。"
+    if _has_greeting_reply_compose_signal(packet):
+        return "你好，在的。你直接发小区、房号、预算、房源表、图片或视频需求，我马上帮你查。"
+    prioritized = _priority_evidence_reply_text(packet, bundle)
+    if prioritized:
+        return prioritized
     for item in bundle.evidence:
         if item.summary:
             return item.summary
+    raw_tool_result = bundle.raw_tool_result if isinstance(bundle.raw_tool_result, dict) else {}
+    actions = set(_string_list(raw_tool_result.get("actions")))
+    if (
+        "search_inventory" in actions
+        and not raw_tool_result.get("inventory_rows")
+        and not raw_tool_result.get("target_rows")
+        and not raw_tool_result.get("inventory_read_error")
+    ):
+        return "我按这个条件查了，最新房源表里暂时没有匹配的房源。你可以放宽预算、区域或户型，我再帮你筛。"
     return ""
 
 
-def _unsupported_high_risk_values(output: dict[str, Any], bundle: ToolEvidenceBundle) -> list[str]:
+def _priority_evidence_reply_text(packet: StructuredTaskPacket, bundle: ToolEvidenceBundle) -> str:
+    task_text = _packet_task_search_text(packet)
+    preferred_types: list[str] = []
+    if any(marker in task_text for marker in ("send_image", "image", "图片", "照片")):
+        preferred_types.append("missing_media")
+    if any(marker in task_text for marker in ("send_video", "video", "视频", "原视频", "高清")):
+        preferred_types.append("missing_media")
+    if any(marker in task_text for marker in ("viewing_guidance", "viewing", "看房", "密码", "门锁", "门禁")):
+        preferred_types.extend(["viewing_password", "viewing_contact", "viewing_guidance"])
+    if any(marker in task_text for marker in ("deposit_policy", "send_deposit_policy", "免押", "无忧住", "芝麻", "押金", "服务费")):
+        preferred_types.append("deposit_policy")
+    for evidence_type in preferred_types:
+        for item in bundle.evidence:
+            if str(item.evidence_type or "").strip() == evidence_type and str(item.summary or "").strip():
+                return str(item.summary or "").strip()
+    return ""
+
+
+def _packet_task_search_text(packet: StructuredTaskPacket) -> str:
+    parts: list[str] = []
+    for task in packet.tasks:
+        parts.extend(
+            [
+                str(getattr(task, "task_type", "") or ""),
+                str(getattr(task, "user_text", "") or ""),
+                " ".join(str(tool) for tool in getattr(task, "required_tools", []) or []),
+            ]
+        )
+    parts.append(str(packet.rewritten_query or ""))
+    return " ".join(part for part in parts if part).lower()
+
+
+def _unsupported_high_risk_values(
+    output: dict[str, Any],
+    packet: StructuredTaskPacket,
+    bundle: ToolEvidenceBundle,
+) -> list[str]:
     text = json.dumps(safe_artifact_payload(output), ensure_ascii=False, default=str)
     reasons: list[str] = []
     if _URL_RE.search(text):
@@ -324,7 +448,7 @@ def _unsupported_high_risk_values(output: dict[str, Any], bundle: ToolEvidenceBu
         reasons.append("llm2_output_contains_full_phone")
     if _PASSWORD_RE.search(text):
         reasons.append("llm2_output_contains_password_like_value")
-    allowed_prices = _allowed_price_tokens(bundle)
+    allowed_prices = _allowed_price_tokens(packet, bundle)
     for token in _money_tokens(text):
         if token not in allowed_prices:
             reasons.append(f"unsupported_price_or_budget:{token}")
@@ -360,7 +484,7 @@ def _unsupported_plain_facts(text: str, support_payload: Any, *, prefix: str) ->
     return reasons
 
 
-def _allowed_price_tokens(bundle: ToolEvidenceBundle) -> set[str]:
+def _allowed_price_tokens(packet: StructuredTaskPacket, bundle: ToolEvidenceBundle) -> set[str]:
     text_parts: list[str] = []
     for item in bundle.evidence:
         text_parts.append(item.summary)
@@ -368,12 +492,46 @@ def _allowed_price_tokens(bundle: ToolEvidenceBundle) -> set[str]:
             if _is_price_field(key):
                 text_parts.append(str(value))
     text_parts.append(json.dumps(bundle.field_values, ensure_ascii=False, default=str))
-    return set(_money_tokens("\n".join(text_parts))) | {
+    return set(_money_tokens("\n".join(text_parts))) | _constraint_price_tokens(packet) | {
         str(value).strip()
         for item in bundle.evidence
         for key, value in item.field_values.items()
         if _is_price_field(key) and str(value).strip().isdigit()
     }
+
+
+def _constraint_price_tokens(packet: StructuredTaskPacket) -> set[str]:
+    payload = {
+        "rewritten_query": packet.rewritten_query,
+        "inherited_constraints": packet.inherited_constraints,
+        "replaced_constraints": packet.replaced_constraints,
+        "tasks": [
+            {
+                "user_text": task.user_text,
+                "constraints": task.constraints,
+            }
+            for task in packet.tasks
+        ],
+    }
+    tokens: set[str] = set(_money_tokens(json.dumps(payload, ensure_ascii=False, default=str)))
+
+    def visit(value: Any, path: tuple[str, ...] = ()) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit(item, (*path, str(key)))
+            return
+        if isinstance(value, list):
+            for item in value:
+                visit(item, path)
+            return
+        key_text = " ".join(path).lower()
+        if not any(marker in key_text for marker in ("budget", "price", "rent", "预算", "价格", "租金", "押一", "押二")):
+            return
+        for token in re.findall(r"(?<!\d)[1-9]\d{2,5}(?!\d)", str(value)):
+            tokens.add(token)
+
+    visit(payload)
+    return tokens
 
 
 def _money_tokens(text: str) -> list[str]:
@@ -396,6 +554,7 @@ def _claims_from_output(
     result: list[Claim] = []
     errors: list[str] = []
     valid_tasks = {task.task_id for task in packet.tasks}
+    single_task_id = next(iter(valid_tasks), "") if len(valid_tasks) == 1 else ""
     for index, raw in enumerate(raw_claims, start=1):
         if not isinstance(raw, dict):
             continue
@@ -416,8 +575,11 @@ def _claims_from_output(
             continue
         task_id = str(raw.get("task_id") or "").strip()
         if task_id and task_id not in valid_tasks:
-            errors.append(f"claim_{index}_unknown_task_id")
-            continue
+            if single_task_id:
+                task_id = single_task_id
+            else:
+                errors.append(f"claim_{index}_unknown_task_id")
+                continue
         result.append(
             Claim(
                 prompt_version=LLM2_OUTBOUND_PROMPT_VERSION,
@@ -528,6 +690,7 @@ def _action_captions_from_output(
     if not isinstance(raw_captions, list):
         return _BuildResult()
     actions_by_id = {action.action_id: action for action in send_actions}
+    has_caption_required_action = any(action.action_type in {"video", "image", "inventory_sheet"} for action in send_actions)
     result: list[ActionCaption] = []
     errors: list[str] = []
     for index, raw in enumerate(raw_captions, start=1):
@@ -536,7 +699,10 @@ def _action_captions_from_output(
         action_id = str(raw.get("action_id") or "").strip()
         action = actions_by_id.get(action_id)
         if not action:
-            errors.append(f"caption_{index}_unknown_action_id")
+            if has_caption_required_action:
+                errors.append(f"caption_{index}_unknown_action_id")
+            continue
+        if action.action_type in CONTROLLED_SLOT_ACTION_TYPES:
             continue
         evidence = evidence_by_id.get(action.evidence_id)
         caption_text = str(raw.get("text") or (evidence.summary if evidence else action.action_type))
@@ -578,8 +744,21 @@ def _default_claims(packet: StructuredTaskPacket, bundle: ToolEvidenceBundle) ->
     for index, evidence in enumerate(bundle.evidence, start=1):
         if not evidence.evidence_id or not evidence.summary:
             continue
-        if evidence.evidence_type in {"video", "image", "inventory_sheet"}:
+        evidence_type = str(evidence.evidence_type or "").strip()
+        if evidence_type in {"video", "image", "inventory_sheet"}:
             continue
+        summary_backed_types = {
+            "missing_media",
+            "viewing_guidance",
+            "viewing_contact",
+            "viewing_password",
+            "target_error",
+            "candidate_selection_error",
+            "field_target_error",
+        }
+        if evidence_type in summary_backed_types:
+            continue
+        claim_value = evidence.field_values or evidence.summary
         claims.append(
             Claim(
                 prompt_version=LLM2_OUTBOUND_PROMPT_VERSION,
@@ -593,8 +772,8 @@ def _default_claims(packet: StructuredTaskPacket, bundle: ToolEvidenceBundle) ->
                 evidence_id=evidence.evidence_id,
                 claim_id=f"claim-evidence-{index}",
                 task_id=_first_task_id(packet),
-                field=evidence.evidence_type,
-                value=evidence.field_values or evidence.summary,
+                field=evidence_type,
+                value=claim_value,
                 evidence_ref=evidence.evidence_id,
                 text=evidence.summary,
                 support=[evidence.evidence_id],
@@ -613,7 +792,7 @@ def _default_action_captions(
     captions: list[ActionCaption] = []
     for index, action in enumerate(send_actions, start=1):
         evidence = evidence_by_id.get(action.evidence_id)
-        if action.action_type == "text":
+        if action.action_type == "text" or action.action_type in CONTROLLED_SLOT_ACTION_TYPES:
             continue
         label = _candidate_label_for_action(action, evidence, candidate_labels)
         captions.append(

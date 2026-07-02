@@ -121,17 +121,150 @@ class OfflineFeishuClient:
         return {"skipped": [{"source": "offline_qa_replay", "reason": "external_feishu_sync_disabled"}]}
 
 
+OFFLINE_ACTION_TO_TASK_TYPE = {
+    "search_inventory": "inventory_search",
+    "compact_listing": "summarize_candidates",
+    "context_tools": "context_lookup",
+    "send_inventory_sheet": "send_inventory_sheet",
+    "send_image": "send_image",
+    "send_video": "send_video",
+    "explain_missing_media": "explain_missing_media",
+    "explain_unavailable_viewing": "viewing_guidance",
+    "send_contract_contact": "contract_contact",
+    "send_deposit_policy": "deposit_policy",
+    "generate_reply": "reply_text",
+}
+
+OFFLINE_ACTION_TO_TOOL = {
+    "search_inventory": "inventory.search",
+    "compact_listing": "inventory.compact",
+    "context_tools": "context.memory",
+    "send_inventory_sheet": "inventory.sheet_artifact",
+    "send_image": "media.image",
+    "send_video": "media.video",
+    "explain_missing_media": "media.availability",
+    "explain_unavailable_viewing": "viewing.policy",
+    "send_contract_contact": "contact.contract",
+    "send_deposit_policy": "deposit.policy",
+    "generate_reply": "reply.compose",
+}
+
+
+def _offline_production_actions(content: str) -> list[str]:
+    signals = main._deterministic_signals(content)
+    if signals.get("is_greeting") or main._is_short_acknowledgement(content):
+        return ["generate_reply"]
+    if signals.get("wants_inventory_sheet"):
+        return ["send_inventory_sheet", "generate_reply"]
+    if signals.get("wants_video") or signals.get("wants_original_video"):
+        return ["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"]
+    if signals.get("wants_image"):
+        return ["search_inventory", "context_tools", "send_image", "explain_missing_media", "generate_reply"]
+    if signals.get("wants_viewing") or signals.get("wants_password") or signals.get("wants_access"):
+        return ["search_inventory", "context_tools", "explain_unavailable_viewing", "generate_reply"]
+    if signals.get("wants_deposit"):
+        return ["send_deposit_policy", "generate_reply"]
+    if signals.get("wants_contract_contact"):
+        return ["send_contract_contact", "generate_reply"]
+    return ["search_inventory", "generate_reply"]
+
+
+def _offline_task_atoms(content: str, actions: list[str]) -> list[dict[str, Any]]:
+    atoms: list[dict[str, Any]] = []
+    for index, action in enumerate(actions, start=1):
+        atoms.append(
+            {
+                "task_id": f"offline-task-{index}-{action}",
+                "task_type": OFFLINE_ACTION_TO_TASK_TYPE.get(action, action),
+                "user_text": content,
+                "constraint_operation": "inherit" if action in {"context_tools", "generate_reply"} else "replace",
+                "constraints": {},
+                "required_tools": [OFFLINE_ACTION_TO_TOOL.get(action, action)],
+            }
+        )
+    return atoms
+
+
+async def offline_build_kf_task_packet(**kwargs: Any) -> Any:
+    content = str(kwargs.get("content") or "")
+    actions = _offline_production_actions(content)
+    selected_numbers = []
+    try:
+        selected_numbers = list(main._selection_indices_from_text(content))
+    except Exception:
+        selected_numbers = []
+    output = {
+        "rewritten_query": content,
+        "response_strategy": {"mode": "tool_first"},
+        "constraints": {"inherit": {}, "replace": {}, "exclude": {}, "clear": []},
+        "task_atoms": _offline_task_atoms(content, actions),
+        "candidate_binding": {
+            "selected_candidate_numbers": selected_numbers,
+            "reason": "offline_qa_deterministic_binding",
+        },
+        "tool_plan": {
+            "actions": actions,
+            "required_tools": [
+                OFFLINE_ACTION_TO_TOOL.get(action, action)
+                for action in actions
+            ],
+            "need_rewrite_clarification": False,
+            "reason": "offline QA deterministic production tool plan",
+            "source": "offline_qa_llm1_task_packet",
+        },
+    }
+    return main.build_kf_task_packet_shadow(
+        output,
+        content=content,
+        raw_dialog_context=kwargs.get("raw_dialog_context"),
+        structured_memory=kwargs.get("structured_memory"),
+        inventory_index=kwargs.get("inventory_index"),
+        candidate_set=kwargs.get("candidate_set"),
+        conversation_id=str(kwargs.get("conversation_id") or ""),
+        turn_id=str(kwargs.get("turn_id") or ""),
+        case_id=str(kwargs.get("case_id") or ""),
+        inventory_snapshot_id=str(kwargs.get("inventory_snapshot_id") or ""),
+        candidate_set_id=str(kwargs.get("candidate_set_id") or ""),
+        source_label="llm1_production_offline_qa",
+        mode="production",
+    ).packet
+
+
+async def offline_compose_kf_outbound_production(**kwargs: Any) -> dict[str, Any]:
+    return {
+        "reply_text": "",
+        "self_review": {
+            "status": "retry",
+            "retry_reason": "offline QA delegates customer text to controlled evidence renderer",
+            "llm2_decides_media_targets": False,
+        },
+        "source": "offline_qa_llm2_empty_for_controlled_renderer",
+    }
+
+
 def install_offline_service_stubs() -> dict[str, Any]:
     originals: dict[str, Any] = {}
     if hasattr(main, "FeishuClient"):
         originals["FeishuClient"] = main.FeishuClient
         main.FeishuClient = OfflineFeishuClient
+    originals["reply_generator.build_kf_task_packet"] = main.reply_generator.build_kf_task_packet
+    originals["reply_generator.compose_kf_outbound_production"] = (
+        main.reply_generator.compose_kf_outbound_production
+    )
+    main.reply_generator.build_kf_task_packet = offline_build_kf_task_packet
+    main.reply_generator.compose_kf_outbound_production = offline_compose_kf_outbound_production
     return originals
 
 
 def restore_offline_service_stubs(originals: dict[str, Any]) -> None:
     if "FeishuClient" in originals:
         main.FeishuClient = originals["FeishuClient"]
+    if "reply_generator.build_kf_task_packet" in originals:
+        main.reply_generator.build_kf_task_packet = originals["reply_generator.build_kf_task_packet"]
+    if "reply_generator.compose_kf_outbound_production" in originals:
+        main.reply_generator.compose_kf_outbound_production = originals[
+            "reply_generator.compose_kf_outbound_production"
+        ]
 
 
 def load_questions(path: Path = INPUT_SOURCE_PATH) -> list[str]:
@@ -280,6 +413,37 @@ def _summarize_stage_result(stage: str, result: Any) -> dict[str, Any]:
             "source": result.get("source"),
         }
     if stage == "tools" and isinstance(result, dict):
+        if result.get("source") == "langgraph_business_knowledge":
+            rule_evidence = result.get("rule_evidence") if isinstance(result.get("rule_evidence"), dict) else {}
+            actions = ["generate_reply"]
+            if rule_evidence.get("contract_contact"):
+                actions.insert(0, "send_contract_contact")
+            if rule_evidence.get("deposit_policy"):
+                actions.insert(0, "send_deposit_policy")
+            return {
+                "actions": actions,
+                "business_knowledge": {
+                    "source": result.get("source"),
+                    "topics": result.get("topics") or [],
+                    "card_count": len(result.get("cards") or []),
+                    "knowledge_context": _short_text(result.get("knowledge_context"), 800),
+                },
+                "rule_evidence": rule_evidence,
+                "deterministic_reply_source": result.get("source"),
+                "inventory_rows": [],
+                "target_rows": [],
+                "video_rows": [],
+                "image_rows": [],
+                "target_listing_ids": [],
+                "video_listing_ids": [],
+                "image_listing_ids": [],
+                "video_count": 0,
+                "image_count": 0,
+                "inventory_image_count": 0,
+                "missing_media": [],
+                "media_status": None,
+                "suppress_actions": False,
+            }
         return {
             "actions": result.get("actions"),
             "inventory_rows": _room_labels(result.get("inventory_rows")),
@@ -295,6 +459,9 @@ def _summarize_stage_result(stage: str, result: Any) -> dict[str, Any]:
             "missing_media": result.get("missing_media"),
             "media_status": result.get("media_status"),
             "suppress_actions": bool(result.get("suppress_actions")),
+            "business_knowledge": result.get("business_knowledge") if isinstance(result.get("business_knowledge"), dict) else {},
+            "rule_evidence": result.get("rule_evidence") if isinstance(result.get("rule_evidence"), dict) else {},
+            "deterministic_reply_source": result.get("deterministic_reply_source"),
         }
     if stage == "final_selfcheck" and isinstance(result, dict):
         selfcheck = result.get("selfcheck") if isinstance(result.get("selfcheck"), dict) else {}
@@ -423,6 +590,7 @@ async def send_turn(
         "_understand_message": main._understand_message,
         "_plan_actions": main._plan_actions,
         "_execute_tools": main._execute_tools,
+        "_retrieve_business_knowledge_for_langgraph": main._retrieve_business_knowledge_for_langgraph,
         "_generate_reply_result": main._generate_reply_result,
         "_send_final_actions": main._send_final_actions,
     }
@@ -454,6 +622,10 @@ async def send_turn(
         main._understand_message = timed_stage("rewrite_intent", originals["_understand_message"])
         main._plan_actions = timed_stage("planner", originals["_plan_actions"])
         main._execute_tools = timed_stage("tools", originals["_execute_tools"])
+        main._retrieve_business_knowledge_for_langgraph = timed_stage(
+            "tools",
+            originals["_retrieve_business_knowledge_for_langgraph"],
+        )
         main._generate_reply_result = timed_stage("final_selfcheck", originals["_generate_reply_result"])
         main._send_final_actions = timed_stage("send", originals["_send_final_actions"])
         await asyncio.wait_for(main._handle_text_message(message), timeout=turn_timeout)
@@ -463,6 +635,7 @@ async def send_turn(
         main._understand_message = originals["_understand_message"]
         main._plan_actions = originals["_plan_actions"]
         main._execute_tools = originals["_execute_tools"]
+        main._retrieve_business_knowledge_for_langgraph = originals["_retrieve_business_knowledge_for_langgraph"]
         main._generate_reply_result = originals["_generate_reply_result"]
         main._send_final_actions = originals["_send_final_actions"]
     turn = {

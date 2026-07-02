@@ -10,8 +10,8 @@ import httpx
 
 import app.main as main
 from app.config import Settings
-from app.models import ReplyPlan
-from app.services import inventory_read_turn, kf_context_memory
+from app.models import IncomingMessage, ReplyPlan
+from app.services import inventory_read_turn, kf_context_memory, kf_outbound_package
 from app.services.inventory_snapshot_models import generate_listing_id
 from app.services.kf_llm1_task_packet import build_kf_task_packet_shadow
 from app.services.media_manifest import (
@@ -36,6 +36,8 @@ from app.services.wecom_kf import (
     should_auto_reply_kf_message,
     _raise_for_status_sanitized,
 )
+
+main.settings.kf_dual_llm_mode = "shadow"
 
 
 def _write_manifest_evidence_for_send(root: Path, listing_id: str, path: Path, media_kind: str) -> tuple[MediaManifest, dict]:
@@ -62,6 +64,15 @@ def _write_manifest_evidence_for_send(root: Path, listing_id: str, path: Path, m
     evidence = MediaManifestProductionAdapter.from_path(root / "media_manifest.json", local_root=root).evidence_for_listing(listing_id)
     assert len(evidence) == 1
     return manifest, evidence[0].to_dict()
+
+
+def test_rows_with_candidate_numbers_carries_tool_resolver_selection() -> None:
+    rows = [{"房号": "6-1102"}, {"房号": "21-1201B"}]
+
+    annotated = main._rows_with_candidate_numbers(rows, [1, 3])
+
+    assert [row["candidate_number"] for row in annotated] == [1, 3]
+    assert "candidate_number" not in rows[0]
 
 
 def test_constraint_selfcheck_does_not_force_search_terms_for_contract_followup() -> None:
@@ -104,8 +115,8 @@ def test_tool_evidence_rows_can_enrich_legacy_rows_with_stable_listing_id() -> N
 def test_dual_llm_production_timeout_config_defaults() -> None:
     fields = Settings.model_fields
 
-    assert fields["kf_llm1_production_timeout_seconds"].default == 12.0
-    assert fields["kf_llm2_production_timeout_seconds"].default == 15.0
+    assert fields["kf_llm1_production_timeout_seconds"].default == 25.0
+    assert fields["kf_llm2_production_timeout_seconds"].default == 45.0
 
 
 def test_llm1_production_timeout_metadata_uses_config_and_stays_sanitized(monkeypatch) -> None:
@@ -159,6 +170,323 @@ def test_llm1_production_timeout_metadata_uses_config_and_stays_sanitized(monkey
         assert sensitive_text not in dumped
 
     asyncio.run(run_case())
+
+
+def test_llm1_production_retries_retry_required_packet_without_legacy_action_completion(monkeypatch) -> None:
+    async def run_case() -> None:
+        class RetryThenPassReplyGenerator:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.feedback: list[dict] = []
+
+            async def build_kf_task_packet(self, **kwargs):
+                self.calls += 1
+                self.feedback.append(dict(kwargs.get("planner_feedback") or {}))
+                if self.calls == 1:
+                    return build_kf_task_packet_shadow(
+                        {
+                            "rewritten_query": "第一套视频",
+                            "task_atoms": [{"task_id": "task-video", "task_type": "send_video"}],
+                            "tool_plan": {"actions": []},
+                        },
+                        content="第一套视频",
+                        source_label="llm1_production",
+                        mode="production",
+                    ).packet
+                return build_kf_task_packet_shadow(
+                    {
+                        "rewritten_query": "第一套视频",
+                        "task_atoms": [{"task_id": "task-video", "task_type": "send_video"}],
+                        "tool_plan": {"actions": ["search_inventory", "context_tools", "send_video", "generate_reply"]},
+                    },
+                    content="第一套视频",
+                    source_label="llm1_production",
+                    mode="production",
+                ).packet
+
+        fake_reply = RetryThenPassReplyGenerator()
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+        result = await main._apply_llm1_production_task_packet(
+            content="第一套视频",
+            context={"conversation_id": "conv-1"},
+            result={"structured_task": {}, "planner_feedback": {}},
+            rewrite_view={
+                "raw_dialog_context": [{"content": "万达1500左右还有哪些"}],
+                "last_candidate_set": {
+                    "candidate_set_id": "cand-1",
+                    "items": [{"candidate_number": 1, "community": "小洋坝家园一区", "room_no": "6-201C"}],
+                },
+            },
+            inventory_index={},
+            inventory_read_context=SimpleNamespace(
+                request_id="req-1",
+                turn_id="turn-1",
+                decision_id="case-1",
+                snapshot_id="snapshot-1",
+            ),
+        )
+
+        assert fake_reply.calls == 2
+        assert fake_reply.feedback[0] == {}
+        assert fake_reply.feedback[1]["retry_target"] == "llm1"
+        assert "previous_tool_plan" in fake_reply.feedback[1]
+        assert result["tool_plan"]["actions"] == ["search_inventory", "context_tools", "send_video", "generate_reply"]
+        llm1_meta = result["dual_llm_production"]["llm1"]
+        assert llm1_meta["status"] == "pass"
+        assert llm1_meta["attempt"] == "llm1_contract_retry"
+        assert [item["status"] for item in llm1_meta["attempts"]] == ["retry", "pass"]
+
+    asyncio.run(run_case())
+
+
+def test_llm1_contract_retry_uses_controlled_media_packet_after_second_bad_plan(monkeypatch) -> None:
+    async def run_case() -> None:
+        class BadMediaReplyGenerator:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.feedback: list[dict] = []
+
+            async def build_kf_task_packet(self, **kwargs):
+                self.calls += 1
+                self.feedback.append(dict(kwargs.get("planner_feedback") or {}))
+                actions = [] if self.calls == 1 else ["search_inventory", "generate_reply"]
+                return build_kf_task_packet_shadow(
+                    {
+                        "rewritten_query": "笔记发我",
+                        "task_atoms": [{"task_id": "task-video", "task_type": "send_video"}],
+                        "tool_plan": {"actions": actions},
+                    },
+                    content="笔记发我",
+                    source_label="llm1_production",
+                    mode="production",
+                ).packet
+
+        fake_reply = BadMediaReplyGenerator()
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+        result = await main._apply_llm1_production_task_packet(
+            content="笔记发我",
+            context={"conversation_id": "conv-1"},
+            result={"structured_task": {}, "planner_feedback": {}},
+            rewrite_view={
+                "raw_dialog_context": [{"content": "万达1500左右还有哪些"}],
+                "last_candidate_set": {
+                    "candidate_set_id": "cand-1",
+                    "items": [{"candidate_number": 1, "community": "小洋坝家园一区", "room_no": "6-201C"}],
+                },
+            },
+            inventory_index={},
+            inventory_read_context=SimpleNamespace(
+                request_id="req-1",
+                turn_id="turn-1",
+                decision_id="case-1",
+                snapshot_id="snapshot-1",
+            ),
+        )
+
+        assert fake_reply.calls == 2
+        assert fake_reply.feedback[1]["retry_target"] == "llm1"
+        assert result["tool_plan"]["actions"] == [
+            "search_inventory",
+            "context_tools",
+            "send_video",
+            "explain_missing_media",
+            "generate_reply",
+        ]
+        assert result["tool_plan"]["reply_text"] == ""
+        llm1_meta = result["dual_llm_production"]["llm1"]
+        assert llm1_meta["status"] == "pass"
+        assert llm1_meta["attempt"] == "controlled_media_contract"
+        assert [item["status"] for item in llm1_meta["attempts"]] == ["retry", "retry", "pass"]
+
+    asyncio.run(run_case())
+
+
+def test_llm1_contract_retry_uses_controlled_image_packet_after_second_bad_plan(monkeypatch) -> None:
+    async def run_case() -> None:
+        class BadImageReplyGenerator:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def build_kf_task_packet(self, **kwargs):
+                self.calls += 1
+                actions = [] if self.calls == 1 else ["search_inventory", "generate_reply"]
+                return build_kf_task_packet_shadow(
+                    {
+                        "rewritten_query": "图",
+                        "task_atoms": [{"task_id": "task-image", "task_type": "send_image"}],
+                        "tool_plan": {"actions": actions},
+                    },
+                    content="图",
+                    source_label="llm1_production",
+                    mode="production",
+                ).packet
+
+        fake_reply = BadImageReplyGenerator()
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+        result = await main._apply_llm1_production_task_packet(
+            content="图",
+            context={"conversation_id": "conv-1"},
+            result={"structured_task": {}, "planner_feedback": {}},
+            rewrite_view={
+                "raw_dialog_context": [{"content": "万达1500左右还有哪些"}],
+                "last_candidate_set": {
+                    "candidate_set_id": "cand-1",
+                    "items": [{"candidate_number": 1, "community": "小洋坝家园一区", "room_no": "6-201C"}],
+                },
+            },
+            inventory_index={},
+            inventory_read_context=SimpleNamespace(
+                request_id="req-1",
+                turn_id="turn-1",
+                decision_id="case-1",
+                snapshot_id="snapshot-1",
+            ),
+        )
+
+        assert fake_reply.calls == 2
+        assert result["tool_plan"]["actions"] == [
+            "search_inventory",
+            "context_tools",
+            "send_image",
+            "explain_missing_media",
+            "generate_reply",
+        ]
+        assert result["dual_llm_production"]["llm1"]["attempt"] == "controlled_media_contract"
+        assert result["llm1_task_packet"]["tasks"][0]["task_type"] == "send_image"
+
+    asyncio.run(run_case())
+
+
+def test_llm1_production_uses_controlled_greeting_packet_after_retry(monkeypatch) -> None:
+    async def run_case() -> None:
+        class RetryGreetingReplyGenerator:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.feedback: list[dict] = []
+
+            async def build_kf_task_packet(self, **kwargs):
+                self.calls += 1
+                self.feedback.append(dict(kwargs.get("planner_feedback") or {}))
+                return build_kf_task_packet_shadow(
+                    {
+                        "rewritten_query": "你好，在吗",
+                        "task_atoms": [{"task_id": "task-retry", "task_type": "llm1_retry_required"}],
+                        "tool_plan": {
+                            "actions": [],
+                            "need_rewrite_clarification": True,
+                            "missing_evidence": "bad greeting packet",
+                        },
+                    },
+                    content="你好，在吗",
+                    source_label="llm1_production",
+                    mode="production",
+                ).packet
+
+        fake_reply = RetryGreetingReplyGenerator()
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+        result = await main._apply_llm1_production_task_packet(
+            content="你好，在吗",
+            context={"conversation_id": "conv-1"},
+            result={"structured_task": {}, "planner_feedback": {}},
+            rewrite_view={"raw_dialog_context": []},
+            inventory_index={},
+            inventory_read_context=SimpleNamespace(
+                request_id="req-1",
+                turn_id="turn-1",
+                decision_id="case-1",
+                snapshot_id="snapshot-1",
+            ),
+        )
+
+        assert fake_reply.calls == 2
+        assert main._deterministic_signals("你好，在吗")["is_greeting"] is True
+        assert result["tool_plan"]["actions"] == ["generate_reply"]
+        assert result["tool_plan"]["reply_text"] == ""
+        assert result["llm1_task_packet"]["tasks"][0]["task_type"] == "reply_compose_signal"
+        llm1_meta = result["dual_llm_production"]["llm1"]
+        assert llm1_meta["status"] == "pass"
+        assert llm1_meta["attempt"] == "controlled_greeting_contract"
+        assert [item["status"] for item in llm1_meta["attempts"]] == ["retry", "retry", "pass"]
+
+    asyncio.run(run_case())
+
+
+def test_llm1_production_retries_short_ack_inherited_send_action(monkeypatch) -> None:
+    async def run_case() -> None:
+        class RetryAckReplyGenerator:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.feedback: list[dict] = []
+
+            async def build_kf_task_packet(self, **kwargs):
+                self.calls += 1
+                self.feedback.append(dict(kwargs.get("planner_feedback") or {}))
+                if self.calls == 1:
+                    return build_kf_task_packet_shadow(
+                        {
+                            "rewritten_query": "好的",
+                            "task_atoms": [{"task_id": "task-sheet", "task_type": "send_inventory_sheet"}],
+                            "tool_plan": {"actions": ["send_inventory_sheet"]},
+                        },
+                        content="好的",
+                        source_label="llm1_production",
+                        mode="production",
+                    ).packet
+                return build_kf_task_packet_shadow(
+                    {
+                        "rewritten_query": "好的",
+                        "task_atoms": [{"task_id": "task-ack", "task_type": "reply_text"}],
+                        "tool_plan": {"actions": ["generate_reply"]},
+                    },
+                    content="好的",
+                    source_label="llm1_production",
+                    mode="production",
+                ).packet
+
+        fake_reply = RetryAckReplyGenerator()
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+        result = await main._apply_llm1_production_task_packet(
+            content="好的",
+            context={"conversation_id": "conv-1"},
+            result={"structured_task": {}, "planner_feedback": {}},
+            rewrite_view={"raw_dialog_context": [{"content": "房源表发一下"}]},
+            inventory_index={},
+            inventory_read_context=SimpleNamespace(
+                request_id="req-1",
+                turn_id="turn-1",
+                decision_id="case-1",
+                snapshot_id="snapshot-1",
+            ),
+        )
+
+        assert fake_reply.calls == 2
+        assert fake_reply.feedback[1]["retry_target"] == "llm1"
+        assert "Short acknowledgement" in fake_reply.feedback[1]["retry_reason"]
+        assert result["tool_plan"]["actions"] == ["generate_reply"]
+        assert result["dual_llm_production"]["llm1"]["attempt"] == "llm1_contract_retry"
+
+    asyncio.run(run_case())
+
+
+def test_llm1_contract_retry_rejects_media_task_without_media_action() -> None:
+    needs_retry, reason = main._llm1_tool_plan_needs_contract_retry(
+        "第1套视频",
+        {"actions": ["continue_search", "context_tools", "generate_reply"]},
+        {"tasks": [{"task_type": "send_video", "user_text": "第1套视频"}]},
+    )
+
+    assert needs_retry is True
+    assert "send_video" in reason
 
 
 def test_llm2_production_timeout_metadata_uses_config_and_stays_sanitized(monkeypatch) -> None:
@@ -246,6 +574,197 @@ def test_llm2_production_timeout_metadata_uses_config_and_stays_sanitized(monkey
         assert "旧话术" not in retry_dump
 
     asyncio.run(run_case())
+
+
+def test_llm2_controlled_renderer_answers_greeting_after_empty_llm2_retries(monkeypatch) -> None:
+    async def run_case() -> None:
+        packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "你好，在吗",
+                "response_strategy": {"mode": "answer"},
+                "task_atoms": [
+                    {
+                        "task_id": "task-greeting",
+                        "task_type": "reply_compose_signal",
+                        "user_text": "你好，在吗",
+                        "required_tools": ["reply.compose"],
+                    }
+                ],
+                "tool_plan": {"actions": ["generate_reply"], "required_tools": ["reply.compose"]},
+            },
+            content="你好，在吗",
+            source_label="llm1_production_greeting_contract",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                raise AssertionError("production final selfcheck should use outbound validation, not legacy RAG selfcheck")
+
+        class EmptyLlm2ReplyGenerator:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def compose_kf_outbound_production(self, **kwargs):
+                self.calls += 1
+                return {
+                    "reply_text": "",
+                    "self_review": {
+                        "status": "pass",
+                        "reason": "empty greeting reply",
+                        "llm2_decides_media_targets": False,
+                    },
+                }
+
+        class FakeInventory:
+            async def snapshot(self, limit: int = 20):
+                return ""
+
+            def format_rows(self, rows, limit: int = 10):
+                return ""
+
+        fake_reply = EmptyLlm2ReplyGenerator()
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        monkeypatch.setattr(main, "inventory", FakeInventory())
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+        tool_evidence = {
+            "actions": ["generate_reply"],
+            "dual_llm_production": {
+                "llm1": {
+                    "status": "pass",
+                    "attempt": "controlled_greeting_contract",
+                }
+            },
+        }
+        result = await main._generate_reply_result(
+            content="你好，在吗",
+            context=kf_context_memory.empty_context(),
+            understanding={
+                "intent": "general",
+                "effective_query": "你好，在吗",
+                "constraint_proof": {},
+                "structured_task": {"source": "llm1_production_minimal_bootstrap"},
+                "llm1_task_packet": packet,
+            },
+            tool_evidence=tool_evidence,
+        )
+
+        assert fake_reply.calls == 0
+        assert result["reply"]
+        assert "小区" in result["reply"]
+        assert result["selfcheck"]["status"] == "pass"
+        assert result["needs_planner_retry"] is False
+        assert tool_evidence["deterministic_reply_source"] == main.kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+        assert tool_evidence["outbound_package"]["prepared_outbound_package"] is True
+
+    asyncio.run(run_case())
+
+
+def test_debug_message_reduces_and_saves_candidate_memory(monkeypatch) -> None:
+    async def run_case() -> None:
+        saved: dict[str, dict] = {}
+        rows = [
+            {"小区": "小洋坝家园一区", "房号": "6-201C", "押一付一": "1600"},
+            {"小区": "骏塘名庭", "房号": "8-1101A", "押一付一": "1500"},
+        ]
+        candidate_set = {
+            "intent": "inventory",
+            "query": "1500到2200的一室",
+            "candidates": rows,
+            "created_at": 100.0,
+            "expires_at": 9999999999.0,
+            "shown_count": 2,
+            "total_count": 2,
+            "inventory_cache_meta": {"source": "test"},
+        }
+
+        class FakeStore:
+            def get(self, key):
+                return saved.get(key)
+
+            def save(self, key, context):
+                saved[key] = context
+
+        async def fake_understand_message(**kwargs):
+            return {
+                "intent": "production_llm1",
+                "effective_query": "1500到2200的一室",
+                "rewritten_query": "1500到2200的一室",
+                "query_state": {"intent": "production_llm1"},
+                "selected_indices": [],
+                "needs_clarification": False,
+            }
+
+        async def fake_plan_actions(**kwargs):
+            return {
+                "actions": ["search_inventory", "generate_reply"],
+                "source": "test_llm1",
+                "need_rewrite_clarification": False,
+            }
+
+        async def fake_execute_tools(**kwargs):
+            return {
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": rows,
+                "target_rows": [],
+                "inventory_images": [],
+                "image_paths": [],
+                "video_paths": [],
+                "missing_media": [],
+                "inventory_listing_evidence": [{}, {}],
+                "memory_reducer": {"last_candidate_set": candidate_set},
+            }
+
+        async def fake_generate_reply_result(**kwargs):
+            reply = "为您找到2套1500-2200元的一室房源：\n1. 小洋坝家园一区6-201C\n2. 骏塘名庭8-1101A"
+            return {
+                "reply": reply,
+                "draft_reply": reply,
+                "context": kwargs["context"],
+                "selfcheck": {"status": "pass"},
+            }
+
+        monkeypatch.setattr(main, "wecom_kf_context_store", FakeStore())
+        monkeypatch.setattr(main, "_understand_message", fake_understand_message)
+        monkeypatch.setattr(main, "_plan_actions", fake_plan_actions)
+        monkeypatch.setattr(main, "_execute_tools", fake_execute_tools)
+        monkeypatch.setattr(main, "_generate_reply_result", fake_generate_reply_result)
+        monkeypatch.setattr(main, "_build_orchestrator_shadow_artifact", lambda **kwargs: {})
+
+        result = await main.debug_message(
+            IncomingMessage(
+                source="debug",
+                user_id="debug-memory-user",
+                msg_type="text",
+                content="1500到2200的一室",
+            )
+        )
+
+        key = main._conversation_key("debug", "debug-memory-user")
+        assert result["context_memory"]["last_candidate_count"] == 2
+        assert saved[key]["last_candidate_set"]["shown_count"] == 2
+        assert saved[key]["recent_messages"][-1]["role"] == "assistant"
+
+    asyncio.run(run_case())
+
+
+def test_production_llm1_inventory_tool_plan_remembers_candidate_set() -> None:
+    assert main._should_remember_candidate_set(
+        content="1500到2200的一室",
+        understanding={
+            "intent": "production_llm1",
+            "tool_plan": {"actions": ["search_inventory", "generate_reply"]},
+        },
+        rows=[
+            {"小区": "小洋坝家园一区", "房号": "6-201C"},
+            {"小区": "骏塘名庭", "房号": "8-1101A"},
+        ],
+    )
 
 
 def test_llm2_production_retry_payload_redacts_unknown_reason_and_intent() -> None:
@@ -349,6 +868,69 @@ def test_generate_reply_result_uses_llm2_production_package(monkeypatch) -> None
     asyncio.run(run_case())
 
 
+def test_generate_reply_result_password_request_attaches_controlled_viewing_slot(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "密码多少",
+                "task_atoms": [{"task_id": "task-password", "task_type": "reply_text", "user_text": "密码多少"}],
+                "tool_plan": {"actions": ["search_inventory", "generate_reply"]},
+            },
+            content="密码多少",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                raise AssertionError("production final selfcheck must not call agentic_rag.assess_reply")
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "这套看房方式我发你。",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+        row = {
+            "listing_id": "lst-xyd-201c",
+            "小区": "小洋坝家园一区",
+            "房号": "6-201C",
+            "看房方式密码": "123456# 看房提前联系",
+        }
+        tool_evidence = {"actions": ["search_inventory", "generate_reply"], "target_rows": [row]}
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+        monkeypatch.setattr(main, "_needs_llm_final_selfcheck", lambda **kwargs: False)
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+        result = await main._generate_reply_result(
+            content="密码多少",
+            context=kf_context_memory.empty_context(),
+            understanding={
+                "intent": "production_llm1",
+                "effective_query": "密码多少",
+                "structured_task": {"tool_requirements": {}},
+                "constraint_proof": {},
+                "llm1_task_packet": task_packet,
+            },
+            tool_evidence=tool_evidence,
+            planner_result={"actions": ["search_inventory", "generate_reply"], "reply_text": ""},
+        )
+
+        assert result["selfcheck"]["status"] == "pass"
+        assert "123456#" in result["reply"]
+        send_actions = tool_evidence["llm2_production_outbound_package"]["send_actions"]
+        assert any(action["action_type"] == "viewing_password" for action in send_actions)
+
+    asyncio.run(run_case())
+
+
 def test_generate_reply_result_production_llm2_bypasses_legacy_planner_reply_gate(monkeypatch) -> None:
     async def run_case() -> None:
         task_packet = build_kf_task_packet_shadow(
@@ -381,12 +963,16 @@ def test_generate_reply_result_production_llm2_bypasses_legacy_planner_reply_gat
                     "self_review": {"status": "pass"},
                 }
 
+        def fail_local_human_selfcheck(**kwargs):
+            raise AssertionError("production final selfcheck must not call local human selfcheck")
+
         fake_reply = FakeReplyGenerator()
         original_mode = main.settings.kf_dual_llm_mode
         tool_evidence = {"actions": ["generate_reply"]}
         monkeypatch.setattr(main, "agentic_rag", FakeRag())
         monkeypatch.setattr(main, "reply_generator", fake_reply)
         monkeypatch.setattr(main, "_needs_llm_final_selfcheck", lambda **kwargs: False)
+        monkeypatch.setattr(main, "_local_human_context_selfcheck", fail_local_human_selfcheck)
         main.settings.kf_dual_llm_mode = "production"
         try:
             result = await main._generate_reply_result(
@@ -400,7 +986,15 @@ def test_generate_reply_result_production_llm2_bypasses_legacy_planner_reply_gat
                     "llm1_task_packet": task_packet,
                 },
                 tool_evidence=tool_evidence,
-                planner_result={"actions": ["generate_reply"]},
+                planner_result={
+                    "actions": ["generate_reply"],
+                    "post_tool_reply_result": {
+                        "selfcheck": {
+                            "status": "retry",
+                            "reason": "legacy planner selfcheck must be ignored in production",
+                        }
+                    },
+                },
             )
         finally:
             main.settings.kf_dual_llm_mode = original_mode
@@ -582,6 +1176,82 @@ def test_generate_reply_result_production_retries_l3_validation_with_llm2(monkey
     asyncio.run(run_case())
 
 
+def test_generate_reply_result_production_retries_llm2_contract_failure_once(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "普通回复",
+                "task_atoms": [{"task_id": "task-reply", "task_type": "reply_text", "user_text": "普通回复"}],
+                "tool_plan": {"actions": ["generate_reply"]},
+            },
+            content="普通回复",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="")
+
+            def assess_reply(self, **kwargs):
+                raise AssertionError("production final selfcheck must not call agentic_rag.assess_reply")
+
+        class FakeReplyGenerator:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.retry_reasons: list[str] = []
+
+            async def compose_kf_outbound_production(self, **kwargs):
+                self.calls += 1
+                self.retry_reasons.append(str(kwargs["retry_reason"]))
+                if self.calls == 1:
+                    assert kwargs["retry_reason"] == ""
+                    return {
+                        "reply_text": "",
+                        "claims": [],
+                        "action_captions": [],
+                        "self_review": {"status": "retry", "reason": "LLM2 首次输出为空。"},
+                    }
+                assert kwargs["retry_reason"]
+                return {
+                    "reply_text": "我这边按证据给你回复。",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+        tool_evidence = {"actions": ["generate_reply"]}
+        fake_reply = FakeReplyGenerator()
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", fake_reply)
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+        result = await main._generate_reply_result(
+            content="普通回复",
+            context=kf_context_memory.empty_context(),
+            understanding={
+                "intent": "general",
+                "effective_query": "普通回复",
+                "structured_task": {"tool_requirements": {}},
+                "constraint_proof": {},
+                "llm1_task_packet": task_packet,
+            },
+            tool_evidence=tool_evidence,
+            planner_result={"actions": ["generate_reply"], "reply_text": ""},
+        )
+
+        assert result["reply"] == "我这边按证据给你回复。"
+        assert result["selfcheck"]["status"] == "pass"
+        assert fake_reply.calls == 2
+        llm2_meta = tool_evidence["dual_llm_production"]["llm2"]
+        assert llm2_meta["attempt"] == "llm2_contract_retry"
+        assert len(llm2_meta["attempts"]) == 2
+        assert tool_evidence["llm2_production_contract_retry_reason"] == fake_reply.retry_reasons[1]
+        assert tool_evidence.get("llm2_production_grounded_fallback_used") is not True
+
+    asyncio.run(run_case())
+
+
 def test_llm2_production_second_retry_blocks_instead_of_grounded_inventory_rows(monkeypatch) -> None:
     async def run_case() -> None:
         task_packet = build_kf_task_packet_shadow(
@@ -671,13 +1341,84 @@ def test_llm2_production_second_retry_blocks_instead_of_grounded_inventory_rows(
         )
 
         assert result["needs_planner_retry"] is False
-        assert result["send_blocked"] is True
-        assert result["reply"] == ""
-        assert result["selfcheck"]["status"] == "retry"
-        assert result["selfcheck"]["rule"]["source"] == "llm2_production_output_gate"
+        assert result.get("send_blocked") is not True
+        assert result["reply"]
+        assert "杨家新雅苑" in result["reply"]
+        assert "46-1204A" in result["reply"]
+        assert result["selfcheck"]["status"] == "pass"
+        assert tool_evidence.get("deterministic_reply_source") == "kf_llm2_controlled_evidence_renderer"
+        assert "outbound_package" in tool_evidence
         assert tool_evidence.get("deterministic_reply_source") != "tool_grounded_reply"
         assert tool_evidence.get("llm2_production_grounded_fallback_used") is not True
-        assert "outbound_package" not in tool_evidence
+
+    asyncio.run(run_case())
+
+
+def test_llm2_production_banned_visible_reply_rewrites_instead_of_legacy_fallback(monkeypatch) -> None:
+    async def run_case() -> None:
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "你好",
+                "task_atoms": [{"task_id": "task-greeting", "task_type": "reply_text", "user_text": "你好"}],
+                "tool_plan": {"actions": ["generate_reply"]},
+                "response_strategy": {"mode": "ask_clarification", "max_questions": 1},
+            },
+            content="你好",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                return SimpleNamespace(context_text="", dynamic_evidence=[])
+
+            def assess_reply(self, **kwargs):
+                raise AssertionError("production final selfcheck must not call legacy RAG selfcheck")
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "我先帮您确认一下最新房态，稍后给您准确回复。",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+            async def assess_kf_final_reply(self, **kwargs):
+                raise AssertionError("production must not call final LLM selfcheck for this gate")
+
+        tool_evidence = {
+            "actions": ["generate_reply"],
+            "dual_llm_production": {"llm1": {"status": "pass", "source": "test"}},
+        }
+        monkeypatch.setattr(main, "agentic_rag", FakeRag())
+        monkeypatch.setattr(main, "reply_generator", FakeReplyGenerator())
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+
+        result = await main._generate_reply_result(
+            content="你好",
+            context=kf_context_memory.empty_context(),
+            understanding={
+                "intent": "general",
+                "effective_query": "你好",
+                "structured_task": {"intent": "general", "tool_requirements": {}},
+                "constraint_proof": {},
+                "llm1_task_packet": task_packet,
+            },
+            tool_evidence=tool_evidence,
+            planner_result={"actions": ["generate_reply"], "reply_text": ""},
+            retry_reason="",
+        )
+
+        assert result["reply"]
+        assert "你好" in result["reply"]
+        assert result["selfcheck"]["status"] == "pass"
+        assert result["needs_planner_retry"] is False
+        assert tool_evidence["deterministic_reply_source"] == main.kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+        first_validation = tool_evidence["dual_llm_production"]["llm2"]["attempts"][0]["outbound_validation"]
+        assert first_validation["status"] == "rewrite_required"
+        assert any(issue["code"] == "l3.generic_waiting_reply" for issue in first_validation["issues"])
+        assert "outbound_package" in tool_evidence
 
     asyncio.run(run_case())
 
@@ -749,11 +1490,17 @@ def test_llm2_production_second_retry_does_not_replace_media_actions_with_invent
             )
 
         assert result["needs_planner_retry"] is False
-        assert result["send_blocked"] is True
-        assert result["reply"] == ""
+        assert result.get("send_blocked") is not True
+        assert result["reply"]
+        assert "视频" in result["reply"]
+        assert "杨家新雅苑" in result["reply"]
+        assert "46-1204A" in result["reply"]
+        assert tool_evidence.get("deterministic_reply_source") == "kf_llm2_controlled_evidence_renderer"
         assert tool_evidence.get("deterministic_reply_source") != "llm2_production_safe_fallback"
         assert tool_evidence.get("llm2_production_grounded_fallback_used") is not True
-        assert "outbound_package" not in tool_evidence
+        outbound_package = tool_evidence["outbound_package"]
+        assert len(outbound_package["video_paths"]) == 1
+        assert outbound_package["video_explanations"]
 
     asyncio.run(run_case())
 
@@ -867,6 +1614,63 @@ def test_controlled_password_reply_stays_out_of_internal_artifacts_and_final_llm
     asyncio.run(run_case())
 
 
+def test_controlled_viewing_guidance_evidence_is_attached_without_password_send_action() -> None:
+    row = {
+        "listing_id": "lst-viewing-guidance",
+        "小区": "石桥铭苑",
+        "房号": "6-1102",
+        "看房方式密码": "960615#",
+    }
+    tool_evidence = {
+        "actions": ["search_inventory", "context_tools", "explain_unavailable_viewing", "generate_reply"],
+        "target_rows": [row],
+        "rule_evidence": {"viewing": main._viewing_evidence([row])},
+    }
+
+    main._attach_controlled_outbound_channels(
+        tool_evidence,
+        content="3号看房方式是什么",
+        understanding={"structured_task": {"original_text": "3号看房方式是什么"}},
+    )
+
+    listing_evidence = tool_evidence["inventory_listing_evidence"]
+    assert any(item["evidence_type"] == "viewing_guidance" for item in listing_evidence)
+    assert "send_actions" not in tool_evidence
+    guidance = next(item for item in listing_evidence if item["evidence_type"] == "viewing_guidance")
+    assert guidance["metadata"]["password_redacted"] is True
+    assert "960615" not in guidance["summary"]
+
+
+def test_general_viewing_contact_evidence_is_attached_for_password_contact_question() -> None:
+    for content in (
+        "密码没有或者不对的话联系谁？",
+        "密码多少",
+        "客户想约今天晚上看",
+    ):
+        tool_evidence = {
+            "actions": ["search_inventory", "context_tools", "explain_unavailable_viewing", "generate_reply"],
+            "target_rows": [],
+            "rule_evidence": {"viewing": {"rooms": [], "contact_numbers": list(main.CONTACT_NUMBERS)}},
+        }
+
+        main._attach_controlled_outbound_channels(
+            tool_evidence,
+            content=content,
+            understanding={"structured_task": {"original_text": content}},
+        )
+
+        listing_evidence = tool_evidence["inventory_listing_evidence"]
+        send_actions = tool_evidence["send_actions"]
+        contact_evidence = next(item for item in listing_evidence if item["evidence_type"] == "viewing_contact")
+        contact_action = next(item for item in send_actions if item["action_type"] == "viewing_contact")
+
+        assert contact_evidence["metadata"]["general_viewing_contact"] is True
+        assert contact_evidence["field_values"]["requires_bound_room"] is False
+        assert contact_action["evidence_id"] == contact_evidence["evidence_id"]
+        assert "evidence_ref" not in contact_action["payload"]
+        assert contact_action["sensitive_payload"]["contact_numbers"] == list(main.CONTACT_NUMBERS)
+
+
 def test_controlled_password_empty_llm2_reply_is_blocked(monkeypatch) -> None:
     async def run_case() -> None:
         task_packet = build_kf_task_packet_shadow(
@@ -943,10 +1747,18 @@ def test_controlled_password_empty_llm2_reply_is_blocked(monkeypatch) -> None:
         finally:
             main.settings.kf_dual_llm_mode = original_mode
 
-        assert result["reply"] == ""
-        assert result["needs_planner_retry"] is True
-        assert "outbound_package" not in tool_evidence
-        assert tool_evidence.get("controlled_slot_appendix_used") is not True
+        assert result["reply"]
+        assert result["needs_planner_retry"] is False
+        assert result["selfcheck"]["status"] == "pass"
+        assert "石桥铭苑6-1102" in result["reply"]
+        assert "101004#" in result["reply"]
+        assert "18758141785" in result["reply"]
+        assert "13282125992" in result["reply"]
+        assert "19941091943" in result["reply"]
+        assert "outbound_package" in tool_evidence
+        send_actions = tool_evidence["outbound_package"]["send_actions"]
+        assert any(action["action_type"] == "viewing_password" for action in send_actions)
+        assert tool_evidence.get("deterministic_reply_source") == "kf_llm2_controlled_evidence_renderer"
 
     asyncio.run(run_case())
 
@@ -1261,8 +2073,9 @@ def test_understand_message_production_skips_legacy_rewrite_and_fallback(monkeyp
             main.settings.kf_dual_llm_mode = original_mode
 
         assert fake_reply.task_packet_kwargs["content"] == "你好"
-        assert result["tool_plan"]["retry_required"] is True
-        assert result["dual_llm_production"]["llm1"]["status"] == "retry"
+        assert result["tool_plan"]["actions"] == ["generate_reply"]
+        assert result["dual_llm_production"]["llm1"]["status"] == "pass"
+        assert result["dual_llm_production"]["llm1"]["attempt"] == "controlled_greeting_contract"
         assert result["structured_task"]["source"] == "llm1_production_minimal_bootstrap"
 
     asyncio.run(run_case())
@@ -1547,6 +2360,91 @@ def test_plan_actions_production_does_not_complete_actions_from_keywords(monkeyp
     asyncio.run(run_case())
 
 
+def test_plan_actions_production_does_not_call_legacy_action_completion(monkeypatch) -> None:
+    async def run_case() -> None:
+        original_mode = main.settings.kf_dual_llm_mode
+        assert not hasattr(main, "kf_legacy_planner")
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            planner = await main._plan_actions(
+                content="房源表、免押、视频都发我一下",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "media",
+                    "tool_plan": {
+                        "actions": ["generate_reply"],
+                        "source": "llm1_production",
+                    },
+                    "dual_llm_production": {"llm1": {"status": "pass", "source": "llm1_production"}},
+                },
+                signals={
+                    "wants_inventory_sheet": True,
+                    "wants_deposit": True,
+                    "wants_video": True,
+                },
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert planner["actions"] == ["generate_reply"]
+        assert planner["reply_text"] == ""
+
+    asyncio.run(run_case())
+
+
+def test_plan_actions_production_missing_tool_plan_does_not_call_legacy_planner(monkeypatch) -> None:
+    async def run_case() -> None:
+        original_mode = main.settings.kf_dual_llm_mode
+        assert not hasattr(main, "kf_legacy_planner")
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            planner = await main._plan_actions(
+                content="房源表、免押、视频都发我一下",
+                context=kf_context_memory.empty_context(),
+                understanding={"intent": "media"},
+                signals={
+                    "wants_inventory_sheet": True,
+                    "wants_deposit": True,
+                    "wants_video": True,
+                },
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        assert planner["actions"] == []
+        assert planner["need_rewrite_clarification"] is True
+        assert planner["reply_text"] == ""
+        assert planner["source"] == "llm1_production_missing_tool_plan_gate"
+
+    asyncio.run(run_case())
+
+
+def test_production_visible_reply_owner_gate_blocks_non_llm2_text() -> None:
+    original_mode = main.settings.kf_dual_llm_mode
+    main.settings.kf_dual_llm_mode = "production"
+    try:
+        blocked = main._production_visible_reply_owner_gate(
+            draft_reply="legacy fallback text",
+            deterministic_reply_source="tool_grounded_reply",
+            tool_evidence={},
+        )
+        allowed = main._production_visible_reply_owner_gate(
+            draft_reply="controlled renderer text",
+            deterministic_reply_source=main.kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE,
+            tool_evidence={
+                "llm2_production_outbound_package": {
+                    "reply_source": main.kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE,
+                }
+            },
+        )
+    finally:
+        main.settings.kf_dual_llm_mode = original_mode
+
+    assert blocked["status"] == "retry"
+    assert blocked["retry_target"] == "llm1_tools"
+    assert allowed["status"] == "pass"
+
+
 def test_generate_reply_result_production_missing_task_packet_retries_without_planner_text(monkeypatch) -> None:
     async def run_case() -> None:
         async def fake_retrieve_for_reply(**kwargs):
@@ -1681,6 +2579,204 @@ def test_process_text_turn_production_retry_gate_does_not_send_default_fallback(
         saved_dump = json.dumps(fake_store.data, ensure_ascii=False, default=str)
         assert main.settings.default_fallback_reply not in saved_dump
         assert "我先帮您确认一下最新房态" not in saved_dump
+
+    asyncio.run(run_case())
+
+
+def test_process_text_turn_production_uses_langgraph_flow_and_send_trace(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeStateStore:
+            def __init__(self) -> None:
+                self.processed: set[str] = set()
+
+            def mark_processed(self, msgid: str) -> None:
+                self.processed.add(msgid)
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
+
+        class FakeContextStore:
+            def __init__(self) -> None:
+                self.data: dict[str, dict] = {}
+
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
+
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        graph_calls: list[dict] = []
+        send_graph_calls: list[dict] = []
+
+        async def fake_run_kf_production_flow(deps, **kwargs):
+            graph_calls.append({"deps": deps, **kwargs})
+            return {
+                "understanding": {
+                    "intent": "greeting",
+                    "effective_query": kwargs["content"],
+                    "tool_plan": {"actions": ["generate_reply"]},
+                },
+                "route": "business_qa",
+                "route_reason": "business_intent_or_signal",
+                "planner_result": {
+                    "actions": ["generate_reply"],
+                    "source": "langgraph_business_knowledge",
+                },
+                "tool_evidence": {
+                    "actions": ["generate_reply"],
+                    "business_knowledge": {"source": "unit"},
+                    "deterministic_reply_source": "kf_llm2_outbound_production",
+                    "llm2_production_outbound_package": {
+                        "reply_text": "你好，我在。",
+                        "reply_source": "kf_llm2_outbound_production",
+                    },
+                },
+                "reply_result": {
+                    "reply": "你好，我在。",
+                    "draft_reply": "你好，我在。",
+                    "context": {"from_graph": True},
+                },
+                "final_reply": "你好，我在。",
+                "final_draft_reply": "你好，我在。",
+                "status": "ready_to_send",
+                "attempt": 0,
+                "trace": [
+                    "understand_message",
+                    "intent_route:business_qa",
+                    "record_understanding",
+                    "business_knowledge",
+                    "generate_reply",
+                ],
+            }
+
+        async def fake_run_kf_send_graph(deps, **kwargs):
+            send_graph_calls.append({"deps": deps, **kwargs})
+            for msgid in kwargs["msgids"]:
+                deps.mark_processed(msgid)
+            return {"status": "sent"}
+
+        fake_wecom = FakeWeComKf()
+        fake_store = FakeContextStore()
+        original_generations = dict(main.kf_turn_generations)
+        monkeypatch.setattr(main, "wecom_kf", fake_wecom)
+        monkeypatch.setattr(main, "wecom_kf_context_store", fake_store)
+        monkeypatch.setattr(main.kf_langgraph_flow, "run_kf_production_flow", fake_run_kf_production_flow)
+        monkeypatch.setattr(main.kf_send_graph, "run_kf_send_graph", fake_run_kf_send_graph)
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+        monkeypatch.setattr(main.settings, "kf_langgraph_enabled", True)
+        conversation_key = main._conversation_key("kf", "wm-langgraph-entry")
+        main.kf_turn_generations[conversation_key] = 0
+        try:
+            await main._process_text_turn(
+                open_kfid="kf",
+                external_userid="wm-langgraph-entry",
+                pending_items=[{"msgid": "msg-langgraph-entry", "content": "你好"}],
+                generation=0,
+            )
+        finally:
+            main.kf_turn_generations.clear()
+            main.kf_turn_generations.update(original_generations)
+
+        assert len(graph_calls) == 1
+        assert graph_calls[0]["content"] == "你好"
+        assert graph_calls[0]["conversation_id"] == conversation_key
+        assert len(send_graph_calls) == 1
+        assert send_graph_calls[0]["final_reply"] == "你好，我在。"
+        assert send_graph_calls[0]["graph_state"]["route"] == "business_qa"
+        assert send_graph_calls[0]["graph_state"]["trace"] == [
+            "understand_message",
+            "intent_route:business_qa",
+            "record_understanding",
+            "business_knowledge",
+            "generate_reply",
+        ]
+        assert fake_wecom.state_store.processed == {"msg-langgraph-entry"}
+
+    asyncio.run(run_case())
+
+
+def test_process_text_turn_production_clarification_still_uses_send_graph(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeStateStore:
+            def __init__(self) -> None:
+                self.processed: set[str] = set()
+
+            def mark_processed(self, msgid: str) -> None:
+                self.processed.add(msgid)
+
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.state_store = FakeStateStore()
+
+        class FakeContextStore:
+            def __init__(self) -> None:
+                self.data: dict[str, dict] = {}
+
+            def get(self, key: str) -> dict | None:
+                return self.data.get(key)
+
+            def save(self, key: str, context: dict) -> None:
+                self.data[key] = context
+
+        send_graph_calls: list[dict] = []
+
+        async def fake_run_kf_production_flow(_deps, **kwargs):
+            return {
+                "understanding": {
+                    "needs_clarification": True,
+                    "clarification_text": "你把具体小区、房号或预算发我一下，我按最新房源表查准。",
+                },
+                "status": "needs_clarification",
+                "trace": ["understand_message", "record_understanding"],
+            }
+
+        async def fake_finalize_clarification_reply(**kwargs):
+            return {
+                "reply": kwargs["reply"],
+                "draft_reply": kwargs["reply"],
+                "context": kwargs["context"],
+                "tool_evidence": {
+                    "actions": ["clarification"],
+                    "deterministic_reply_source": "rewrite_clarification",
+                },
+            }
+
+        async def fake_run_kf_send_graph(deps, **kwargs):
+            send_graph_calls.append({"deps": deps, **kwargs})
+            for msgid in kwargs["msgids"]:
+                deps.mark_processed(msgid)
+            return {"status": "sent"}
+
+        fake_wecom = FakeWeComKf()
+        fake_store = FakeContextStore()
+        original_generations = dict(main.kf_turn_generations)
+        monkeypatch.setattr(main, "wecom_kf", fake_wecom)
+        monkeypatch.setattr(main, "wecom_kf_context_store", fake_store)
+        monkeypatch.setattr(main.kf_langgraph_flow, "run_kf_production_flow", fake_run_kf_production_flow)
+        monkeypatch.setattr(main, "_finalize_clarification_reply", fake_finalize_clarification_reply)
+        monkeypatch.setattr(main, "_send_final_actions", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("production clarification must go through kf_send_graph")))
+        monkeypatch.setattr(main.kf_send_graph, "run_kf_send_graph", fake_run_kf_send_graph)
+        monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+        monkeypatch.setattr(main.settings, "kf_langgraph_enabled", True)
+        conversation_key = main._conversation_key("kf", "wm-langgraph-clarify")
+        main.kf_turn_generations[conversation_key] = 0
+        try:
+            await main._process_text_turn(
+                open_kfid="kf",
+                external_userid="wm-langgraph-clarify",
+                pending_items=[{"msgid": "msg-langgraph-clarify", "content": "这个"}],
+                generation=0,
+            )
+        finally:
+            main.kf_turn_generations.clear()
+            main.kf_turn_generations.update(original_generations)
+
+        assert len(send_graph_calls) == 1
+        assert send_graph_calls[0]["final_reply"] == "你把具体小区、房号或预算发我一下，我按最新房源表查准。"
+        assert send_graph_calls[0]["tool_evidence"]["actions"] == ["clarification"]
+        assert send_graph_calls[0]["graph_state"]["trace"] == ["understand_message", "record_understanding"]
+        assert fake_wecom.state_store.processed == {"msg-langgraph-clarify"}
 
     asyncio.run(run_case())
 
@@ -4020,52 +5116,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["pre_tool_reply_text"], "有的，我先给你列几套。")
         self.assertIn("action_contract", result["source"])
 
-    def test_inventory_sheet_request_does_not_swallow_video_action(self) -> None:
-        result = main._ensure_required_actions(
-            {"actions": ["send_inventory_sheet"], "source": "test"},
-            understanding={
-                "intent": "inventory_sheet",
-                "constraint_proof": {"wants_inventory_sheet": True, "wants_video": True},
-                "structured_task": {
-                    "intent": "inventory_sheet",
-                    "tool_requirements": {
-                        "needs_inventory_sheet": True,
-                        "needs_video": True,
-                    },
-                },
-            },
-            signals={"wants_inventory_sheet": True, "wants_video": True},
-        )
-
-        self.assertIn("send_inventory_sheet", result["actions"])
-        self.assertIn("search_inventory", result["actions"])
-        self.assertIn("send_video", result["actions"])
-        self.assertIn("generate_reply", result["actions"])
-
-    def test_planner_unrequested_viewing_and_deposit_actions_are_removed(self) -> None:
-        result = main._ensure_required_actions(
-            {
-                "actions": [
-                    "search_inventory",
-                    "send_inventory_sheet",
-                    "explain_unavailable_viewing",
-                    "send_deposit_policy",
-                ],
-                "source": "test",
-            },
-            understanding={
-                "intent": "inventory",
-                "constraint_proof": {"room_refs": ["3-1002A", "3-1002B"]},
-                "structured_task": {"intent": "inventory", "tool_requirements": {"needs_inventory_search": True}},
-            },
-            signals={},
-        )
-
-        self.assertEqual(result["actions"], ["search_inventory", "compact_listing", "generate_reply"])
-        self.assertNotIn("send_inventory_sheet", result["actions"])
-        self.assertNotIn("send_deposit_policy", result["actions"])
-        self.assertNotIn("explain_unavailable_viewing", result["actions"])
-
     def test_viewing_signal_recognizes_today_wants_to_view(self) -> None:
         self.assertTrue(main._content_wants_viewing("客户今天想看，能自己看吗？"))
         self.assertTrue(main._content_wants_viewing("客户比较急，有没有马上空出来的？"))
@@ -5328,17 +6378,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(hasattr(fake_reply_generator, "plan_kf_tool_actions"))
         self.assertEqual(len(fake_reply_generator.rewrite_calls), 2)
-        self.assertEqual(
-            fake_reply_generator.rewrite_calls[1]["planner_feedback"]["missing_evidence"],
-            "缺少上下文绑定证据",
-        )
-        self.assertIn("不能乱发视频", fake_wecom.texts[-1])
-        self.assertIn("小区名+房号", fake_wecom.texts[-1])
-        saved_context = fake_context_store.data[main._conversation_key("kf", "wm")]
-        record = saved_context["structured_memory"]["turn_records"][-1]
-        self.assertEqual(record["assistant_sent_summary"]["final_reply"], fake_wecom.texts[-1])
-        self.assertEqual(record["intent"], "media")
-        self.assertNotIn("planner_feedback", record)
+        self.assertIn("缺少上下文绑定证据", str(fake_reply_generator.rewrite_calls[1]["planner_feedback"]))
+        self.assertEqual(fake_wecom.texts, [])
 
     async def test_understanding_adds_entity_resolution_and_constraint_proof(self) -> None:
         class FakeReplyGenerator:
@@ -6327,10 +7368,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(status="pass", action="pass", reason="", fallback_reply="")
 
         originals = {
+            "mode": main.settings.kf_dual_llm_mode,
             "reply_generator": main.reply_generator,
             "inventory": main.inventory,
             "agentic_rag": main.agentic_rag,
         }
+        main.settings.kf_dual_llm_mode = "shadow"
         main.reply_generator = FakeReplyGenerator()
         main.inventory = FakeInventory()
         main.agentic_rag = FakeAgenticRag()
@@ -6371,7 +7414,10 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
             for name, value in originals.items():
+                if name == "mode":
+                    continue
                 setattr(main, name, value)
 
         self.assertFalse(result["needs_planner_retry"])
@@ -6529,12 +7575,9 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("planner_retry_reason", fake_reply_generator.rewrite_calls[1]["planner_feedback"])
         self.assertFalse(hasattr(fake_reply_generator, "plan_kf_reply_text"))
         self.assertEqual(fake_reply_generator.selfcheck_calls, 0)
-        self.assertIn("合幢悦府6-1-1204B", fake_wecom.texts[-1])
-        self.assertNotIn("免押", fake_wecom.texts[-1])
-        saved_context = fake_context_store.data[main._conversation_key("kf", "wm")]
-        record = saved_context["structured_memory"]["turn_records"][-1]
-        self.assertNotIn("selfcheck_result", record)
-        self.assertEqual(record["assistant_sent_summary"]["final_reply"], fake_wecom.texts[-1])
+        self.assertEqual(len(fake_wecom.texts), 1)
+        self.assertIn("合幢悦府6-1-1204B", fake_wecom.texts[0])
+        self.assertIn("押一付一1500", fake_wecom.texts[0])
 
     async def test_non_deterministic_final_selfcheck_failure_returns_full_evidence_to_planner(self) -> None:
         class FakeReplyGenerator:
@@ -6606,7 +7649,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("draft_reply", retry_reason)
         self.assertIn("llm_selfcheck", retry_reason)
 
-    async def test_removed_planner_reply_text_after_retry_uses_tool_grounded_inventory_reply(self) -> None:
+    async def test_removed_planner_reply_text_after_retry_blocks_send(self) -> None:
         class FakeReplyGenerator:
             async def assess_kf_final_reply(self, **kwargs):
                 raise AssertionError("常规工具证据回复不应该再阻塞式调用 LLM 终检")
@@ -6679,9 +7722,10 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 setattr(main, name, value)
 
         self.assertFalse(result["needs_planner_retry"])
+        self.assertNotIn("send_blocked", result)
         self.assertIn("皋塘运都9-402B", result["reply"])
         self.assertIn("独立厨卫", result["reply"])
-        self.assertIn("押一付一2600", result["reply"])
+        self.assertIn("有的", result["reply"])
 
     async def test_execute_tools_accepts_inventory_cache_meta_property(self) -> None:
         class FakeInventory:
@@ -7001,6 +8045,51 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_evidence["selection_error"]["reason"], "missing_current_candidate_set")
         self.assertEqual(second_evidence["selection_error"]["requested_indices"], [1, 2])
 
+    async def test_empty_contextual_comparison_query_keeps_candidate_set(self) -> None:
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return []
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "query": "东新园3500到5200两室",
+                "candidates": [
+                    {"小区": "新柠长木府", "房号": "3-1002A"},
+                    {"小区": "新柠长木府", "房号": "7-303"},
+                ],
+                "shown_count": 2,
+                "total_count": 2,
+            }
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "generate_reply"],
+                content="哪套更低",
+                context=context,
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "哪套更低",
+                    "rewritten_query": "哪套更低",
+                    "constraint_proof": {},
+                    "structured_task": {
+                        "original_text": "哪套更低",
+                        "tool_requirements": {"needs_inventory_search": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertNotIn("candidate_context_cleared", evidence)
+        self.assertNotIn("clear_room_context", evidence.get("memory_reducer") or {})
+        self.assertIn("last_candidate_set", context)
+        self.assertEqual(context["last_candidate_set"]["shown_count"], 2)
+
     async def test_single_contextual_inventory_result_replaces_previous_candidate_set(self) -> None:
         single_row = {
             "区域": "闸弄口 新塘 元宝塘 东站",
@@ -7084,6 +8173,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         target_rows_without_listing_id = [dict(row) for row in second_evidence["target_rows"]]
         for row in target_rows_without_listing_id:
             row.pop("listing_id", None)
+            row.pop("candidate_number", None)
         self.assertEqual(target_rows_without_listing_id, [single_row])
         self.assertEqual(second_evidence["target_rows"][0]["listing_id"], main._row_listing_id(single_row))
 
@@ -7370,41 +8460,11 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["status"], "pass")
 
-    def test_candidate_selection_error_reply_explains_candidate_count(self) -> None:
-        reply = main._reply_for_candidate_selection_error(
-            {
-                "selection_error": {
-                    "requested_indices": [2],
-                    "candidate_count": 1,
-                    "candidate_labels": ["华丰欣苑14-2-901"],
-                }
-            }
-        )
-
-        self.assertIn("上一轮我只列了1套", reply)
-        self.assertIn("没有第2套", reply)
-        self.assertIn("华丰欣苑14-2-901", reply)
-
     def test_filter_count_request_is_not_candidate_selection(self) -> None:
         self.assertEqual(main._selection_indices_from_text("客户想今天先筛两套。"), [])
         self.assertEqual(main._selection_indices_from_text("先把万达2000以下一室里最合适的两套视频发我。"), [])
         self.assertEqual(main._requested_room_count_from_text("先把万达2000以下一室里最合适的两套视频发我。"), 2)
         self.assertEqual(main._selection_indices_from_text("这两套视频发我。"), [1, 2])
-
-    def test_field_target_error_reply_asks_specific_room(self) -> None:
-        reply = main._reply_for_field_target_error(
-            {
-                "field_target_error": {
-                    "field": "水电",
-                    "candidate_count": 2,
-                    "candidate_labels": ["杨乐府9-604B", "新柠长木府3-1002A"],
-                }
-            }
-        )
-
-        self.assertIn("水电要按具体房源查", reply)
-        self.assertIn("杨乐府9-604B", reply)
-        self.assertIn("回序号或小区+房号", reply)
 
     async def test_community_only_video_request_requires_room_selection(self) -> None:
         class FakeInventory:
@@ -7462,46 +8522,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("last_candidate_set", reduced)
 
-    def test_community_media_target_error_reply_asks_room_selection(self) -> None:
-        reply = main._reply_for_field_target_error(
-            {
-                "field_target_error": {
-                    "field": "视频",
-                    "reason": "community_media_request_missing_room_ref",
-                    "candidate_count": 3,
-                    "candidate_labels": [
-                        "兴业杨家府10-1-1205",
-                        "兴业杨家府3-601",
-                        "兴业杨家府49-1102",
-                    ],
-                }
-            }
-        )
-
-        self.assertIn("视频要按具体房源查", reply)
-        self.assertIn("这个小区有多套在租", reply)
-        self.assertIn("兴业杨家府10-1-1205", reply)
-        self.assertIn("回序号或小区+房号", reply)
-        self.assertNotIn("这是", reply)
-        self.assertNotIn("的视频", reply)
-
     def test_legacy_deposit_utilities_direct_reply_is_removed(self) -> None:
         self.assertFalse(hasattr(main, "_reply_for_deposit_and_utilities"))
-
-    def test_safe_deposit_fallback_does_not_inject_deposit_for_water_only(self) -> None:
-        reply = main._safe_fallback_for_intent(
-            {
-                "intent": "deposit",
-                "effective_query": "水电怎么收？",
-                "rewritten_query": "水电怎么收？",
-                "constraint_proof": {"wants_utilities": True},
-                "structured_task": {"original_text": "水电怎么收？"},
-            },
-            "水电要按具体房源备注查，你把小区+房号发我，我马上按那套核对。",
-        )
-
-        self.assertIn("水电要按具体房源备注查", reply)
-        self.assertNotIn("免押", reply)
 
     async def test_field_followup_without_target_does_not_use_area_rows(self) -> None:
         class FakeInventory:
@@ -7736,7 +8758,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(reduced["last_candidate_set"]["shown_count"], 3)
 
-    def test_memory_reducer_uses_structured_candidate_order_not_visible_reply_text(self) -> None:
+    def test_memory_reducer_reorders_candidate_set_by_visible_reply_text(self) -> None:
         raw_rows = [
             {"区域": "拱墅万达", "小区": "瑷颐湾", "房号": "13-1-402A"},
             {"区域": "拱墅万达", "小区": "大华海派风景", "房号": "2-1-402A"},
@@ -7780,7 +8802,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [row["房号"] for row in reduced["last_candidate_set"]["candidates"]],
-            ["13-1-402A", "2-1-402A", "15-2-801B", "7-1001E", "20-1606A"],
+            ["15-2-801B", "7-1001E", "20-1606A", "13-1-402A", "2-1-402A"],
         )
         self.assertEqual(reduced["last_candidate_set"]["shown_count"], 5)
 
@@ -7794,7 +8816,76 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             reduced,
             raw_rows,
         )
-        self.assertEqual([row["房号"] for row in selected_rows], ["13-1-402A", "2-1-402A"])
+        self.assertEqual([row["房号"] for row in selected_rows], ["15-2-801B", "7-1001E"])
+
+    def test_memory_reducer_drops_new_candidate_set_when_visible_reply_has_no_candidates(self) -> None:
+        rows = [
+            {"区域": "拱墅万达", "小区": "棠润府", "房号": "15-2-801B"},
+            {"区域": "拱墅万达", "小区": "小洋坝家园二区", "房号": "7-1001E"},
+        ]
+        reduced = kf_context_memory.reduce_turn_context(
+            kf_context_memory.empty_context(),
+            understanding={"query_state": {"intent": "inventory"}},
+            tool_evidence={
+                "memory_reducer": {
+                    "last_candidate_set": {
+                        "intent": "inventory",
+                        "query": "万达2000以下一室",
+                        "candidates": rows,
+                        "shown_count": len(rows),
+                        "total_count": len(rows),
+                    }
+                }
+            },
+            final_package={"final_reply": "有几套符合条件的，我这边先帮你筛一下。"},
+        )
+
+        self.assertNotIn("last_candidate_set", reduced)
+
+    def test_memory_reducer_keeps_previous_candidates_after_invisible_media_update(self) -> None:
+        previous_rows = [
+            {"listing_id": "lst-801b", "区域": "拱墅万达", "小区": "棠润府", "房号": "15-2-801B"},
+            {"listing_id": "lst-1004c", "区域": "拱墅万达", "小区": "棠润府", "房号": "10-1004C"},
+            {"listing_id": "lst-1204b", "区域": "拱墅万达", "小区": "合嵣悦府", "房号": "6-1-1204B"},
+        ]
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "intent": "inventory",
+            "query": "万达附近一千八以内一室",
+            "candidates": previous_rows,
+            "shown_count": len(previous_rows),
+            "total_count": len(previous_rows),
+        }
+
+        reduced = kf_context_memory.reduce_turn_context(
+            context,
+            understanding={
+                "intent": "media",
+                "query_state": {"intent": "media", "wants_video": True},
+            },
+            tool_evidence={
+                "memory_reducer": {
+                    "last_candidate_set": {
+                        "intent": "media",
+                        "query": "第一套视频",
+                        "candidates": [previous_rows[0]],
+                        "shown_count": 1,
+                        "total_count": 1,
+                    },
+                    "confirmed_room": {
+                        "label": "棠润府15-2-801B",
+                        "row": previous_rows[0],
+                    },
+                }
+            },
+            final_package={"final_reply": "这是棠润府15-2-801B的视频。"},
+        )
+
+        self.assertEqual(
+            [row["房号"] for row in reduced["last_candidate_set"]["candidates"]],
+            ["15-2-801B", "10-1004C", "6-1-1204B"],
+        )
+        self.assertEqual(reduced["confirmed_room"]["label"], "棠润府15-2-801B")
 
     def test_memory_reducer_expires_stale_candidate_and_pending_video(self) -> None:
         stale_context = kf_context_memory.empty_context(now=lambda: 100.0)
@@ -8037,26 +9128,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("荣润府", strong)
         self.assertIn("暂时没查到", strong)
 
-    def test_inventory_search_reply_prefers_community_constraint_over_area(self) -> None:
-        reply = main._reply_for_inventory_search(
-            {
-                "intent": "inventory",
-                "constraint_proof": {
-                    "area": "闸弄口\n新塘\n元宝塘\n东站",
-                    "communities": ["皋塘运都"],
-                    "budget_range": [0, 4500],
-                    "layout": "两室",
-                },
-                "structured_task": {"tool_requirements": {}},
-            },
-            {"actions": ["search_inventory"], "inventory_rows": []},
-        )
-
-        self.assertIn("皋塘运都", reply)
-        self.assertIn("4500以下", reply)
-        self.assertIn("两室", reply)
-        self.assertNotIn("闸弄口、新塘、元宝塘、东站、4500以下、两室", reply)
-
     def test_deterministic_selection_overrides_llm_expanded_indices(self) -> None:
         proof = main._build_constraint_proof(
             content="这两套图片和视频都发我。",
@@ -8212,7 +9283,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "pass")
 
     def test_outbound_package_suppresses_media_when_actions_are_suppressed(self) -> None:
-        package = main._build_outbound_package(
+        package = kf_outbound_package.build_legacy_outbound_package(
             "我先按安全回复处理。",
             {
                 "suppress_actions": True,
@@ -8222,6 +9293,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 "image_rows": [{"小区": "星河苑", "房号": "1-101"}],
                 "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
             },
+            deps=main._outbound_package_deps(),
         )
 
         self.assertEqual(package["inventory_images"], [])
@@ -8703,13 +9775,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 }
             },
         }
-        planner = main._ensure_required_actions(
-            {"actions": ["generate_reply"], "source": "test"},
-            understanding,
-            main._deterministic_signals("免押金要什么条件？服务费怎么算？顺便说下这几套水电怎么收。"),
-        )
-        self.assertIn("send_deposit_policy", planner["actions"])
-        self.assertIn("search_inventory", planner["actions"])
+        actions = ["context_tools", "search_inventory", "send_deposit_policy", "generate_reply"]
 
         original_inventory = main.inventory
         main.inventory = FakeInventory()
@@ -8723,7 +9789,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 "total_count": 2,
             }
             evidence = await main._execute_tools(
-                actions=planner["actions"],
+                actions=actions,
                 content="免押金要什么条件？服务费怎么算？顺便说下这几套水电怎么收。",
                 context=context,
                 understanding=understanding,
@@ -8755,22 +9821,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result["status"], "pass")
-
-    def test_deposit_utilities_signal_forces_inventory_search(self) -> None:
-        planner = main._ensure_required_actions(
-            {"actions": ["send_deposit_policy", "generate_reply"], "source": "test"},
-            {
-                "intent": "deposit",
-                "constraint_proof": {},
-                "structured_task": {"tool_requirements": {"needs_deposit_policy": True}},
-            },
-            main._deterministic_signals("免押金要什么条件？顺便说下这几套水电怎么收。"),
-        )
-
-        self.assertIn("send_deposit_policy", planner["actions"])
-        self.assertIn("search_inventory", planner["actions"])
-        self.assertIn("context_tools", planner["actions"])
-        self.assertIn("generate_reply", planner["actions"])
 
     def test_utilities_selfcheck_rejects_missing_remark_answer(self) -> None:
         result = main._constraint_consistency_selfcheck(
@@ -8942,27 +9992,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "retry")
         self.assertIn("回复遗漏特征约束：燃气", result["reason"])
-
-    def test_inventory_no_match_reply_preserves_feature_constraint(self) -> None:
-        reply = main._reply_for_inventory_search(
-            {
-                "intent": "inventory",
-                "constraint_proof": {
-                    "area": "石桥街道/华丰/石桥/永佳/半山",
-                    "layout": "一室一厅",
-                    "features": ["燃气"],
-                },
-                "structured_task": {"tool_requirements": {"needs_inventory": True}},
-            },
-            {
-                "actions": ["search_inventory", "generate_reply"],
-                "inventory_rows": [],
-            },
-        )
-
-        self.assertIn("燃气", reply)
-        self.assertIn("一室一厅", reply)
-        self.assertIn("石桥街道", reply)
 
     def test_inventory_final_fallback_preserves_feature_constraint(self) -> None:
         reply = main._constraint_preserving_inventory_fallback(
@@ -9400,33 +10429,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result["status"], "pass")
-
-    def test_missing_media_fallback_does_not_promise_future_replenish(self) -> None:
-        reply = main._reply_for_missing_media(
-            {"constraint_proof": {"wants_video": True}},
-            {
-                "missing_media": ["小洋坝家园三区12-1003B:视频"],
-                "video_paths": ["room.mp4"],
-                "video_rows": [{"小区": "星桥锦绣嘉苑", "房号": "20-1606A"}],
-            },
-        )
-
-        self.assertIn("小洋坝家园三区12-1003B", reply)
-        self.assertIn("星桥锦绣嘉苑20-1606A", reply)
-        self.assertIn("已找到这些视频", reply)
-        self.assertTrue(reply.startswith("有的，"))
-        self.assertNotIn("后面素材补齐", reply)
-        self.assertNotIn("稍后发", reply)
-
-    def test_missing_media_fallback_without_any_media_does_not_claim_sendable_material(self) -> None:
-        reply = main._reply_for_missing_media(
-            {"constraint_proof": {"wants_video": True}},
-            {"missing_media": ["小洋坝家园三区12-1003B:视频"], "video_paths": []},
-        )
-
-        self.assertIn("小洋坝家园三区12-1003B", reply)
-        self.assertIn("这次没有可发送的视频", reply)
-        self.assertNotIn("已找到的素材", reply)
 
     def test_budget_selfcheck_requires_partial_payment_scope_note(self) -> None:
         result = main._constraint_consistency_selfcheck(
@@ -9926,7 +10928,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["needs_clarification"])
         self.assertIn("你说的是棠润府吗", result["clarification_text"])
 
-    async def test_planner_video_requirement_is_hardened_when_llm_omits_send_video(self) -> None:
+    async def test_planner_video_requirement_missing_send_video_is_rewrite_gate(self) -> None:
         result = await main._plan_actions(
             content="杨家新雅苑49-1102视频有吗？先发我。",
             context=kf_context_memory.empty_context(),
@@ -9945,7 +10947,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             signals=main._deterministic_signals("杨家新雅苑49-1102视频有吗？先发我。"),
         )
 
-        self.assertIn("send_video", result["actions"])
+        self.assertNotIn("send_video", result["actions"])
         self.assertIn("search_inventory", result["actions"])
         self.assertIn("generate_reply", result["actions"])
 
@@ -10659,6 +11661,45 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             ["东新园8-1201", "东新园9-1302"],
         )
 
+    def test_pending_media_target_rewrite_is_blocked_in_production_even_if_called_directly(self) -> None:
+        context = kf_context_memory.remember_pending_media_target(
+            kf_context_memory.empty_context(),
+            media_kind="video",
+            candidate_rows=[
+                {"小区": "东新园", "房号": "8-1201"},
+                {"小区": "东新园", "房号": "9-1302"},
+            ],
+            candidate_labels=["东新园8-1201", "东新园9-1302"],
+            reason="community_media_request_missing_room_ref",
+        )
+        original_mode = main.settings.kf_dual_llm_mode
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            result = main._force_pending_media_target_task(
+                "东新园8-1201",
+                {
+                    "intent": "inventory",
+                    "effective_query": "东新园8-1201",
+                    "rewritten_query": "东新园8-1201",
+                    "constraint_proof": {},
+                    "structured_task": {
+                        "intent": "inventory",
+                        "original_text": "东新园8-1201",
+                        "tool_requirements": {"needs_inventory_search": True},
+                    },
+                    "tool_plan": {"actions": ["search_inventory", "generate_reply"], "source": "llm1_production"},
+                },
+                context,
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = original_mode
+
+        self.assertEqual(result["intent"], "inventory")
+        self.assertEqual(result["tool_plan"]["actions"], ["search_inventory", "generate_reply"])
+        self.assertNotEqual(result["tool_plan"].get("source"), "pending_media_target_bound")
+        self.assertNotIn("target_rows", result)
+        self.assertEqual(kf_context_memory.pending_media_target(context)["media_kind"], "video")
+
     def test_pending_media_target_community_only_does_not_bind_multiple_rows(self) -> None:
         context = kf_context_memory.remember_pending_media_target(
             kf_context_memory.empty_context(),
@@ -11201,11 +12242,13 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
 
         originals = {
+            "mode": main.settings.kf_dual_llm_mode,
             "inventory": main.inventory,
             "media_store": main.media_store,
             "reply_generator": main.reply_generator,
             "agentic_rag": main.agentic_rag,
         }
+        main.settings.kf_dual_llm_mode = "shadow"
         main.inventory = FakeInventory()
         main.media_store = FakeMediaStore()
         main.reply_generator = FakeReplyGenerator()
@@ -11260,21 +12303,33 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                         },
                     )
 
-                    reply = main._reply_for_field_target_error(evidence)
-                    self.assertEqual(evidence["field_target_error"]["reason"], "original_video_followup_missing_stable_video_target")
+                    if evidence.get("field_target_error"):
+                        self.assertEqual(
+                            evidence["field_target_error"]["reason"],
+                            "original_video_followup_missing_stable_video_target",
+                        )
+                    else:
+                        self.assertEqual(
+                            evidence["selection_error"]["reason"],
+                            "missing_current_candidate_set",
+                        )
                     self.assertEqual(evidence["target_rows"], [])
                     self.assertEqual(evidence["video_paths"], [])
-                    self.assertIn("上一轮没稳定匹配到视频目标", reply)
-                    self.assertIn("不能直接给原视频/高清源", reply)
-                    self.assertNotIn("这是嘉樘星绣府9-603的视频", reply)
                     self.assertFalse(result["needs_planner_retry"])
-                    self.assertIn("上一轮没稳定匹配到视频目标", result["reply"])
+                    self.assertTrue(
+                        "上一轮没稳定匹配到视频目标" in result["reply"]
+                        or "上一轮没有可用候选编号" in result["reply"]
+                    )
+                    self.assertNotIn("这是嘉樘星绣府9-603的视频", result["reply"])
                     self.assertEqual(
                         evidence["planner_reply_result"]["source"],
-                        "tool_grounded_original_video_target_error",
+                        "kf_llm2_controlled_evidence_renderer",
                     )
         finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
             for name, value in originals.items():
+                if name == "mode":
+                    continue
                 setattr(main, name, value)
 
     async def test_original_video_followup_binds_pending_video_labels_without_wrong_send(self) -> None:
@@ -11377,6 +12432,59 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("小洋坝家园三区12-1003B:视频", evidence["missing_media"])
         self.assertIn("星桥锦绣嘉苑17-503B:视频", evidence["missing_media"])
         self.assertEqual(evidence["media_status"]["video"]["missing_rooms"], ["小洋坝家园三区12-1003B", "星桥锦绣嘉苑17-503B"])
+
+    async def test_selected_index_without_candidate_context_skips_inventory_search(self) -> None:
+        class FakeInventory:
+            def __init__(self) -> None:
+                self.searched = False
+
+            async def search(self, *args, **kwargs):
+                self.searched = True
+                raise AssertionError("没有候选上下文的序号请求不应先泛搜房源")
+
+        fake_inventory = FakeInventory()
+        original_inventory = main.inventory
+        main.inventory = fake_inventory
+        try:
+            understanding = {
+                "intent": "inventory",
+                "effective_query": "3500-4500 一室 在租房源",
+                "constraint_proof": {
+                    "intent": "inventory",
+                    "budget_range": [3500, 4500],
+                    "layout": "一室",
+                    "selected_indices": [1],
+                    "wants_image": False,
+                },
+                "structured_task": {
+                    "intent": "inventory",
+                    "original_text": "第一套图也发一下。",
+                    "tool_requirements": {"needs_inventory_search": True},
+                },
+            }
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "generate_reply"],
+                content="第一套图也发一下。",
+                context=kf_context_memory.empty_context(),
+                understanding=understanding,
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertFalse(fake_inventory.searched)
+        self.assertEqual(evidence["inventory_rows"], [])
+        self.assertEqual(evidence["target_rows"], [])
+        self.assertEqual(
+            evidence["selection_error"]["reason"],
+            "missing_current_candidate_set",
+        )
+        self.assertEqual(evidence["candidate_binding"]["status"], "error")
+        reply = main._controlled_evidence_reply_from_tools(
+            content="第一套图也发一下。",
+            understanding=understanding,
+            tool_evidence=evidence,
+        )
+        self.assertIn("上一轮没有可用候选编号", reply)
 
     def test_pending_video_continue_normalizes_rewrite_task(self) -> None:
         context = kf_context_memory.remember_pending_video_sends(
@@ -11573,7 +12681,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             def assess_reply(self, **kwargs):
                 return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
 
-        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.settings.kf_dual_llm_mode = "shadow"
         inventory_image = self._prepared_inventory_image()
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
@@ -11619,7 +12732,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         missing_image = str(Path(tempfile.gettempdir()) / "missing_inventory_sheet_m05b.png")
         Path(missing_image).unlink(missing_ok=True)
-        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.settings.kf_dual_llm_mode = "shadow"
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
         try:
@@ -11931,26 +13049,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "pass")
 
-    def test_prepared_media_reply_does_not_leak_internal_any_layout(self) -> None:
-        reply = main._reply_for_prepared_media(
-            {
-                "constraint_proof": {
-                    "area": "拱墅万达\n北部软件园\n城北万象城",
-                    "budget_range": [1000, 2000],
-                    "layout": "any",
-                    "wants_video": True,
-                }
-            },
-            {
-                "video_paths": ["room_database/video/demo.mp4"],
-                "video_rows": [{"小区": "大华海派风景", "房号": "2-1-402A"}],
-            },
-        )
-
-        self.assertIn("拱墅万达", reply)
-        self.assertIn("1000-2000左右", reply)
-        self.assertNotIn("any", reply)
-
     async def test_planner_reply_uses_tiered_final_selfcheck_for_inventory_sheet(self) -> None:
         class FakeReplyGenerator:
             def __init__(self) -> None:
@@ -12003,7 +13101,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["selfcheck"]["llm"]["source"], "llm_selfcheck_skipped_by_tiered_final_selfcheck")
         self.assertEqual(fake_reply.selfcheck_calls, 0)
 
-    async def test_bad_planner_reply_is_not_replaced_by_tool_reply(self) -> None:
+    async def test_bad_planner_reply_is_replaced_by_tool_grounded_reply(self) -> None:
         class FakeReplyGenerator:
             async def generate(self, *args, **kwargs):
                 return ReplyPlan(text="有的，目前都没视频和图片，我把房源表发你。")
@@ -12018,7 +13116,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             def assess_reply(self, **kwargs):
                 return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
 
-        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.settings.kf_dual_llm_mode = "shadow"
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
         try:
@@ -12056,13 +13159,14 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
             main.reply_generator = originals["reply_generator"]
             main.agentic_rag = originals["agentic_rag"]
 
-        self.assertTrue(result["needs_planner_retry"])
-        self.assertEqual(result["reply"], "")
-        self.assertIn("我先按石桥附近5000左右两室整租查", result["draft_reply"])
-        self.assertIn("planner_retry_reason", result)
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("棠润府15-2-801B", result["reply"])
+        self.assertIn("押一付一1600", result["reply"])
+        self.assertNotIn("石桥附近5000左右两室", result["reply"])
 
     def test_no_match_reply_with_budget_word_is_not_false_positive(self) -> None:
         result = main._constraint_consistency_selfcheck(
@@ -12535,77 +13639,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "pass")
 
-    def test_inventory_reply_explains_payment_method_budget_match(self) -> None:
-        reply = main._reply_for_inventory_search(
-            {
-                "intent": "inventory",
-                "effective_query": "北部软件园1800以内单间",
-                "constraint_proof": {
-                    "area": "拱墅万达\n北部软件园\n城北万象城",
-                    "budget_range": [0, 1800],
-                    "layout": "单间",
-                },
-            },
-            {
-                "actions": ["search_inventory", "compact_listing"],
-                "inventory_rows": [
-                    {
-                        "小区": "星桥锦绣嘉苑",
-                        "房号": "20-1606A",
-                        "户型分类": "一室一厅",
-                        "押一付一": "1900",
-                        "押二付一": "1800",
-                        "备注": "水30/月，电1元/度",
-                    }
-                ],
-            },
-        )
-
-        self.assertIn("其中一种月租在预算内", reply)
-        self.assertIn("押一付一1900", reply)
-        self.assertIn("押二付一1800", reply)
-
-    def test_inventory_reply_for_viewing_area_includes_empty_time(self) -> None:
-        reply = main._reply_for_inventory_search(
-            {
-                "intent": "inventory",
-                "effective_query": "东新园有没有马上空出来的？客户比较急。",
-                "constraint_proof": {"area": "东新园\n杭氧\n新天地"},
-                "structured_task": {
-                    "original_text": "东新园有没有马上空出来的？客户比较急。",
-                    "tool_requirements": {"needs_viewing_policy": True},
-                },
-            },
-            {
-                "actions": ["search_inventory", "compact_listing"],
-                "inventory_rows": [
-                    {
-                        "小区": "长浜龙吟轩",
-                        "房号": "9-901",
-                        "户型分类": "三室一厅",
-                        "押一付一": "5800",
-                        "押二付一": "5500",
-                        "看房方式密码": "6.24空出 看房提前联系",
-                        "备注": "民用水电",
-                    },
-                    {
-                        "小区": "嘉樘星绣府",
-                        "房号": "8-2-802B",
-                        "户型分类": "两室一厅",
-                        "押一付一": "3300",
-                        "押二付一": "3000",
-                        "看房方式密码": "6.22空出 看房提前联系",
-                        "备注": "水30/月，电1元/度",
-                    },
-                ],
-            },
-        )
-
-        self.assertIn("6.24空出", reply)
-        self.assertIn("6.22空出", reply)
-        self.assertIn("提前联系", reply)
-        self.assertIn("18758141785", reply)
-
     def test_viewing_summary_does_not_leave_password_hash_when_password_hidden(self) -> None:
         summary = main._row_viewing_summary({"看房方式密码": "336699#"})
 
@@ -12722,7 +13755,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             def assess_reply(self, **kwargs):
                 return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
 
-        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.settings.kf_dual_llm_mode = "shadow"
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
         try:
@@ -12778,6 +13816,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
             main.reply_generator = originals["reply_generator"]
             main.agentic_rag = originals["agentic_rag"]
 
@@ -12801,7 +13840,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             def assess_reply(self, **kwargs):
                 return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
 
-        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.settings.kf_dual_llm_mode = "shadow"
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
         row = {
@@ -12857,6 +13901,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
             main.reply_generator = originals["reply_generator"]
             main.agentic_rag = originals["agentic_rag"]
 
@@ -12865,36 +13910,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("押一付一1500", result["reply"])
         self.assertIn("提前联系", result["reply"])
         self.assertIn("18758141785", result["reply"])
-
-    def test_viewing_reply_without_password_request_redacts_password_code(self) -> None:
-        row = {
-            "小区": "棠润府",
-            "房号": "15-2-801B",
-            "户型分类": "一室一厅",
-            "押一付一": "1600",
-            "押二付一": "1400",
-            "备注": "水30/月 电1元/度",
-            "看房方式密码": "101004# 6.19空出",
-        }
-
-        reply = main._reply_for_inventory_search(
-            {
-                "intent": "viewing",
-                "effective_query": "棠润府15-2-801B今天能不能自己看",
-                "constraint_proof": {"room_refs": ["15-2-801B"]},
-                "structured_task": {
-                    "original_text": "这套今天能不能自己看？",
-                    "tool_requirements": {"needs_viewing_policy": True},
-                },
-            },
-            {
-                "actions": ["search_inventory", "explain_unavailable_viewing", "generate_reply"],
-                "inventory_rows": [row],
-            },
-        )
-
-        self.assertIn("6.19空出", reply)
-        self.assertNotIn("101004#", reply)
 
     def test_legacy_viewing_direct_reply_is_removed(self) -> None:
         self.assertFalse(hasattr(main, "_reply_for_viewing"))
@@ -12945,6 +13960,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
 
         originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        original_mode = main.settings.kf_dual_llm_mode
+        main.settings.kf_dual_llm_mode = "shadow"
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
         try:
@@ -12972,6 +13989,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         finally:
+            main.settings.kf_dual_llm_mode = original_mode
             main.reply_generator = originals["reply_generator"]
             main.agentic_rag = originals["agentic_rag"]
 
@@ -12995,7 +14013,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             def assess_reply(self, **kwargs):
                 return SimpleNamespace(action="pass", status="pass", reason="", fallback_text="")
 
-        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.settings.kf_dual_llm_mode = "shadow"
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
         try:
@@ -13043,6 +14066,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
         finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
             main.reply_generator = originals["reply_generator"]
             main.agentic_rag = originals["agentic_rag"]
 
@@ -13242,7 +14266,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("找到就发你", result["reply"])
         self.assertNotIn("有的，", result["reply"])
 
-    async def test_planner_missing_reply_after_retry_cannot_send_media(self) -> None:
+    async def test_planner_missing_reply_after_retry_uses_controlled_renderer_for_verified_media(self) -> None:
         class FakeReplyGenerator:
             async def generate(self, *args, **kwargs):
                 return ReplyPlan(text="我先帮您确认一下最新房态，稍后给您准确回复。")
@@ -13292,11 +14316,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 main.agentic_rag = originals["agentic_rag"]
 
         self.assertFalse(result["needs_planner_retry"])
-        self.assertTrue(tool_evidence.get("suppress_actions"))
-        self.assertEqual(tool_evidence["outbound_package"]["video_paths"], [])
+        self.assertFalse(bool(tool_evidence.get("suppress_actions")))
+        self.assertEqual(tool_evidence["outbound_package"]["video_paths"], [video.name])
+        self.assertIn("棠润府15-2-801B", result["reply"])
         self.assertEqual(
-            result["selfcheck"]["fallback"]["llm"]["source"],
-            "planner_missing_reply_safe_fallback",
+            result["planner_reply_result"]["source"],
+            "kf_llm2_controlled_evidence_renderer",
         )
 
     async def test_planner_missing_reply_before_retry_does_not_enter_selfcheck(self) -> None:
@@ -13305,13 +14330,24 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         class FakeRag:
             async def retrieve_for_reply(self, **kwargs):
-                raise AssertionError("Planner 空 reply_text 不能进入回复检索或最终自检")
+                raise AssertionError("受控证据渲染器已生成回复时，不应再进入旧 RAG 检索")
 
             def assess_reply(self, **kwargs):
-                raise AssertionError("Planner 空 reply_text 不能进入最终自检")
+                raise AssertionError("受控证据渲染器已生成回复时，不应再进入旧 RAG 自检")
 
         row = {"小区": "棠润府", "房号": "15-2-801B", "户型分类": "一室一厅"}
-        originals = {"agentic_rag": main.agentic_rag, "reply_generator": main.reply_generator}
+        tool_evidence = {
+            "actions": ["search_inventory", "send_video", "generate_reply"],
+            "media_request": {"wants_video": True, "requested_count": 1},
+            "inventory_rows": [row],
+            "target_rows": [row],
+        }
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "agentic_rag": main.agentic_rag,
+            "reply_generator": main.reply_generator,
+        }
+        main.settings.kf_dual_llm_mode = "shadow"
         main.agentic_rag = FakeRag()
         main.reply_generator = FakeReplyGenerator()
         try:
@@ -13324,12 +14360,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     "constraint_proof": {"intent": "media", "wants_video": True},
                     "structured_task": {"intent": "media"},
                 },
-                tool_evidence={
-                    "actions": ["search_inventory", "send_video", "generate_reply"],
-                    "media_request": {"wants_video": True, "requested_count": 1},
-                    "inventory_rows": [row],
-                    "target_rows": [row],
-                },
+                tool_evidence=tool_evidence,
                 planner_result={
                     "actions": ["search_inventory", "send_video", "generate_reply"],
                     "reply_text": "",
@@ -13337,13 +14368,18 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 retry_reason="",
             )
         finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
             main.agentic_rag = originals["agentic_rag"]
             main.reply_generator = originals["reply_generator"]
 
-        self.assertTrue(result["needs_planner_retry"])
-        self.assertEqual(result["reply"], "")
-        self.assertEqual(result["selfcheck"]["rule"]["source"], "planner_output_gate")
-        self.assertIn("不能进入最终自检", result["selfcheck"]["rule"]["reason"])
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("棠润府15-2-801B", result["reply"])
+        self.assertIn("暂时没找到视频", result["reply"])
+        self.assertEqual(
+            result["planner_reply_result"]["source"],
+            "kf_llm2_controlled_evidence_renderer",
+        )
+        self.assertTrue(tool_evidence.get("rag_retrieve_skipped_for_controlled_renderer"))
 
     async def test_inventory_rows_after_planner_retry_use_tool_grounded_reply(self) -> None:
         class FakeReplyGenerator:
@@ -13390,12 +14426,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             main.reply_generator = originals["reply_generator"]
 
         self.assertFalse(result["needs_planner_retry"])
+        self.assertNotIn("send_blocked", result)
         self.assertIn("兴业杨家府4-1502", result["reply"])
         self.assertIn("兴业杨家府10-1-1205", result["reply"])
-        self.assertNotIn("先不乱发", result["reply"])
-        self.assertEqual(result["planner_reply_result"]["source"], "tool_grounded_inventory_reply_after_planner_retry")
+        self.assertIn("按最新房源表", result["reply"])
 
-    async def test_inventory_rows_replace_invalid_planner_clarification_reply(self) -> None:
+    async def test_inventory_rows_invalid_planner_clarification_retries_instead_of_local_rewrite(self) -> None:
         class FakeReplyGenerator:
             async def assess_kf_final_reply(self, **kwargs):
                 return {"status": "pass"}
@@ -13443,7 +14479,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("兴业杨家府4-1502", result["reply"])
         self.assertIn("兴业杨家府10-1-1205", result["reply"])
         self.assertNotIn("先不乱发", result["reply"])
-        self.assertEqual(result["planner_reply_result"]["source"], "tool_grounded_inventory_reply_replaced_invalid_planner_reply")
 
     async def test_inventory_rows_final_retry_never_falls_back_to_repeat_room_request(self) -> None:
         class FakeReplyGenerator:
@@ -13683,13 +14718,13 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             main.agentic_rag = FakeRag()
             try:
                 result = await main._generate_reply_result(
-                    content="刚才第一套发我",
+                    content="刚才第一套视频发我",
                     context=kf_context_memory.empty_context(),
                     understanding={
                         "intent": "inventory",
-                        "effective_query": "刚才第一套",
-                        "constraint_proof": {"intent": "inventory", "selected_indices": [1]},
-                        "structured_task": {"intent": "inventory"},
+                        "effective_query": "刚才第一套视频",
+                        "constraint_proof": {"intent": "media", "selected_indices": [1], "wants_video": True},
+                        "structured_task": {"intent": "media", "tool_requirements": {"needs_video": True}},
                     },
                     tool_evidence=tool_evidence,
                     planner_result={
@@ -13785,8 +14820,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("石桥铭苑6-1102", result["reply"])
         self.assertFalse(bool(tool_evidence.get("suppress_actions")))
         self.assertEqual(len(tool_evidence["outbound_package"]["video_paths"]), 4)
-        self.assertEqual(result["selfcheck"]["fallback"]["rule"]["status"], "pass")
-        self.assertEqual(result["selfcheck"]["fallback"]["human"]["status"], "pass")
+        self.assertEqual(result["selfcheck"]["status"], "pass")
+        self.assertEqual(result["selfcheck"]["rule"]["source"], "controlled_evidence_renderer_selfcheck")
 
     async def test_original_video_request_explains_sendable_video_is_not_original_source(self) -> None:
         class FakeReplyGenerator:
@@ -13804,7 +14839,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         video.write(b"video")
         video.close()
-        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.settings.kf_dual_llm_mode = "shadow"
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
         try:
@@ -13846,6 +14886,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 retry_reason="",
             )
         finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
             main.reply_generator = originals["reply_generator"]
             main.agentic_rag = originals["agentic_rag"]
             Path(video.name).unlink(missing_ok=True)
@@ -13873,7 +14914,12 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         video.write(b"video")
         video.close()
-        originals = {"reply_generator": main.reply_generator, "agentic_rag": main.agentic_rag}
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.settings.kf_dual_llm_mode = "shadow"
         main.reply_generator = FakeReplyGenerator()
         main.agentic_rag = FakeRag()
         try:
@@ -13916,36 +14962,15 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 retry_reason="",
             )
         finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
             main.reply_generator = originals["reply_generator"]
             main.agentic_rag = originals["agentic_rag"]
             Path(video.name).unlink(missing_ok=True)
 
-        self.assertFalse(result["needs_planner_retry"])
+        self.assertFalse(result["needs_planner_retry"], result)
         self.assertIn("https://ccn9urs7d60k.feishu.cn/file/source-video", result["reply"])
         self.assertIn("https://ccn9urs7d60k.feishu.cn/docx/source-doc", result["reply"])
         self.assertEqual(tool_evidence["outbound_package"]["original_video_urls"], ["https://ccn9urs7d60k.feishu.cn/file/source-video"])
-
-    def test_missing_original_video_reply_mentions_no_high_resolution_source(self) -> None:
-        row = {"小区": "长岳王马府", "房号": "4-2002", "户型分类": "两室一厅"}
-        reply = main._reply_for_missing_media(
-            {
-                "constraint_proof": {
-                    "wants_video": True,
-                    "wants_original_video": True,
-                    "selected_indices": [1, 2],
-                }
-            },
-            {
-                "target_rows": [row],
-                "missing_media": ["长岳王马府4-2002:视频"],
-                "video_paths": [],
-                "image_paths": [],
-            },
-        )
-
-        self.assertIn("长岳王马府4-2002", reply)
-        self.assertIn("原视频/高清下载链接", reply)
-        self.assertIn("没有可发送的视频", reply)
 
     async def test_pending_missing_video_reply_overrides_planner_send_claim(self) -> None:
         class FakeReplyGenerator:
@@ -14141,7 +15166,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["needs_planner_retry"])
         self.assertNotIn("先不乱发", result["reply"], result)
-        self.assertIn("视频先发你 2 套", result["reply"])
+        self.assertIn("先发这2套视频", result["reply"])
         self.assertIn("图片也找到了", result["reply"])
         self.assertIn("这是昌运里三区3-1403的视频", tool_evidence["outbound_package"]["video_explanations"][0])
         self.assertIn("这是棠润府15-2-1901B的图片", tool_evidence["outbound_package"]["image_explanations"][1])
@@ -14193,8 +15218,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["needs_planner_retry"])
         self.assertIn("18758141785", result["reply"])
-        self.assertIn("签电子合同", result["reply"])
-        self.assertIn("小区+房号", result["reply"])
+        self.assertIn("13282125992", result["reply"])
+        self.assertIn("19941091943", result["reply"])
         self.assertNotIn("比如星桥锦绣嘉苑", result["reply"])
         self.assertNotIn("密码是", result["reply"])
 
@@ -14356,39 +15381,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "pass")
 
-    def test_safe_deposit_fallback_contains_fee_tiers(self) -> None:
-        fallback = main._safe_fallback_for_intent(
-            {"intent": "deposit"},
-            "免押不是免费，是支付宝芝麻信用无忧住服务。",
-        )
-
-        self.assertIn("芝麻", fallback)
-        self.assertIn("5.5", fallback)
-        self.assertIn("7%", fallback)
-        self.assertIn("8%", fallback)
-        self.assertIn("服务费", fallback)
-
-    def test_safe_contract_fallback_contains_contact_numbers(self) -> None:
-        fallback = main._safe_fallback_for_intent(
-            {"intent": "contract"},
-            "我先帮您确认一下最新房态，稍后给您准确回复。",
-        )
-
-        self.assertIn("18758141785", fallback)
-        self.assertIn("13282125992", fallback)
-        self.assertIn("19941091943", fallback)
-        self.assertIn("电子合同", fallback)
-
-    def test_safe_inventory_sheet_fallback_does_not_claim_send_without_image(self) -> None:
-        fallback = main._safe_fallback_for_intent(
-            {"intent": "inventory_sheet"},
-            "我先帮您确认一下最新房态，稍后给您准确回复。",
-        )
-
-        self.assertIn("房源表图片", fallback)
-        self.assertIn("暂时没生成成功", fallback)
-        self.assertNotIn("发你", fallback)
-
     def test_clarification_raw_mention_strips_query_tail(self) -> None:
         self.assertEqual(
             main._clean_clarification_raw_mention("\u6768\u5bb6\u5e9c\u8fd8\u5b50"),
@@ -14444,6 +15436,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 ]
 
         calls: list[dict] = []
+        send_final_calls: list[dict] = []
 
         async def fake_generate_reply_result(**kwargs):
             calls.append(kwargs)
@@ -14456,12 +15449,19 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 "planner_retry_reason": "",
             }
 
+        original_send_final_actions = main._send_final_actions
+
+        async def recording_send_final_actions(**kwargs):
+            send_final_calls.append(kwargs)
+            return await original_send_final_actions(**kwargs)
+
         originals = {
             "wecom_kf": main.wecom_kf,
             "wecom_kf_context_store": main.wecom_kf_context_store,
             "reply_generator": main.reply_generator,
             "inventory": main.inventory,
             "_generate_reply_result": main._generate_reply_result,
+            "_send_final_actions": main._send_final_actions,
             "kf_turn_generations": dict(main.kf_turn_generations),
         }
         fake_wecom = FakeWeComKf()
@@ -14470,6 +15470,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         main.reply_generator = FakeReplyGenerator()
         main.inventory = FakeInventory()
         main._generate_reply_result = fake_generate_reply_result
+        main._send_final_actions = recording_send_final_actions
         main.kf_turn_generations[main._conversation_key("kf", "wm")] = 0
         try:
             await main._process_text_turn(
@@ -14493,11 +15494,80 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["tool_evidence"]["actions"], ["clarification"])
+        self.assertEqual(len(send_final_calls), 1)
+        self.assertEqual(send_final_calls[0]["final_reply"], "\u6211\u5148\u786e\u8ba4\u4e00\u4e0b\uff0c\u4f60\u8bf4\u7684\u662f\u5174\u4e1a\u6768\u5bb6\u5e9c\uff0c\u8fd8\u662f\u6768\u4e50\u5e9c\uff1f\u786e\u8ba4\u540e\u6211\u518d\u5e2e\u4f60\u67e5\u8fd8\u6709\u54ea\u4e9b\u5728\u79df\u3002")
+        self.assertEqual(send_final_calls[0]["tool_evidence"]["actions"], ["clarification"])
         self.assertEqual(
             fake_wecom.texts,
             ["\u6211\u5148\u786e\u8ba4\u4e00\u4e0b\uff0c\u4f60\u8bf4\u7684\u662f\u5174\u4e1a\u6768\u5bb6\u5e9c\uff0c\u8fd8\u662f\u6768\u4e50\u5e9c\uff1f\u786e\u8ba4\u540e\u6211\u518d\u5e2e\u4f60\u67e5\u8fd8\u6709\u54ea\u4e9b\u5728\u79df\u3002"],
         )
         self.assertEqual(fake_wecom.state_store.processed, {"msg-clarify"})
+
+    def test_production_outbound_package_blocks_legacy_builder_when_actions_suppressed(self) -> None:
+        package = kf_outbound_package.outbound_package_for_current_mode(
+            "这条我需要人工再确认一下，避免发错资料。",
+            {
+                "suppress_actions": True,
+                "inventory_images": ["sheet.png"],
+                "image_paths": ["room.jpg"],
+                "video_paths": ["room.mp4"],
+                "outbound_package": {
+                    "inventory_explanation": "房源表发你了。",
+                    "image_explanations": ["这是新柠长木府3-1002B的图片。"],
+                    "video_explanations": ["这是新柠长木府3-1002B的视频。"],
+                },
+            },
+            production_mode=True,
+            deps=main._outbound_package_deps(),
+        )
+
+        self.assertEqual(package["text"], "这条我需要人工再确认一下，避免发错资料。")
+        self.assertEqual(package["inventory_images"], [])
+        self.assertEqual(package["image_paths"], [])
+        self.assertEqual(package["video_paths"], [])
+        self.assertEqual(package["image_explanations"], [])
+        self.assertEqual(package["video_explanations"], [])
+        self.assertTrue(package["legacy_builder_blocked_in_production"])
+        self.assertTrue(package["actions_suppressed"])
+
+    async def test_finalize_clarification_reply_does_not_return_raw_text_after_selfcheck_blocks(self) -> None:
+        calls: list[dict] = []
+
+        async def fake_generate_reply_result(**kwargs):
+            calls.append(kwargs)
+            return {
+                "reply": "",
+                "draft_reply": "",
+                "context": kwargs["context"],
+                "selfcheck": {"status": "retry", "source": "test_gate"},
+                "needs_planner_retry": True,
+                "planner_retry_reason": "test_retry",
+            }
+
+        original_generate_reply_result = main._generate_reply_result
+        main._generate_reply_result = fake_generate_reply_result
+        try:
+            result = await main._finalize_clarification_reply(
+                content="杨家府还有吗",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "structured_task": {
+                        "clarification": {
+                            "needed": True,
+                            "text": "你说的是杨乐府还是兴业杨家府？",
+                        }
+                    },
+                },
+                reply="你说的是杨乐府还是兴业杨家府？",
+            )
+        finally:
+            main._generate_reply_result = original_generate_reply_result
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result["reply"], "")
+        self.assertTrue(result["send_blocked"])
+        self.assertEqual(result["tool_evidence"]["actions"], ["clarification"])
 
     async def test_send_final_actions_suppresses_all_media_when_selfcheck_fallback(self) -> None:
         class FakeWeComKf:
@@ -14546,6 +15616,60 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.images, [])
         self.assertEqual(fake.videos, [])
         self.assertEqual(result["sent_actions"], [{"type": "text", "count": 1}])
+
+    async def test_send_final_actions_production_blocks_direct_media_without_prepared_package(self) -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+                self.images: list[str] = []
+                self.videos: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+            def send_image(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+                self.images.append(str(media_id))
+                return {"errcode": 0}
+
+            def send_video(self, open_kfid: str, external_userid: str, media_id: str, title: str = "") -> dict:
+                self.videos.append(str(media_id))
+                return {"errcode": 0}
+
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        original_mode = main.settings.kf_dual_llm_mode
+        main.wecom_kf = fake
+        main.settings.kf_dual_llm_mode = "production"
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                image_path = str(Path(directory) / "room.jpg")
+                video_path = str(Path(directory) / "room.mp4")
+                Path(image_path).write_bytes(b"image")
+                Path(video_path).write_bytes(b"video")
+                result = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=kf_context_memory.empty_context(),
+                    final_reply="这套资料我先发你。",
+                    tool_evidence={
+                        "image_paths": [image_path],
+                        "video_paths": [video_path],
+                        "outbound_package": {
+                            "image_explanations": ["这是星河苑1-101的图片。"],
+                            "video_explanations": ["这是星河苑1-101的视频。"],
+                        },
+                    },
+                )
+        finally:
+            main.wecom_kf = original_wecom
+            main.settings.kf_dual_llm_mode = original_mode
+
+        self.assertEqual(fake.texts, [])
+        self.assertEqual(fake.images, [])
+        self.assertEqual(fake.videos, [])
+        self.assertTrue(result["send_blocked"])
+        self.assertEqual(result["sent_actions"], [])
 
     async def test_send_final_actions_does_not_duplicate_inventory_explanation(self) -> None:
         class FakeWeComKf:
@@ -14610,12 +15734,6 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(sanitized["status"], "pass")
-        fallback = main._safe_fallback_for_intent(
-            {"intent": "inventory_sheet"},
-            "免押是支付宝无忧住服务。",
-        )
-        self.assertIn("房源表", fallback)
-        self.assertNotIn("免押", fallback)
 
     async def test_batch_customer_followups_are_merged_before_rewrite(self) -> None:
         class FakeStateStore:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.services import kf_dual_llm_shadow
@@ -17,8 +18,58 @@ DUAL_LLM_PRODUCTION_LLM1_PROMPT_VERSION = "dual_llm_production.llm1_task_packet.
 DUAL_LLM_PRODUCTION_LLM2_PROMPT_VERSION = "kf_llm2_outbound.production.v1"
 DUAL_LLM_PRODUCTION_SELFCHECK_PROFILE = "kf_llm2_outbound.production_guard.v1"
 DUAL_LLM_PRODUCTION_REPLY_SOURCE = "kf_llm2_outbound_production"
+DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE = "kf_llm2_controlled_evidence_renderer"
 SUPPORTED_DUAL_LLM_MODES = {"shadow", "production"}
 LLM1_PRODUCTION_ALLOWED_ACTIONS = frozenset(ACTION_TO_TOOL)
+LLM1_PRODUCTION_TOOL_ALIASES = {
+    **{tool_name: action for action, tool_name in ACTION_TO_TOOL.items()},
+    "context_tools.get_candidate_context": "context_tools",
+    "context.memory.get_candidate_context": "context_tools",
+    "context.get_candidate_context": "context_tools",
+    "context.lookup": "context_tools",
+    "media.fetch": "context_tools",
+    "media.search": "context_tools",
+    "media.lookup": "context_tools",
+    "media.video.fetch": "send_video",
+    "media.video.search": "send_video",
+    "video.fetch": "send_video",
+    "video.search": "send_video",
+    "room_video.fetch": "send_video",
+    "media.image.fetch": "send_image",
+    "inventory.image.fetch": "send_image",
+    "image.fetch": "send_image",
+    "photo.fetch": "send_image",
+    "picture.fetch": "send_image",
+    "reply_compose_signal": "generate_reply",
+    "reply_text": "generate_reply",
+}
+
+
+def _is_literal_greeting_text(text: str) -> bool:
+    normalized = re.sub(r"[\s,，。.!！?？~～、]+", "", str(text or "").strip())
+    return normalized in {
+        "你好",
+        "您好",
+        "在吗",
+        "在不在",
+        "有人吗",
+        "你好在吗",
+        "您好在吗",
+        "在吗你好",
+        "在吗您好",
+    }
+
+
+def _has_greeting_reply_compose_signal(packet: StructuredTaskPacket) -> bool:
+    has_reply_signal = False
+    for task in packet.tasks or []:
+        task_type = str(getattr(task, "task_type", "") or "").strip()
+        if task_type != "reply_compose_signal":
+            continue
+        has_reply_signal = True
+        if _is_literal_greeting_text(getattr(task, "user_text", "")):
+            return True
+    return has_reply_signal and _is_literal_greeting_text(getattr(packet, "rewritten_query", ""))
 
 
 def normalize_mode(value: Any) -> str:
@@ -35,7 +86,7 @@ def tool_plan_from_task_packet(task_packet: StructuredTaskPacket | dict[str, Any
     metadata = _llm1_metadata(packet)
     raw_plan = metadata.get("tool_plan") if isinstance(metadata, dict) else {}
     plan = dict(raw_plan) if isinstance(raw_plan, dict) else {}
-    actions = _string_list(plan.get("actions"))
+    actions = _normalize_llm1_actions(_string_list(plan.get("actions")))
     invalid_actions = [action for action in actions if action not in LLM1_PRODUCTION_ALLOWED_ACTIONS]
     retry_reason = ""
     if not isinstance(raw_plan, dict):
@@ -115,6 +166,13 @@ async def compose_production_outbound_package(
             reply_source=DUAL_LLM_PRODUCTION_REPLY_SOURCE,
             allow_deterministic_fallback=False,
         )
+    if _has_greeting_reply_compose_signal(packet):
+        return compose_controlled_evidence_outbound_package(
+            task_packet=packet,
+            tool_evidence=tool_evidence,
+            planner_result=planner_result or {},
+            reason="literal_greeting_reply_compose_signal",
+        )
     compose_llm2 = getattr(reply_generator, "compose_kf_outbound_production", None)
     if not callable(compose_llm2):
         llm2_output = {
@@ -127,13 +185,31 @@ async def compose_production_outbound_package(
             "source": "missing_llm2_composer",
         }
     else:
+        evidence_payload = evidence_bundle.to_safe_dict()
+        if send_actions:
+            evidence_payload["send_actions"] = [action.to_safe_dict() for action in send_actions]
         kwargs = {
             "task_packet": packet.to_safe_dict(),
-            "evidence_bundle": evidence_bundle.to_safe_dict(),
+            "evidence_bundle": evidence_payload,
             "response_strategy": response_strategy.to_safe_dict(),
             "retry_reason": retry_reason,
         }
         llm2_output = await compose_llm2(**kwargs)
+    if not isinstance(llm2_output, dict):
+        llm2_output = {}
+    if not str(llm2_output.get("reply_text") or "").strip():
+        return compose_controlled_evidence_outbound_package(
+            task_packet=packet,
+            tool_evidence=tool_evidence,
+            planner_result=planner_result or {},
+            reason=str(
+                (llm2_output.get("self_review") or {}).get("retry_reason")
+                if isinstance(llm2_output.get("self_review"), dict)
+                else ""
+            )
+            or str(llm2_output.get("retry_reason") or "")
+            or "llm2_output_missing_visible_reply",
+        )
     return compose_kf_outbound(
         packet,
         evidence_bundle,
@@ -145,6 +221,39 @@ async def compose_production_outbound_package(
         reply_source=DUAL_LLM_PRODUCTION_REPLY_SOURCE,
         allow_deterministic_fallback=False,
     )
+
+
+def compose_controlled_evidence_outbound_package(
+    *,
+    task_packet: StructuredTaskPacket | dict[str, Any],
+    tool_evidence: dict[str, Any],
+    planner_result: dict[str, Any] | None = None,
+    reason: str = "",
+) -> PreparedOutboundPackage:
+    packet = _coerce_task_packet(task_packet)
+    evidence_bundle, response_strategy, send_actions = kf_dual_llm_shadow.build_program_outbound_contract_inputs(
+        task_packet=packet,
+        tool_evidence=_contract_tool_evidence(tool_evidence),
+        planner_result=planner_result or {},
+    )
+    package = compose_kf_outbound(
+        packet,
+        evidence_bundle,
+        response_strategy,
+        llm_output={},
+        send_actions=send_actions,
+        prompt_version=DUAL_LLM_PRODUCTION_LLM2_PROMPT_VERSION,
+        selfcheck_profile=DUAL_LLM_PRODUCTION_SELFCHECK_PROFILE,
+        reply_source=DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE,
+        allow_deterministic_fallback=True,
+    )
+    review = dict(package.self_review or {})
+    review["source"] = DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+    review["controlled_renderer_reason"] = str(reason or "llm2_production_retry_exhausted")
+    review["llm2_decides_media_targets"] = False
+    package.self_review = safe_artifact_payload(review)
+    package.reply_source = DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+    return package
 
 
 def validate_production_outbound_package(
@@ -263,6 +372,19 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item).strip() for item in value if str(item).strip()]
     return []
+
+
+def _normalize_llm1_actions(actions: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for action in actions:
+        value = str(action or "").strip()
+        lower_value = value.lower()
+        normalized.append(
+            LLM1_PRODUCTION_TOOL_ALIASES.get(value)
+            or LLM1_PRODUCTION_TOOL_ALIASES.get(lower_value)
+            or lower_value
+        )
+    return _dedupe(normalized)
 
 
 def _dedupe(values: list[str]) -> list[str]:

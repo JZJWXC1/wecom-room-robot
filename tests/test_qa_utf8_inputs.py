@@ -237,11 +237,22 @@ def test_historical_failure_fixture_is_synthetic_and_sanitized() -> None:
 
 def test_random_guard_qa_generation_is_utf8_clean_and_covers_required_categories() -> None:
     windows = run_rag_random_guard_utf8.generate_random_guard_windows(seed=20260624)
-    integrity = run_rag_10windows_10turns_utf8.chinese_integrity_report(windows, required_tokens=())
+    integrity = run_rag_10windows_10turns_utf8.chinese_integrity_report(
+        windows,
+        required_tokens=(),
+        expected_window_count=run_rag_random_guard_utf8.RANDOM_GUARD_WINDOW_COUNT,
+        min_turn_count=(
+            run_rag_random_guard_utf8.RANDOM_GUARD_WINDOW_COUNT
+            * run_rag_random_guard_utf8.RANDOM_GUARD_TURNS_PER_WINDOW
+        ),
+    )
     coverage = run_rag_random_guard_utf8.coverage_report(windows)
 
     assert integrity["passed"], integrity
     assert coverage["passed"], coverage
+    assert len(windows) == 20
+    assert coverage["expected_window_count"] == 20
+    assert coverage["turn_count"] == 200
     assert windows[0]["turns"][0]
 
 
@@ -438,11 +449,11 @@ def test_fact_based_random_guard_uses_rewrite_inventory_index_rows() -> None:
     windows = run_rag_random_guard_utf8.generate_fact_based_guard_windows(
         sample_index,
         seed=20260624,
-        count=10,
+        count=20,
     )
     coverage = run_rag_random_guard_utf8.coverage_report(windows)
 
-    assert len(windows) == 10
+    assert len(windows) == 20
     assert coverage["passed"], coverage
     assert all(window["generation_source"] == "rewrite_inventory_index" for window in windows)
     joined = "\n".join(turn for window in windows for turn in window["turns"])
@@ -1444,7 +1455,9 @@ def test_fast_gate_includes_send_receipt_and_fault_replay_tests() -> None:
     assert "Save-SanitizedQaArtifact" in script
     assert "--min-window-count" in script
     assert "--min-turn-count" in script
-    assert "run_rag_random_guard_utf8.py" in script
+    assert "run_kf_qa_gate_graph_utf8.py" in script
+    assert "run_rag_random_guard_utf8.py" not in script
+    assert "--legacy-rehearsal" in script
     assert "video upload transcode retry gate" in script
     assert "Assert-QaArtifactReleaseGate" in script
     assert "high=0 medium=0" in script

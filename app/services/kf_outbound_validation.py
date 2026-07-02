@@ -161,7 +161,11 @@ INTERNAL_LEAK_PATTERN = re.compile(
 TEMPLATE_PATTERN = re.compile(r"(?:XX|某某|某小区|某房号|TODO|\{\{|\}\}|<小区>|<房号>|例如某套|示例房源)")
 FUTURE_SEND_PATTERN = re.compile(r"(?:稍后|等下|待会|晚点|之后).{0,8}(?:发|传)|(?:可以|能|会).{0,4}发你")
 PAST_SENT_PATTERN = re.compile(r"(?:已发|发你了|已经发|给你发过去了|这是.{0,16}(?:视频|图片|房源表))")
-MISSING_MEDIA_PATTERN = re.compile(r"(?:暂无|没有|没找到|暂时没).{0,8}(?:视频|图片|照片)")
+MISSING_MEDIA_PATTERN = re.compile(r"(?:暂无|没有|没找到|暂时没|暂未(?:找到)?).{0,8}(?:视频|图片|照片)")
+GENERIC_WAITING_PATTERN = re.compile(
+    r"(?:我先帮[你您]?(?:确认|核实)|先(?:帮[你您]?)?(?:确认|核实)|稍后(?:再)?(?:给[你您])?(?:回复|答复)|"
+    r"晚点(?:再)?(?:给[你您])?(?:回复|答复)|避免发错|确认一下最新房态)"
+)
 HARD_FORBIDDEN_HUMAN_PATTERN = re.compile(
     r"(?:作为(?:一个)?AI|系统显示|根据上下文|无法完成该请求|马上通知[你您]|稍后(?:会)?通知[你您]|稍后(?:会)?为[你您]推送|"
     r"有新(?:房源|资源)(?:会)?第一时间通知)",
@@ -241,6 +245,8 @@ def _build_indexes(package: PreparedOutboundPackage) -> _PackageIndexes:
     evidence_by_id = {item.evidence_id: item for item in evidence_items if item.evidence_id}
     action_by_id = {action.action_id: action for action in package.send_actions if action.action_id}
     candidate_numbers = {item.candidate_number for item in _candidate_items(package.candidate_set)}
+    for evidence in evidence_items:
+        candidate_numbers.update(_candidate_numbers_from_model(evidence))
     listing_ids = {
         listing_id
         for listing_id in (
@@ -403,7 +409,7 @@ def _validate_l2(
     context: OutboundValidationContext,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
-    issues.extend(_validate_task_answered(package, context))
+    issues.extend(_validate_task_answered(package, indexes, context))
     issues.extend(_validate_candidate_ref_bounds(package, indexes))
 
     if _is_video_only_request(context):
@@ -472,8 +478,17 @@ def _validate_l3(package: PreparedOutboundPackage, context: OutboundValidationCo
     issues: list[ValidationIssue] = []
     text = package.reply_text or ""
     has_media_action = any(_is_media_action(action) for action in package.send_actions)
+    allow_missing_media_text = _package_has_missing_media_evidence(package)
     if text:
-        issues.extend(_validate_l3_text(text, "reply_text", context=context, has_media_action=has_media_action))
+        issues.extend(
+            _validate_l3_text(
+                text,
+                "reply_text",
+                context=context,
+                has_media_action=has_media_action,
+                allow_missing_media_text=allow_missing_media_text,
+            )
+        )
     for index, caption in enumerate(package.action_captions):
         action = _action_for_caption(caption.action_id, package)
         caption_has_media_action = _is_media_action(action) if action is not None else False
@@ -483,9 +498,16 @@ def _validate_l3(package: PreparedOutboundPackage, context: OutboundValidationCo
                 f"action_captions[{index}].text",
                 context=None,
                 has_media_action=caption_has_media_action,
+                allow_missing_media_text=False,
             )
         )
     return issues
+
+
+def _package_has_missing_media_evidence(package: PreparedOutboundPackage) -> bool:
+    if package.missing_items:
+        return True
+    return any(evidence.evidence_type == "missing_media" for evidence in _evidence_items(package.evidence_bundle))
 
 
 def _validate_l3_text(
@@ -494,6 +516,7 @@ def _validate_l3_text(
     *,
     context: OutboundValidationContext | None,
     has_media_action: bool,
+    allow_missing_media_text: bool,
 ) -> list[ValidationIssue]:
     if not text:
         return []
@@ -508,6 +531,10 @@ def _validate_l3_text(
         )
     if TEMPLATE_PATTERN.search(text):
         issues.append(_issue(ValidationLevel.L3, "l3.template_talk", "Reply contains placeholder or template wording; regenerate wording only.", path))
+    if GENERIC_WAITING_PATTERN.search(text):
+        issues.append(
+            _issue(ValidationLevel.L3, "l3.generic_waiting_reply", "Reply is a generic waiting/confirmation fallback; regenerate wording only.", path)
+        )
     if context is not None and _asks_known_condition_again(text, context):
         issues.append(
             _issue(ValidationLevel.L3, "l3.repeats_known_condition", "Reply asks again for conditions already known in context.", path)
@@ -520,7 +547,7 @@ def _validate_l3_text(
         issues.append(
             _issue(ValidationLevel.L3, "l3.action_tense_error", "Reply claims a media action was sent but no media action is prepared.", path)
         )
-    if has_media_action and MISSING_MEDIA_PATTERN.search(text):
+    if has_media_action and MISSING_MEDIA_PATTERN.search(text) and not allow_missing_media_text:
         issues.append(
             _issue(ValidationLevel.L3, "l3.action_tense_error", "Reply says media is missing while a media send action is prepared.", path)
         )
@@ -710,7 +737,11 @@ def _validate_sensitive_values_are_evidence_only(
     return issues
 
 
-def _validate_task_answered(package: PreparedOutboundPackage, context: OutboundValidationContext) -> list[ValidationIssue]:
+def _validate_task_answered(
+    package: PreparedOutboundPackage,
+    indexes: _PackageIndexes,
+    context: OutboundValidationContext,
+) -> list[ValidationIssue]:
     task_packet = context.task_packet
     if task_packet is None:
         return []
@@ -719,7 +750,7 @@ def _validate_task_answered(package: PreparedOutboundPackage, context: OutboundV
     for index, task in enumerate(task_packet.tasks):
         if task.task_id in explicit_answered:
             continue
-        if not _task_is_answered(task, package):
+        if not _task_is_answered(task, package, indexes):
             issues.append(
                 _issue(
                     ValidationLevel.L2,
@@ -732,19 +763,67 @@ def _validate_task_answered(package: PreparedOutboundPackage, context: OutboundV
     return issues
 
 
-def _task_is_answered(task: Any, package: PreparedOutboundPackage) -> bool:
+def _task_is_answered(task: Any, package: PreparedOutboundPackage, indexes: _PackageIndexes) -> bool:
     task_text = _task_search_text(task)
+    task_type = str(getattr(task, "task_type", "") or "").strip()
+    if task_type == "reply_compose_signal":
+        return bool((package.reply_text or "").strip()) or bool(package.claims) or bool(package.send_actions)
     if _contains_any(task_text, MEDIA_VIDEO_MARKERS):
-        return any(_is_video_action(action) for action in package.send_actions)
+        return any(_is_video_action(action) for action in package.send_actions) or _has_missing_media_answer(
+            package,
+            expected_kind="video",
+        ) or _has_target_error_answer(package, indexes)
     if _contains_any(task_text, MEDIA_IMAGE_MARKERS):
-        return any(_is_image_action(action) for action in package.send_actions)
+        return any(_is_image_action(action) for action in package.send_actions) or _has_missing_media_answer(
+            package,
+            expected_kind="image",
+        ) or _has_target_error_answer(package, indexes)
     if _contains_any(task_text, MEDIA_SHEET_MARKERS):
         return any(_is_sheet_action(action) for action in package.send_actions)
     if _mentions_password(task_text):
         return any(_is_password_action(action) for action in package.send_actions) or any(
             _mentions_password(_claim_visible_payload(claim)) for claim in package.claims
+        ) or any(_is_evidence_bound_viewing_contact_action(action, indexes) for action in package.send_actions) or _has_target_error_answer(
+            package,
+            indexes,
         )
     return bool((package.reply_text or "").strip()) or bool(package.claims) or bool(package.send_actions)
+
+
+def _has_missing_media_answer(package: PreparedOutboundPackage, *, expected_kind: str) -> bool:
+    text = package.reply_text or ""
+    if not text or not MISSING_MEDIA_PATTERN.search(text):
+        return False
+    if expected_kind == "video" and "视频" not in text:
+        return False
+    if expected_kind == "image" and not any(token in text for token in ("图片", "照片")):
+        return False
+    for evidence in _evidence_items(package.evidence_bundle):
+        if evidence.evidence_type != "missing_media":
+            continue
+        media_kind = str((evidence.field_values or {}).get("media_kind") or "").strip().lower()
+        if media_kind in {expected_kind, "media", "video_and_image"} or expected_kind in media_kind:
+            return True
+        if expected_kind == "video" and "视频" in evidence.summary:
+            return True
+        if expected_kind == "image" and any(token in evidence.summary for token in ("图片", "照片")):
+            return True
+    return False
+
+
+def _has_target_error_answer(package: PreparedOutboundPackage, indexes: _PackageIndexes) -> bool:
+    if not str(package.reply_text or "").strip() and not package.claims:
+        return False
+    for evidence in indexes.evidence_by_id.values():
+        evidence_type = str(evidence.evidence_type or "").strip().lower()
+        metadata = evidence.metadata if isinstance(evidence.metadata, Mapping) else {}
+        field_values = evidence.field_values if isinstance(evidence.field_values, Mapping) else {}
+        code = str(metadata.get("controlled_error_code") or field_values.get("error_code") or "").strip().lower()
+        if evidence_type in {"selection_error", "field_target_error", "missing_target"}:
+            return True
+        if code in {"selection_error", "field_target_error", "missing_target", "original_video_target_error"}:
+            return True
+    return False
 
 
 def _is_video_only_request(context: OutboundValidationContext) -> bool:
@@ -878,6 +957,8 @@ def _evidence_field_values_contain(evidence: EvidenceItem, expected: str, field_
 
 
 def _evidence_field_values(evidence: EvidenceItem) -> Mapping[str, Any]:
+    if isinstance(evidence.field_values, Mapping) and evidence.field_values:
+        return evidence.field_values
     for source in (evidence.metadata, evidence.legacy_unknown_fields):
         for key in FIELD_VALUE_KEYS:
             raw_values = source.get(key) if isinstance(source, Mapping) else None
@@ -894,6 +975,12 @@ def _iter_candidate_number_refs(model: Any) -> Iterable[tuple[str, Any]]:
 def _candidate_ref_payload(model: Any) -> Any:
     if isinstance(model, Claim):
         return {"legacy_unknown_fields": model.legacy_unknown_fields}
+    if isinstance(model, EvidenceItem):
+        return {
+            "field_values": model.field_values,
+            "metadata": model.metadata,
+            "legacy_unknown_fields": model.legacy_unknown_fields,
+        }
     if isinstance(model, SendAction):
         return {
             "payload": model.payload,
@@ -934,6 +1021,16 @@ def _coerce_candidate_number(value: Any) -> int | None:
     if isinstance(value, str) and value.strip().isdigit():
         return int(value.strip())
     return None
+
+
+def _candidate_numbers_from_model(model: Any) -> set[int]:
+    numbers: set[int] = set()
+    for _, raw_ref in _iter_candidate_number_refs(model):
+        for value in _as_sequence(raw_ref):
+            number = _coerce_candidate_number(value)
+            if number is not None:
+                numbers.add(number)
+    return numbers
 
 
 def _as_sequence(value: Any) -> list[Any]:
@@ -1030,6 +1127,8 @@ def _key_mentions_link(text: str) -> bool:
 
 
 def _is_password_action(action: SendAction) -> bool:
+    if action.action_type == "viewing_contact":
+        return False
     return _mentions_password(
         {
             "action_type": action.action_type,
@@ -1063,6 +1162,13 @@ def _is_evidence_bound_password_action(action: SendAction, indexes: _PackageInde
     return any(_evidence_allows_password(indexes.evidence_by_id[ref]) for ref in refs)
 
 
+def _is_evidence_bound_viewing_contact_action(action: SendAction, indexes: _PackageIndexes) -> bool:
+    refs = [ref for ref in _action_evidence_refs(action) if ref in indexes.evidence_by_id]
+    if not refs or not _is_viewing_contact_action(action):
+        return False
+    return any(_evidence_requires_viewing_contact(indexes.evidence_by_id[ref]) for ref in refs)
+
+
 def _evidence_allows_password(evidence: EvidenceItem) -> bool:
     evidence_type = str(evidence.evidence_type or "").strip().lower()
     metadata = evidence.metadata if isinstance(evidence.metadata, Mapping) else {}
@@ -1070,20 +1176,44 @@ def _evidence_allows_password(evidence: EvidenceItem) -> bool:
     return evidence_type in {"viewing_password", "password", "viewing"} or channel == "viewing_password"
 
 
+def _evidence_requires_viewing_contact(evidence: EvidenceItem) -> bool:
+    evidence_type = str(evidence.evidence_type or "").strip().lower()
+    metadata = evidence.metadata if isinstance(evidence.metadata, Mapping) else {}
+    field_values = evidence.field_values if isinstance(evidence.field_values, Mapping) else {}
+    channel = str(metadata.get("controlled_channel") or "").strip().lower()
+    return (
+        evidence_type == "viewing_contact"
+        or channel == "viewing_contact"
+        or bool(field_values.get("needs_contact"))
+    )
+
+
 def _is_media_action(action: SendAction) -> bool:
     return _is_video_action(action) or _is_image_action(action) or _is_sheet_action(action)
 
 
 def _is_video_action(action: SendAction) -> bool:
+    if str(action.action_type or "").strip().lower() in {"video", "send_video", "room_video"}:
+        return True
     return _contains_any(_action_search_text(action), MEDIA_VIDEO_MARKERS)
 
 
 def _is_image_action(action: SendAction) -> bool:
+    if str(action.action_type or "").strip().lower() in {"image", "send_image", "photo", "picture"}:
+        return True
     return _contains_any(_action_search_text(action), MEDIA_IMAGE_MARKERS)
 
 
 def _is_sheet_action(action: SendAction) -> bool:
+    if str(action.action_type or "").strip().lower() in {"inventory_sheet", "send_inventory_sheet"}:
+        return True
     return _contains_any(_action_search_text(action), MEDIA_SHEET_MARKERS)
+
+
+def _is_viewing_contact_action(action: SendAction) -> bool:
+    metadata = action.metadata if isinstance(action.metadata, Mapping) else {}
+    channel = str(metadata.get("controlled_channel") or "").strip().lower()
+    return str(action.action_type or "").strip().lower() == "viewing_contact" or channel == "viewing_contact"
 
 
 def _action_search_text(action: SendAction) -> str:
@@ -1103,10 +1233,25 @@ def _task_search_text(task: Any) -> str:
             str(getattr(task, "task_id", "")),
             str(getattr(task, "task_type", "")),
             str(getattr(task, "user_text", "")),
-            _stable_json(getattr(task, "constraints", {})),
+            _stable_json(_task_search_constraints(getattr(task, "constraints", {}))),
             _stable_json(getattr(task, "required_tools", [])),
         ]
     )
+
+
+def _task_search_constraints(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+    blocked = {
+        "confirmed_room",
+        "candidate_set",
+        "candidates",
+        "inventory_rows",
+        "target_rows",
+        "rows",
+        "row",
+    }
+    return {str(key): item for key, item in value.items() if str(key) not in blocked}
 
 
 def _contains_any(text: str, markers: Sequence[str]) -> bool:

@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.config import settings
 from app.services.feishu import FeishuClient
+from app.services import inventory_cutover_graph, inventory_sync_graph
 from app.services.inventory import InventoryService
 from app.services.inventory_sensitive_access import legacy_listing_id_for_row
 from app.services.inventory_snapshot_builder import (
@@ -482,11 +483,153 @@ async def refresh_runtime_artifacts(*, sync_media_manifest: bool) -> dict[str, A
     return result
 
 
+def _ok_skipped(stage: str, reason: str) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "skipped": True,
+        "stage": stage,
+        "reason": reason,
+    }
+
+
+def _region_sync_ok(previous_results: dict[str, Any]) -> bool:
+    region = dict(previous_results.get("region_result") or {})
+    return bool(region.get("ok"))
+
+
+def _cutover_rehearsal_root() -> Path:
+    return Path("qa_artifacts") / f"inventory_cutover_region_sync_{int(time.time())}_{os.getpid()}"
+
+
+async def run_sync_graph_pipeline(
+    *,
+    dry_run: bool,
+    sync_media: bool,
+    fail_fast: bool = True,
+) -> dict[str, Any]:
+    async def sync_region_inventory(**kwargs: Any) -> dict[str, Any]:
+        return await run_sync(
+            dry_run=bool(kwargs.get("dry_run")),
+            sync_media=bool(kwargs.get("sync_media")),
+        )
+
+    async def refresh_inventory_cache(**kwargs: Any) -> dict[str, Any]:
+        if bool(kwargs.get("dry_run")):
+            return _ok_skipped("refresh_inventory_cache", "dry_run")
+        if not _region_sync_ok(dict(kwargs.get("previous_results") or {})):
+            return _ok_skipped("refresh_inventory_cache", "region_sync_not_ok")
+        return await refresh_rewrite_inventory_index()
+
+    async def render_inventory_sheet_image(**kwargs: Any) -> dict[str, Any]:
+        if bool(kwargs.get("dry_run")):
+            return _ok_skipped("render_inventory_sheet_image", "dry_run")
+        if not _region_sync_ok(dict(kwargs.get("previous_results") or {})):
+            return _ok_skipped("render_inventory_sheet_image", "region_sync_not_ok")
+        return _ok_skipped("render_inventory_sheet_image", "region_sync_service_renders_sheet_images")
+
+    async def build_media_manifest(**kwargs: Any) -> dict[str, Any]:
+        if bool(kwargs.get("dry_run")):
+            return _ok_skipped("build_media_manifest", "dry_run")
+        if not bool(kwargs.get("sync_media")):
+            return _ok_skipped("build_media_manifest", "skip_media_requested")
+        if not _region_sync_ok(dict(kwargs.get("previous_results") or {})):
+            return _ok_skipped("build_media_manifest", "region_sync_not_ok")
+        service = InventoryService()
+        frame = await service.refresh()
+        rows = rows_from_frame(frame)
+        return await refresh_media_manifest(rows)
+
+    async def publish_snapshot(**kwargs: Any) -> dict[str, Any]:
+        if bool(kwargs.get("dry_run")):
+            return _ok_skipped("publish_snapshot", "dry_run")
+        if not _region_sync_ok(dict(kwargs.get("previous_results") or {})):
+            return _ok_skipped("publish_snapshot", "region_sync_not_ok")
+        root = _cutover_rehearsal_root()
+        state = await inventory_cutover_graph.run_inventory_cutover_graph(
+            inventory_cutover_graph.build_local_inventory_cutover_deps(),
+            root=root,
+            min_parity_cases=20,
+            conversation_id=f"inventory-cutover-region-sync:{int(time.time())}",
+        )
+        return {
+            "ok": state.get("status") == "passed",
+            "ready": state.get("status") == "passed",
+            "root": str(root),
+            "status": state.get("status") or "",
+            "blocked_stage": state.get("blocked_stage") or "",
+            "failures": list(state.get("failures") or []),
+            "trace": list(state.get("trace") or []),
+            "report": dict(state.get("report") or {}),
+        }
+
+    async def write_report(**kwargs: Any) -> dict[str, Any]:
+        status = str(kwargs.get("status") or "")
+        results = dict(kwargs.get("results") or {})
+        return {
+            "ok": status == "passed",
+            "status": status,
+            "blocked_stage": kwargs.get("blocked_stage") or "",
+            "failures": list(kwargs.get("failures") or []),
+            "results": results,
+            "trace": list(kwargs.get("trace") or []),
+        }
+
+    state = await inventory_sync_graph.run_inventory_sync_graph(
+        inventory_sync_graph.InventorySyncGraphDeps(
+            refresh_inventory_cache=refresh_inventory_cache,
+            sync_region_inventory=sync_region_inventory,
+            render_inventory_sheet_image=render_inventory_sheet_image,
+            build_media_manifest=build_media_manifest,
+            publish_snapshot=publish_snapshot,
+            write_report=write_report,
+        ),
+        dry_run=dry_run,
+        sync_media=sync_media,
+        fail_fast=fail_fast,
+        conversation_id=f"feishu-region-sync:{int(time.time())}",
+    )
+    region_result = dict(state.get("region_result") or {})
+    result = dict(region_result)
+    result.update(
+        {
+            "ok": state.get("status") == "passed",
+            "graph": {
+                "schema_version": "feishu_region_inventory_sync_graph.v1",
+                "status": state.get("status") or "",
+                "blocked_stage": state.get("blocked_stage") or "",
+                "failures": list(state.get("failures") or []),
+                "trace": list(state.get("trace") or []),
+            },
+            "rewrite_index": dict(state.get("cache_result") or {}),
+            "inventory_sheet_image": dict(state.get("image_result") or {}),
+            "media_manifest": dict(state.get("media_manifest_result") or {}),
+            "cutover_rehearsal": dict(state.get("snapshot_result") or {}),
+            "graph_report": dict(state.get("report") or {}),
+        }
+    )
+    return result
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Sync Feishu region inventory and media.")
     parser.add_argument("--dry-run", action="store_true", help="Only print planned changes.")
     parser.add_argument("--skip-media", action="store_true", help="Only sync the target sheet, not media files.")
     parser.add_argument("--no-lock", action="store_true", help="Run without the overlap lock.")
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="Compatibility no-op; LangGraph inventory sync is now the default.",
+    )
+    parser.add_argument(
+        "--legacy-sync",
+        action="store_true",
+        help="Run the pre-LangGraph sync path explicitly.",
+    )
+    parser.add_argument(
+        "--no-fail-fast",
+        action="store_true",
+        help="With the LangGraph pipeline, continue later audit stages after a stage reports failure.",
+    )
     parser.add_argument(
         "--config-template",
         action="store_true",
@@ -528,8 +671,17 @@ def main() -> int:
             print_json(result)
             return 2
 
-        result = asyncio.run(run_sync(dry_run=args.dry_run, sync_media=not args.skip_media))
-        if result.get("ok") and not args.dry_run:
+        if not args.legacy_sync:
+            result = asyncio.run(
+                run_sync_graph_pipeline(
+                    dry_run=args.dry_run,
+                    sync_media=not args.skip_media,
+                    fail_fast=not args.no_fail_fast,
+                )
+            )
+        else:
+            result = asyncio.run(run_sync(dry_run=args.dry_run, sync_media=not args.skip_media))
+        if result.get("ok") and not args.dry_run and args.legacy_sync:
             try:
                 runtime_artifacts = asyncio.run(
                     refresh_runtime_artifacts(sync_media_manifest=not args.skip_media)

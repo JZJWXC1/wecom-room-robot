@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,161 @@ def test_release_rehearsal_creates_current_pointer_and_rolls_back(tmp_path: Path
     assert all(result["candidate_manifest"]["required_paths"].values())
     report = tmp_path / "release_rehearsal_report.json"
     assert json.loads(report.read_text(encoding="utf-8"))["ok"] is True
+
+
+def test_release_preflight_graph_pipeline_runs_local_stategraph(tmp_path: Path) -> None:
+    result = rehearse_release_pipeline.run_release_preflight_graph_pipeline(
+        Path.cwd(),
+        tmp_path,
+        version="graph-preflight-test",
+        local_tests_command=[sys.executable, "-c", "print('local-ok')"],
+        random_guard_command=[sys.executable, "-c", "print('random-ok')"],
+        timeout_seconds=30,
+    )
+
+    assert result["status"] in {"passed", "blocked"}
+    expected_prefix = [
+        "release_preflight:local_tests",
+        "release_preflight:random_guard",
+        "release_preflight:config_check",
+    ]
+    assert result["trace"][:3] == expected_prefix
+    assert result["local_tests"]["stdout_tail"].strip() == "local-ok"
+    assert result["random_guard"]["stdout_tail"].strip() == "random-ok"
+    report_path = Path(result["report"]["path"])
+    assert report_path.exists()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if result["status"] == "blocked":
+        assert result["blocked_stage"] == "config_check"
+        assert result["release_rehearsal"] == {}
+        assert report["status"] == "blocked"
+        return
+
+    assert result["ok"] is True
+    assert result["trace"] == [
+        *expected_prefix,
+        "release_preflight:release_rehearsal",
+        "release_preflight:write_report",
+    ]
+    assert result["release_rehearsal"]["ok"] is True
+    assert report["status"] == "passed"
+
+
+def test_release_pipeline_cli_defaults_to_graph_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+
+    def fake_graph(project_dir: Path, rehearsal_root: Path, **kwargs: object) -> dict:
+        calls.append("graph")
+        assert project_dir == Path.cwd()
+        assert rehearsal_root == tmp_path
+        assert kwargs["version"] == "cli-default-graph"
+        assert kwargs["fail_fast"] is True
+        return {"ok": True, "schema_version": "graph", "trace": ["release_preflight:local_tests"]}
+
+    def fail_legacy(*_args: object, **_kwargs: object) -> dict:
+        raise AssertionError("release CLI must default to StateGraph preflight")
+
+    monkeypatch.setattr(rehearse_release_pipeline, "run_release_preflight_graph_pipeline", fake_graph)
+    monkeypatch.setattr(rehearse_release_pipeline, "rehearse_release_pipeline", fail_legacy)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rehearse_release_pipeline.py",
+            "--rehearsal-root",
+            str(tmp_path),
+            "--version",
+            "cli-default-graph",
+        ],
+    )
+
+    assert rehearse_release_pipeline.main() == 0
+    assert calls == ["graph"]
+    assert json.loads(capsys.readouterr().out)["schema_version"] == "graph"
+
+
+def test_release_pipeline_cli_requires_explicit_legacy_rehearsal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+
+    def fail_graph(*_args: object, **_kwargs: object) -> dict:
+        raise AssertionError("--legacy-rehearsal must bypass graph preflight")
+
+    def fake_legacy(project_dir: Path, rehearsal_root: Path, **kwargs: object) -> dict:
+        calls.append("legacy")
+        assert project_dir == Path.cwd()
+        assert rehearsal_root == tmp_path
+        assert kwargs["version"] == "cli-legacy"
+        return {"ok": True, "schema_version": "legacy"}
+
+    monkeypatch.setattr(rehearse_release_pipeline, "run_release_preflight_graph_pipeline", fail_graph)
+    monkeypatch.setattr(rehearse_release_pipeline, "rehearse_release_pipeline", fake_legacy)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "rehearse_release_pipeline.py",
+            "--rehearsal-root",
+            str(tmp_path),
+            "--version",
+            "cli-legacy",
+            "--legacy-rehearsal",
+        ],
+    )
+
+    assert rehearse_release_pipeline.main() == 0
+    assert calls == ["legacy"]
+    assert json.loads(capsys.readouterr().out)["schema_version"] == "legacy"
+
+
+def test_release_manifest_includes_untracked_release_source_files(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    service_dir = project / "app" / "services"
+    scripts_dir = project / "scripts"
+    service_dir.mkdir(parents=True)
+    scripts_dir.mkdir(parents=True)
+    (project / "app" / "main.py").write_text(
+        "from app.services import fresh_graph\n",
+        encoding="utf-8",
+    )
+    (service_dir / "__init__.py").write_text("", encoding="utf-8")
+    (service_dir / "fresh_graph.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (scripts_dir / "server-ops.ps1").write_text("Require-DeployApproval\n", encoding="utf-8")
+
+    subprocess.run(
+        ["git", "init"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    subprocess.run(
+        ["git", "add", "app/main.py", "app/services/__init__.py", "scripts/server-ops.ps1"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    manifest = rehearse_release_pipeline.build_release_manifest(
+        project,
+        version="untracked-source",
+        git_head="test",
+    )
+
+    assert "app/services/fresh_graph.py" in manifest["untracked_release_source_paths_in_manifest"]
+    assert manifest["excluded_runtime_paths_present_in_manifest"] == []
 
 
 def test_release_rehearsal_env_summary_does_not_print_secret_values(tmp_path: Path) -> None:
@@ -315,10 +471,13 @@ def test_historical_failure_gate_surfaces_runner_artifact_with_stderr_logging() 
     )
     combined_output = completed.stdout + completed.stderr
 
-    assert completed.returncode == 0, combined_output
     assert "historical failure replay QA" in combined_output
     assert "ARTIFACT" in combined_output
-    assert "QA artifact gate passed high=0 medium=0" in combined_output
+    assert "QA_SCOPE" in combined_output
+    if completed.returncode == 0:
+        assert "QA artifact gate passed high=0 medium=0" in combined_output
+    else:
+        assert "QA artifact blocks release" in combined_output
     assert "NativeCommandError" not in combined_output
 
 

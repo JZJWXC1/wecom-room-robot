@@ -74,6 +74,7 @@ ROW_ALIASES: dict[str, tuple[str, ...]] = {
     "source_kind": ("source_kind", "inventory_source_kind"),
     "source_hash": ("source_hash", "inventory_source_hash"),
     "snapshot_id": ("inventory_snapshot_id", "snapshot_id"),
+    "candidate_number": ("candidate_number", "candidate_no", "candidate_index", "selection_number"),
 }
 
 
@@ -482,6 +483,15 @@ def _evidence_bundle_from(
         for index, path in enumerate(_string_list(evidence.get(key)), start=1):
             row = _media_row_for_index(evidence, kind, index)
             listing_id = _row_text(row, "listing_id") if row else ""
+            binding_number = _media_binding_number(kind, index, row)
+            candidate_number = _media_candidate_number(kind, row)
+            metadata = {
+                "media_number": index,
+                "binding_number": binding_number,
+                "path_hash": _stable_hash(path),
+            }
+            if candidate_number is not None:
+                metadata["candidate_number"] = candidate_number
             evidence_items.append(
                 EvidenceItem(
                     conversation_id=task_packet.conversation_id,
@@ -490,22 +500,20 @@ def _evidence_bundle_from(
                     inventory_snapshot_id=task_packet.inventory_snapshot_id,
                     candidate_set_id=task_packet.candidate_set_id,
                     listing_id=listing_id,
-                    evidence_id=f"evd-{kind}-{index}",
+                    evidence_id=f"evd-{kind}-{binding_number}",
                     evidence_type=kind,
-                    summary=_media_evidence_summary(kind, index, row),
+                    summary=_media_evidence_summary(kind, binding_number, row),
                     source_kind=str(evidence.get("source_kind") or ""),
                     source_record_id=_stable_hash(path),
                     field_values=_media_field_values(kind, index, row),
                     sensitivity="public",
                     fetched_at=str(evidence.get("fetched_at") or ""),
-                    metadata={
-                        "media_number": index,
-                        "path_hash": _stable_hash(path),
-                        "candidate_number": index if kind in {"video", "image"} else None,
-                    },
+                    metadata=metadata,
                 )
             )
     evidence_items.extend(_rule_evidence_items(task_packet, evidence))
+    evidence_items.extend(_target_error_evidence_items(task_packet, evidence))
+    evidence_items.extend(_original_video_evidence_items(task_packet, evidence))
     evidence_items.extend(_missing_media_evidence_items(task_packet, evidence))
     return ToolEvidenceBundle(
         conversation_id=task_packet.conversation_id,
@@ -638,6 +646,25 @@ def _send_actions_from(
             row = _media_row_for_index(evidence, kind, index)
             listing_id = _row_text(row, "listing_id") if row else ""
             room_label = _room_label(row) if row else ""
+            binding_number = _media_binding_number(kind, index, row)
+            candidate_number = _media_candidate_number(kind, row)
+            payload = {
+                "media_number": index,
+                "binding_number": binding_number,
+                "path_hash": _stable_hash(path),
+                "community": _row_text(row, "community") if row else "",
+                "room_no": _row_text(row, "room_no") if row else "",
+            }
+            metadata = {
+                "source": "program_evidence",
+                "kind": kind,
+                "room_label": room_label,
+                "media_number": index,
+                "binding_number": binding_number,
+            }
+            if candidate_number is not None:
+                payload["candidate_number"] = candidate_number
+                metadata["candidate_number"] = candidate_number
             result.append(
                 SendAction(
                     conversation_id=task_packet.conversation_id,
@@ -646,16 +673,11 @@ def _send_actions_from(
                     inventory_snapshot_id=task_packet.inventory_snapshot_id,
                     candidate_set_id=task_packet.candidate_set_id,
                     listing_id=listing_id,
-                    evidence_id=f"evd-{kind}-{index}",
-                    action_id=f"send-{kind}-{index}",
+                    evidence_id=f"evd-{kind}-{binding_number}",
+                    action_id=f"send-{kind}-{binding_number}",
                     action_type=action_type,
-                    payload={
-                        "media_number": index,
-                        "path_hash": _stable_hash(path),
-                        "community": _row_text(row, "community") if row else "",
-                        "room_no": _row_text(row, "room_no") if row else "",
-                    },
-                    metadata={"source": "program_evidence", "kind": kind, "room_label": room_label},
+                    payload=payload,
+                    metadata=metadata,
                 )
             )
     return result
@@ -859,8 +881,8 @@ def _media_row_for_index(evidence: dict[str, Any], kind: str, index: int) -> dic
         if 0 <= index - 1 < len(rows):
             return rows[index - 1]
     rows = _rows_from_evidence(evidence)
-    if kind in {"video", "image"} and len(rows) == 1:
-        return rows[0]
+    if kind in {"video", "image"} and 0 <= index - 1 < len(rows):
+        return rows[index - 1]
     return {}
 
 
@@ -883,11 +905,16 @@ def _media_evidence_summary(kind: str, index: int, row: dict[str, Any]) -> str:
 
 
 def _media_field_values(kind: str, index: int, row: dict[str, Any]) -> dict[str, Any]:
+    binding_number = _media_binding_number(kind, index, row)
+    candidate_number = _media_candidate_number(kind, row)
     values = {
         "kind": kind,
         "media_number": index,
+        "binding_number": binding_number,
         "send_channel": "image" if kind in {"image", "inventory_sheet"} else "video",
     }
+    if candidate_number is not None:
+        values["candidate_number"] = candidate_number
     if kind == "inventory_sheet":
         values["artifact"] = "inventory_sheet_png"
     if row:
@@ -924,6 +951,185 @@ def _rule_evidence_items(task_packet: StructuredTaskPacket, evidence: dict[str, 
             )
         )
     return result
+
+
+def _target_error_evidence_items(task_packet: StructuredTaskPacket, evidence: dict[str, Any]) -> list[EvidenceItem]:
+    result: list[EvidenceItem] = []
+    selection_error = evidence.get("selection_error")
+    if isinstance(selection_error, dict) and selection_error:
+        requested_indices: list[int] = []
+        for raw_index in selection_error.get("requested_indices") or []:
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if index > 0:
+                requested_indices.append(index)
+        requested_indices = _dedupe_ints(requested_indices)
+        try:
+            candidate_count = int(selection_error.get("candidate_count") or 0)
+        except (TypeError, ValueError):
+            candidate_count = 0
+        candidate_labels = _string_list(selection_error.get("candidate_labels"))[:8]
+        requested_text = "、".join(f"第{index}套" for index in requested_indices) or "客户所选序号"
+        summary = f"客户选择了{requested_text}，但上一轮只有 {candidate_count} 套候选。"
+        if candidate_labels:
+            summary += " 上一轮候选：" + "、".join(candidate_labels[:5]) + "。"
+        field_values = {
+            "error_code": "selection_error",
+            "requested_indices": requested_indices,
+            "candidate_count": candidate_count,
+            "candidate_labels": candidate_labels,
+            "reason": str(selection_error.get("reason") or ""),
+        }
+        result.append(
+            EvidenceItem(
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                candidate_set_id=task_packet.candidate_set_id,
+                evidence_id="evd-target-selection-error-1",
+                evidence_type="selection_error",
+                summary=summary,
+                source_kind="tool_resolver",
+                source_record_id=_stable_hash(field_values),
+                field_values=field_values,
+                sensitivity="public",
+                metadata={"controlled_error_code": "selection_error"},
+            )
+        )
+
+    field_target_error = evidence.get("field_target_error")
+    if isinstance(field_target_error, dict) and field_target_error:
+        field = str(field_target_error.get("field") or "这个信息").strip()
+        reason = str(field_target_error.get("reason") or "field_target_error").strip()
+        candidate_labels = _string_list(field_target_error.get("candidate_labels"))[:8]
+        if reason == "original_video_followup_missing_stable_video_target":
+            summary = "客户追问原视频/高清源，但上一轮没有稳定绑定到可继续追问的视频房源。"
+            error_code = "original_video_target_error"
+        elif reason == "community_media_request_missing_room_ref":
+            summary = f"客户按小区要{field}，但该小区有多套候选，工具未绑定到具体房源。"
+            error_code = "field_target_error"
+        else:
+            summary = f"客户要查询{field}，但工具未绑定到具体房源。"
+            error_code = "field_target_error"
+        if candidate_labels:
+            summary += " 可供客户选择的候选：" + "、".join(candidate_labels[:5]) + "。"
+        try:
+            candidate_count = int(field_target_error.get("candidate_count") or len(candidate_labels))
+        except (TypeError, ValueError):
+            candidate_count = len(candidate_labels)
+        field_values = {
+            "error_code": error_code,
+            "field": field,
+            "reason": reason,
+            "candidate_count": candidate_count,
+            "candidate_labels": candidate_labels,
+            "requires_customer_room_ref": True,
+        }
+        result.append(
+            EvidenceItem(
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                candidate_set_id=task_packet.candidate_set_id,
+                evidence_id="evd-target-field-error-1",
+                evidence_type="field_target_error",
+                summary=summary,
+                source_kind="tool_resolver",
+                source_record_id=_stable_hash(field_values),
+                field_values=field_values,
+                sensitivity="public",
+                metadata={"controlled_error_code": error_code},
+            )
+        )
+    missing_target_reason = str(evidence.get("missing_target_reason") or "").strip()
+    if missing_target_reason and not result:
+        field_values = {
+            "error_code": "missing_target",
+            "missing_target": True,
+            "reason": missing_target_reason,
+            "resolution": "需要先确认具体房源",
+            "requires_customer_room_ref": True,
+        }
+        result.append(
+            EvidenceItem(
+                conversation_id=task_packet.conversation_id,
+                turn_id=task_packet.turn_id,
+                case_id=task_packet.case_id,
+                inventory_snapshot_id=task_packet.inventory_snapshot_id,
+                candidate_set_id=task_packet.candidate_set_id,
+                evidence_id="evd-target-missing-1",
+                evidence_type="missing_target",
+                summary="客户请求发送素材或查询单套信息，但工具没有可绑定的目标房源。",
+                source_kind="tool_resolver",
+                source_record_id=_stable_hash(field_values),
+                field_values=field_values,
+                sensitivity="public",
+                metadata={"controlled_error_code": "missing_target"},
+            )
+        )
+    return result
+
+
+def _original_video_evidence_items(task_packet: StructuredTaskPacket, evidence: dict[str, Any]) -> list[EvidenceItem]:
+    request = evidence.get("original_video_request")
+    request_data = dict(request) if isinstance(request, dict) else {}
+    original_paths = _string_list(evidence.get("original_video_paths"))
+    original_urls = _string_list(evidence.get("original_video_urls"))
+    material_urls = _string_list(evidence.get("material_page_urls"))
+    requested = bool(
+        request_data.get("requested")
+        or original_paths
+        or original_urls
+        or material_urls
+    )
+    if not requested:
+        return []
+    has_original_source = bool(
+        request_data.get("has_original_source")
+        or original_paths
+        or original_urls
+        or material_urls
+    )
+    has_sendable_video = bool(_string_list(evidence.get("video_paths")))
+    if has_original_source:
+        evidence_type = "original_video_source"
+        summary = "客户要原视频/高清源，素材库已有原视频或素材页来源证据。"
+    elif has_sendable_video:
+        evidence_type = "original_video_unavailable"
+        summary = "客户要原视频/高清源；当前只有企业微信可发送视频，没有原片或高清下载链接证据。"
+    else:
+        evidence_type = "original_video_unavailable"
+        summary = "客户要原视频/高清源；工具未找到普通视频，也未找到原片或高清下载链接证据。"
+    field_values = {
+        "error_code": evidence_type,
+        "requested": True,
+        "has_original_source": has_original_source,
+        "has_sendable_video": has_sendable_video,
+        "original_video_path_count": len(original_paths),
+        "original_video_urls": original_urls[:3],
+        "material_page_urls": material_urls[:3],
+    }
+    return [
+        EvidenceItem(
+            conversation_id=task_packet.conversation_id,
+            turn_id=task_packet.turn_id,
+            case_id=task_packet.case_id,
+            inventory_snapshot_id=task_packet.inventory_snapshot_id,
+            candidate_set_id=task_packet.candidate_set_id,
+            evidence_id="evd-original-video-1",
+            evidence_type=evidence_type,
+            summary=summary,
+            source_kind="media_store",
+            source_record_id=_stable_hash(field_values),
+            field_values=field_values,
+            sensitivity="public",
+            metadata={"controlled_error_code": evidence_type},
+        )
+    ]
 
 
 def _missing_media_kind(evidence: dict[str, Any]) -> str:
@@ -1024,6 +1230,7 @@ def _row_field_values(row: dict[str, Any]) -> dict[str, Any]:
             "rent_pay2": _row_int(row, "rent_pay2"),
             "utilities": _row_text(row, "utilities"),
             "has_viewing_text": bool(_row_text(row, "viewing")),
+            "candidate_number": _row_int(row, "candidate_number"),
             "source_kind": _row_text(row, "source_kind"),
         }
     )
@@ -1046,6 +1253,21 @@ def _row_int(row: dict[str, Any], field: str) -> int | None:
         return int(digits)
     except ValueError:
         return None
+
+
+def _media_binding_number(kind: str, index: int, row: dict[str, Any] | None) -> int:
+    candidate_number = _media_candidate_number(kind, row)
+    if candidate_number is not None:
+        return candidate_number
+    return index
+
+
+def _media_candidate_number(kind: str, row: dict[str, Any] | None) -> int | None:
+    if kind in {"video", "image"} and isinstance(row, dict):
+        candidate_number = _row_int(row, "candidate_number")
+        if candidate_number and candidate_number > 0:
+            return candidate_number
+    return None
 
 
 def _safe_dict(value: Any) -> dict[str, Any]:

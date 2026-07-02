@@ -93,6 +93,15 @@ def resolve_tool_targets(
         limit=target_limit,
     )
     candidate_rows = _candidate_rows(safe_context)
+    confirmed_context = _confirmed_row(safe_context) or _confirmed_row_from_understanding(safe_understanding)
+    has_media_action = any(action in actions for action in ("send_image", "send_video"))
+    can_bind_media_candidate_context = bool(
+        has_media_action
+        and candidate_rows
+        and not selected_indices
+        and not _room_refs_from_text(original_room_text)
+        and not _has_new_scoped_media_constraints_in_text(original_room_text, proof)
+    )
     field_followup_requires_specific_room = _field_followup_needs_specific_room(
         content,
         safe_understanding,
@@ -106,6 +115,12 @@ def resolve_tool_targets(
             search_rows=rows,
         )
     )
+    if (
+        can_bind_media_candidate_context
+        or selected_indices
+    ):
+        field_followup_requires_specific_room = False
+        media_target_error = {}
     target_selection_uses_candidates = bool(
         selected_indices
         and candidate_rows
@@ -120,6 +135,39 @@ def resolve_tool_targets(
         "inventory_row_count": len(rows),
         "inventory_labels": [_row_label(row) for row in rows[:10]],
     }
+
+    if (
+        selected_indices
+        and not candidate_rows
+        and not pending_video_rows
+        and not pending_video
+        and not confirmed_context
+        and not _room_refs_from_text(original_room_text)
+    ):
+        selection_error = {
+            "reason": "missing_current_candidate_set",
+            "requested_indices": selected_indices,
+            "candidate_count": 0,
+            "candidate_labels": [],
+        }
+        binding.update(
+            {
+                "status": "error",
+                "error_type": "selection_error",
+                "reason": selection_error["reason"],
+            }
+        )
+        return ToolResolverResult(
+            target_rows=[],
+            selection_error=selection_error,
+            field_target_error={},
+            missing_target_reason=str(selection_error["reason"]),
+            candidate_binding=binding,
+            inventory_rows_override=[],
+            clear_inventory_rows=True,
+            clear_media_outputs=True,
+            selected_indices=selected_indices,
+        )
 
     target_rows: list[dict[str, Any]] = []
     if not (pending_video_handled or field_followup_requires_specific_room or media_target_error):
@@ -174,8 +222,9 @@ def resolve_tool_targets(
     )
 
     if not target_rows and not pending_video_handled and _has_bound_room_field_followup(content):
-        confirmed = _confirmed_row(safe_context)
-        if confirmed and not _has_explicit_candidate_selection(content):
+        confirmed = _confirmed_row(safe_context) or _confirmed_row_from_understanding(safe_understanding)
+        allow_selected_confirmed_field = bool(selected_indices == [1] and not has_media_action)
+        if confirmed and (not _has_explicit_candidate_selection(content) or allow_selected_confirmed_field):
             target_rows = _enforce_target_rows_community_constraints([confirmed], rows, proof)
             if target_rows:
                 binding.update(
@@ -292,7 +341,8 @@ def resolve_tool_targets(
         and not explicit_room_refs
         and not original_video_target_error
         and not selected_indices
-        and any(action in actions for action in ("send_image", "send_video"))
+        and has_media_action
+        and _inventory_rows_media_request_can_bind(query_text, proof)
     ):
         target_rows = rows[:target_limit]
         binding.update(
@@ -303,11 +353,27 @@ def resolve_tool_targets(
             }
         )
 
+    if (
+        not target_rows
+        and candidate_rows
+        and not explicit_room_refs
+        and not original_video_target_error
+        and can_bind_media_candidate_context
+    ):
+        target_rows = candidate_rows[:target_limit]
+        binding.update(
+            {
+                "status": "bound",
+                "source": "media_candidate_context",
+                "target_labels": [_row_label(row) for row in target_rows],
+            }
+        )
+
     if target_rows and selected_indices:
         inventory_rows_override = list(target_rows)
 
     missing_target_reason = ""
-    if not target_rows and any(action in actions for action in ("send_image", "send_video")):
+    if not target_rows and has_media_action:
         missing_target_reason = "media_target_unbound"
         binding.setdefault("reason", missing_target_reason)
 
@@ -369,8 +435,10 @@ def _joined_text(*parts: Any) -> str:
 
 
 def _int_list(value: Any) -> list[int]:
-    if not isinstance(value, list):
-        return []
+    if isinstance(value, str):
+        value = [part.strip() for part in value.replace("，", ",").split(",")]
+    elif not isinstance(value, list):
+        value = [value] if value not in (None, "") else []
     numbers: list[int] = []
     for item in value:
         try:
@@ -405,6 +473,45 @@ def _requested_room_count_from_text(text: str) -> int:
         if word in value:
             return count
     return 0
+
+
+def _inventory_rows_media_request_can_bind(query_text: str, proof: dict[str, Any]) -> bool:
+    if not _proof_community_norms(proof):
+        return True
+    requested_count = _requested_room_count_from_text(query_text)
+    if requested_count:
+        return True
+    return any(
+        word in str(query_text or "")
+        for word in ("这几套", "这几间", "这些", "都发", "全部", "全发", "都要")
+    )
+
+
+def _has_new_scoped_media_constraints(proof: dict[str, Any]) -> bool:
+    hard_constraints = dict(proof.get("hard_constraints") or {})
+    if any(proof.get(key) for key in ("area", "communities", "budget_range", "layout")):
+        return True
+    return any(bool(hard_constraints.get(key)) for key in ("area", "community", "budget_range", "layout"))
+
+
+def _has_new_scoped_media_constraints_in_text(text: str, proof: dict[str, Any]) -> bool:
+    value = normalize_search_text(str(text or ""))
+    if not value:
+        return False
+    hard_constraints = dict(proof.get("hard_constraints") or {})
+    communities = set(_proof_community_norms(proof))
+    raw_hard_community = hard_constraints.get("community")
+    if isinstance(raw_hard_community, list | tuple | set):
+        communities.update(normalize_search_text(str(item)) for item in raw_hard_community if normalize_search_text(str(item)))
+    elif raw_hard_community:
+        communities.add(normalize_search_text(str(raw_hard_community)))
+    if any(community and community in value for community in communities):
+        return True
+    for raw_scope in (proof.get("area"), hard_constraints.get("area"), proof.get("layout"), hard_constraints.get("layout")):
+        scope = normalize_search_text(str(raw_scope or ""))
+        if scope and scope in value:
+            return True
+    return False
 
 
 def _candidate_selection_count_from_text(text: str) -> int:
@@ -690,7 +797,9 @@ def _row_label(row: dict[str, Any]) -> str:
 
 
 def _candidate_rows(context: dict[str, Any]) -> list[dict[str, Any]]:
-    candidate_set = context.get("last_candidate_set") or {}
+    candidate_set = kf_context_memory.normalize_last_candidate_set(
+        context.get("last_candidate_set") if isinstance(context, dict) else {}
+    )
     return [row for row in candidate_set.get("candidates") or [] if isinstance(row, dict)]
 
 
@@ -698,6 +807,48 @@ def _confirmed_row(context: dict[str, Any]) -> dict[str, Any]:
     confirmed = context.get("confirmed_room") or {}
     row = confirmed.get("row") if isinstance(confirmed, dict) else {}
     return row if isinstance(row, dict) else {}
+
+
+def _confirmed_row_from_understanding(understanding: dict[str, Any]) -> dict[str, Any]:
+    def row_from_confirmed(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        row = value.get("row")
+        return row if isinstance(row, dict) else {}
+
+    safe_understanding = understanding if isinstance(understanding, dict) else {}
+    for container in (
+        safe_understanding,
+        safe_understanding.get("structured_task") if isinstance(safe_understanding.get("structured_task"), dict) else {},
+    ):
+        if not isinstance(container, dict):
+            continue
+        row = row_from_confirmed(container.get("confirmed_room"))
+        if row:
+            return row
+        inherited = container.get("inherited_constraints")
+        if isinstance(inherited, dict):
+            row = row_from_confirmed(inherited.get("confirmed_room"))
+            if row:
+                return row
+        packet = container.get("llm1_task_packet")
+        if not isinstance(packet, dict):
+            continue
+        inherited = packet.get("inherited_constraints")
+        if isinstance(inherited, dict):
+            row = row_from_confirmed(inherited.get("confirmed_room"))
+            if row:
+                return row
+        for task in packet.get("tasks") or []:
+            if not isinstance(task, dict):
+                continue
+            constraints = task.get("constraints")
+            if not isinstance(constraints, dict):
+                continue
+            row = row_from_confirmed(constraints.get("confirmed_room"))
+            if row:
+                return row
+    return {}
 
 
 def _normalize_intent(value: Any, fallback: str = "general") -> str:
@@ -745,20 +896,29 @@ def _has_specific_room_context_reference(query_text: str) -> bool:
 
 
 def _content_wants_viewing(content: str) -> bool:
+    text = str(content or "")
+    if re.search(r"约.{0,8}看", text) or re.search(r"(?:今晚|晚上|今天晚上).{0,6}看", text):
+        return True
     return any(
-        word in str(content or "")
+        word in text
         for word in (
             "密码",
             "看房",
             "今天看",
             "今天想看",
             "今天能看",
+            "今天晚上看",
+            "今晚看",
+            "晚上看",
             "现在看",
             "自己看",
             "能自己看",
             "自助看",
             "直接看",
             "去看",
+            "约看",
+            "预约看",
+            "约个时间",
             "门口",
             "去门口",
             "怎么安排",
@@ -912,6 +1072,8 @@ def _should_bind_confirmed_room_context(understanding: dict[str, Any], query_tex
     is_bound_field_followup = _has_bound_room_field_followup(original_text)
     if not is_bound_field_followup and _looks_like_new_scoped_inventory_query(query_text, proof):
         return False
+    if _content_wants_viewing(query_text):
+        return True
     if not bool(understanding.get("context_reference")) and not is_bound_field_followup:
         return False
     if _has_specific_room_context_reference(query_text):
@@ -997,7 +1159,15 @@ def _target_rows_from_understanding(
         or _normalize_intent(understanding.get("intent")) == "viewing"
         or _content_wants_viewing(query_text)
     )
+    wants_media = bool(
+        proof.get("wants_video")
+        or proof.get("wants_image")
+        or proof.get("wants_original_video")
+        or requirements.get("needs_video")
+        or requirements.get("needs_image")
+    )
     candidates = _candidate_rows(context)
+    confirmed = _confirmed_row(context) or _confirmed_row_from_understanding(understanding)
     selected = _selected_indices_from_understanding(understanding, current_text or query_text, limit=target_limit)
     if not selected:
         matched_by_room_ref = _target_rows_from_room_refs(understanding, search_rows, content=content)
@@ -1017,7 +1187,6 @@ def _target_rows_from_understanding(
         if matched_by_room_ref:
             return matched_by_room_ref
 
-    confirmed = _confirmed_row(context)
     if (
         confirmed
         and _should_bind_confirmed_room_context(understanding, query_text)
@@ -1066,6 +1235,13 @@ def _target_rows_from_understanding(
 
     if selected:
         if not candidates:
+            if (
+                selected == [1]
+                and confirmed
+                and not wants_media
+                and _should_bind_confirmed_room_context(understanding, query_text)
+            ):
+                return [confirmed]
             return []
         if any(index > len(candidates) for index in selected):
             return []
@@ -1075,11 +1251,6 @@ def _target_rows_from_understanding(
             if 1 <= index <= len(candidates)
         ]
 
-    wants_media = bool(
-        proof.get("wants_video")
-        or proof.get("wants_image")
-        or proof.get("wants_original_video")
-    )
     if wants_media:
         recent_media_rows = _recent_assistant_mentioned_rows(
             context,
@@ -1450,21 +1621,28 @@ def _media_target_error_for_unclear_room(
         return {}
     if _has_single_room_context_pronoun(query_text):
         return {}
+    proof_communities = _proof_community_norms(proof)
+    matched_rows = [
+        row
+        for row in search_rows
+        if normalize_search_text(_row_value(row, ("小区", "小区名", "社区", "楼盘"))) in proof_communities
+    ]
+    if proof_communities and len(matched_rows) > 1:
+        field = "视频" if proof.get("wants_video") or proof.get("wants_original_video") else "图片"
+        return {
+            "field": field,
+            "reason": "community_media_request_missing_room_ref",
+            "candidate_count": len(matched_rows),
+            "candidate_labels": [_row_label(row) for row in matched_rows[:10]],
+        }
     if _media_request_targets_previous_candidates(str(task.get("original_text") or query_text)):
         return {}
     requested_count = _requested_room_count_from_text(query_text)
     if requested_count or any(word in query_text for word in ("最合适", "推荐", "几套", "几间", "都发", "全部", "都要", "全发")):
         return {}
 
-    proof_communities = _proof_community_norms(proof)
     if not proof_communities:
         return {}
-
-    matched_rows = [
-        row
-        for row in search_rows
-        if normalize_search_text(_row_value(row, ("小区", "小区名", "社区", "楼盘"))) in proof_communities
-    ]
     if len(matched_rows) <= 1:
         return {}
 
@@ -1502,6 +1680,7 @@ def _selection_error(
     missing_candidate_selection_context = bool(
         selected_indices
         and not selection_has_prior_context
+        and not target_rows
         and not selection_has_direct_room_ref
         and not original_video_target_error
     )

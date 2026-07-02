@@ -18,14 +18,22 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.models import IncomingMessage
 from app.services import (
+    inventory_sync_graph,
     inventory_read_turn,
     inventory_sensitive_access,
     kf_agentic_rag,
+    kf_business_knowledge,
     kf_context_memory,
     kf_dual_llm_production,
+    kf_entry_graph,
+    kf_langgraph_flow,
+    kf_media_binding_graph,
     kf_orchestrator_flow,
     kf_orchestrator_shadow,
     kf_outbox,
+    kf_outbound_package,
+    kf_receipt_graph,
+    kf_send_graph,
     kf_send_receipts,
     kf_tool_resolver,
     kf_turn_flow,
@@ -48,6 +56,7 @@ from app.services.inventory_read_models import (
     assert_evidence_consistency,
 )
 from app.services.inventory_snapshot_models import is_safe_listing_id
+from app.services.kf_llm1_task_packet import build_kf_task_packet_shadow
 from app.services.inventory_query import (
     parse_inventory_query,
     row_matches_hard_constraints,
@@ -96,6 +105,9 @@ agentic_rag = kf_agentic_rag.KfAgenticRagService(
     knowledge_dir=settings.kf_agentic_rag_knowledge_dir,
     enabled=settings.kf_agentic_rag_enabled,
     max_evidence=settings.kf_agentic_rag_max_evidence,
+)
+business_knowledge = kf_business_knowledge.KfBusinessKnowledgeService(
+    settings.kf_agentic_rag_knowledge_dir
 )
 wecom_kf = WeComKfClient()
 wecom_kf_context_store = WeComKfContextStore()
@@ -355,31 +367,52 @@ async def _restart_kf_turn(
         return
 
 
-async def _handle_text_messages_batch(messages: list[dict[str, Any]]) -> None:
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-    for message in messages:
-        if not should_auto_reply_kf_message(message):
-            continue
-        msgid = _kf_message_id(message)
-        if msgid and wecom_kf.state_store.is_processed(msgid):
-            continue
-        open_kfid = str(message.get("open_kfid") or "").strip()
-        external_userid = str(message.get("external_userid") or "").strip()
-        item = _kf_pending_message_item(message)
-        if not open_kfid or not external_userid or not item.get("content"):
-            continue
-        grouped.setdefault((open_kfid, external_userid), []).append(item)
-    if not grouped:
+def _kf_entry_graph_deps() -> kf_entry_graph.KfEntryGraphDeps:
+    state_store = getattr(wecom_kf, "state_store", None)
+    is_processed = getattr(state_store, "is_processed", None)
+    if not callable(is_processed):
+        is_processed = lambda _msgid: False
+    return kf_entry_graph.KfEntryGraphDeps(
+        is_enter_session_event=is_kf_enter_session_event,
+        should_auto_reply_message=should_auto_reply_kf_message,
+        message_id=_kf_message_id,
+        is_processed=is_processed,
+        open_kfid=lambda message: str(message.get("open_kfid") or "").strip(),
+        external_userid=lambda message: str(message.get("external_userid") or "").strip(),
+        pending_item=_kf_pending_message_item,
+    )
+
+
+async def _plan_kf_entry_dispatch(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    state = await kf_entry_graph.run_kf_entry_graph(
+        _kf_entry_graph_deps(),
+        messages=messages,
+        conversation_id="kf-entry-dispatch",
+    )
+    return dict(state.get("dispatch_plan") or {})
+
+
+async def _dispatch_kf_text_groups(text_groups: list[dict[str, Any]]) -> None:
+    if not text_groups:
         return
     tasks = [
         _restart_kf_turn(
-            open_kfid=open_kfid,
-            external_userid=external_userid,
-            new_items=items,
+            open_kfid=str(group.get("open_kfid") or "").strip(),
+            external_userid=str(group.get("external_userid") or "").strip(),
+            new_items=[dict(item) for item in group.get("items") or [] if isinstance(item, dict)],
         )
-        for (open_kfid, external_userid), items in grouped.items()
+        for group in text_groups
+        if str(group.get("open_kfid") or "").strip()
+        and str(group.get("external_userid") or "").strip()
+        and group.get("items")
     ]
-    await asyncio.gather(*tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
+
+
+async def _handle_text_messages_batch(messages: list[dict[str, Any]]) -> None:
+    dispatch_plan = await _plan_kf_entry_dispatch(messages)
+    await _dispatch_kf_text_groups(kf_entry_graph.text_groups_from_dispatch_plan(dispatch_plan))
 
 
 def _conversation_text(context: dict[str, Any] | None, *, limit: int = 10) -> str:
@@ -402,8 +435,10 @@ def _string_list(value: Any) -> list[str]:
 
 
 def _int_list(value: Any) -> list[int]:
-    if not isinstance(value, list):
-        return []
+    if isinstance(value, str):
+        value = [part.strip() for part in value.replace("，", ",").split(",")]
+    elif not isinstance(value, list):
+        value = [value] if value not in (None, "") else []
     numbers: list[int] = []
     for item in value:
         try:
@@ -745,6 +780,35 @@ def _field_followup_label(text: str) -> str:
     return "这个信息"
 
 
+def _selected_indices_without_candidate_context(
+    *,
+    content: str,
+    understanding: dict[str, Any],
+    context: dict[str, Any],
+    pending_video: dict[str, Any] | None = None,
+) -> list[int]:
+    selected_indices = _selected_indices_from_understanding(understanding, content)
+    if not selected_indices or not _has_explicit_candidate_selection(content):
+        return []
+    task = dict(understanding.get("structured_task") or {})
+    original_room_text = " ".join(
+        str(part).strip()
+        for part in (
+            content,
+            task.get("original_text"),
+            understanding.get("original_query"),
+        )
+        if str(part or "").strip()
+    )
+    if _room_refs_from_text(original_room_text):
+        return []
+    if _candidate_rows(context) or _confirmed_row(context):
+        return []
+    if pending_video:
+        return []
+    return selected_indices
+
+
 def _field_followup_needs_specific_room(content: str, understanding: dict[str, Any]) -> bool:
     if not _has_bound_room_field_followup(content):
         return False
@@ -776,6 +840,14 @@ def _dual_llm_production_enabled() -> bool:
     return kf_dual_llm_production.production_enabled(getattr(settings, "kf_dual_llm_mode", "shadow"))
 
 
+def _langgraph_production_flow_enabled() -> bool:
+    if not _dual_llm_production_enabled():
+        return False
+    if not bool(getattr(settings, "kf_langgraph_enabled", False)):
+        raise RuntimeError("KF_DUAL_LLM_MODE=production requires KF_LANGGRAPH_ENABLED=true")
+    return True
+
+
 def _configured_positive_float(value: Any, default: float) -> float:
     try:
         number = float(value)
@@ -793,8 +865,8 @@ def _llm1_production_timeout_seconds() -> float:
 
 def _llm2_production_timeout_seconds() -> float:
     return _configured_positive_float(
-        getattr(settings, "kf_llm2_production_timeout_seconds", 15.0),
-        15.0,
+        getattr(settings, "kf_llm2_production_timeout_seconds", 45.0),
+        45.0,
     )
 
 
@@ -850,6 +922,407 @@ def _llm1_production_retry_plan(understanding: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def _is_short_acknowledgement(content: str) -> bool:
+    text = re.sub(r"[\s，,。.!！?？~～、]+", "", str(content or "").strip().lower())
+    text = re.sub(r"(啦|哈|呀|喔|哦)+$", "", text)
+    if not text:
+        return False
+    tokens = ("okay", "ok", "好的", "好滴", "嗯嗯", "谢谢", "辛苦", "收到", "可以", "好", "嗯", "行")
+    if text in set(tokens):
+        return True
+    if len(text) > 12:
+        return False
+
+    def can_segment(offset: int) -> bool:
+        if offset == len(text):
+            return True
+        return any(
+            text.startswith(token, offset) and can_segment(offset + len(token))
+            for token in tokens
+        )
+
+    return can_segment(0)
+
+
+def _is_literal_greeting(content: str) -> bool:
+    text = re.sub(r"[\s,，。.!！?？~～、]+", "", str(content or "").strip())
+    return text in {
+        "你好",
+        "您好",
+        "在吗",
+        "在不在",
+        "有人吗",
+        "你好在吗",
+        "您好在吗",
+        "在吗你好",
+        "在吗您好",
+    }
+
+
+def _llm1_packet_task_types(packet_payload: dict[str, Any]) -> set[str]:
+    tasks = packet_payload.get("tasks") or packet_payload.get("task_atoms") or []
+    return {
+        str(task.get("task_type") or task.get("type") or "").strip()
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("task_type") or task.get("type") or "").strip()
+    }
+
+
+def _task_packet_has_greeting_reply_compose_signal(packet_payload: Any) -> bool:
+    if not isinstance(packet_payload, dict):
+        return False
+    has_reply_signal = False
+    tasks = packet_payload.get("tasks") or packet_payload.get("task_atoms") or []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_type = str(task.get("task_type") or task.get("type") or "").strip()
+        if task_type != "reply_compose_signal":
+            continue
+        has_reply_signal = True
+        if _is_literal_greeting(str(task.get("user_text") or "")):
+            return True
+    return has_reply_signal and _is_literal_greeting(str(packet_payload.get("rewritten_query") or ""))
+
+
+def _task_packet_has_reply_compose_signal(packet_payload: Any) -> bool:
+    if not isinstance(packet_payload, dict):
+        return False
+    tasks = packet_payload.get("tasks") or packet_payload.get("task_atoms") or []
+    return any(
+        isinstance(task, dict)
+        and str(task.get("task_type") or task.get("type") or "").strip() == "reply_compose_signal"
+        for task in tasks
+    )
+
+
+def _content_wants_inventory_search(content: str) -> bool:
+    text = str(content or "").strip()
+    if not text or _is_literal_greeting(text) or _is_short_acknowledgement(text):
+        return False
+    query = parse_inventory_query(text)
+    has_search_scope = bool(
+        query.room_refs
+        or query.price_range
+        or query.room_type_aliases
+        or query.feature_aliases
+        or query.anchor_terms
+    )
+    if not has_search_scope:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "有没有",
+            "有吗",
+            "还有吗",
+            "还有没有",
+            "还有",
+            "还在吗",
+            "还在",
+            "在吗",
+            "空房",
+            "空的",
+            "有空吗",
+            "有空",
+            "可租",
+            "在租",
+            "房源",
+            "推荐",
+            "哪套",
+            "哪些",
+            "几套",
+            "预算",
+            "左右",
+            "上下",
+            "以内",
+            "以下",
+            "一室",
+            "两室",
+            "单间",
+            "整租",
+        )
+    )
+
+
+def _controlled_tool_plan_from_rewrite_requirements(
+    understanding: dict[str, Any],
+    signals: dict[str, Any],
+) -> dict[str, Any]:
+    def _tool_names(value: Any) -> list[str]:
+        if isinstance(value, str):
+            return [value.strip()] if value.strip() else []
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    requirements: dict[str, Any] = {}
+    required_tools: set[str] = set(_tool_names(understanding.get("required_tools")))
+    structured_task = understanding.get("structured_task")
+    if isinstance(structured_task, dict):
+        task_requirements = structured_task.get("tool_requirements")
+        if isinstance(task_requirements, dict):
+            requirements.update(task_requirements)
+        required_tools.update(_tool_names(structured_task.get("required_tools")))
+        tasks = structured_task.get("tasks")
+        if isinstance(tasks, list):
+            for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                nested_requirements = task.get("tool_requirements")
+                if isinstance(nested_requirements, dict):
+                    requirements.update(nested_requirements)
+                required_tools.update(_tool_names(task.get("required_tools") or task.get("tools")))
+    task_packet = understanding.get("task_packet")
+    if isinstance(task_packet, dict):
+        required_tools.update(_tool_names(task_packet.get("required_tools")))
+        packet_tasks = task_packet.get("tasks")
+        if isinstance(packet_tasks, list):
+            for task in packet_tasks:
+                if isinstance(task, dict):
+                    required_tools.update(_tool_names(task.get("required_tools") or task.get("tools")))
+    top_level_requirements = understanding.get("tool_requirements")
+    if isinstance(top_level_requirements, dict):
+        requirements.update(top_level_requirements)
+    if required_tools:
+        if required_tools & {"inventory.sheet_artifact"}:
+            requirements.setdefault("needs_inventory_sheet", True)
+        if required_tools & {"media.video", "media.video.fetch", "media.video.search"}:
+            requirements.setdefault("needs_video", True)
+        if required_tools & {"media.image", "media.image.fetch", "media.image.search"}:
+            requirements.setdefault("needs_image", True)
+        if required_tools & {"contact.contract", "contract.contact"}:
+            requirements.setdefault("needs_contract_contact", True)
+        if required_tools & {"deposit.policy", "policy.deposit"}:
+            requirements.setdefault("needs_deposit_policy", True)
+        if required_tools & {"viewing.policy", "viewing.contact", "viewing.password"}:
+            requirements.setdefault("needs_viewing_policy", True)
+        if required_tools & {"inventory.search", "inventory.lookup", "inventory.filter"}:
+            requirements.setdefault("needs_inventory_search", True)
+        if required_tools & {"inventory.utilities", "utilities.policy"}:
+            requirements.setdefault("needs_utilities", True)
+    if not requirements:
+        return {}
+    actions: list[str] = []
+    reason = ""
+    if requirements.get("needs_inventory_sheet") or signals.get("wants_inventory_sheet"):
+        actions = ["send_inventory_sheet", "generate_reply"]
+        reason = "rewrite_requirements_inventory_sheet"
+    elif (
+        requirements.get("needs_video")
+        or signals.get("wants_video")
+        or signals.get("wants_original_video")
+    ):
+        actions = ["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"]
+        reason = "rewrite_requirements_video"
+    elif requirements.get("needs_image") or signals.get("wants_image"):
+        actions = ["search_inventory", "context_tools", "send_image", "explain_missing_media", "generate_reply"]
+        reason = "rewrite_requirements_image"
+    elif requirements.get("needs_contract_contact") or signals.get("wants_contract_contact"):
+        actions = ["send_contract_contact", "generate_reply"]
+        reason = "rewrite_requirements_contract_contact"
+    elif requirements.get("needs_deposit_policy") or signals.get("wants_deposit"):
+        actions = ["send_deposit_policy", "generate_reply"]
+        reason = "rewrite_requirements_deposit_policy"
+    elif requirements.get("needs_viewing_policy") or signals.get("wants_viewing"):
+        actions = ["search_inventory", "context_tools", "explain_unavailable_viewing", "generate_reply"]
+        reason = "rewrite_requirements_viewing"
+    elif (
+        requirements.get("needs_inventory_search")
+        or requirements.get("needs_utilities")
+        or signals.get("wants_inventory_field")
+    ):
+        actions = ["search_inventory", "context_tools", "generate_reply"]
+        reason = "rewrite_requirements_inventory_search"
+    if not actions:
+        return {}
+    return {
+        "actions": actions,
+        "need_rewrite_clarification": False,
+        "reply_text": "",
+        "source": "controlled_task_packet_from_rewrite_requirements",
+        "controlled_reason": reason,
+    }
+
+
+def _llm1_tool_plan_needs_contract_retry(
+    content: str,
+    tool_plan: dict[str, Any],
+    packet_payload: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    if tool_plan.get("retry_required") or tool_plan.get("need_rewrite_clarification"):
+        return True, str(
+            tool_plan.get("missing_evidence")
+            or tool_plan.get("retry_reason")
+            or "LLM1 production task packet requested retry."
+        )
+    actions = set(_string_list(tool_plan.get("actions")))
+    task_types = _llm1_packet_task_types(packet_payload or {})
+    signals = _deterministic_signals(content)
+    media_actions = {"send_image", "send_video", "explain_missing_media"}
+    if (
+        signals.get("wants_inventory_field")
+        and not (signals.get("wants_video") or signals.get("wants_original_video") or signals.get("wants_image"))
+        and actions & media_actions
+    ):
+        return True, "User asks for inventory field facts, not media. LLM1 production tool_plan must not include send_image, send_video or explain_missing_media for this turn."
+    if (
+        signals.get("wants_viewing")
+        and not (signals.get("wants_video") or signals.get("wants_original_video") or signals.get("wants_image"))
+        and actions & media_actions
+    ):
+        return True, "User asks for viewing or password, not media. LLM1 production tool_plan must not include send_image, send_video or explain_missing_media for this turn."
+    if (signals.get("wants_video") or signals.get("wants_original_video") or "send_video" in task_types) and "send_video" not in actions:
+        return True, "User/task explicitly asks for video. LLM1 production tool_plan must include send_video, context_tools, explain_missing_media and generate_reply when the candidate can be bound; do not use continue_search alone."
+    if (signals.get("wants_image") or "send_image" in task_types) and "send_image" not in actions:
+        return True, "User/task explicitly asks for images. LLM1 production tool_plan must include send_image, context_tools, explain_missing_media and generate_reply when the candidate can be bound; do not use continue_search alone."
+    if signals.get("wants_inventory_sheet") and "send_inventory_sheet" not in actions:
+        return True, "User explicitly asks for the inventory sheet. LLM1 production tool_plan must include send_inventory_sheet and generate_reply."
+    if signals.get("wants_deposit") and "send_deposit_policy" not in actions:
+        return True, "User explicitly asks for deposit or no-deposit policy. LLM1 production tool_plan must include send_deposit_policy and generate_reply."
+    if signals.get("wants_contract_contact") and "send_contract_contact" not in actions:
+        return True, "User explicitly asks about contract, booking, deposit payment or signing. LLM1 production tool_plan must include send_contract_contact and generate_reply."
+    if signals.get("wants_viewing") and "explain_unavailable_viewing" not in actions:
+        return True, "User explicitly asks for viewing, door access or password. LLM1 production tool_plan must include explain_unavailable_viewing and generate_reply, with search_inventory/context_tools when a room can be bound."
+    if signals.get("wants_inventory_field") and "search_inventory" not in actions:
+        return True, "User asks for inventory field facts such as rent, utilities, layout or room details. LLM1 production tool_plan must include search_inventory and generate_reply."
+    if _content_wants_inventory_search(content) and "search_inventory" not in actions:
+        return True, "User asks for available inventory with a concrete scope such as community, budget, layout or room. LLM1 production tool_plan must include search_inventory and generate_reply before any visible reply."
+    if _is_short_acknowledgement(content):
+        inherited_send_actions = {
+            "send_inventory_sheet",
+            "send_image",
+            "send_video",
+            "send_deposit_policy",
+            "send_contract_contact",
+            "explain_unavailable_viewing",
+            "explain_missing_media",
+        }
+        if actions & inherited_send_actions:
+            return True, "Short acknowledgement should not inherit or repeat prior send/policy actions unless the user explicitly asks."
+    return False, ""
+
+
+def _force_llm1_contract_retry_plan(tool_plan: dict[str, Any], reason: str) -> dict[str, Any]:
+    retry_plan = dict(tool_plan or {})
+    retry_plan["retry_required"] = True
+    retry_plan["need_rewrite_clarification"] = True
+    retry_plan["actions"] = []
+    retry_plan["missing_evidence"] = reason
+    retry_plan["reply_text"] = ""
+    return safe_artifact_payload(retry_plan)
+
+
+CONTROLLED_LLM1_CONTRACT_ACTIONS = {
+    "generate_reply",
+    "search_inventory",
+    "context_tools",
+    "send_inventory_sheet",
+    "send_image",
+    "send_video",
+    "explain_missing_media",
+    "send_deposit_policy",
+    "send_contract_contact",
+    "explain_unavailable_viewing",
+}
+
+CONTROLLED_LLM1_CONTRACT_TASK_TYPES = {
+    "reply_compose_signal",
+    "send_inventory_sheet",
+    "send_image",
+    "send_video",
+    "deposit_policy",
+    "contract_contact",
+    "viewing_guidance",
+    "inventory_search",
+}
+
+CONTROLLED_LLM1_CONTRACT_SOURCE = "controlled_task_packet_after_llm1_failure"
+
+
+def _controlled_llm1_contract_packet(
+    *,
+    content: str,
+    raw_dialog_context: list[dict[str, Any]],
+    structured_memory: dict[str, Any],
+    inventory_index: dict[str, Any],
+    candidate_set: dict[str, Any],
+    conversation_id: str,
+    turn_id: str,
+    case_id: str,
+    inventory_snapshot_id: str,
+    candidate_set_id: str,
+    source_label: str,
+    task_type: str,
+    actions: list[str],
+    required_tools: list[str],
+    reason: str,
+    selected_candidate_numbers: list[int] | None = None,
+):
+    selected_candidates = _int_list(selected_candidate_numbers)
+    safe_actions = [str(action).strip() for action in actions if str(action).strip()]
+    invalid_actions = [action for action in safe_actions if action not in CONTROLLED_LLM1_CONTRACT_ACTIONS]
+    if task_type not in CONTROLLED_LLM1_CONTRACT_TASK_TYPES or invalid_actions:
+        raise ValueError(
+            "controlled LLM1 fallback only supports explicitly whitelisted task/action contracts"
+        )
+    raw_output = {
+        "rewritten_query": str(content or ""),
+        "source": CONTROLLED_LLM1_CONTRACT_SOURCE,
+        "response_strategy": {"mode": "answer"},
+        "task_atoms": [
+            {
+                "task_id": f"task-controlled-{task_type.replace('_', '-')}",
+                "task_type": task_type,
+                "user_text": str(content or ""),
+                "constraint_operation": "inherit",
+                "constraints": {"controlled_contract_reason": reason},
+                "required_tools": required_tools,
+            }
+        ],
+        "candidate_binding": {
+            "selected_candidate_numbers": selected_candidates,
+            "reason": "controlled_contract_text_selection" if selected_candidates else "controlled_contract_no_llm_binding",
+        },
+        "tool_plan": {
+            "actions": safe_actions,
+            "required_tools": required_tools,
+            "need_rewrite_clarification": False,
+            "reason": reason,
+            "source": CONTROLLED_LLM1_CONTRACT_SOURCE,
+            "owner": "llm1_fallback",
+            "controlled_source_label": source_label,
+        },
+    }
+    build = build_kf_task_packet_shadow(
+        raw_output,
+        content=content,
+        raw_dialog_context=raw_dialog_context,
+        structured_memory=structured_memory,
+        inventory_index=inventory_index,
+        candidate_set=candidate_set,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        case_id=case_id,
+        inventory_snapshot_id=inventory_snapshot_id,
+        candidate_set_id=candidate_set_id,
+        source_label=source_label,
+        mode="production",
+    )
+    packet = build.packet
+    packet_payload = packet.to_safe_dict() if hasattr(packet, "to_safe_dict") else safe_artifact_payload(packet)
+    if not isinstance(packet_payload, dict):
+        packet_payload = {}
+    tool_plan = dict(kf_dual_llm_production.tool_plan_from_task_packet(packet))
+    tool_plan["source"] = CONTROLLED_LLM1_CONTRACT_SOURCE
+    tool_plan["owner"] = "llm1_fallback"
+    tool_plan["controlled_source_label"] = source_label
+    tool_plan["controlled_reason"] = reason
+    tool_plan["reply_text"] = ""
+    tool_plan = safe_artifact_payload(tool_plan)
+    return packet, packet_payload, tool_plan
+
+
 async def _apply_llm1_production_task_packet(
     *,
     content: str,
@@ -880,18 +1353,22 @@ async def _apply_llm1_production_task_packet(
     turn_id = str(inventory_read_context.turn_id or "")
     candidate_set = rewrite_view.get("last_candidate_set") if isinstance(rewrite_view, dict) else {}
     candidate_set_id = str(candidate_set.get("candidate_set_id") or "") if isinstance(candidate_set, dict) else ""
+    raw_dialog_context = list(rewrite_view.get("raw_dialog_context") or [])
+    structured_memory = rewrite_view if isinstance(rewrite_view, dict) else {}
+    candidate_set_payload = candidate_set if isinstance(candidate_set, dict) else {}
     timeout_seconds = _llm1_production_timeout_seconds()
-    started_at = time.monotonic()
-    try:
+
+    async def build_attempt(attempt_feedback: dict[str, Any]) -> tuple[Any, dict[str, Any], dict[str, Any], float]:
+        started_at = time.monotonic()
         packet = await asyncio.wait_for(
             build_packet(
                 content=content,
-                raw_dialog_context=list(rewrite_view.get("raw_dialog_context") or []),
-                structured_memory=rewrite_view,
+                raw_dialog_context=raw_dialog_context,
+                structured_memory=structured_memory,
                 inventory_index=inventory_index,
-                candidate_set=candidate_set if isinstance(candidate_set, dict) else {},
+                candidate_set=candidate_set_payload,
                 legacy_rewrite=result,
-                planner_feedback=result.get("planner_feedback") or {},
+                planner_feedback=attempt_feedback,
                 conversation_id=conversation_id,
                 turn_id=turn_id,
                 case_id=str(inventory_read_context.decision_id or ""),
@@ -905,6 +1382,251 @@ async def _apply_llm1_production_task_packet(
         if not isinstance(packet_payload, dict):
             packet_payload = {}
         tool_plan = kf_dual_llm_production.tool_plan_from_task_packet(packet)
+        return packet, packet_payload, tool_plan, started_at
+
+    started_at = time.monotonic()
+    try:
+        planner_feedback = dict(result.get("planner_feedback") or {})
+        packet, packet_payload, tool_plan, started_at = await build_attempt(planner_feedback)
+        llm1_attempts = [
+            {
+                "attempt": "initial",
+                "status": "retry" if tool_plan.get("retry_required") or tool_plan.get("need_rewrite_clarification") else "pass",
+                "source": str(tool_plan.get("source") or "llm1_production_task_packet"),
+                "task_count": len(packet_payload.get("tasks") or []),
+                "action_count": len(tool_plan.get("actions") or []),
+            }
+        ]
+        needs_contract_retry, contract_retry_reason = _llm1_tool_plan_needs_contract_retry(content, tool_plan, packet_payload)
+        if needs_contract_retry:
+            retry_feedback = dict(planner_feedback)
+            retry_feedback["retry_target"] = "llm1"
+            retry_feedback["retry_reason"] = contract_retry_reason
+            retry_feedback["previous_tool_plan"] = safe_artifact_payload(tool_plan)
+            retry_packet, retry_packet_payload, retry_tool_plan, retry_started_at = await build_attempt(retry_feedback)
+            retry_attempt = {
+                "attempt": "llm1_contract_retry",
+                "status": "retry" if retry_tool_plan.get("retry_required") or retry_tool_plan.get("need_rewrite_clarification") else "pass",
+                "source": str(retry_tool_plan.get("source") or "llm1_production_task_packet"),
+                "task_count": len(retry_packet_payload.get("tasks") or []),
+                "action_count": len(retry_tool_plan.get("actions") or []),
+            }
+            retry_needs_contract_retry, retry_contract_retry_reason = _llm1_tool_plan_needs_contract_retry(
+                content,
+                retry_tool_plan,
+                retry_packet_payload,
+            )
+            if retry_needs_contract_retry:
+                retry_tool_plan = _force_llm1_contract_retry_plan(retry_tool_plan, retry_contract_retry_reason)
+                retry_attempt["status"] = "retry"
+                retry_attempt["action_count"] = 0
+                retry_attempt["retry_reason"] = retry_contract_retry_reason
+            llm1_attempts.append(retry_attempt)
+            packet = retry_packet
+            packet_payload = retry_packet_payload
+            tool_plan = retry_tool_plan
+            started_at = retry_started_at
+
+        final_needs_retry, final_retry_reason = _llm1_tool_plan_needs_contract_retry(content, tool_plan, packet_payload)
+        if final_needs_retry:
+            signals = _deterministic_signals(content)
+            selected_candidate_numbers = _selection_indices_from_text(content)
+            controlled_packet: tuple[Any, dict[str, Any], dict[str, Any]] | None = None
+            controlled_attempt = ""
+            if signals.get("is_greeting"):
+                controlled_attempt = "controlled_greeting_contract"
+                controlled_packet = _controlled_llm1_contract_packet(
+                    content=content,
+                    raw_dialog_context=raw_dialog_context,
+                    structured_memory=structured_memory,
+                    inventory_index=inventory_index,
+                    candidate_set=candidate_set_payload,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    case_id=str(inventory_read_context.decision_id or ""),
+                    inventory_snapshot_id=str(inventory_read_context.snapshot_id or ""),
+                    candidate_set_id=candidate_set_id,
+                    source_label="llm1_production_greeting_contract",
+                    task_type="reply_compose_signal",
+                    actions=["generate_reply"],
+                    required_tools=["reply.compose"],
+                    reason="Literal greeting after LLM1 retry; compose a natural greeting and invite the broker to send community, room, budget, inventory sheet, image or video needs.",
+                )
+            elif _is_short_acknowledgement(content):
+                controlled_attempt = "controlled_ack_contract"
+                controlled_packet = _controlled_llm1_contract_packet(
+                    content=content,
+                    raw_dialog_context=raw_dialog_context,
+                    structured_memory=structured_memory,
+                    inventory_index=inventory_index,
+                    candidate_set=candidate_set_payload,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    case_id=str(inventory_read_context.decision_id or ""),
+                    inventory_snapshot_id=str(inventory_read_context.snapshot_id or ""),
+                    candidate_set_id=candidate_set_id,
+                    source_label="llm1_production_ack_contract",
+                    task_type="reply_compose_signal",
+                    actions=["generate_reply"],
+                    required_tools=["reply.compose"],
+                    reason="Short acknowledgement after LLM1 retry; compose a natural acknowledgement without inheriting prior send or policy actions.",
+                )
+            elif signals.get("wants_inventory_sheet"):
+                controlled_attempt = "controlled_inventory_sheet_contract"
+                controlled_packet = _controlled_llm1_contract_packet(
+                    content=content,
+                    raw_dialog_context=raw_dialog_context,
+                    structured_memory=structured_memory,
+                    inventory_index=inventory_index,
+                    candidate_set=candidate_set_payload,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    case_id=str(inventory_read_context.decision_id or ""),
+                    inventory_snapshot_id=str(inventory_read_context.snapshot_id or ""),
+                    candidate_set_id=candidate_set_id,
+                    source_label="llm1_production_inventory_sheet_contract",
+                    task_type="send_inventory_sheet",
+                    actions=["send_inventory_sheet", "generate_reply"],
+                    required_tools=["inventory.sheet_artifact", "reply.compose"],
+                    reason=f"Literal inventory sheet request after LLM1 retry: {final_retry_reason}",
+                )
+            elif signals.get("wants_video") or signals.get("wants_original_video") or signals.get("wants_image"):
+                wants_image_only = bool(signals.get("wants_image")) and not (
+                    signals.get("wants_video") or signals.get("wants_original_video")
+                )
+                media_action = "send_image" if wants_image_only else "send_video"
+                media_tool = "media.image" if wants_image_only else "media.video"
+                controlled_attempt = "controlled_media_contract"
+                controlled_packet = _controlled_llm1_contract_packet(
+                    content=content,
+                    raw_dialog_context=raw_dialog_context,
+                    structured_memory=structured_memory,
+                    inventory_index=inventory_index,
+                    candidate_set=candidate_set_payload,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    case_id=str(inventory_read_context.decision_id or ""),
+                    inventory_snapshot_id=str(inventory_read_context.snapshot_id or ""),
+                    candidate_set_id=candidate_set_id,
+                    source_label="llm1_production_media_contract",
+                    task_type=media_action,
+                    actions=["search_inventory", "context_tools", media_action, "explain_missing_media", "generate_reply"],
+                    required_tools=["inventory.search", "context.memory", media_tool, "media.availability", "reply.compose"],
+                    reason=f"Literal media request after LLM1 retry: {final_retry_reason}",
+                    selected_candidate_numbers=selected_candidate_numbers,
+                )
+            elif signals.get("wants_deposit"):
+                controlled_attempt = "controlled_deposit_contract"
+                controlled_packet = _controlled_llm1_contract_packet(
+                    content=content,
+                    raw_dialog_context=raw_dialog_context,
+                    structured_memory=structured_memory,
+                    inventory_index=inventory_index,
+                    candidate_set=candidate_set_payload,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    case_id=str(inventory_read_context.decision_id or ""),
+                    inventory_snapshot_id=str(inventory_read_context.snapshot_id or ""),
+                    candidate_set_id=candidate_set_id,
+                    source_label="llm1_production_deposit_contract",
+                    task_type="deposit_policy",
+                    actions=["send_deposit_policy", "generate_reply"],
+                    required_tools=["deposit.policy", "reply.compose"],
+                    reason=f"Literal deposit policy request after LLM1 retry: {final_retry_reason}",
+                )
+            elif signals.get("wants_contract_contact"):
+                controlled_attempt = "controlled_contract_contact_contract"
+                controlled_packet = _controlled_llm1_contract_packet(
+                    content=content,
+                    raw_dialog_context=raw_dialog_context,
+                    structured_memory=structured_memory,
+                    inventory_index=inventory_index,
+                    candidate_set=candidate_set_payload,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    case_id=str(inventory_read_context.decision_id or ""),
+                    inventory_snapshot_id=str(inventory_read_context.snapshot_id or ""),
+                    candidate_set_id=candidate_set_id,
+                    source_label="llm1_production_contract_contact_contract",
+                    task_type="contract_contact",
+                    actions=["send_contract_contact", "generate_reply"],
+                    required_tools=["contact.contract", "reply.compose"],
+                    reason=f"Literal contract contact request after LLM1 retry: {final_retry_reason}",
+                    selected_candidate_numbers=selected_candidate_numbers,
+                )
+            elif signals.get("wants_viewing"):
+                controlled_attempt = "controlled_viewing_contract"
+                controlled_packet = _controlled_llm1_contract_packet(
+                    content=content,
+                    raw_dialog_context=raw_dialog_context,
+                    structured_memory=structured_memory,
+                    inventory_index=inventory_index,
+                    candidate_set=candidate_set_payload,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    case_id=str(inventory_read_context.decision_id or ""),
+                    inventory_snapshot_id=str(inventory_read_context.snapshot_id or ""),
+                    candidate_set_id=candidate_set_id,
+                    source_label="llm1_production_viewing_contract",
+                    task_type="viewing_guidance",
+                    actions=["search_inventory", "context_tools", "explain_unavailable_viewing", "generate_reply"],
+                    required_tools=["inventory.search", "context.memory", "viewing.policy", "reply.compose"],
+                    reason=f"Literal viewing/password request after LLM1 retry: {final_retry_reason}",
+                    selected_candidate_numbers=selected_candidate_numbers,
+                )
+            elif _content_wants_inventory_search(content):
+                controlled_attempt = "controlled_inventory_search_contract"
+                controlled_packet = _controlled_llm1_contract_packet(
+                    content=content,
+                    raw_dialog_context=raw_dialog_context,
+                    structured_memory=structured_memory,
+                    inventory_index=inventory_index,
+                    candidate_set=candidate_set_payload,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    case_id=str(inventory_read_context.decision_id or ""),
+                    inventory_snapshot_id=str(inventory_read_context.snapshot_id or ""),
+                    candidate_set_id=candidate_set_id,
+                    source_label="llm1_production_inventory_search_contract",
+                    task_type="inventory_search",
+                    actions=["search_inventory", "context_tools", "generate_reply"],
+                    required_tools=["inventory.search", "context.memory", "reply.compose"],
+                    reason=f"Literal inventory availability/search request after LLM1 retry: {final_retry_reason}",
+                    selected_candidate_numbers=selected_candidate_numbers,
+                )
+            elif signals.get("wants_inventory_field"):
+                controlled_attempt = "controlled_inventory_field_contract"
+                controlled_packet = _controlled_llm1_contract_packet(
+                    content=content,
+                    raw_dialog_context=raw_dialog_context,
+                    structured_memory=structured_memory,
+                    inventory_index=inventory_index,
+                    candidate_set=candidate_set_payload,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    case_id=str(inventory_read_context.decision_id or ""),
+                    inventory_snapshot_id=str(inventory_read_context.snapshot_id or ""),
+                    candidate_set_id=candidate_set_id,
+                    source_label="llm1_production_inventory_field_contract",
+                    task_type="inventory_search",
+                    actions=["search_inventory", "context_tools", "generate_reply"],
+                    required_tools=["inventory.search", "context.memory", "reply.compose"],
+                    reason=f"Literal inventory field request after LLM1 retry: {final_retry_reason}",
+                    selected_candidate_numbers=selected_candidate_numbers,
+                )
+            if controlled_packet is not None:
+                packet, packet_payload, tool_plan = controlled_packet
+                llm1_attempts.append(
+                    {
+                        "attempt": controlled_attempt,
+                        "status": "retry" if tool_plan.get("retry_required") or tool_plan.get("need_rewrite_clarification") else "pass",
+                        "source": str(tool_plan.get("source") or "llm1_production_controlled_contract"),
+                        "task_count": len(packet_payload.get("tasks") or []),
+                        "action_count": len(tool_plan.get("actions") or []),
+                    }
+                )
+            else:
+                tool_plan = _force_llm1_contract_retry_plan(tool_plan, final_retry_reason)
     except Exception as exc:
         logger.warning("KF LLM1 production task packet failed: error_type=%s", type(exc).__name__)
         failure_plan = {
@@ -942,14 +1664,16 @@ async def _apply_llm1_production_task_packet(
         constraint_proof["selected_indices"] = selected_candidate_numbers
         result["constraint_proof"] = constraint_proof
     llm1_status = "retry" if tool_plan.get("retry_required") or tool_plan.get("need_rewrite_clarification") else "pass"
-    result["dual_llm_production"] = {
-        "llm1": {
-            "status": llm1_status,
-            "source": str(tool_plan.get("source") or "llm1_production_task_packet"),
-            "task_count": len(packet_payload.get("tasks") or []),
-            "action_count": len(tool_plan.get("actions") or []),
-        }
+    llm1_payload = {
+        "status": llm1_status,
+        "source": str(tool_plan.get("source") or "llm1_production_task_packet"),
+        "task_count": len(packet_payload.get("tasks") or []),
+        "action_count": len(tool_plan.get("actions") or []),
     }
+    if len(llm1_attempts) > 1:
+        llm1_payload["attempt"] = llm1_attempts[-1]["attempt"]
+        llm1_payload["attempts"] = llm1_attempts
+    result["dual_llm_production"] = {"llm1": llm1_payload}
     return result
 
 
@@ -1265,6 +1989,8 @@ def _force_pending_media_target_task(
     target_rows = _pending_media_target_rows_for_content(content, result, context)
     if not target_rows:
         return result
+    if _dual_llm_production_enabled():
+        return result
     if not allow_task_rewrite:
         return result
 
@@ -1368,9 +2094,21 @@ def _should_remember_candidate_set(
     if not rows:
         return False
     intent = _normalize_intent(understanding.get("intent"), "inventory")
-    if intent not in {"inventory", "general", "media"}:
+    tool_plan = understanding.get("tool_plan") if isinstance(understanding.get("tool_plan"), dict) else {}
+    tool_actions = _string_list(tool_plan.get("actions"))
+    task_packet = understanding.get("llm1_task_packet") if isinstance(understanding.get("llm1_task_packet"), dict) else {}
+    task_types = [
+        str(task.get("task_type") or task.get("type") or "").strip()
+        for task in (task_packet.get("tasks") or task_packet.get("task_atoms") or [])
+        if isinstance(task, dict)
+    ]
+    inventory_like = "search_inventory" in tool_actions or "inventory_search" in task_types
+    if intent not in {"inventory", "general", "media"} and not inventory_like:
         return False
     proof = dict(understanding.get("constraint_proof") or {})
+    raw_content = str(content or "")
+    if _has_explicit_candidate_selection(raw_content) and not _room_refs_from_text(raw_content):
+        return False
     text = " ".join(
         str(part).strip()
         for part in (
@@ -1385,7 +2123,7 @@ def _should_remember_candidate_set(
     if (proof.get("wants_video") or proof.get("wants_image")) and _has_single_room_context_pronoun(text):
         return False
     selected = _int_list(understanding.get("selected_indices")) or _int_list(proof.get("selected_indices"))
-    if selected:
+    if (selected or _has_explicit_candidate_selection(text)) and not _looks_like_new_scoped_inventory_query(text, proof):
         return False
     if len(rows) > 1:
         return True
@@ -1432,6 +2170,8 @@ def _should_clear_room_context_after_empty_inventory_search(
         return False
     if _has_bound_room_field_followup(content) or _has_single_room_context_pronoun(query_text):
         return False
+    if _is_contextual_comparison_or_field_followup(query_text):
+        return False
     if _looks_like_new_scoped_inventory_query(query_text, proof):
         return True
     if _has_explicit_inventory_anchor(query_text):
@@ -1443,157 +2183,71 @@ def _should_clear_room_context_after_empty_inventory_search(
     return False
 
 
-def _fallback_actions_from_structured_task(understanding: dict[str, Any], signals: dict[str, Any]) -> list[str]:
-    task = dict(understanding.get("structured_task") or {})
-    requirements = dict(task.get("tool_requirements") or {})
-    actions: list[str] = []
-    if signals.get("wants_inventory_sheet") or requirements.get("needs_inventory_sheet"):
-        actions.append("send_inventory_sheet")
-    if requirements.get("needs_deposit_policy"):
-        actions.append("send_deposit_policy")
-    if requirements.get("needs_viewing_policy"):
-        actions.append("search_inventory")
-        actions.append("context_tools")
-        actions.append("explain_unavailable_viewing")
-    if (
-        requirements.get("needs_inventory_search")
-        or requirements.get("needs_video")
-        or requirements.get("needs_image")
-        or requirements.get("needs_utilities")
-    ):
-        actions.append("search_inventory")
-    if requirements.get("needs_video"):
-        actions.append("context_tools")
-        actions.append("send_video")
-    if requirements.get("needs_image"):
-        actions.append("context_tools")
-        actions.append("send_image")
-    if requirements.get("needs_contract_contact"):
-        actions.append("send_contract_contact")
-    if requirements.get("needs_price_contact"):
-        actions.append("send_price_negotiation_contact")
-    if "search_inventory" in actions:
-        actions.append("compact_listing")
-    if actions == ["send_inventory_sheet"]:
-        return actions
-    if (
-        (signals.get("wants_deposit") or requirements.get("needs_deposit_policy"))
-        and not requirements.get("needs_utilities")
-        and actions == ["send_deposit_policy"]
-    ):
-        return ["send_deposit_policy", "generate_reply"]
-    actions.append("generate_reply")
-    return list(dict.fromkeys(actions))
+def _is_short_media_followup_without_scope(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value or _room_refs_from_text(value):
+        return False
+    if not any(word in value for word in ("视频", "图片", "照片", "素材", "图")):
+        return False
+    scoped_markers = (
+        "小区",
+        "附近",
+        "左右",
+        "以内",
+        "以下",
+        "以上",
+        "预算",
+        "一室",
+        "两室",
+        "三室",
+        "整租",
+        "单间",
+        "府",
+        "苑",
+        "园",
+        "湾",
+        "轩",
+        "庭",
+        "寓",
+        "公寓",
+        "家园",
+    )
+    return not any(marker in value for marker in scoped_markers)
 
 
-def _ensure_required_actions(
-    planner_result: dict[str, Any],
+def _should_restore_candidate_rows_for_media_followup(
+    *,
+    content: str,
     understanding: dict[str, Any],
-    signals: dict[str, Any],
-) -> dict[str, Any]:
-    result = dict(planner_result or {})
-    actions = _safe_action_list(result)
+    actions: list[str],
+) -> bool:
+    if not any(action in actions for action in ("send_image", "send_video")):
+        return False
     proof = dict(understanding.get("constraint_proof") or {})
     task = dict(understanding.get("structured_task") or {})
-    requirements = dict(task.get("tool_requirements") or {})
-    intent = _normalize_intent(understanding.get("intent"))
-    needs_video = bool(signals.get("wants_video") or proof.get("wants_video") or requirements.get("needs_video"))
-    needs_image = bool(signals.get("wants_image") or proof.get("wants_image") or requirements.get("needs_image"))
-    needs_viewing = bool(signals.get("wants_viewing") or requirements.get("needs_viewing_policy") or intent == "viewing")
-
-    if signals.get("wants_inventory_sheet") or proof.get("wants_inventory_sheet") or requirements.get("needs_inventory_sheet") or intent == "inventory_sheet":
-        if "send_inventory_sheet" not in actions:
-            actions.insert(0, "send_inventory_sheet")
-        result["need_rewrite_clarification"] = False
-        result["source"] = f"{result.get('source') or 'planner'}+deterministic_inventory_sheet"
-        if not (needs_video or needs_image or needs_viewing):
-            result["actions"] = ["send_inventory_sheet"]
-            return result
-
-    if signals.get("wants_deposit") or requirements.get("needs_deposit_policy") or intent == "deposit":
-        needs_utilities = bool(
-            signals.get("wants_utilities")
-            or proof.get("wants_utilities")
-            or requirements.get("needs_utilities")
+    query_text = " ".join(
+        str(part).strip()
+        for part in (
+            content,
+            task.get("original_text"),
+            understanding.get("effective_query"),
+            understanding.get("rewritten_query"),
+            proof.get("budget_label"),
         )
-        if needs_utilities:
-            if "send_deposit_policy" not in actions:
-                actions.append("send_deposit_policy")
-            if "search_inventory" not in actions:
-                actions.append("search_inventory")
-            if "context_tools" not in actions:
-                actions.append("context_tools")
-            if "generate_reply" not in actions:
-                actions.append("generate_reply")
-            result["actions"] = list(dict.fromkeys(actions))
-            result["need_rewrite_clarification"] = False
-            result["source"] = f"{result.get('source') or 'planner'}+deterministic_deposit_utilities"
-            return result
-        result["actions"] = ["send_deposit_policy", "generate_reply"]
-        result["need_rewrite_clarification"] = False
-        result["source"] = f"{result.get('source') or 'planner'}+deterministic_deposit"
-        return result
-
-    if signals.get("wants_contract_contact") or requirements.get("needs_contract_contact") or intent == "contract":
-        result["actions"] = ["send_contract_contact", "generate_reply"]
-        result["need_rewrite_clarification"] = False
-        result["source"] = f"{result.get('source') or 'planner'}+deterministic_contract"
-        return result
-
-    if needs_viewing:
-        for action in ("search_inventory", "context_tools", "explain_unavailable_viewing", "generate_reply"):
-            if action not in actions:
-                actions.append(action)
-
-    if needs_video or needs_image:
-        if "search_inventory" not in actions:
-            actions.insert(0, "search_inventory")
-        if "context_tools" not in actions:
-            actions.append("context_tools")
-        if needs_video and "send_video" not in actions:
-            actions.append("send_video")
-        if needs_image and "send_image" not in actions:
-            actions.append("send_image")
-        if "explain_missing_media" not in actions:
-            actions.append("explain_missing_media")
-        if "generate_reply" not in actions:
-            actions.append("generate_reply")
-
-    removable_when_unasked = {
-        "send_inventory_sheet": bool(
-            signals.get("wants_inventory_sheet")
-            or proof.get("wants_inventory_sheet")
-            or requirements.get("needs_inventory_sheet")
-            or intent == "inventory_sheet"
-        ),
-        "send_deposit_policy": bool(signals.get("wants_deposit") or requirements.get("needs_deposit_policy") or intent == "deposit"),
-        "explain_unavailable_viewing": needs_viewing,
-        "send_contract_contact": bool(signals.get("wants_contract_contact") or requirements.get("needs_contract_contact") or intent == "contract"),
-        "send_video": needs_video,
-        "send_image": needs_image,
-        "explain_missing_media": bool(needs_video or needs_image),
-    }
-    filtered_actions = [
-        action
-        for action in actions
-        if action not in removable_when_unasked or removable_when_unasked[action]
-    ]
-    if filtered_actions != actions:
-        actions = filtered_actions
-        result["source"] = f"{result.get('source') or 'planner'}+unrequested_actions_removed"
-
-    if intent == "inventory" or requirements.get("needs_inventory_search"):
-        if "search_inventory" not in actions:
-            actions.insert(0, "search_inventory")
-        if "compact_listing" not in actions:
-            actions.append("compact_listing")
-        if "generate_reply" not in actions:
-            actions.append("generate_reply")
-
-    if actions != _safe_action_list(result):
-        result["actions"] = list(dict.fromkeys(actions))
-        result["source"] = f"{result.get('source') or 'planner'}+deterministic_actions"
-    return result
+        if str(part or "").strip()
+    )
+    if not query_text:
+        return False
+    if proof.get("room_refs") or _room_refs_from_text(query_text):
+        return False
+    if _has_explicit_candidate_selection(query_text):
+        return True
+    original_text = str(task.get("original_text") or content)
+    if not _is_short_media_followup_without_scope(original_text or query_text):
+        return False
+    if _looks_like_new_scoped_inventory_query(query_text, proof):
+        return False
+    return True
 
 
 def _planner_reply_text(result: dict[str, Any]) -> str:
@@ -1687,7 +2341,69 @@ def _content_wants_utilities(content: str) -> bool:
 
 
 def _content_wants_price(content: str) -> bool:
-    return any(word in content for word in ("价格", "多少钱", "租金", "月租", "押一付一", "押二付一", "多少一月"))
+    text = str(content or "")
+    if re.search(r"(?:是不是|是|租|月租|价格)[^\d]{0,6}\d{3,5}", text):
+        return True
+    if re.search(r"\d{3,5}\s*(?:吗|么|不|是不是)", text):
+        return True
+    return any(
+        word in content
+        for word in (
+            "价格",
+            "多少钱",
+            "租金",
+            "月租",
+            "押一付一",
+            "押二付一",
+            "多少一月",
+            "更低",
+            "最低",
+            "更便宜",
+            "哪套便宜",
+            "哪个便宜",
+            "哪间便宜",
+            "哪个贵",
+            "哪套贵",
+        )
+    )
+
+
+def _content_wants_inventory_field(content: str) -> bool:
+    return bool(
+        _content_wants_price(content)
+        or _content_wants_utilities(content)
+        or any(word in content for word in ("户型", "装修", "特点"))
+    )
+
+
+def _is_contextual_comparison_or_field_followup(content: str) -> bool:
+    text = str(content or "")
+    markers = (
+        "哪套",
+        "哪个",
+        "哪间",
+        "更低",
+        "最低",
+        "便宜",
+        "贵",
+        "水电",
+        "水费",
+        "电费",
+        "价格",
+        "租金",
+        "押一付一",
+        "押二付一",
+        "分别",
+    )
+    if not any(word in text for word in markers):
+        return False
+    parsed = parse_inventory_query(text)
+    if parsed.room_refs or _area_alias_hits(text):
+        return False
+    stripped = text
+    for word in markers:
+        stripped = stripped.replace(word, "")
+    return not _has_explicit_inventory_anchor(stripped)
 
 
 def _content_wants_password(content: str) -> bool:
@@ -1721,20 +2437,29 @@ def _understanding_wants_price(understanding: dict[str, Any], *, content: str = 
 
 
 def _content_wants_viewing(content: str) -> bool:
+    text = str(content or "")
+    if re.search(r"约.{0,8}看", text) or re.search(r"(?:今晚|晚上|今天晚上).{0,6}看", text):
+        return True
     return any(
-        word in content
+        word in text
         for word in (
             "密码",
             "看房",
             "今天看",
             "今天想看",
             "今天能看",
+            "今天晚上看",
+            "今晚看",
+            "晚上看",
             "现在看",
             "自己看",
             "能自己看",
             "自助看",
             "直接看",
             "去看",
+            "约看",
+            "预约看",
+            "约个时间",
             "门口",
             "去门口",
             "怎么安排",
@@ -1755,18 +2480,42 @@ def _content_wants_viewing(content: str) -> bool:
 
 
 def _deterministic_signals(content: str) -> dict[str, Any]:
+    stripped = str(content or "").strip()
+    wants_room_image = False
+    if not _content_wants_inventory_sheet(content):
+        wants_room_image = (
+            any(word in content for word in ("图片", "照片", "实拍图", "房间图", "室内图", "户型图"))
+            or stripped in {"图", "看图", "发图"}
+            or (
+                "图" in content
+                and any(word in content for word in ("发", "看", "给", "传", "要", "补"))
+            )
+        )
     wants_original_video = any(word in content for word in ("原视频", "原片", "高清", "源文件", "下载链接", "太糊", "模糊", "保存", "转发"))
+    wants_contract_contact = (
+        any(word in content for word in ("合同", "签约", "定金", "订金", "订房", "定房", "锁房", "预定"))
+        or any(word in content for word in ("怎么定", "如何定", "怎么订", "如何订", "定流程", "订流程", "定其中一套"))
+        or (
+            "看中" in content
+            and any(word in content for word in ("号码", "电话", "联系", "找哪", "找谁", "找哪个", "怎么定", "怎么订"))
+        )
+    )
+    wants_price_contact = any(word in content for word in ("最低价", "优惠", "便宜点", "砍价"))
     return {
         "wants_inventory_sheet": _content_wants_inventory_sheet(content),
-        "wants_video": any(word in content for word in ("视频", "实拍", "笔记")),
+        "wants_video": any(word in content for word in ("视频", "实拍", "笔记")) or stripped in {"视", "看视频", "发视频"},
         "wants_original_video": wants_original_video,
-        "wants_image": any(word in content for word in ("图片", "照片", "实拍图", "房间图")),
-        "wants_contract_contact": any(word in content for word in ("合同", "签约", "定金", "订金", "订房", "定房")),
-        "wants_price_contact": any(word in content for word in ("最低价", "优惠", "便宜点", "砍价")),
+        "wants_image": wants_room_image,
+        "wants_contract_contact": wants_contract_contact,
+        "wants_price_contact": wants_price_contact,
+        "wants_price_negotiation": wants_price_contact,
+        "wants_password": _content_wants_password(content),
+        "wants_price": _content_wants_price(content),
         "wants_deposit": _content_wants_deposit(content),
         "wants_utilities": _content_wants_utilities(content),
+        "wants_inventory_field": _content_wants_inventory_field(content),
         "wants_viewing": _content_wants_viewing(content),
-        "is_greeting": content.strip() in {"你好", "您好", "在吗", "在不在", "有人吗"},
+        "is_greeting": _is_literal_greeting(content),
     }
 
 
@@ -1874,6 +2623,115 @@ async def _sync_feishu_media(*, force: bool = False) -> dict[str, Any]:
         return await FeishuClient().sync_all_media()
 
 
+def _inventory_sync_graph_skipped(stage: str, reason: str) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "stage": stage,
+        "skipped": True,
+        "reason": reason,
+    }
+
+
+def _inventory_sync_region_result_ok(previous_results: dict[str, Any]) -> bool:
+    region_result = dict(previous_results.get("region_result") or {})
+    return region_result.get("ok") is not False
+
+
+async def _run_admin_region_inventory_sync_graph(
+    *,
+    dry_run: bool,
+    sync_media: bool,
+) -> dict[str, Any]:
+    async def sync_region_inventory(**kwargs: Any) -> dict[str, Any]:
+        return await RegionInventorySyncService().sync(
+            dry_run=bool(kwargs.get("dry_run")),
+            sync_media=bool(kwargs.get("sync_media")),
+        )
+
+    async def refresh_inventory_cache(**kwargs: Any) -> dict[str, Any]:
+        if bool(kwargs.get("dry_run")):
+            return _inventory_sync_graph_skipped("refresh_inventory_cache", "dry_run")
+        if not _inventory_sync_region_result_ok(dict(kwargs.get("previous_results") or {})):
+            return _inventory_sync_graph_skipped("refresh_inventory_cache", "region_sync_not_ok")
+        try:
+            return await _refresh_inventory()
+        except Exception as exc:
+            logger.exception("rewrite_inventory_index_after_region_sync_failed")
+            return {"ok": False, "stage": "refresh_inventory_cache", "error": str(exc)}
+
+    async def render_inventory_sheet_image(**kwargs: Any) -> dict[str, Any]:
+        if bool(kwargs.get("dry_run")):
+            return _inventory_sync_graph_skipped("render_inventory_sheet_image", "dry_run")
+        return _inventory_sync_graph_skipped(
+            "render_inventory_sheet_image",
+            "region_inventory_sync_service_updates_target_sheet",
+        )
+
+    async def build_media_manifest(**kwargs: Any) -> dict[str, Any]:
+        if bool(kwargs.get("dry_run")):
+            return _inventory_sync_graph_skipped("build_media_manifest", "dry_run")
+        if not bool(kwargs.get("sync_media")):
+            return _inventory_sync_graph_skipped("build_media_manifest", "skip_media_requested")
+        return _inventory_sync_graph_skipped(
+            "build_media_manifest",
+            "admin_endpoint_does_not_publish_media_manifest",
+        )
+
+    async def publish_snapshot(**kwargs: Any) -> dict[str, Any]:
+        if bool(kwargs.get("dry_run")):
+            return _inventory_sync_graph_skipped("publish_snapshot", "dry_run")
+        return _inventory_sync_graph_skipped(
+            "publish_snapshot",
+            "admin_endpoint_never_switches_snapshot_without_approve_deploy",
+        )
+
+    async def write_report(**kwargs: Any) -> dict[str, Any]:
+        status = str(kwargs.get("status") or "")
+        return {
+            "ok": status == "passed",
+            "status": status,
+            "blocked_stage": kwargs.get("blocked_stage") or "",
+            "failures": list(kwargs.get("failures") or []),
+            "results": dict(kwargs.get("results") or {}),
+            "trace": list(kwargs.get("trace") or []),
+        }
+
+    state = await inventory_sync_graph.run_inventory_sync_graph(
+        inventory_sync_graph.InventorySyncGraphDeps(
+            refresh_inventory_cache=refresh_inventory_cache,
+            sync_region_inventory=sync_region_inventory,
+            render_inventory_sheet_image=render_inventory_sheet_image,
+            build_media_manifest=build_media_manifest,
+            publish_snapshot=publish_snapshot,
+            write_report=write_report,
+        ),
+        dry_run=dry_run,
+        sync_media=sync_media,
+        fail_fast=True,
+        conversation_id=f"admin-feishu-region-sync:{time.time_ns()}",
+    )
+    region_result = dict(state.get("region_result") or {})
+    result = dict(region_result)
+    result.update(
+        {
+            "ok": state.get("status") == "passed",
+            "graph": {
+                "schema_version": "admin_feishu_region_inventory_sync_graph.v1",
+                "status": state.get("status") or "",
+                "blocked_stage": state.get("blocked_stage") or "",
+                "failures": list(state.get("failures") or []),
+                "trace": list(state.get("trace") or []),
+            },
+            "rewrite_index": dict(state.get("cache_result") or {}),
+            "inventory_sheet_image": dict(state.get("image_result") or {}),
+            "media_manifest": dict(state.get("media_manifest_result") or {}),
+            "cutover_rehearsal": dict(state.get("snapshot_result") or {}),
+            "graph_report": dict(state.get("report") or {}),
+        }
+    )
+    return result
+
+
 def _current_inventory_images() -> list[Path]:
     paths = sorted(Path().glob(settings.inventory_image_glob))
     if not paths and settings.inventory_image_path.exists():
@@ -1923,6 +2781,26 @@ def _row_with_listing_id(row: dict[str, Any]) -> dict[str, Any]:
 
 def _rows_with_listing_ids(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [_row_with_listing_id(row) for row in rows if isinstance(row, dict)]
+
+
+def _rows_with_candidate_numbers(rows: list[dict[str, Any]], candidate_numbers: list[int]) -> list[dict[str, Any]]:
+    if not rows or not candidate_numbers:
+        return rows
+    enriched_rows: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        if index >= len(candidate_numbers):
+            enriched_rows.append(row)
+            continue
+        candidate_number = candidate_numbers[index]
+        if candidate_number <= 0 or str(row.get("candidate_number") or "").strip():
+            enriched_rows.append(row)
+            continue
+        enriched = dict(row)
+        enriched["candidate_number"] = candidate_number
+        enriched_rows.append(enriched)
+    return enriched_rows
 
 
 def _area_alias_hits(text: str) -> list[dict[str, str]]:
@@ -4711,6 +5589,8 @@ def _should_bind_confirmed_room_context(
         return True
     if not is_bound_field_followup and _looks_like_new_scoped_inventory_query(query_text, proof):
         return False
+    if _content_wants_viewing(query_text):
+        return True
     if not bool(understanding.get("context_reference")) and not is_bound_field_followup:
         return False
     if _has_specific_room_context_reference(query_text):
@@ -5645,7 +6525,10 @@ async def _plan_actions(
             result = {
                 "actions": [],
                 "need_rewrite_clarification": True,
-                "missing_evidence": "LLM1 production 没有写入 tool_plan，必须重试 LLM1，不能用本地 deterministic signals 补动作。",
+                "missing_evidence": (
+                    "LLM1 production did not provide tool_plan; retry LLM1 instead "
+                    "of completing actions from deterministic local rules."
+                ),
                 "source": "llm1_production_missing_tool_plan_gate",
                 "reply_text": "",
             }
@@ -5656,15 +6539,40 @@ async def _plan_actions(
             result["planner_retry_reason"] = retry_reason
             result["source"] = f"{result.get('source') or 'llm1_production_tool_plan'}+retry_packet"
         return _ensure_planner_action_contract(result, understanding, signals)
+    return _plan_actions_shadow_or_legacy(
+        initial_result=result,
+        understanding=understanding,
+        signals=signals,
+        retry_reason=retry_reason,
+    )
+
+
+def _plan_actions_shadow_or_legacy(
+    *,
+    initial_result: dict[str, Any] | None,
+    understanding: dict[str, Any],
+    signals: dict[str, Any],
+    retry_reason: str = "",
+) -> dict[str, Any]:
+    result = dict(initial_result or {})
     if result:
         result["source"] = f"{result.get('source') or 'orchestrator_pre_tool_plan'}+from_rewrite"
+        if result.get("need_rewrite_clarification") and not _safe_action_list(result):
+            controlled_result = _controlled_tool_plan_from_rewrite_requirements(understanding, signals)
+            if controlled_result:
+                result = controlled_result
     else:
-        result = {
-            "actions": _fallback_actions_from_structured_task(understanding, signals),
-            "confidence": 0.55,
-            "source": "structured_task_deterministic_plan",
-            "reason": "Orchestrator 工具前阶段未返回 tool_plan，按结构化任务和确定性信号补齐工具计划。",
-        }
+        result = _controlled_tool_plan_from_rewrite_requirements(understanding, signals)
+        if not result:
+            result = {
+                "actions": [],
+                "need_rewrite_clarification": True,
+                "missing_evidence": (
+                    "LLM1/task packet did not provide tool_plan; legacy local action completion has been removed."
+                ),
+                "source": "missing_tool_plan_gate",
+                "reply_text": "",
+            }
     llm1_retry_plan = _llm1_production_retry_plan(understanding)
     if llm1_retry_plan:
         if retry_reason:
@@ -5674,9 +6582,9 @@ async def _plan_actions(
         result["planner_retry_reason"] = retry_reason
         result["source"] = f"{result.get('source') or 'orchestrator_pre_tool_plan'}+retry_packet"
     if not _safe_action_list(result) and not result.get("need_rewrite_clarification"):
-        result["actions"] = _fallback_actions_from_structured_task(understanding, signals)
-        result["source"] = f"{result.get('source') or 'planner'}+structured_task_fallback"
-    result = _ensure_required_actions(result, understanding, signals)
+        result["need_rewrite_clarification"] = True
+        result["missing_evidence"] = "tool_plan actions missing after legacy local action completion removal."
+        result["source"] = f"{result.get('source') or 'planner'}+missing_actions_gate"
     result = _ensure_planner_action_contract(result, understanding, signals)
     return result
 
@@ -5829,6 +6737,30 @@ async def _collect_room_media(
     return paths, matched_rows, missing, sync_result
 
 
+def _empty_original_video_sources() -> dict[str, list[Any]]:
+    return {
+        "original_video_paths": [],
+        "original_video_urls": [],
+        "material_page_urls": [],
+        "source_records": [],
+        "media_manifest_evidence": [],
+    }
+
+
+def _original_video_sources_for_listings(listing_ids: list[str]) -> dict[str, Any]:
+    handler = getattr(media_store, "original_video_sources_for_listings", None)
+    if not callable(handler):
+        return _empty_original_video_sources()
+    return dict(handler(listing_ids) or {})
+
+
+def _original_video_sources_for_paths(paths: list[Path]) -> dict[str, Any]:
+    handler = getattr(media_store, "original_video_sources_for_paths", None)
+    if not callable(handler):
+        return _empty_original_video_sources()
+    return dict(handler(paths) or {})
+
+
 def _memory_reducer_meta(evidence: dict[str, Any]) -> dict[str, Any]:
     meta = evidence.setdefault("memory_reducer", {})
     if not isinstance(meta, dict):
@@ -5964,6 +6896,12 @@ async def _execute_tools(
 
     pending_video_handled = False
     pending_video = kf_context_memory.pending_video_sends(working_context)
+    selected_without_candidate_context = _selected_indices_without_candidate_context(
+        content=content,
+        understanding=understanding,
+        context=working_context,
+        pending_video=pending_video,
+    )
     if (
         "send_video" in actions
         and _wants_continue_pending_video(content, understanding)
@@ -6028,6 +6966,7 @@ async def _execute_tools(
     )
     if (
         not pending_video_handled
+        and not selected_without_candidate_context
         and (
             "search_inventory" in actions
             or any(action in actions for action in ("send_image", "send_video", "compact_listing"))
@@ -6106,6 +7045,51 @@ async def _execute_tools(
                         )
             if candidate_rows:
                 rows = candidate_rows[:10]
+        if not rows and _should_restore_candidate_rows_for_media_followup(
+            content=content,
+            understanding=understanding,
+            actions=actions,
+        ):
+            restored_rows = _candidate_rows(working_context)
+            restored_source = "last_candidate_set"
+            candidate_query = ""
+            if not restored_rows:
+                candidate_query = _last_candidate_query_from_memory(working_context)
+                if candidate_query:
+                    try:
+                        restored_rows, restored_evidence = await _inventory_search_rows_for_context(
+                            inventory_read_context,
+                            candidate_query,
+                            limit=10,
+                        )
+                        inventory_read_turn.extend_listing_evidence(inventory_listing_evidence, restored_evidence)
+                    except InventoryReadError as exc:
+                        logger.warning("media candidate context restore blocked by read router: %s", exc.to_dict())
+                        inventory_read_turn.clear_fact_evidence(evidence, exc)
+                        restored_rows = []
+                    restored_rows = _filter_rows_by_constraint_proof(
+                        restored_rows,
+                        {},
+                        query_text=candidate_query,
+                    )
+                    restored_source = "last_candidate_query"
+            if restored_rows:
+                rows = restored_rows[:10]
+                evidence["media_candidate_context_restored"] = {
+                    "source": restored_source,
+                    "query": candidate_query or _last_candidate_query_from_memory(working_context),
+                    "row_count": len(rows),
+                    "labels": [_row_label(row) for row in rows[:10]],
+                }
+                if restored_source == "last_candidate_query":
+                    _suggest_last_candidate_set_memory(
+                        evidence,
+                        working_context,
+                        intent=_normalize_intent(understanding.get("intent"), "media"),
+                        query=candidate_query,
+                        rows=rows,
+                        inventory_cache_meta=inventory_source_metadata,
+                    )
         evidence["inventory_rows"] = rows
         if rows and _should_remember_candidate_set(content=content, understanding=understanding, rows=rows):
             _suggest_last_candidate_set_memory(
@@ -6145,75 +7129,6 @@ async def _execute_tools(
             inventory_read_context=inventory_read_context,
         )
 
-    tool_resolution = kf_tool_resolver.resolve_tool_targets(
-        actions=actions,
-        content=content,
-        context=working_context,
-        understanding=understanding,
-        inventory_rows=rows,
-        pending_video=pending_video,
-        pending_video_rows=pending_video_rows,
-        pending_video_handled=pending_video_handled,
-        target_limit=KF_VIDEO_SEND_LIMIT,
-    )
-    target_rows = tool_resolution.target_rows
-    selected_indices = tool_resolution.selected_indices
-    if tool_resolution.candidate_binding:
-        evidence["candidate_binding"] = tool_resolution.candidate_binding
-    if tool_resolution.missing_target_reason:
-        evidence["missing_target_reason"] = tool_resolution.missing_target_reason
-    if tool_resolution.selection_error:
-        evidence["selection_error"] = tool_resolution.selection_error
-    if tool_resolution.field_target_error:
-        evidence["field_target_error"] = tool_resolution.field_target_error
-        pending_candidate_rows = [
-            row
-            for row in (
-                tool_resolution.field_target_error.get("candidate_rows")
-                or rows
-                or _candidate_rows(working_context)
-            )
-            if isinstance(row, dict)
-        ]
-        _remember_pending_media_target_from_error(
-            context,
-            error=tool_resolution.field_target_error,
-            proof=proof,
-            candidate_rows=pending_candidate_rows,
-        )
-    if tool_resolution.pending_video_context_bound:
-        evidence["pending_video_context_bound"] = tool_resolution.pending_video_context_bound
-    if tool_resolution.original_video_target_binding:
-        original_video_request = dict(evidence.get("original_video_request") or {})
-        if original_video_request.get("requested"):
-            original_video_request["target_binding"] = tool_resolution.original_video_target_binding
-            original_video_request["reason"] = "上一轮没有稳定匹配到视频目标，不能直接给原视频/高清源。"
-            evidence["original_video_request"] = original_video_request
-    if tool_resolution.inventory_rows_override is not None:
-        rows = tool_resolution.inventory_rows_override
-        evidence["inventory_rows"] = rows
-    if tool_resolution.clear_inventory_rows:
-        rows = []
-        evidence["inventory_rows"] = []
-    if tool_resolution.clear_media_outputs:
-        evidence["image_rows"] = []
-        evidence["video_rows"] = []
-        evidence["image_paths"] = []
-        evidence["video_paths"] = []
-    rows = _rows_with_listing_ids(rows)
-    target_rows = _rows_with_listing_ids(target_rows)
-    evidence["inventory_rows"] = _rows_with_listing_ids(evidence.get("inventory_rows") or rows)
-    evidence["target_rows"] = target_rows
-    if target_rows and dict(understanding.get("query_state") or {}).get("pending_media_target_bound"):
-        evidence["pending_media_target_bound"] = {
-            "media_kind": str(dict(understanding.get("query_state") or {}).get("media_kind") or ""),
-            "target_labels": [_row_label(row) for row in target_rows],
-        }
-        kf_context_memory.clear_pending_media_target(context)
-    if target_rows and selected_indices:
-        rows = target_rows
-        evidence["inventory_rows"] = target_rows
-
     if evidence.get("inventory_read_error"):
         rows = []
         target_rows = []
@@ -6232,125 +7147,62 @@ async def _execute_tools(
             rows = []
             target_rows = []
 
-    media_collect_specs: list[tuple[str, Any]] = []
-    if "send_image" in actions and target_rows:
-        media_collect_specs.append(
-            (
-                "image",
-                _collect_room_media(
-                    target_rows,
-                    media_kind="image",
-                    limit=KF_VIDEO_SEND_LIMIT,
-                ),
-            )
+    if not evidence.get("inventory_read_error"):
+        media_state = await kf_media_binding_graph.run_kf_media_binding_graph(
+            kf_media_binding_graph.KfMediaBindingGraphDeps(
+                resolve_tool_targets=kf_tool_resolver.resolve_tool_targets,
+                collect_room_media=_collect_room_media,
+                original_video_sources_for_listings=_original_video_sources_for_listings,
+                original_video_sources_for_paths=_original_video_sources_for_paths,
+                row_labeler=_row_label,
+                row_listing_id=_row_listing_id,
+                rows_with_listing_ids=_rows_with_listing_ids,
+                rows_with_candidate_numbers=_rows_with_candidate_numbers,
+            ),
+            actions=actions,
+            content=content,
+            context=working_context,
+            understanding=understanding,
+            inventory_rows=rows,
+            pending_video=pending_video,
+            pending_video_rows=pending_video_rows,
+            pending_video_handled=pending_video_handled,
+            media_request=media_request,
+            original_video_request=dict(evidence.get("original_video_request") or {}),
+            wants_original_video=bool(proof.get("wants_original_video")),
+            dual_llm_production=_dual_llm_production_enabled(),
+            target_limit=KF_VIDEO_SEND_LIMIT,
+            base_evidence=evidence,
+            conversation_id=f"media-binding:{hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]}",
         )
-    if "send_video" in actions and target_rows:
-        media_collect_specs.append(
-            (
-                "video",
-                _collect_room_media(
-                    target_rows,
-                    media_kind="video",
-                    limit=KF_VIDEO_SEND_LIMIT,
-                ),
-            )
-        )
-    if media_collect_specs:
-        media_results = await asyncio.gather(
-            *(spec[1] for spec in media_collect_specs),
-            return_exceptions=True,
-        )
-        for (media_kind, _), result in zip(media_collect_specs, media_results):
-            if isinstance(result, Exception):
-                logger.warning("collect room media failed: kind=%s reason=%s", media_kind, result)
-                paths: list[Path] = []
-                matched_rows: list[dict[str, Any]] = []
-                missing = [_row_label(row) for row in target_rows]
-                sync_result = {"failed": [{"source": "collect_room_media", "reason": str(result)}]}
-            else:
-                paths, matched_rows, missing, sync_result = result
-            media_manifest_evidence = []
-            if isinstance(sync_result, dict):
-                raw_manifest_evidence = sync_result.pop("_media_manifest_evidence", [])
-                media_manifest_evidence = [
-                    dict(item)
-                    for item in raw_manifest_evidence
-                    if isinstance(item, dict)
-                ]
-            if media_manifest_evidence:
-                evidence.setdefault("media_manifest_evidence", []).extend(media_manifest_evidence)
-                evidence[f"{media_kind}_media_manifest_evidence"] = media_manifest_evidence
-
-            if media_kind == "image":
-                evidence["image_paths"] = [str(path) for path in paths]
-                evidence["image_rows"] = _rows_with_listing_ids(matched_rows)
-                if sync_result:
-                    evidence.setdefault("media_sync", {})["image"] = sync_result
-                evidence["missing_media"].extend(f"{label}:图片" for label in missing)
-                evidence.setdefault("media_status", {})["image"] = {
-                    "requested_count": media_request.get("requested_count") or len(target_rows),
-                    "sent_count": len(paths),
-                    "missing_rooms": missing,
-                    "sync_status": sync_result,
-                }
-                continue
-
-            evidence["video_paths"] = [str(path) for path in paths]
-            evidence["video_rows"] = _rows_with_listing_ids(matched_rows)
-            if sync_result:
-                evidence.setdefault("media_sync", {})["video"] = sync_result
-            evidence["missing_media"].extend(f"{label}:视频" for label in missing)
-            requested_count = int(media_request.get("requested_count") or len(target_rows) or 0)
-            evidence.setdefault("media_status", {})["video"] = {
-                "requested_count": requested_count,
-                "sent_count": len(paths),
-                "missing_rooms": missing,
-                "sync_status": sync_result,
-            }
-            if proof.get("wants_original_video"):
-                if _dual_llm_production_enabled():
-                    listing_ids = [
-                        _row_listing_id(row)
-                        for row in _rows_with_listing_ids(matched_rows)
-                        if _row_listing_id(row)
-                    ]
-                    source_summary = media_store.original_video_sources_for_listings(listing_ids)
-                else:
-                    source_summary = media_store.original_video_sources_for_paths(paths)
-                evidence["original_video_paths"] = source_summary.get("original_video_paths") or []
-                evidence["original_video_urls"] = source_summary.get("original_video_urls") or []
-                evidence["material_page_urls"] = source_summary.get("material_page_urls") or []
-                if source_summary.get("media_manifest_evidence"):
-                    original_evidence = [
-                        dict(item)
-                        for item in source_summary.get("media_manifest_evidence") or []
-                        if isinstance(item, dict)
-                    ]
-                    evidence["original_video_media_manifest_evidence"] = original_evidence
-                    evidence.setdefault("media_manifest_evidence", []).extend(original_evidence)
-                if source_summary.get("source_records"):
-                    evidence["original_video_source_records"] = source_summary["source_records"]
-                evidence["original_video_request"] = {
-                    "requested": True,
-                    "has_original_source": bool(
-                        evidence.get("original_video_paths")
-                        or evidence.get("original_video_urls")
-                        or evidence.get("material_page_urls")
-                    ),
-                    "has_sendable_video": bool(paths),
-                    "sendable_video_count": len(paths),
-                    "missing_rooms": missing,
-                    "reason": "当前素材库只提供企业微信可发送视频，没有单独的原视频/高清下载链接证据。",
-                }
-            if requested_count and len(paths) < requested_count:
-                _suggest_pending_video_memory(
-                    evidence,
-                    paths=[],
-                    labels=missing,
-                    reason="missing_or_pending_video",
-                    requested_count=requested_count,
-                    sent_count=len(paths),
+        evidence = dict(media_state.get("evidence") or evidence)
+        evidence["media_binding_trace"] = list(media_state.get("trace") or [])
+        if media_state.get("failures"):
+            evidence["media_binding_failures"] = list(media_state.get("failures") or [])
+        rows = [row for row in media_state.get("rows") or evidence.get("inventory_rows") or [] if isinstance(row, dict)]
+        target_rows = [
+            row
+            for row in media_state.get("target_rows") or evidence.get("target_rows") or []
+            if isinstance(row, dict)
+        ]
+        if evidence.get("field_target_error"):
+            pending_candidate_rows = [
+                row
+                for row in (
+                    evidence.get("field_target_error", {}).get("candidate_rows")
+                    or rows
+                    or _candidate_rows(working_context)
                 )
+                if isinstance(row, dict)
+            ]
+            _remember_pending_media_target_from_error(
+                context,
+                error=dict(evidence.get("field_target_error") or {}),
+                proof=proof,
+                candidate_rows=pending_candidate_rows,
+            )
+        if evidence.get("pending_media_target_bound"):
+            kf_context_memory.clear_pending_media_target(context)
 
     if "send_contract_contact" in actions:
         evidence["rule_evidence"]["contract_contact"] = list(CONTACT_NUMBERS)
@@ -7509,57 +8361,12 @@ def _sanitize_rule_selfcheck_for_intent(
     return rule_selfcheck
 
 
-def _safe_fallback_for_intent(understanding: dict[str, Any], fallback: str) -> str:
-    intent = _normalize_intent(understanding.get("intent"))
-    fallback = str(fallback or "").strip()
-    if intent == "deposit":
-        task = dict(understanding.get("structured_task") or {})
-        requirements = dict(task.get("tool_requirements") or {})
-        original_text = " ".join(
-            str(part).strip()
-            for part in (
-                task.get("original_text"),
-                understanding.get("effective_query"),
-                understanding.get("rewritten_query"),
-            )
-            if str(part or "").strip()
-        )
-        needs_utilities = bool(
-            requirements.get("needs_utilities")
-            or dict(understanding.get("constraint_proof") or {}).get("wants_utilities")
-            or dict(understanding.get("query_state") or {}).get("wants_utilities")
-        )
-        if needs_utilities and original_text and not _content_wants_deposit(original_text):
-            return fallback or "水电要按具体房源备注查，你把小区+房号发我，我马上按那套核对。"
-        required = ("芝麻", "服务费")
-        fee_tokens = ("5.5", "7%", "8%", "5.5%-8%")
-        if not fallback or not all(token in fallback for token in required) or not any(token in fallback for token in fee_tokens):
-            fallback = "免押走支付宝无忧住芝麻信用评估，不是完全免费免押。通过后可以不直接付押金，但要按租期支付免押服务费：3个月约5.5%，3-6个月约7%，6-12个月约8%。具体是否支持和最终金额以签约页为准。"
-        if needs_utilities and "水电" not in fallback:
-            fallback += " 水电要按具体房源备注查，你把小区+房号发我，我再按那套确认。"
-        return fallback
-    if intent == "contract":
-        if (
-            not fallback
-            or not _reply_mentions_any(fallback, list(CONTACT_NUMBERS))
-            or any(word in fallback for word in ("稍后给您准确回复", "我先帮您确认一下最新房态", "稍后确认"))
-        ):
-            return "客户看中了就直接联系 18758141785 / 13282125992 / 19941091943 预定和签电子合同。联系时把小区名和房号发过去确认房态；定金一般至少半个月房租，个人原因退定不退。"
-    if intent == "inventory_sheet":
-        if (
-            not fallback
-            or any(word in fallback for word in ("免押", "无忧住", "芝麻", "押金服务费"))
-            or any(word in fallback for word in ("稍后给您准确回复", "我先帮您确认一下最新房态", "稍后确认"))
-        ):
-            return "房源表图片这边暂时没生成成功，我先不乱发。你也可以先发小区、预算或户型，我按文字先帮你筛。"
-    if intent == "media":
-        if (
-            not fallback
-            or any(word in fallback for word in ("免押", "无忧住", "芝麻"))
-            or any(word in fallback for word in ("稍后给您准确回复", "我先帮您确认一下最新房态", "稍后确认"))
-        ):
-            return "我这边暂时没稳定匹配到对应素材，不能乱发视频或图片。你回我序号，或者直接发小区名+房号，我马上按那套查图片/视频。"
-    return fallback or settings.default_fallback_reply
+def _outbound_package_deps() -> kf_outbound_package.OutboundPackageDeps:
+    return kf_outbound_package.OutboundPackageDeps(
+        row_label=_row_label,
+        row_brief=_row_brief,
+        safe_rule_evidence_for_summary=inventory_sensitive_access.safe_rule_evidence_for_summary,
+    )
 
 
 def _media_request_summary(content: str, understanding: dict[str, Any]) -> dict[str, Any]:
@@ -7626,6 +8433,9 @@ def _viewing_evidence(rows: list[dict[str, Any]]) -> dict[str, Any]:
         result.append(
             {
                 "room": _row_label(row),
+                "listing_id": str(row.get("listing_id") or "").strip(),
+                "evidence_id": str(row.get("evidence_id") or row.get("source_hash") or "").strip(),
+                "source_hash": str(row.get("source_hash") or "").strip(),
                 "viewing": viewing,
                 "has_password": has_password,
                 "needs_contact": needs_contact,
@@ -7693,6 +8503,28 @@ def _user_explicitly_asked_password_for_controlled_channel(content: str, underst
     return any(_content_wants_password(text) for text in texts if text)
 
 
+def _user_reported_viewing_exception_for_controlled_channel(content: str, understanding: dict[str, Any]) -> bool:
+    task = dict(understanding.get("structured_task") or {})
+    texts = [
+        str(content or ""),
+        str(task.get("original_text") or ""),
+        str(understanding.get("effective_query") or ""),
+        str(understanding.get("rewritten_query") or ""),
+    ]
+    return any(
+        any(marker in text for marker in ("密码不对", "打不开", "开不了", "门锁", "门禁", "开门失败", "进不去"))
+        for text in texts
+        if text
+    )
+
+
+def _content_wants_viewing_contact(content: str) -> bool:
+    text = str(content or "")
+    if not any(marker in text for marker in ("联系", "找谁", "问谁", "电话", "号码")):
+        return False
+    return any(marker in text for marker in ("密码", "打不开", "开不了", "门锁", "门打不开", "看房", "约看", "预约"))
+
+
 def _attach_controlled_outbound_channels(
     tool_evidence: dict[str, Any],
     *,
@@ -7737,7 +8569,7 @@ def _attach_controlled_outbound_channels(
                 "evidence_id": evidence_id,
                 "action_id": "send-controlled-contract-contact-1",
                 "action_type": "contract_contact",
-                "payload": {"evidence_ref": evidence_id, "contact_count": len(contacts)},
+                "payload": {"contact_count": len(contacts)},
                 "metadata": {
                     "source": "controlled_rule_evidence",
                     "controlled_channel": "contract_contact",
@@ -7750,6 +8582,71 @@ def _attach_controlled_outbound_channels(
     viewing_rule = rule_evidence.get("viewing") if isinstance(rule_evidence.get("viewing"), dict) else {}
     viewing_rooms = [room for room in viewing_rule.get("rooms") or [] if isinstance(room, dict)]
     user_asked_password = _user_explicitly_asked_password_for_controlled_channel(content, understanding)
+    if (
+        "explain_unavailable_viewing" in actions
+        and not viewing_rooms
+        and (
+            _content_wants_viewing_contact(content)
+            or _content_wants_viewing(content)
+            or _content_wants_password(content)
+        )
+    ):
+        evidence_id = "evd-controlled-viewing-contact-general-1"
+        contacts = [
+            str(number)
+            for number in viewing_rule.get("contact_numbers") or rule_evidence.get("viewing_contact") or CONTACT_NUMBERS
+            if str(number).strip()
+        ]
+        viewing_exception = user_asked_password or _user_reported_viewing_exception_for_controlled_channel(content, understanding)
+        summary = "看房或密码异常需要联系确认。" if viewing_exception else "看房需要联系确认。"
+        room_label = "看房/密码异常" if viewing_exception else "看房"
+        _append_unique_evidence(
+            evidence_items,
+            {
+                "evidence_id": evidence_id,
+                "evidence_type": "viewing_contact",
+                "summary": summary,
+                "source_kind": "viewing_rule_evidence",
+                "source_record_id": _controlled_hash(
+                    {
+                        "viewing_contact": contacts,
+                        "scope": "general_exception" if viewing_exception else "general_viewing",
+                    }
+                ),
+                "field_values": {
+                    "room": room_label,
+                    "needs_contact": True,
+                    "requires_bound_room": False,
+                },
+                "sensitivity": "controlled_contact",
+                "metadata": {
+                    "controlled_channel": "viewing_contact",
+                    "evidence_bound": True,
+                    "general_viewing_contact": True,
+                    "viewing_exception": viewing_exception,
+                },
+            },
+        )
+        _append_unique_send_action(
+            controlled_actions,
+            {
+                "evidence_id": evidence_id,
+                "action_id": "send-controlled-viewing-contact-general-1",
+                "action_type": "viewing_contact",
+                "payload": {"room": room_label},
+                "metadata": {
+                    "source": "controlled_rule_evidence",
+                    "controlled_channel": "viewing_contact",
+                    "evidence_bound": True,
+                    "general_viewing_contact": True,
+                    "viewing_exception": viewing_exception,
+                },
+                "sensitive_payload": {
+                    "room": room_label,
+                    "contact_numbers": contacts,
+                },
+            },
+        )
     for index, room in enumerate(viewing_rooms, start=1):
         room_label = str(room.get("room") or "").strip()
         listing_id = str(room.get("listing_id") or "").strip()
@@ -7758,6 +8655,38 @@ def _attach_controlled_outbound_channels(
         has_password = bool(room.get("has_password"))
         needs_contact = bool(room.get("needs_contact"))
         safe_room = room_label or f"房源{index}"
+        guidance_summary = (
+            f"{safe_room} 看房需要联系确认。"
+            if needs_contact
+            else f"{safe_room} 可以按看房方式自助查看；具体开门信息按受控通道单独确认。"
+            if has_password
+            else f"{safe_room} 看房方式需要联系确认。"
+        )
+        _append_unique_evidence(
+            evidence_items,
+            {
+                "evidence_id": f"evd-controlled-viewing-guidance-{index}",
+                "listing_id": listing_id,
+                "evidence_type": "viewing_guidance",
+                "summary": guidance_summary,
+                "source_kind": "viewing_rule_evidence",
+                "source_record_id": source_evidence_id or _controlled_hash(
+                    {"room": safe_room, "has_password": has_password, "needs_contact": needs_contact}
+                ),
+                "field_values": {
+                    "room": safe_room,
+                    "has_password": has_password,
+                    "needs_contact": needs_contact,
+                    "future_or_unavailable": bool(room.get("future_or_unavailable")),
+                },
+                "sensitivity": "public",
+                "metadata": {
+                    "controlled_channel": "viewing_guidance",
+                    "evidence_bound": True,
+                    "password_redacted": bool(has_password),
+                },
+            },
+        )
         if has_password and viewing_text and user_asked_password:
             evidence_id = f"evd-controlled-viewing-password-{index}"
             _append_unique_evidence(
@@ -7789,7 +8718,7 @@ def _attach_controlled_outbound_channels(
                     "listing_id": listing_id,
                     "action_id": f"send-controlled-viewing-password-{index}",
                     "action_type": "viewing_password",
-                    "payload": {"evidence_ref": evidence_id, "room": safe_room},
+                    "payload": {"room": safe_room},
                     "metadata": {
                         "source": "controlled_rule_evidence",
                         "controlled_channel": "viewing_password",
@@ -7835,7 +8764,7 @@ def _attach_controlled_outbound_channels(
                     "listing_id": listing_id,
                     "action_id": f"send-controlled-viewing-contact-{index}",
                     "action_type": "viewing_contact",
-                    "payload": {"evidence_ref": evidence_id, "room": safe_room},
+                    "payload": {"room": safe_room},
                     "metadata": {
                         "source": "controlled_rule_evidence",
                         "controlled_channel": "viewing_contact",
@@ -7889,82 +8818,6 @@ def _append_controlled_slot_appendix(reply_text: str, appendix: str) -> str:
     if not reply or not slot_text:
         return reply
     return f"{reply}\n{slot_text}".strip()
-
-
-def _reply_for_missing_media(understanding: dict[str, Any], tool_evidence: dict[str, Any]) -> str:
-    proof = dict(understanding.get("constraint_proof") or {})
-    missing = [str(item) for item in tool_evidence.get("missing_media") or [] if str(item).strip()]
-    wants_video = bool(proof.get("wants_video"))
-    wants_image = bool(proof.get("wants_image"))
-    wants_original_video = bool(proof.get("wants_original_video"))
-    pending_continue = str(proof.get("pending_video_action") or "").lower() == "continue"
-    if not wants_video and not wants_image:
-        return ""
-    media_name = "图片和视频" if wants_video and wants_image else ("视频" if wants_video else "图片")
-    has_sendable_media = bool(tool_evidence.get("video_paths") or tool_evidence.get("image_paths"))
-    sent_rows: list[dict[str, Any]] = []
-    if wants_video:
-        sent_rows.extend(row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict))
-    if wants_image:
-        sent_rows.extend(row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict))
-    sent_labels = []
-    for row in sent_rows[:5]:
-        label = _row_label(row)
-        if label and label not in sent_labels:
-            sent_labels.append(label)
-    if wants_original_video and has_sendable_media and sent_labels:
-        suffix = (
-            f"已找到这些企业微信可发送视频，我先正常发你：{'、'.join(sent_labels)}。"
-            "但平台可能会压缩；目前没有单独的原视频/高清下载链接证据，我不冒充原片。"
-        )
-    elif wants_original_video and has_sendable_media:
-        suffix = (
-            "已找到的企业微信可发送视频我先正常发你。"
-            "但平台可能会压缩；目前没有单独的原视频/高清下载链接证据，我不冒充原片。"
-        )
-    elif wants_original_video:
-        suffix = "这次没有可发送的视频，也没找到原视频/高清下载链接证据。你也可以换一套小区+房号，我再按那套查。"
-    elif has_sendable_media and sent_labels:
-        suffix = f"已找到这些{media_name}，我先正常发你：{'、'.join(sent_labels)}。"
-    elif has_sendable_media:
-        suffix = f"已找到的{media_name}我先正常发你。"
-    elif pending_continue:
-        suffix = f"剩下这些暂时没有可发送的{media_name}，我不乱发。"
-    else:
-        suffix = f"这次没有可发送的{media_name}。你也可以换一套小区+房号，我再按那套查。"
-    if not missing:
-        if has_sendable_media:
-            return suffix
-        requested_rows = [
-            row
-            for row in (tool_evidence.get("target_rows") or tool_evidence.get("inventory_rows") or [])
-            if isinstance(row, dict)
-        ]
-        labels = [_row_label(row) for row in requested_rows[:5] if _row_label(row)]
-        if labels:
-            if has_sendable_media:
-                return f"有的，房源我查到了，但这几套本地暂时没找到{media_name}：{'、'.join(labels)}。{suffix}"
-            return f"房源我查到了，但这几套本地暂时没找到{media_name}：{'、'.join(labels)}。{suffix}"
-        condition = "、".join(
-            part
-            for part in (_constraint_area_text(proof), _constraint_budget_text(proof), _constraint_layout_text(proof))
-            if part
-        )
-        if condition:
-            return f"我这边暂时没查到{condition}对应的在租房源，所以这次没有可发的{media_name}。你可以放宽预算、区域或户型，我再帮你筛。"
-        return f"我这边还没绑定到具体房源，暂时没法发{media_name}。你回我序号，或者直接发小区名+房号，我马上按那套查。"
-    labels = []
-    for item in missing[:5]:
-        label = item.split(":", 1)[0].strip()
-        if label and label not in labels:
-            labels.append(label)
-    if labels:
-        if has_sendable_media:
-            return f"有的，这几套房源我查到了；其中本地暂时没找到{media_name}：{'、'.join(labels)}。{suffix}"
-        return f"这几套房源我查到了，但本地暂时没找到{media_name}：{'、'.join(labels)}。{suffix}"
-    if has_sendable_media:
-        return f"有的，房源我查到了，但本地暂时没找到{media_name}。{suffix}"
-    return f"房源我查到了，但本地暂时没找到{media_name}。{suffix}"
 
 
 def _understanding_wants_contract_contact(understanding: dict[str, Any], *, content: str = "") -> bool:
@@ -8172,412 +9025,6 @@ def _exact_room_refs_from_understanding(understanding: dict[str, Any], proof: di
     return parse_inventory_query(query).room_refs
 
 
-def _reply_for_inventory_search(understanding: dict[str, Any], tool_evidence: dict[str, Any]) -> str:
-    actions = [str(action) for action in tool_evidence.get("actions") or []]
-    if "search_inventory" not in actions and "compact_listing" not in actions:
-        return ""
-    rows = [row for row in tool_evidence.get("inventory_rows") or [] if isinstance(row, dict)]
-    proof = dict(understanding.get("constraint_proof") or {})
-    task = dict(understanding.get("structured_task") or {})
-    requirements = dict(task.get("tool_requirements") or {})
-    wants_viewing = bool(
-        requirements.get("needs_viewing_policy")
-        or _normalize_intent(understanding.get("intent")) == "viewing"
-        or _content_wants_viewing(str(task.get("original_text") or ""))
-        or _content_wants_viewing(str(understanding.get("effective_query") or understanding.get("rewritten_query") or ""))
-    )
-    condition = _constraint_condition_text(proof)
-    if rows:
-        exact_room_refs = _exact_room_refs_from_understanding(understanding, proof)
-        if len(rows) == 1 and exact_room_refs:
-            if wants_viewing:
-                viewing_query = " ".join(
-                    str(part).strip()
-                    for part in (
-                        task.get("original_text"),
-                        understanding.get("effective_query"),
-                        understanding.get("rewritten_query"),
-                    )
-                    if str(part or "").strip()
-                )
-                allow_password = _content_wants_password(viewing_query)
-                return (
-                    f"还在，{_room_facts_text(rows[0])}，{_row_viewing_summary(rows[0], allow_password=allow_password)}。\n"
-                    "今天想看的话，建议先联系18758141785 / 13282125992 / 19941091943确认时间。"
-                )
-            return f"还在，{_room_facts_text(rows[0])}。\n要视频、图片或者看房方式的话，直接说这套就行。"
-        heading = f"有的，{condition}我查到这些还在租：" if condition else "有的，我查到这些还在租："
-        budget_note = _budget_payment_note(rows, proof)
-        if budget_note:
-            heading += f"\n{budget_note}"
-        if wants_viewing:
-            heading = f"有的，{condition}我查到这些看房时间比较明确的在租房源：" if condition else "有的，我查到这些看房时间比较明确的在租房源："
-            viewing_rows = [
-                row
-                for row in rows
-                if any(word in _row_viewing_summary(row) for word in ("空出", "提前联系", "预约", "联系"))
-            ] or rows
-            lines = [_room_line_with_viewing(row, index) for index, row in enumerate(viewing_rows[:8], 1)]
-        else:
-            lines = [_room_line(row, index) for index, row in enumerate(rows[:8], 1)]
-        tail = ""
-        if wants_viewing:
-            tail = "\n如果客户今天比较急，先联系18758141785 / 13282125992 / 19941091943确认哪套能安排。"
-        elif len(rows) > len(lines):
-            tail = f"\n还有 {len(rows) - len(lines)} 套没列完，你要视频/图片可以直接回序号或小区+房号。"
-        elif len(rows) == 1:
-            tail = "\n要视频、图片或者看房方式的话，直接说这套就行。"
-        else:
-            tail = "\n你要视频、图片或者看房方式的话，直接回序号或小区+房号就行。"
-        return heading + "\n" + "\n".join(lines) + tail
-    if condition:
-        return f"我这边暂时没查到{condition}完全匹配的在租房源。你可以放宽一点预算、户型或区域，我再帮你筛一轮。"
-    return "我这边暂时没查到完全匹配的在租房源。你把区域、预算或户型再补一下，我继续帮你筛。"
-
-
-def _reply_for_candidate_selection_error(tool_evidence: dict[str, Any]) -> str:
-    error = dict(tool_evidence.get("selection_error") or {})
-    if not error:
-        return ""
-    requested_indices: list[int] = []
-    for index in error.get("requested_indices") or []:
-        try:
-            number = int(index)
-        except (TypeError, ValueError):
-            continue
-        if number > 0 and number not in requested_indices:
-            requested_indices.append(number)
-    candidate_count = int(error.get("candidate_count") or 0)
-    candidate_labels = [str(label).strip() for label in error.get("candidate_labels") or [] if str(label).strip()]
-    if not requested_indices:
-        return ""
-    requested_text = "、".join(f"第{index}套" for index in requested_indices)
-    if candidate_count <= 0:
-        return f"刚才没有可选候选房源，所以没法按{requested_text}查。你把小区、房号或区域预算再发我，我重新筛。"
-    prefix = f"上一轮我只列了{candidate_count}套，没有{requested_text}。"
-    if candidate_labels:
-        labels_text = "、".join(candidate_labels[:5])
-        return f"{prefix}上一轮候选是：{labels_text}。你可以直接说第1套，或者换区域/预算我重新筛。"
-    return f"{prefix}你可以重新说小区+房号，或者换区域/预算我重新筛。"
-
-
-def _reply_for_field_target_error(tool_evidence: dict[str, Any]) -> str:
-    error = dict(tool_evidence.get("field_target_error") or {})
-    if not error:
-        return ""
-    if error.get("reason") == "original_video_followup_missing_stable_video_target":
-        return (
-            "上一轮没稳定匹配到视频目标，所以我不能直接给原视频/高清源，避免发错房源。"
-            "你回房源序号，或者直接发小区名+房号，我马上按那套查普通视频和原视频链接。"
-        )
-    field = str(error.get("field") or "这个信息").strip()
-    candidate_labels = [str(label).strip() for label in error.get("candidate_labels") or [] if str(label).strip()]
-    if field in {"素材", "视频", "图片"}:
-        prefix = f"{field}要按具体房源查，不能乱发。"
-    else:
-        prefix = f"{field}要按具体房源查。"
-    if candidate_labels:
-        labels_text = "、".join(f"{index}. {label}" for index, label in enumerate(candidate_labels[:5], 1))
-        if error.get("reason") == "community_media_request_missing_room_ref":
-            return f"{prefix}这个小区有多套在租：{labels_text}。你回序号或小区+房号，我按那套给你查准。"
-        return f"{prefix}刚才候选是：{labels_text}。你回序号或小区+房号，我按那套给你查准。"
-    return f"{prefix}你把小区+房号发我，我马上按最新房源表查准。"
-
-
-def _reply_for_prepared_media(understanding: dict[str, Any], tool_evidence: dict[str, Any]) -> str:
-    video_paths = [str(path) for path in tool_evidence.get("video_paths") or [] if str(path).strip()]
-    image_paths = [str(path) for path in tool_evidence.get("image_paths") or [] if str(path).strip()]
-    if not video_paths and not image_paths:
-        return ""
-    proof = dict(understanding.get("constraint_proof") or {})
-    condition = "、".join(
-        part
-        for part in (_constraint_area_text(proof), _constraint_budget_text(proof), _constraint_layout_text(proof))
-        if part
-    )
-    video_rows = [row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)]
-    image_rows = [row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict)]
-    parts: list[str] = []
-    if video_paths:
-        labels = [_row_label(row) for row in video_rows[: len(video_paths)] if _row_label(row)]
-        prefix = f"{condition}的" if condition else ""
-        if labels:
-            parts.append(f"找到了，{prefix}视频先发你 {len(video_paths)} 套：{'、'.join(labels)}。")
-        else:
-            parts.append(f"找到了，{prefix}视频先发你 {len(video_paths)} 套。")
-    if image_paths:
-        labels = [_row_label(row) for row in image_rows[: len(image_paths)] if _row_label(row)]
-        prefix = f"{condition}的" if condition else ""
-        if labels:
-            parts.append(f"{prefix}图片也找到了：{'、'.join(labels)}。")
-        else:
-            parts.append(f"{prefix}图片也找到了，共 {len(image_paths)} 张。")
-    missing_reply = _reply_for_missing_media(understanding, tool_evidence) if tool_evidence.get("missing_media") else ""
-    if missing_reply:
-        parts.append(missing_reply)
-    original_notice = _reply_for_original_video_request(understanding, tool_evidence)
-    if original_notice:
-        parts.append(original_notice)
-    return "\n".join(parts)
-
-
-def _reply_for_original_video_request(understanding: dict[str, Any], tool_evidence: dict[str, Any]) -> str:
-    proof = dict(understanding.get("constraint_proof") or {})
-    if not proof.get("wants_original_video"):
-        return ""
-    original_paths = [str(path) for path in tool_evidence.get("original_video_paths") or [] if str(path).strip()]
-    original_urls = [str(url) for url in tool_evidence.get("original_video_urls") or [] if str(url).strip()]
-    material_urls = [str(url) for url in tool_evidence.get("material_page_urls") or [] if str(url).strip()]
-    has_original_source = bool(original_paths or original_urls or material_urls)
-    video_count = len([path for path in tool_evidence.get("video_paths") or [] if str(path).strip()])
-    if has_original_source:
-        links = list(dict.fromkeys([*original_urls, *material_urls]))[:3]
-        if links:
-            return "原视频/高清源文件链接也找到了：\n" + "\n".join(links)
-        return "素材库记录了原视频源文件，但没有可直接转发的下载链接；我先发微信可发送版。"
-    if video_count:
-        return "先说明一下：我这边发的是企业微信可发送视频，平台可能会压缩；目前没有单独的原视频/高清下载链接证据，我不冒充原片。"
-    return "这套原视频/高清源和普通视频暂时都没找到，我不乱发。"
-
-
-def _build_outbound_package(reply_text: str, tool_evidence: dict[str, Any]) -> dict[str, Any]:
-    suppress_actions = bool(tool_evidence.get("suppress_actions"))
-    inventory_images = [] if suppress_actions else [str(path) for path in tool_evidence.get("inventory_images") or []]
-    image_paths = [] if suppress_actions else [str(path) for path in tool_evidence.get("image_paths") or []]
-    video_paths = [] if suppress_actions else [str(path) for path in tool_evidence.get("video_paths") or []]
-    image_rows = [] if suppress_actions else [row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict)]
-    video_rows = [] if suppress_actions else [row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)]
-    return {
-        "text": safe_artifact_payload(reply_text),
-        "inventory_images": inventory_images,
-        "inventory_explanation": "房源表发你了，你可以让客户先整体看一下。" if inventory_images else "",
-        "image_paths": image_paths,
-        "image_explanations": [f"这是{_row_label(row)}的图片。" for row in image_rows[: len(image_paths)]],
-        "video_paths": video_paths,
-        "video_explanations": [f"这是{_row_label(row)}的视频。" for row in video_rows[: len(video_paths)]],
-        "missing_media": list(tool_evidence.get("missing_media") or []),
-        "media_request": tool_evidence.get("media_request") or {},
-        "media_status": tool_evidence.get("media_status") or {},
-        "original_video_request": tool_evidence.get("original_video_request") or {},
-        "original_video_urls": list(tool_evidence.get("original_video_urls") or []),
-        "material_page_urls": list(tool_evidence.get("material_page_urls") or []),
-        "rule_evidence": inventory_sensitive_access.safe_rule_evidence_for_summary(
-            tool_evidence.get("rule_evidence") or {}
-        ),
-        "reply_source": str(tool_evidence.get("deterministic_reply_source") or ""),
-        "target_rooms": [_row_brief(row) for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)],
-    }
-
-
-def _prepared_outbound_package_payload(tool_evidence: dict[str, Any]) -> dict[str, Any]:
-    payload = tool_evidence.get("llm2_production_outbound_package")
-    return dict(payload) if isinstance(payload, dict) and payload else {}
-
-
-def _outbound_package_action_kind(action: dict[str, Any]) -> str:
-    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
-    metadata = action.get("metadata") if isinstance(action.get("metadata"), dict) else {}
-    raw_kind = str(metadata.get("kind") or payload.get("kind") or "").strip().lower()
-    if raw_kind in {"inventory_sheet", "sheet", "inventory"}:
-        return "inventory_sheet"
-    if raw_kind in {"video", "image"}:
-        return raw_kind
-    action_type = str(action.get("action_type") or "").strip().lower()
-    marker = f"{action.get('action_id') or ''} {action.get('evidence_id') or ''}".lower()
-    if "inventory_sheet" in marker or "inventory-sheet" in marker:
-        return "inventory_sheet"
-    if action_type == "video":
-        return "video"
-    if action_type == "image":
-        return "image"
-    return ""
-
-
-def _outbound_package_action_position(action: dict[str, Any], fallback: int) -> int:
-    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
-    metadata = action.get("metadata") if isinstance(action.get("metadata"), dict) else {}
-    for source in (payload, metadata, action):
-        for key in ("media_number", "position", "display_order", "index"):
-            try:
-                value = int(source.get(key))
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                return value
-    marker = f"{action.get('action_id') or ''} {action.get('evidence_id') or ''}"
-    match = re.search(r"(?:video|image|inventory[_-]?sheet)[_-](\d+)", marker, re.I)
-    if match:
-        try:
-            return max(1, int(match.group(1)))
-        except ValueError:
-            return fallback
-    return fallback
-
-
-def _outbound_package_paths_for_kind(tool_evidence: dict[str, Any], kind: str) -> list[str]:
-    if kind == "video":
-        return [str(path) for path in tool_evidence.get("video_paths") or [] if str(path).strip()]
-    if kind == "image":
-        return [str(path) for path in tool_evidence.get("image_paths") or [] if str(path).strip()]
-    if kind == "inventory_sheet":
-        return [
-            str(path)
-            for path in (tool_evidence.get("inventory_image_paths") or tool_evidence.get("inventory_images") or [])
-            if str(path).strip()
-        ]
-    return []
-
-
-def _outbound_package_rows_for_kind(tool_evidence: dict[str, Any], kind: str) -> list[dict[str, Any]]:
-    key = "video_rows" if kind == "video" else "image_rows" if kind == "image" else ""
-    return [row for row in tool_evidence.get(key) or [] if isinstance(row, dict)] if key else []
-
-
-def _outbound_package_path_for_action(
-    action: dict[str, Any],
-    *,
-    tool_evidence: dict[str, Any],
-    kind: str,
-    position: int,
-) -> str:
-    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
-    metadata = action.get("metadata") if isinstance(action.get("metadata"), dict) else {}
-    for source in (payload, metadata, action):
-        for key in ("local_path", "path", "file_path", "media_path"):
-            value = str(source.get(key) or "").strip()
-            if value:
-                return value
-    paths = _outbound_package_paths_for_kind(tool_evidence, kind)
-    return paths[position - 1] if 0 < position <= len(paths) else ""
-
-
-def _outbound_package_caption_by_action_id(package: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    captions = [item for item in package.get("action_captions") or [] if isinstance(item, dict)]
-
-    def sort_key(item: dict[str, Any]) -> int:
-        try:
-            return int(item.get("display_order"))
-        except (TypeError, ValueError):
-            return 10_000
-
-    result: dict[str, dict[str, Any]] = {}
-    for caption in sorted(captions, key=sort_key):
-        action_id = str(caption.get("action_id") or "").strip()
-        if action_id and action_id not in result:
-            result[action_id] = caption
-    return result
-
-
-def _execution_package_from_prepared_outbound_package(
-    *,
-    reply_text: str,
-    tool_evidence: dict[str, Any],
-) -> dict[str, Any]:
-    package = _prepared_outbound_package_payload(tool_evidence)
-    if not package:
-        return {}
-    captions_by_action_id = _outbound_package_caption_by_action_id(package)
-    send_actions = [item for item in package.get("send_actions") or [] if isinstance(item, dict)]
-    prepared_actions: list[dict[str, Any]] = []
-    inventory_images: list[str] = []
-    image_paths: list[str] = []
-    video_paths: list[str] = []
-    inventory_caption = ""
-    image_captions: list[str] = []
-    video_captions: list[str] = []
-    for fallback_position, action in enumerate(send_actions, start=1):
-        kind = _outbound_package_action_kind(action)
-        if kind not in {"inventory_sheet", "image", "video"}:
-            continue
-        position = _outbound_package_action_position(action, fallback_position)
-        path = _outbound_package_path_for_action(
-            action,
-            tool_evidence=tool_evidence,
-            kind=kind,
-            position=position,
-        )
-        if not path:
-            continue
-        action_id = str(action.get("action_id") or "").strip()
-        caption = captions_by_action_id.get(action_id, {})
-        caption_text = str(caption.get("text") or "").strip()
-        prepared_action = {
-            "action_id": action_id,
-            "action_type": str(action.get("action_type") or "").strip(),
-            "kind": kind,
-            "path": path,
-            "position": position,
-            "caption": caption_text,
-            "caption_id": str(caption.get("caption_id") or "").strip(),
-            "send_action": safe_artifact_payload(action),
-        }
-        prepared_actions.append(prepared_action)
-        if kind == "inventory_sheet":
-            inventory_images.append(path)
-            if caption_text and not inventory_caption:
-                inventory_caption = caption_text
-        elif kind == "image":
-            image_paths.append(path)
-            if caption_text:
-                image_captions.append(caption_text)
-        elif kind == "video":
-            video_paths.append(path)
-            if caption_text:
-                video_captions.append(caption_text)
-    return {
-        "text": safe_artifact_payload(str(package.get("reply_text") or reply_text or "")),
-        "prepared_outbound_package": True,
-        "prepared_package_source": "llm2_production_outbound_package",
-        "inventory_images": inventory_images,
-        "inventory_explanation": inventory_caption,
-        "image_paths": image_paths,
-        "image_explanations": image_captions,
-        "video_paths": video_paths,
-        "video_explanations": video_captions,
-        "prepared_actions": prepared_actions,
-        "action_captions": safe_artifact_payload(package.get("action_captions") or []),
-        "send_actions": safe_artifact_payload(send_actions),
-        "missing_media": list(tool_evidence.get("missing_media") or []),
-        "media_request": tool_evidence.get("media_request") or {},
-        "media_status": tool_evidence.get("media_status") or {},
-        "original_video_request": tool_evidence.get("original_video_request") or {},
-        "original_video_urls": list(tool_evidence.get("original_video_urls") or []),
-        "material_page_urls": list(tool_evidence.get("material_page_urls") or []),
-        "rule_evidence": inventory_sensitive_access.safe_rule_evidence_for_summary(
-            tool_evidence.get("rule_evidence") or {}
-        ),
-        "reply_source": str(package.get("reply_source") or tool_evidence.get("deterministic_reply_source") or ""),
-        "target_rooms": [_row_brief(row) for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)],
-    }
-
-
-def _outbound_package_for_current_mode(reply_text: str, tool_evidence: dict[str, Any]) -> dict[str, Any]:
-    if _dual_llm_production_enabled():
-        prepared_package = _execution_package_from_prepared_outbound_package(
-            reply_text=reply_text,
-            tool_evidence=tool_evidence,
-        )
-        if prepared_package:
-            return prepared_package
-        if not bool(tool_evidence.get("suppress_actions")):
-            return {
-                "text": safe_artifact_payload(reply_text),
-                "inventory_images": [],
-                "inventory_explanation": "",
-                "image_paths": [],
-                "image_explanations": [],
-                "video_paths": [],
-                "video_explanations": [],
-                "missing_media": list(tool_evidence.get("missing_media") or []),
-                "media_request": tool_evidence.get("media_request") or {},
-                "media_status": tool_evidence.get("media_status") or {},
-                "reply_source": str(tool_evidence.get("deterministic_reply_source") or ""),
-                "prepared_outbound_package": False,
-                "legacy_builder_blocked_in_production": True,
-            }
-    return tool_evidence.get("outbound_package") or _build_outbound_package(reply_text, tool_evidence)
-
-
 def _normalize_inventory_sheet_reply_before_selfcheck(
     *,
     draft_reply: str,
@@ -8736,73 +9183,6 @@ def _has_sendable_actions(tool_evidence: dict[str, Any]) -> bool:
     )
 
 
-def _reply_for_sendable_action_fallback(*, content: str, tool_evidence: dict[str, Any]) -> str:
-    """Build a customer-visible action reply from already verified tool evidence."""
-    lines: list[str] = []
-    video_rows = [row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)]
-    image_rows = [row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict)]
-    video_count = len([path for path in tool_evidence.get("video_paths") or [] if str(path).strip()])
-    image_count = len([path for path in tool_evidence.get("image_paths") or [] if str(path).strip()])
-    inventory_image_count = len([path for path in tool_evidence.get("inventory_images") or [] if str(path).strip()])
-
-    def labels_for(rows: list[dict[str, Any]], limit: int) -> list[str]:
-        labels: list[str] = []
-        for row in rows[:limit]:
-            label = _row_label(row)
-            if label and label not in labels:
-                labels.append(label)
-        return labels
-
-    if video_count:
-        labels = labels_for(video_rows, video_count)
-        if len(labels) == 1:
-            lines.append(f"有的，这套视频我发你：{labels[0]}。")
-        elif labels:
-            lines.append(f"有的，按你说的条件先发这{len(labels)}套视频，你给客户筛一下：")
-            lines.extend(f"{index}. 这是{label}的视频。" for index, label in enumerate(labels, start=1))
-        else:
-            lines.append(f"有的，视频我先发你，共{video_count}个。")
-        original_video_request = dict(tool_evidence.get("original_video_request") or {})
-        if original_video_request.get("requested") and not original_video_request.get("has_original_source"):
-            lines.append("先说明一下：我这边发的是企业微信可发送视频，平台可能会压缩；目前没有单独的原视频/高清下载链接证据，我不冒充原片。")
-
-    if image_count:
-        labels = labels_for(image_rows, image_count)
-        if len(labels) == 1:
-            lines.append(f"图片也有，这套图片我发你：{labels[0]}。")
-        elif labels:
-            lines.append(f"图片我也一起发这{len(labels)}套：")
-            lines.extend(f"{index}. 这是{label}的图片。" for index, label in enumerate(labels, start=1))
-        else:
-            lines.append(f"图片我也一起发你，共{image_count}张。")
-
-    if inventory_image_count:
-        lines.append("房源表发你了，你可以让客户先整体看一下。")
-
-    missing_items = [str(item).strip() for item in tool_evidence.get("missing_media") or [] if str(item).strip()]
-    if missing_items:
-        missing_labels = []
-        for item in missing_items:
-            label = item.split(":", 1)[0].strip()
-            media_type = item.split(":", 1)[1].strip() if ":" in item else "素材"
-            text = f"{label}{media_type}" if label else item
-            if text and text not in missing_labels:
-                missing_labels.append(text)
-        if missing_labels:
-            lines.append("另外，" + "、".join(missing_labels[:5]) + "暂时没找到，我就不乱发。")
-    original_video_request = dict(tool_evidence.get("original_video_request") or {})
-    if (
-        original_video_request.get("requested")
-        and not original_video_request.get("has_original_source")
-        and not video_count
-    ):
-        lines.append("这次要的是原视频/高清源，但素材库里普通视频和原片下载链接都没稳定找到，我先不乱发。")
-
-    if not lines:
-        return ""
-    return _normalize_customer_visible_reply_text_before_selfcheck("\n".join(lines))
-
-
 def _merge_preserved_sendable_evidence(
     current: dict[str, Any],
     preserved: dict[str, Any],
@@ -8824,6 +9204,236 @@ def _merge_preserved_sendable_evidence(
     if actions:
         merged["actions"] = list(dict.fromkeys(actions))
     return merged
+
+
+def _controlled_evidence_reply_from_tools(
+    *,
+    content: str,
+    understanding: dict[str, Any],
+    tool_evidence: dict[str, Any],
+    draft_reply: str = "",
+    retry_reason: str = "",
+) -> str:
+    actions = {str(action) for action in tool_evidence.get("actions") or []}
+    proof = dict(understanding.get("constraint_proof") or {})
+    missing_media = [str(item) for item in tool_evidence.get("missing_media") or [] if str(item).strip()]
+    inventory_rows = [row for row in tool_evidence.get("inventory_rows") or [] if isinstance(row, dict)]
+    target_rows = [row for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)]
+    video_rows = [row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)]
+    image_rows = [row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict)]
+    video_paths = [str(path) for path in tool_evidence.get("video_paths") or [] if str(path).strip()]
+    image_paths = [str(path) for path in tool_evidence.get("image_paths") or [] if str(path).strip()]
+    original_video_request = dict(tool_evidence.get("original_video_request") or {})
+    original_urls = [str(url) for url in tool_evidence.get("original_video_urls") or [] if str(url).strip()]
+    material_urls = [str(url) for url in tool_evidence.get("material_page_urls") or [] if str(url).strip()]
+    rule_evidence = dict(tool_evidence.get("rule_evidence") or {})
+    requirements = dict((understanding.get("structured_task") or {}).get("tool_requirements") or {})
+
+    def labels(rows: list[dict[str, Any]], limit: int = 5) -> list[str]:
+        return [_row_label(row) for row in rows[:limit] if _row_label(row)]
+
+    def missing_labels(kind: str) -> list[str]:
+        suffix = f":{kind}"
+        return [item.removesuffix(suffix) for item in missing_media if item.endswith(suffix)]
+
+    def row_detail_line(row: dict[str, Any], index: int) -> str:
+        label = _row_label(row)
+        area = _row_value(row, ("区域", "板块", "area"))
+        layout = _row_value(row, ("户型分类", "户型描述", "户型", "layout_type", "layout_desc"))
+        rent_pay1 = _row_value(row, ("押一付一", "押一付", "押1付1", "月租", "价格", "rent_pay1", "rent_monthly_pay1"))
+        rent_pay2 = _row_value(row, ("押二付一", "押二付", "押2付1", "rent_pay2", "rent_monthly_pay2"))
+        remark = _row_value(row, ("备注", "水电", "utility_summary", "remark"))
+        price_parts = []
+        if rent_pay1:
+            price_parts.append(f"押一付一{rent_pay1}")
+        if rent_pay2 and rent_pay2 != rent_pay1:
+            price_parts.append(f"押二付一{rent_pay2}")
+        details = [
+            item
+            for item in (
+                area,
+                layout,
+                " / ".join(price_parts),
+                remark,
+            )
+            if item
+        ]
+        suffix = "，" + "，".join(details) if details else ""
+        return f"{index}. {label}{suffix}"
+
+    selection_error = dict(tool_evidence.get("selection_error") or {})
+    if selection_error:
+        indices = [
+            int(index)
+            for index in selection_error.get("requested_indices") or []
+            if str(index).isdigit()
+        ]
+        selected_text = "、".join(f"第{index}套" for index in indices) or "这个序号"
+        candidate_count = int(selection_error.get("candidate_count") or 0)
+        if candidate_count:
+            return f"上一轮只列了{candidate_count}套，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
+        return f"上一轮没有可用候选编号，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
+
+    field_error = dict(tool_evidence.get("field_target_error") or {})
+    if field_error.get("reason") == "original_video_followup_missing_stable_video_target":
+        return (
+            "上一轮没稳定匹配到视频目标，当前工具证据里没有原视频/高清下载链接；"
+            "企业微信视频转发后可能会压缩。你回房源序号或小区+房号后，我再按工具查原视频。"
+        )
+
+    candidate_binding = dict(tool_evidence.get("candidate_binding") or {})
+    selected_indices = (
+        _int_list(candidate_binding.get("selected_indices"))
+        or _selected_indices_from_understanding(understanding, content)
+    )
+    if (
+        selected_indices
+        and _has_explicit_candidate_selection(content)
+        and candidate_binding
+        and str(candidate_binding.get("status") or "").lower() != "bound"
+    ):
+        selected_text = "、".join(f"第{index}套" for index in selected_indices) or "这个序号"
+        candidate_count = int(candidate_binding.get("candidate_count") or 0)
+        if candidate_count:
+            return f"上一轮只列了{candidate_count}套，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
+        return f"上一轮没有可用候选编号，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
+
+    if original_video_request.get("requested") or proof.get("wants_original_video"):
+        room_label = (labels(video_rows, 1) or labels([row for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)], 1) or ["这套"])[0]
+        parts: list[str] = []
+        if video_paths:
+            prefix = "有的，" if original_urls else ""
+            parts.append(f"{prefix}这是{room_label}的视频。")
+        if original_urls:
+            parts.append("原视频链接：" + "、".join(original_urls[:3]))
+        elif original_video_request:
+            parts.append("目前工具证据里没有原视频/高清下载链接；企业微信可发送视频转发后可能会压缩。")
+        if material_urls:
+            parts.append("素材页：" + "、".join(material_urls[:3]))
+        if parts:
+            return "\n".join(parts)
+
+    if missing_media:
+        sent_video_labels = labels(video_rows)
+        sent_image_labels = labels(image_rows)
+        missing_video_labels = missing_labels("视频")
+        missing_image_labels = missing_labels("图片")
+        parts = []
+        if sent_video_labels:
+            parts.append(f"有的，已找到这些视频：{'、'.join(sent_video_labels)}。")
+        if sent_image_labels:
+            parts.append(f"图片也找到了：{'、'.join(sent_image_labels)}。")
+        if missing_video_labels:
+            prefix = "另外本地暂时没找到视频" if parts else "房源我查到了，但本地暂时没找到视频"
+            parts.append(f"{prefix}：{'、'.join(missing_video_labels)}。")
+        if missing_image_labels:
+            prefix = "另外本地暂时没找到图片" if parts else "房源我查到了，但本地暂时没找到图片"
+            parts.append(f"{prefix}：{'、'.join(missing_image_labels)}。")
+        if parts:
+            return "\n".join(parts)
+
+    if "send_inventory_sheet" in actions or requirements.get("needs_inventory_sheet") or proof.get("wants_inventory_sheet"):
+        if tool_evidence.get("inventory_images"):
+            area_lines = str(proof.get("area") or "").strip().splitlines()
+            area_label = area_lines[0].strip() if area_lines else ""
+            if area_label:
+                return f"{area_label}附近的房源表发你了，你可以让客户先整体看一下。"
+            return "房源表发你了，你可以让客户先整体看一下。"
+        return "最新房源表图片暂时没取到，我先同步确认一下，避免发错版本。"
+
+    if "send_video" in actions and not video_paths:
+        media_rows = target_rows or inventory_rows
+        media_labels = labels(media_rows)
+        if media_labels:
+            return f"房源我查到了，但本地暂时没找到视频：{'、'.join(media_labels)}。"
+        return "这条视频需求还没稳定匹配到具体房源。你回我小区+房号，或让我重新按当前条件列候选后再按序号发。"
+
+    if "send_image" in actions and not image_paths:
+        media_rows = target_rows or inventory_rows
+        media_labels = labels(media_rows)
+        if media_labels:
+            return f"房源我查到了，但本地暂时没找到图片：{'、'.join(media_labels)}。"
+        return "这条图片需求还没稳定匹配到具体房源。你回我小区+房号，或让我重新按当前条件列候选后再按序号查。"
+
+    if retry_reason and (video_paths or image_paths):
+        parts = []
+        sent_video_labels = labels(video_rows)
+        sent_image_labels = labels(image_rows)
+        if video_paths:
+            if len(video_paths) > 1:
+                target_text = "、".join(sent_video_labels) if sent_video_labels else f"{len(video_paths)}套"
+                parts.append(f"按你说的条件先发这{len(video_paths)}套视频：{target_text}。")
+            else:
+                target_text = sent_video_labels[0] if sent_video_labels else "这套"
+                parts.append(f"这套视频我发你：{target_text}。")
+        if image_paths:
+            target_text = "、".join(sent_image_labels) if sent_image_labels else f"{len(image_paths)}套"
+            parts.append(f"图片也找到了：{target_text}。")
+        if parts:
+            return "\n".join(parts)
+
+    plain_inventory_lookup = (
+        "search_inventory" in actions
+        and not (actions & {"send_video", "send_image", "send_inventory_sheet"})
+        and not (actions & {"explain_unavailable_viewing", "send_contract_contact", "send_deposit_policy"})
+        and not (
+            proof.get("wants_video")
+            or proof.get("wants_original_video")
+            or proof.get("wants_image")
+            or proof.get("wants_inventory_sheet")
+        )
+    )
+    candidate_rows = target_rows or inventory_rows
+    if plain_inventory_lookup and candidate_rows:
+        reply = _final_inventory_evidence_fallback(understanding, tool_evidence)
+        if reply:
+            return reply
+        if len(candidate_rows) == 1 and (target_rows or proof.get("room_refs")):
+            detail = row_detail_line(candidate_rows[0], 1).removeprefix("1. ").strip()
+            return f"还在，{detail}。\n要视频、图片或者看房方式的话，直接说这套就行。"
+        shown_rows = candidate_rows[:5]
+        lines = [row_detail_line(row, index) for index, row in enumerate(shown_rows, start=1)]
+        header = f"有的，按最新房源表，先筛到这{len(shown_rows)}套："
+        tail = "你要哪套的视频或看房方式，回序号或小区+房号我继续查。"
+        return "\n".join([header, *lines, tail])
+    if plain_inventory_lookup and not candidate_rows:
+        return _constraint_preserving_inventory_fallback(
+            understanding,
+            "按最新房源表，这个条件暂时没查到匹配房源。你可以把预算、区域或户型放宽一点，我再查。",
+            tool_evidence,
+        )
+
+    if "send_contract_contact" in actions or requirements.get("needs_contract_contact"):
+        numbers = [str(item).strip() for item in rule_evidence.get("contract_contact") or CONTACT_NUMBERS if str(item).strip()]
+        return "定房、交定金或合同相关问题，直接联系：\n" + "\n".join(numbers)
+
+    viewing_requested = bool(
+        ("explain_unavailable_viewing" in actions or requirements.get("needs_viewing_policy"))
+        and (_content_wants_viewing(content) or requirements.get("needs_viewing_policy"))
+    )
+    if viewing_requested:
+        numbers = [str(item).strip() for item in CONTACT_NUMBERS if str(item).strip()]
+        viewing_rows = target_rows or inventory_rows
+        room_label = (labels(viewing_rows, 1) or ["这套房源"])[0]
+        if viewing_rows and (_content_wants_price(content) or _content_wants_utilities(content)):
+            detail = row_detail_line(viewing_rows[0], 1).removeprefix("1. ").strip()
+            viewing_summary = _row_viewing_summary(viewing_rows[0], allow_password=False)
+            viewing_note = f"\n{viewing_summary}。" if viewing_summary else ""
+            return f"还在，{detail}。{viewing_note}\n看房方式或门锁问题不要乱试，直接联系：\n" + "\n".join(numbers)
+        return f"{room_label}看房方式或门锁问题不要乱试，直接联系：\n" + "\n".join(numbers)
+
+    if (
+        ("send_deposit_policy" in actions or requirements.get("needs_deposit_policy") or proof.get("wants_deposit"))
+        and (requirements.get("needs_utilities") or proof.get("wants_utilities") or "水电" in content)
+    ):
+        return (
+            "免押走支付宝无忧住芝麻信用评估，符合风控后需支付押金金额5.5%-8%的免押服务费。"
+            "水电要按具体房源备注查，你把小区+房号发我，我按那套核对。"
+        )
+    if "send_deposit_policy" in actions or requirements.get("needs_deposit_policy") or proof.get("wants_deposit"):
+        return "免押走支付宝无忧住芝麻信用评估；符合风控后，需支付押金金额5.5%-8%的免押服务费。"
+
+    return ""
 
 
 def _outbound_package_selfcheck(
@@ -8911,6 +9521,8 @@ def _local_human_context_selfcheck(
     )
     if any(word in text for word in hard_forbidden_phrases):
         fail_reasons.append("回复包含硬禁语或系统模板感")
+    if _is_generic_waiting_reply(text):
+        fail_reasons.append("回复是泛化等待/稍后确认话术")
     if fail_reasons:
         return {
             "status": "retry",
@@ -8991,6 +9603,49 @@ def _needs_llm_final_selfcheck(
     if deterministic_reply_source == "planner_reply_text":
         return True
     return False
+
+
+def _production_visible_reply_owner_gate(
+    *,
+    draft_reply: str,
+    deterministic_reply_source: str,
+    tool_evidence: dict[str, Any],
+) -> dict[str, Any]:
+    if not _dual_llm_production_enabled():
+        return {"status": "pass", "source": "production_visible_reply_owner_gate_skipped"}
+    if not str(draft_reply or "").strip():
+        return {"status": "pass", "source": "production_visible_reply_owner_gate_empty_reply"}
+    allowed_sources = {
+        kf_dual_llm_production.DUAL_LLM_PRODUCTION_REPLY_SOURCE,
+        kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE,
+        "kf_llm2_outbound_production_controlled_slots",
+    }
+    package = tool_evidence.get("llm2_production_outbound_package")
+    if not isinstance(package, dict) or not package:
+        return {
+            "status": "retry",
+            "source": "production_visible_reply_owner_gate",
+            "reason": "production 客户可见文本必须来自 LLM2 outbound package 或 controlled evidence renderer；当前缺少 PreparedOutboundPackage。",
+            "retry_target": "llm1_tools",
+        }
+    package_source = str(package.get("reply_source") or "").strip()
+    source = str(deterministic_reply_source or "").strip()
+    if source not in allowed_sources and package_source not in allowed_sources:
+        return {
+            "status": "retry",
+            "source": "production_visible_reply_owner_gate",
+            "reason": (
+                "production 客户可见文本来源不是 LLM2 outbound package 或 controlled evidence renderer；"
+                f"source={source or 'empty'} package_source={package_source or 'empty'}"
+            ),
+            "retry_target": "llm1_tools",
+        }
+    return {
+        "status": "pass",
+        "source": "production_visible_reply_owner_gate",
+        "reply_source": source,
+        "package_source": package_source,
+    }
 
 
 def _has_tool_grounded_reply_fallback(tool_evidence: dict[str, Any]) -> bool:
@@ -9114,7 +9769,11 @@ def _final_inventory_evidence_fallback(
         return ""
     proof = dict(understanding.get("constraint_proof") or {})
     condition = _constraint_condition_text(proof)
-    heading = f"有的，{condition}我查到这些还在租：" if condition else "有的，我查到这些还在租："
+    heading = (
+        f"有的，按最新房源表，{condition}我查到这些还在租："
+        if condition
+        else "有的，按最新房源表我查到这些还在租："
+    )
     budget_note = _budget_payment_note(rows, proof)
     if budget_note:
         heading += f"\n{budget_note}"
@@ -9221,14 +9880,22 @@ async def _generate_reply_result(
         rule_evidence = dict(tool_evidence.get("rule_evidence") or {})
         rule_evidence.setdefault("contract_contact", CONTACT_NUMBERS)
         tool_evidence["rule_evidence"] = rule_evidence
+    rows = [row for row in tool_evidence.get("inventory_rows") or [] if isinstance(row, dict)]
+    target_rows = [row for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)]
+    evidence_rows = target_rows or rows
+    viewing_evidence_rows = target_rows
+    if _content_wants_viewing(content) or _content_wants_password(content):
+        rule_evidence = dict(tool_evidence.get("rule_evidence") or {})
+        if viewing_evidence_rows:
+            rule_evidence.setdefault("viewing", _viewing_evidence(viewing_evidence_rows))
+        else:
+            rule_evidence.setdefault("viewing", {"rooms": [], "contact_numbers": list(CONTACT_NUMBERS)})
+        tool_evidence["rule_evidence"] = rule_evidence
     _attach_controlled_outbound_channels(
         tool_evidence,
         content=content,
         understanding=understanding,
     )
-    rows = [row for row in tool_evidence.get("inventory_rows") or [] if isinstance(row, dict)]
-    target_rows = [row for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)]
-    evidence_rows = target_rows or rows
     production_mode = _dual_llm_production_enabled()
     planner_reply = ""
     if not production_mode:
@@ -9254,11 +9921,6 @@ async def _generate_reply_result(
         planner_result["missing_evidence"] = str(post_tool_reply_result["reason"])
         tool_evidence["planner_reply_result"] = post_tool_reply_result
     planner_reply_result = (planner_result or {}).get("post_tool_reply_result") or {}
-    inventory_search_reply = (
-        ""
-        if production_mode
-        else _reply_for_inventory_search(understanding, tool_evidence)
-    )
     planner_missing_reply = planner_requires_reply and not planner_reply
     if (
         planner_missing_reply
@@ -9267,63 +9929,28 @@ async def _generate_reply_result(
     ):
         planner_missing_reply = False
         tool_evidence["planner_reply_timeout_tool_grounded_fallback"] = True
-    if (
-        planner_missing_reply
-        and retry_reason
-        and inventory_search_reply
-        and _can_use_inventory_reply_when_planner_missing(understanding, tool_evidence)
-    ):
-        planner_missing_reply = False
-        planner_reply = inventory_search_reply
-        planner_result = dict(planner_result or {})
-        planner_result["reply_text"] = planner_reply
-        planner_result["reply_source"] = "tool_grounded_inventory_reply_after_planner_retry"
-        planner_reply_result = {
-            "reply_text": planner_reply,
-            "source": "tool_grounded_inventory_reply_after_planner_retry",
-            "reason": "Planner 重试后仍未生成文本，但房源工具已返回纯房源列表证据，使用工具证据生成待自检回复。",
-        }
-        planner_result["post_tool_reply_result"] = planner_reply_result
-        tool_evidence["planner_reply_result"] = planner_reply_result
-        tool_evidence["planner_missing_reply_tool_grounded_fallback"] = True
-    if (
-        planner_reply
-        and inventory_search_reply
-        and _can_use_inventory_reply_when_planner_missing(understanding, tool_evidence)
-        and _planner_reply_conflicts_with_inventory_rows(planner_reply, tool_evidence)
-    ):
-        planner_reply = inventory_search_reply
-        planner_result = dict(planner_result or {})
-        planner_result["reply_text"] = planner_reply
-        planner_result["reply_source"] = "tool_grounded_inventory_reply_replaced_invalid_planner_reply"
-        planner_reply_result = {
-            "reply_text": planner_reply,
-            "source": "tool_grounded_inventory_reply_replaced_invalid_planner_reply",
-            "reason": "Planner 已拿到房源列表却生成要求客户重复信息的兜底话术，改用工具证据生成待自检回复。",
-        }
-        planner_result["post_tool_reply_result"] = planner_reply_result
-        tool_evidence["planner_reply_result"] = planner_reply_result
-        tool_evidence["planner_invalid_inventory_reply_replaced"] = True
-    pre_gate_field_target_error = dict(tool_evidence.get("field_target_error") or {})
-    if (
-        planner_missing_reply
-        and pre_gate_field_target_error.get("reason") == "original_video_followup_missing_stable_video_target"
-    ):
-        planner_reply = _reply_for_field_target_error(tool_evidence)
-        if planner_reply:
+    if planner_missing_reply:
+        controlled_missing_reply = _controlled_evidence_reply_from_tools(
+            content=content,
+            understanding=understanding,
+            tool_evidence=tool_evidence,
+            draft_reply="",
+            retry_reason=retry_reason or "planner_missing_reply_text",
+        )
+        if controlled_missing_reply:
             planner_missing_reply = False
+            planner_reply = controlled_missing_reply
             planner_result = dict(planner_result or {})
             planner_result["reply_text"] = planner_reply
-            planner_result["reply_source"] = "tool_grounded_original_video_target_error"
+            planner_result["reply_source"] = kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
             planner_reply_result = {
                 "reply_text": planner_reply,
-                "source": "tool_grounded_original_video_target_error",
-                "selfcheck": {"status": "pass", "source": "field_target_error_contract"},
-                "reason": "原视频追问没有稳定上一轮视频目标，使用工具证据生成目标未绑定说明。",
+                "source": kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE,
+                "reason": "Planner/LLM2 缺客户可见文本，由受控证据渲染器按工具证据生成。",
             }
             planner_result["post_tool_reply_result"] = planner_reply_result
             tool_evidence["planner_reply_result"] = planner_reply_result
-            tool_evidence["planner_missing_original_video_target_fallback"] = True
+            tool_evidence["planner_missing_reply_controlled_renderer"] = True
     if planner_missing_reply and not retry_reason:
         gate_selfcheck = {
             "status": "retry",
@@ -9358,26 +9985,8 @@ async def _generate_reply_result(
             "planner_retry_reason": retry_payload,
         }
     if planner_missing_reply:
-        fallback = _safe_fallback_for_intent(
-            understanding,
-            "",
-        )
-        fallback = _normalize_customer_visible_reply_text_before_selfcheck(fallback)
         tool_evidence["suppress_actions"] = True
         tool_evidence["deterministic_reply_source"] = "planner_missing_reply_text"
-        fallback_evidence = {"actions": [], "rule_evidence": {}}
-        fallback_package = _build_outbound_package(fallback, fallback_evidence)
-        fallback_rule_selfcheck = _outbound_package_selfcheck(
-            draft_reply=fallback,
-            tool_evidence=fallback_evidence,
-            outbound_package=fallback_package,
-        )
-        fallback_llm_selfcheck = {
-            "status": "pass",
-            "source": "planner_missing_reply_safe_fallback",
-            "reason": "Planner 重试后仍没有生成 reply_text，不能由自检或兜底话术替 Planner 生成动作说明。",
-        }
-        tool_evidence["outbound_package"] = fallback_package
         retry_payload = _planner_retry_reason_payload(
             content=content,
             understanding=understanding,
@@ -9389,11 +9998,11 @@ async def _generate_reply_result(
                 "source": "planner_output_gate",
                 "reason": "Planner 重试后仍没有生成客户可见 reply_text。",
             },
-            llm_selfcheck=fallback_llm_selfcheck,
+            llm_selfcheck={"status": "skipped", "source": "planner_output_gate"},
             reason="Planner 重试后仍没有生成客户可见 reply_text。",
         )
         return {
-            "reply": fallback,
+            "reply": "",
             "draft_reply": "",
             "planner_reply_result": planner_reply_result,
             "context": context,
@@ -9401,13 +10010,17 @@ async def _generate_reply_result(
                 "status": "retry",
                 "rule": {"status": "retry", "source": "planner_output_gate", "reason": "Planner 重试后仍没有生成客户可见 reply_text。"},
                 "llm": {"status": "skipped", "source": "planner_output_gate"},
-                "fallback": {"rule": fallback_rule_selfcheck, "llm": fallback_llm_selfcheck},
             },
             "needs_planner_retry": False,
             "planner_retry_reason": retry_payload,
+            "send_blocked": True,
         }
-    planner_stage_selfcheck = kf_orchestrator_flow.planner_reply_selfcheck(planner_reply_result)
-    planner_stage_status = kf_orchestrator_flow.planner_reply_selfcheck_status(planner_reply_result)
+    if production_mode:
+        planner_stage_selfcheck = {}
+        planner_stage_status = "pass"
+    else:
+        planner_stage_selfcheck = kf_orchestrator_flow.planner_reply_selfcheck(planner_reply_result)
+        planner_stage_status = kf_orchestrator_flow.planner_reply_selfcheck_status(planner_reply_result)
     if planner_stage_status in {"retry", "fallback"} and not retry_reason:
         stage_reason = str(
             planner_stage_selfcheck.get("planner_retry_reason")
@@ -9458,79 +10071,39 @@ async def _generate_reply_result(
     video_paths = [Path(path) for path in tool_evidence.get("video_paths") or []]
     reply_memory = kf_context_memory.reply_memory_view(context)
 
-    rag_result = await agentic_rag.retrieve_for_reply(
-        content=effective_query,
-        conversation_context=json.dumps(reply_memory, ensure_ascii=False, default=str),
-        rooms=evidence_rows,
-        inventory_snapshot=inventory_text,
-        media_images=[str(path) for path in image_paths],
-        media_videos=[str(path) for path in video_paths],
-        row_video_paths=video_paths,
-        row_image_paths=image_paths,
-        recent_context=reply_memory,
-        inventory_rows=rows,
-        retry_reason=retry_reason,
-        original_content=content,
+    rag_result = None
+    skip_rag_retrieve_for_controlled_renderer = bool(
+        tool_evidence.get("planner_missing_reply_controlled_renderer")
     )
-    knowledge_context = rag_result.context_text
-    if tool_evidence.get("rule_evidence"):
-        knowledge_context += "\n\n确定性规则证据：\n" + str(
-            inventory_sensitive_access.safe_rule_evidence_for_summary(
-                tool_evidence["rule_evidence"]
-            )
-        )
-    if tool_evidence.get("inventory_images"):
-        knowledge_context += "\n\n动作摘要：\n" + json.dumps(
-            {"will_send_inventory_sheet": True, "image_count": len(tool_evidence.get("inventory_images") or [])},
-            ensure_ascii=False,
-        )
-    if tool_evidence.get("missing_media"):
-        knowledge_context += "\n\n缺失素材摘要：\n" + json.dumps(
-            tool_evidence.get("media_status") or {"missing_media": tool_evidence["missing_media"]},
-            ensure_ascii=False,
-            default=str,
+    if production_mode:
+        tool_evidence["rag_retrieve_skipped_in_production"] = True
+    elif skip_rag_retrieve_for_controlled_renderer:
+        tool_evidence["rag_retrieve_skipped_for_controlled_renderer"] = True
+    else:
+        rag_result = await agentic_rag.retrieve_for_reply(
+            content=effective_query,
+            conversation_context=json.dumps(reply_memory, ensure_ascii=False, default=str),
+            rooms=evidence_rows,
+            inventory_snapshot=inventory_text,
+            media_images=[str(path) for path in image_paths],
+            media_videos=[str(path) for path in video_paths],
+            row_video_paths=video_paths,
+            row_image_paths=image_paths,
+            recent_context=reply_memory,
+            inventory_rows=rows,
+            retry_reason=retry_reason,
+            original_content=content,
         )
 
     deterministic_reply_source = ""
-    candidate_selection_error_reply = _reply_for_candidate_selection_error(tool_evidence)
-    field_target_error_reply = _reply_for_field_target_error(tool_evidence)
-    prepared_media_reply = (
-        ""
-        if production_mode
-        else _reply_for_prepared_media(understanding, tool_evidence)
-    )
-    missing_media_reply = (
-        ""
-        if production_mode
-        else _reply_for_missing_media(understanding, tool_evidence)
-    )
-    if planner_missing_reply:
-        draft_reply = ""
-        deterministic_reply_source = "planner_missing_reply_text"
-    elif clarification_only and planner_reply and not production_mode:
+    if clarification_only and planner_reply and not production_mode:
         draft_reply = planner_reply
         deterministic_reply_source = "rewrite_clarification"
-    elif candidate_selection_error_reply:
-        draft_reply = candidate_selection_error_reply
-        deterministic_reply_source = "candidate_selection_error_reply"
-    elif field_target_error_reply:
-        draft_reply = field_target_error_reply
-        deterministic_reply_source = "field_target_error_reply"
-    elif prepared_media_reply:
-        draft_reply = prepared_media_reply
-        deterministic_reply_source = "prepared_media_reply"
-    elif missing_media_reply:
-        draft_reply = missing_media_reply
-        deterministic_reply_source = "missing_media_reply"
-    elif inventory_search_reply and not production_mode and (
-        tool_evidence.get("planner_reply_timeout_tool_grounded_fallback")
-        or tool_evidence.get("planner_missing_reply_tool_grounded_fallback")
-        or tool_evidence.get("planner_invalid_inventory_reply_replaced")
-    ):
-        draft_reply = inventory_search_reply
-        deterministic_reply_source = "tool_grounded_reply"
+    elif planner_missing_reply:
+        draft_reply = ""
+        deterministic_reply_source = "planner_missing_reply_text"
     elif planner_reply and not production_mode:
-        draft_reply = _safe_fallback_for_intent(understanding, planner_reply)
+        draft_reply = planner_reply
         deterministic_reply_source = "planner_reply_text"
     else:
         draft_reply = ""
@@ -9551,22 +10124,34 @@ async def _generate_reply_result(
     if normalized_reply != draft_reply:
         tool_evidence["reply_normalized_for_unasked_viewing_tail"] = True
         draft_reply = normalized_reply
-    original_video_notice = _reply_for_original_video_request(understanding, tool_evidence)
-    if draft_reply and original_video_notice and not any(word in draft_reply for word in ("压缩", "原视频", "高清", "源文件", "下载链接", "素材页")):
-        draft_reply = (draft_reply.rstrip("。") + "。\n" + original_video_notice).strip("。\n") + "。"
-        tool_evidence["reply_normalized_for_original_video_request"] = True
     normalized_reply = _normalize_customer_visible_reply_text_before_selfcheck(draft_reply)
     if normalized_reply != draft_reply:
         tool_evidence["reply_normalized_for_customer_visible_text"] = True
         draft_reply = normalized_reply
+    controlled_evidence_reply = ""
+    if not production_mode:
+        controlled_evidence_reply = _controlled_evidence_reply_from_tools(
+            content=content,
+            understanding=understanding,
+            tool_evidence=tool_evidence,
+            draft_reply=draft_reply,
+            retry_reason=retry_reason,
+        )
+    if controlled_evidence_reply:
+        draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(controlled_evidence_reply)
+        deterministic_reply_source = kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+        tool_evidence["deterministic_reply_source"] = deterministic_reply_source
     if deterministic_reply_source:
         tool_evidence["deterministic_reply_source"] = deterministic_reply_source
     if production_mode:
         llm2_retry_reason = ""
         llm2_rewrite_reason = ""
+        llm2_blocking_validation_reason = ""
         task_packet = understanding.get("llm1_task_packet")
         production_package_payload: dict[str, Any] = {}
+        primary_llm2_package_payload: dict[str, Any] = {}
         production_attempt_payloads: list[dict[str, Any]] = []
+        accepted_llm2_package = False
         if not isinstance(task_packet, dict) or not task_packet:
             llm2_retry_reason = "LLM1 production task packet is missing; LLM2 production cannot compose customer reply."
             production_package_payload = {
@@ -9583,7 +10168,9 @@ async def _generate_reply_result(
                 nonlocal deterministic_reply_source
                 nonlocal llm2_retry_reason
                 nonlocal llm2_rewrite_reason
+                nonlocal llm2_blocking_validation_reason
                 nonlocal production_package_payload
+                nonlocal primary_llm2_package_payload
 
                 started_at = time.monotonic()
                 try:
@@ -9613,6 +10200,7 @@ async def _generate_reply_result(
                     attempt_payload["outbound_validation"] = validation_payload
                     production_attempt_payloads.append(attempt_payload)
                     production_package_payload = attempt_payload
+                    primary_llm2_package_payload = attempt_payload
                     if (
                         kf_dual_llm_production.package_passed(production_package)
                         and outbound_validation.passed
@@ -9624,11 +10212,15 @@ async def _generate_reply_result(
                                 controlled_slot_appendix,
                             )
                         )
-                        deterministic_reply_source = (
-                            "kf_llm2_outbound_production_controlled_slots"
-                            if controlled_slot_appendix
-                            else "kf_llm2_outbound_production"
-                        )
+                        package_reply_source = str(getattr(production_package, "reply_source", "") or "")
+                        if package_reply_source == kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE:
+                            deterministic_reply_source = kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+                        else:
+                            deterministic_reply_source = (
+                                "kf_llm2_outbound_production_controlled_slots"
+                                if controlled_slot_appendix
+                                else "kf_llm2_outbound_production"
+                            )
                         tool_evidence["deterministic_reply_source"] = deterministic_reply_source
                         if controlled_slot_appendix:
                             tool_evidence["controlled_slot_appendix_used"] = True
@@ -9642,8 +10234,13 @@ async def _generate_reply_result(
                         llm2_retry_reason = ""
                         llm2_rewrite_reason = ""
                         return True
+                    if not kf_dual_llm_production.package_passed(production_package) or not production_reply_text:
+                        llm2_retry_reason = kf_dual_llm_production.package_retry_reason(production_package)
+                        llm2_rewrite_reason = ""
+                        return False
                     if outbound_validation.blocking_issues:
                         llm2_retry_reason = kf_dual_llm_production.outbound_validation_retry_reason(outbound_validation)
+                        llm2_blocking_validation_reason = llm2_retry_reason
                         llm2_rewrite_reason = ""
                     elif outbound_validation.requires_rewrite:
                         llm2_rewrite_reason = kf_dual_llm_production.outbound_validation_retry_reason(outbound_validation)
@@ -9674,17 +10271,93 @@ async def _generate_reply_result(
                     }
                     production_attempt_payloads.append(attempt_payload)
                     production_package_payload = attempt_payload
+                    primary_llm2_package_payload = attempt_payload
                     return False
 
             accepted_llm2_package = await compose_and_validate_llm2("initial", retry_reason)
-            if not accepted_llm2_package and llm2_rewrite_reason and not llm2_retry_reason:
+            if not accepted_llm2_package and not llm2_blocking_validation_reason and llm2_rewrite_reason and not llm2_retry_reason:
                 rewrite_reason = llm2_rewrite_reason
                 llm2_rewrite_reason = ""
                 accepted_llm2_package = await compose_and_validate_llm2("l3_rewrite", rewrite_reason)
                 if accepted_llm2_package:
                     tool_evidence["llm2_production_rewrite_reason"] = rewrite_reason
+            if not accepted_llm2_package and not llm2_blocking_validation_reason and llm2_retry_reason:
+                contract_retry_reason = llm2_retry_reason
+                llm2_retry_reason = ""
+                llm2_rewrite_reason = ""
+                accepted_llm2_package = await compose_and_validate_llm2("llm2_contract_retry", contract_retry_reason)
+                if accepted_llm2_package:
+                    tool_evidence["llm2_production_contract_retry_reason"] = contract_retry_reason
+            force_reply_signal_controlled_renderer = (
+                not accepted_llm2_package
+                and not str(draft_reply or "").strip()
+                and _task_packet_has_reply_compose_signal(task_packet)
+            )
+            force_missing_media_controlled_renderer = (
+                not accepted_llm2_package
+                and bool(tool_evidence.get("missing_media"))
+            )
+            if force_reply_signal_controlled_renderer and not (llm2_retry_reason or llm2_rewrite_reason):
+                llm2_retry_reason = "LLM2 production returned empty reply_compose_signal; controlled evidence renderer must compose the reply."
+            if force_missing_media_controlled_renderer and not (llm2_retry_reason or llm2_rewrite_reason):
+                llm2_retry_reason = "LLM2 production did not produce a valid missing-media reply; controlled evidence renderer must use missing_media evidence."
+            allow_controlled_renderer = not llm2_blocking_validation_reason or force_reply_signal_controlled_renderer or force_missing_media_controlled_renderer
+            if not accepted_llm2_package and allow_controlled_renderer and (llm2_retry_reason or llm2_rewrite_reason or llm2_blocking_validation_reason):
+                controlled_renderer_reason = llm2_retry_reason or llm2_rewrite_reason or llm2_blocking_validation_reason
+                controlled_package = kf_dual_llm_production.compose_controlled_evidence_outbound_package(
+                    task_packet=task_packet,
+                    tool_evidence=tool_evidence,
+                    planner_result=planner_result or {},
+                    reason=controlled_renderer_reason,
+                )
+                controlled_payload = kf_dual_llm_production.package_log_payload(controlled_package)
+                controlled_payload["attempt"] = "controlled_evidence_renderer"
+                controlled_slot_appendix = _controlled_slot_appendix_from_outbound_package(controlled_package)
+                controlled_reply_text = str(controlled_package.reply_text or "").strip()
+                controlled_validation = kf_dual_llm_production.validate_production_outbound_package(
+                    controlled_package,
+                    task_packet=task_packet,
+                    user_asked_password=user_asked_password,
+                    known_constraints=known_constraints,
+                )
+                controlled_validation_payload = controlled_validation.to_dict()
+                controlled_payload["outbound_validation"] = controlled_validation_payload
+                production_attempt_payloads.append(controlled_payload)
+                production_package_payload = controlled_payload
+                if (
+                    kf_dual_llm_production.package_passed(controlled_package)
+                    and controlled_validation.passed
+                    and controlled_reply_text
+                ):
+                    draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(
+                        _append_controlled_slot_appendix(
+                            controlled_reply_text,
+                            controlled_slot_appendix,
+                        )
+                    )
+                    deterministic_reply_source = kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+                    tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+                    tool_evidence["llm2_production_outbound_package"] = controlled_package.to_legacy_dict()
+                    tool_evidence["llm2_production_outbound_validation"] = controlled_validation_payload
+                    tool_evidence["llm2_production_controlled_renderer_reason"] = controlled_renderer_reason
+                    llm2_retry_reason = ""
+                    llm2_rewrite_reason = ""
+                    accepted_llm2_package = True
+                elif controlled_validation.blocking_issues:
+                    llm2_retry_reason = llm2_retry_reason or kf_dual_llm_production.outbound_validation_retry_reason(controlled_validation)
+                    llm2_rewrite_reason = ""
+                elif controlled_validation.requires_rewrite:
+                    llm2_rewrite_reason = llm2_rewrite_reason or kf_dual_llm_production.outbound_validation_retry_reason(controlled_validation)
+                    llm2_retry_reason = ""
         dual_meta = dict(tool_evidence.get("dual_llm_production") or understanding.get("dual_llm_production") or {})
-        production_summary = dict(production_package_payload)
+        production_summary_payload = production_package_payload
+        if (
+            not accepted_llm2_package
+            and str(production_package_payload.get("attempt") or "") == "controlled_evidence_renderer"
+            and primary_llm2_package_payload
+        ):
+            production_summary_payload = primary_llm2_package_payload
+        production_summary = dict(production_summary_payload)
         if len(production_attempt_payloads) > 1:
             production_summary["attempts"] = [dict(item) for item in production_attempt_payloads]
         dual_meta["llm2"] = production_summary
@@ -9771,7 +10444,60 @@ async def _generate_reply_result(
                 ),
                 "send_blocked": True,
             }
-    outbound_package = _outbound_package_for_current_mode(draft_reply, tool_evidence)
+        owner_gate = _production_visible_reply_owner_gate(
+            draft_reply=draft_reply,
+            deterministic_reply_source=deterministic_reply_source,
+            tool_evidence=tool_evidence,
+        )
+        tool_evidence["production_visible_reply_owner_gate"] = owner_gate
+        if str(owner_gate.get("status") or "pass").lower() != "pass":
+            if not retry_reason:
+                retry_payload = _llm2_production_retry_reason_payload(
+                    understanding=understanding,
+                    tool_evidence=tool_evidence,
+                    rule_selfcheck=owner_gate,
+                    llm_selfcheck=production_summary.get("self_review") or owner_gate,
+                    reason=str(owner_gate.get("reason") or "production_visible_reply_owner_gate_failed"),
+                )
+                return {
+                    "reply": "",
+                    "draft_reply": draft_reply,
+                    "planner_reply_result": planner_reply_result,
+                    "context": context,
+                    "selfcheck": {
+                        "status": "retry",
+                        "rule": owner_gate,
+                        "llm": production_summary.get("self_review") or owner_gate,
+                    },
+                    "needs_planner_retry": True,
+                    "planner_retry_reason": retry_payload,
+                }
+            return {
+                "reply": "",
+                "draft_reply": draft_reply,
+                "planner_reply_result": planner_reply_result,
+                "context": context,
+                "selfcheck": {
+                    "status": "retry",
+                    "rule": owner_gate,
+                    "llm": production_summary.get("self_review") or owner_gate,
+                },
+                "needs_planner_retry": False,
+                "planner_retry_reason": _llm2_production_retry_reason_payload(
+                    understanding=understanding,
+                    tool_evidence=tool_evidence,
+                    rule_selfcheck=owner_gate,
+                    llm_selfcheck=production_summary.get("self_review") or owner_gate,
+                    reason=str(owner_gate.get("reason") or "production_visible_reply_owner_gate_failed"),
+                ),
+                "send_blocked": True,
+            }
+    outbound_package = kf_outbound_package.outbound_package_for_current_mode(
+        draft_reply,
+        tool_evidence,
+        production_mode=production_mode,
+        deps=_outbound_package_deps(),
+    )
     tool_evidence["outbound_package"] = outbound_package
     selfcheck_stage = timer.stage("final_selfcheck") if timer else nullcontext()
     with selfcheck_stage:
@@ -9786,37 +10512,35 @@ async def _generate_reply_result(
                 "source": "kf_outbound_validation",
                 "outbound_validation_status": validation_payload.get("status") if isinstance(validation_payload, dict) else "pass",
             }
-            human_context_selfcheck = _local_human_context_selfcheck(
-                content=content,
-                draft_reply=draft_reply,
-                tool_evidence=tool_evidence,
-                deterministic_reply_source=deterministic_reply_source,
-            )
-            if str(human_context_selfcheck.get("status") or human_context_selfcheck.get("action") or "pass").lower() != "pass":
-                rule_selfcheck = {
-                    **human_context_selfcheck,
-                    "status": "rewrite_required",
-                    "retry_target": "llm2",
-                }
             rule_status = str(rule_selfcheck.get("status") or rule_selfcheck.get("action") or "pass").lower()
             llm_selfcheck = {
                 "status": "pass",
                 "source": "llm_selfcheck_skipped_by_kf_outbound_validation",
-                "reason": "production 发送前事实和动作只由 validate_prepared_outbound_package 校验；最终 LLM selfcheck 不再抢业务判断。",
+                "reason": (
+                    "production 发送前事实和动作只由 validate_prepared_outbound_package 校验；"
+                    "L3 话术也归 validate_prepared_outbound_package，最终 selfcheck 不再抢业务判断。"
+                ),
             }
         else:
-            assessment = agentic_rag.assess_reply(
-                content=effective_query,
-                reply_text=draft_reply,
-                rag_result=rag_result,
-                retry_attempted=bool(retry_reason),
-            )
-            rule_selfcheck = _assessment_to_dict(assessment)
-            rule_selfcheck = _sanitize_rule_selfcheck_for_intent(
-                rule_selfcheck,
-                content=content,
-                understanding=understanding,
-            )
+            if deterministic_reply_source == kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE:
+                rule_selfcheck = {
+                    "status": "pass",
+                    "source": "controlled_evidence_renderer_selfcheck",
+                    "reason": "受控证据渲染器只消费工具证据，旧 RAG selfcheck 不再改写其客户可见文本。",
+                }
+            else:
+                assessment = agentic_rag.assess_reply(
+                    content=effective_query,
+                    reply_text=draft_reply,
+                    rag_result=rag_result,
+                    retry_attempted=bool(retry_reason),
+                )
+                rule_selfcheck = _assessment_to_dict(assessment)
+                rule_selfcheck = _sanitize_rule_selfcheck_for_intent(
+                    rule_selfcheck,
+                    content=content,
+                    understanding=understanding,
+                )
             constraint_selfcheck = _constraint_consistency_selfcheck(
                 content=content,
                 draft_reply=draft_reply,
@@ -9957,27 +10681,9 @@ async def _generate_reply_result(
             "send_blocked": True,
         }
     if planner_missing_reply:
-        fallback = _safe_fallback_for_intent(
-            understanding,
-            "",
-        )
-        fallback = _normalize_customer_visible_reply_text_before_selfcheck(fallback)
         tool_evidence["suppress_actions"] = True
-        fallback_evidence = {"actions": [], "rule_evidence": {}}
-        fallback_package = _build_outbound_package(fallback, fallback_evidence)
-        fallback_rule_selfcheck = _outbound_package_selfcheck(
-            draft_reply=fallback,
-            tool_evidence=fallback_evidence,
-            outbound_package=fallback_package,
-        )
-        fallback_llm_selfcheck = {
-            "status": "pass",
-            "source": "planner_missing_reply_safe_fallback",
-            "reason": "Planner 重试后仍没有生成 reply_text，不能由自检或兜底话术替 Planner 生成动作说明。",
-        }
-        tool_evidence["outbound_package"] = fallback_package
         return {
-            "reply": fallback,
+            "reply": "",
             "draft_reply": draft_reply,
             "planner_reply_result": planner_reply_result,
             "context": context,
@@ -9985,23 +10691,15 @@ async def _generate_reply_result(
                 "status": final_status,
                 "rule": rule_selfcheck,
                 "llm": llm_selfcheck,
-                "fallback": {"rule": fallback_rule_selfcheck, "llm": fallback_llm_selfcheck},
             },
             "needs_planner_retry": False,
             "planner_retry_reason": planner_retry_reason,
+            "send_blocked": True,
         }
     preserve_sendable_actions = _has_sendable_actions(tool_evidence)
-    sendable_action_fallback = (
-        _reply_for_sendable_action_fallback(content=content, tool_evidence=tool_evidence)
-        if preserve_sendable_actions
-        else ""
-    )
+    sendable_action_fallback = ""
     fallback = str(
-        field_target_error_reply
-        or (missing_media_reply if tool_evidence.get("missing_media") else "")
-        or (sendable_action_fallback if preserve_sendable_actions else "")
-        or missing_media_reply
-        or inventory_search_reply
+        (sendable_action_fallback if preserve_sendable_actions else "")
         or llm_selfcheck.get("fallback_reply")
         or rule_selfcheck.get("fallback_reply")
         or rule_selfcheck.get("fallback_text")
@@ -10009,7 +10707,7 @@ async def _generate_reply_result(
     ).strip()
     fallback = _constraint_preserving_inventory_fallback(
         understanding,
-        _safe_fallback_for_intent(understanding, fallback),
+        fallback,
         tool_evidence,
     )
     fallback = _normalize_customer_visible_reply_text_before_selfcheck(fallback)
@@ -10019,7 +10717,11 @@ async def _generate_reply_result(
     else:
         tool_evidence["suppress_actions"] = True
         fallback_evidence = {"actions": [], "rule_evidence": tool_evidence.get("rule_evidence") or {}}
-    fallback_package = _build_outbound_package(fallback, fallback_evidence)
+    fallback_package = kf_outbound_package.build_legacy_outbound_package(
+        fallback,
+        fallback_evidence,
+        deps=_outbound_package_deps(),
+    )
     fallback_rule_selfcheck = _outbound_package_selfcheck(
         draft_reply=fallback,
         tool_evidence=fallback_evidence,
@@ -10056,7 +10758,11 @@ async def _generate_reply_result(
             tool_evidence.pop("suppress_actions", None)
             fallback = _normalize_customer_visible_reply_text_before_selfcheck(inventory_evidence_fallback)
             fallback_evidence = tool_evidence
-            fallback_package = _build_outbound_package(fallback, fallback_evidence)
+            fallback_package = kf_outbound_package.build_legacy_outbound_package(
+                fallback,
+                fallback_evidence,
+                deps=_outbound_package_deps(),
+            )
             fallback_rule_selfcheck = {
                 "status": "pass",
                 "source": "tool_grounded_inventory_final_fallback",
@@ -10069,15 +10775,16 @@ async def _generate_reply_result(
             tool_evidence["suppress_actions"] = True
             fallback = _constraint_preserving_inventory_fallback(
                 understanding,
-                _safe_fallback_for_intent(
-                    understanding,
-                    "我这边为了避免发错，先不乱发。你把小区+房号或更具体条件发我一下，我重新按最新房源表查准。",
-                ),
+                "我这边为了避免发错，先不乱发。你把小区+房号或更具体条件发我一下，我重新按最新房源表查准。",
                 tool_evidence,
             )
             fallback = _normalize_customer_visible_reply_text_before_selfcheck(fallback)
             fallback_evidence = {"actions": [], "rule_evidence": {}}
-            fallback_package = _build_outbound_package(fallback, fallback_evidence)
+            fallback_package = kf_outbound_package.build_legacy_outbound_package(
+                fallback,
+                fallback_evidence,
+                deps=_outbound_package_deps(),
+            )
     elif preserve_sendable_actions:
         tool_evidence.pop("suppress_actions", None)
     tool_evidence["outbound_package"] = fallback_package
@@ -10195,59 +10902,30 @@ async def _execute_send_action_once(
     stale_guard: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], bool, dict[str, Any]]:
     idempotency_key = kf_send_receipts.build_idempotency_key(action)
-    existing = kf_send_receipts.find_blocking_receipt(context, idempotency_key)
-    if existing:
-        _record_persistent_send_receipt(existing, action=action, idempotency_key=idempotency_key)
-        duplicate = kf_send_receipts.build_duplicate_receipt(
-            action,
-            existing,
-            idempotency_key=idempotency_key,
-            metadata={"duplicate_reason": "context_receipt_blocks_duplicate"},
-        )
-        context = kf_send_receipts.append_receipt(context, duplicate)
-        _record_persistent_send_receipt(duplicate, action=action, idempotency_key=idempotency_key)
-        return context, False, duplicate.to_safe_dict()
-
-    outbox_decision = kf_send_outbox.reserve(action, idempotency_key=idempotency_key)
-    if not outbox_decision.should_send:
-        duplicate = _duplicate_receipt_from_outbox_decision(action, outbox_decision, idempotency_key=idempotency_key)
-        context = kf_send_receipts.append_receipt(context, duplicate)
-        _record_persistent_send_receipt(duplicate, action=action, idempotency_key=idempotency_key)
-        return context, False, duplicate.to_safe_dict()
-
-    try:
-        if stale_guard is not None:
-            stale_guard()
-        provider_result = await _await_if_needed(send_call())
-    except Exception as exc:
-        failed = _build_send_error_receipt(
-            action,
-            idempotency_key=idempotency_key,
-            error=exc,
-            metadata=receipt_metadata,
-        )
-        context = kf_send_receipts.append_receipt(context, failed)
-        _record_persistent_send_receipt(
-            failed,
-            action=action,
-            idempotency_key=idempotency_key,
-            outbox_id=outbox_decision.outbox_id,
-        )
-        raise
-    sent = kf_send_receipts.build_sent_receipt(
-        action,
-        idempotency_key=idempotency_key,
-        provider_result=provider_result if isinstance(provider_result, dict) else {},
-        metadata=receipt_metadata,
-    )
-    context = kf_send_receipts.append_receipt(context, sent)
-    _record_persistent_send_receipt(
-        sent,
+    state = await kf_receipt_graph.run_kf_receipt_graph(
+        kf_receipt_graph.KfReceiptGraphDeps(
+            find_blocking_receipt=kf_send_receipts.find_blocking_receipt,
+            reserve_outbox=lambda send_action, key: kf_send_outbox.reserve(send_action, idempotency_key=key),
+            send_call=lambda: _await_if_needed(send_call()),
+            append_receipt=kf_send_receipts.append_receipt,
+            record_persistent_receipt=_record_persistent_send_receipt,
+            build_duplicate_receipt=kf_send_receipts.build_duplicate_receipt,
+            build_duplicate_from_outbox_decision=_duplicate_receipt_from_outbox_decision,
+            build_error_receipt=_build_send_error_receipt,
+            build_sent_receipt=kf_send_receipts.build_sent_receipt,
+            stale_guard=stale_guard,
+        ),
+        context=context,
         action=action,
         idempotency_key=idempotency_key,
-        outbox_id=outbox_decision.outbox_id,
+        receipt_metadata=receipt_metadata,
+        conversation_id=f"{idempotency_key}:receipt",
     )
-    return context, True, sent.to_safe_dict()
+    return (
+        dict(state.get("context") or context),
+        bool(state.get("sent")),
+        dict(state.get("receipt_payload") or {}),
+    )
 
 
 def _send_action_for_text(
@@ -10618,6 +11296,7 @@ def _build_orchestrator_shadow_artifact(
     tool_evidence: dict[str, Any] | None = None,
     reply_result: dict[str, Any] | None = None,
     final_reply: str = "",
+    graph_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if _dual_llm_production_enabled():
         inventory_context_log: dict[str, Any] = {}
@@ -10643,6 +11322,7 @@ def _build_orchestrator_shadow_artifact(
                 "planner_result_summary": _production_audit_planner_result_summary(planner_result or {}),
                 "tool_evidence_summary": _production_audit_tool_evidence_summary(tool_evidence or {}),
                 "reply_result_summary": _production_audit_reply_result_summary(reply_result or {}),
+                "graph_state": safe_artifact_payload(graph_state or {}),
                 "final_reply_present": bool(str(final_reply or "").strip()),
             }
         )
@@ -11347,12 +12027,25 @@ async def _send_final_actions(
     sent_actions: list[dict[str, Any]] = []
     if stale_guard is not None:
         stale_guard()
-    outbound_package = _outbound_package_for_current_mode(final_reply, tool_evidence)
+    production_mode = _dual_llm_production_enabled()
+    outbound_package = kf_outbound_package.outbound_package_for_current_mode(
+        final_reply,
+        tool_evidence,
+        production_mode=production_mode,
+        deps=_outbound_package_deps(),
+    )
     using_prepared_package = bool(
-        _dual_llm_production_enabled()
+        production_mode
         and isinstance(outbound_package, dict)
         and outbound_package.get("prepared_outbound_package")
     )
+    if production_mode and not using_prepared_package:
+        return {
+            "sent_actions": [],
+            "context": context,
+            "send_blocked": True,
+            "reason": "production requires PreparedOutboundPackage before any visible send action",
+        }
     if using_prepared_package:
         final_reply = str(outbound_package.get("text") or "")
     final_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_reply)
@@ -11372,7 +12065,6 @@ async def _send_final_actions(
 
     if suppress_actions:
         return {"sent_actions": sent_actions, "context": context}
-
     if using_prepared_package:
         for prepared_action in outbound_package.get("prepared_actions") or []:
             if not isinstance(prepared_action, dict):
@@ -11385,7 +12077,7 @@ async def _send_final_actions(
                 position = int(prepared_action.get("position") or 1)
             except (TypeError, ValueError):
                 position = 1
-            rows = _outbound_package_rows_for_kind(tool_evidence, kind)
+            rows = kf_outbound_package.outbound_package_rows_for_kind(tool_evidence, kind)
             row = rows[position - 1] if 0 < position <= len(rows) else {}
             action_id = str(prepared_action.get("action_id") or "").strip()
             caption = str(prepared_action.get("caption") or "").strip()
@@ -11523,38 +12215,287 @@ async def _finalize_clarification_reply(
         "reply_text": draft,
         "reply_source": "rewrite_clarification",
     }
+    first_tool_evidence = dict(tool_evidence)
     first = await _generate_reply_result(
         content=content,
         context=context,
         understanding=understanding,
-        tool_evidence=dict(tool_evidence),
+        tool_evidence=first_tool_evidence,
         planner_result=planner_result,
         timer=timer,
         inventory_read_context=inventory_read_context,
     )
+    first["tool_evidence"] = first_tool_evidence
     if not first.get("needs_planner_retry") and str(first.get("reply") or "").strip():
         return first
     retry_reason = str(first.get("planner_retry_reason") or "clarification_selfcheck_retry")
+    second_tool_evidence = dict(tool_evidence)
     second = await _generate_reply_result(
         content=content,
         context=context,
         understanding=understanding,
-        tool_evidence=dict(tool_evidence),
+        tool_evidence=second_tool_evidence,
         planner_result=planner_result,
         retry_reason=retry_reason,
         timer=timer,
         inventory_read_context=inventory_read_context,
     )
+    second["tool_evidence"] = second_tool_evidence
     if str(second.get("reply") or "").strip():
         return second
+    blocked = dict(second or first)
+    blocked["reply"] = ""
+    blocked["draft_reply"] = str(blocked.get("draft_reply") or "")
+    blocked["context"] = blocked.get("context") or context
+    blocked["selfcheck"] = blocked.get("selfcheck") or first.get("selfcheck") or {}
+    blocked["needs_planner_retry"] = bool(blocked.get("needs_planner_retry", first.get("needs_planner_retry", True)))
+    blocked["planner_retry_reason"] = str(blocked.get("planner_retry_reason") or retry_reason)
+    blocked["send_blocked"] = True
+    blocked["tool_evidence"] = second_tool_evidence
+    return blocked
+
+
+def _langgraph_production_flow_deps(
+    *,
+    turn_metadata: dict[str, Any] | None = None,
+) -> kf_langgraph_flow.KfProductionFlowDeps:
+    metadata = dict(turn_metadata or {})
+
+    async def _record_understanding_for_langgraph(**kwargs: Any) -> dict[str, Any]:
+        context = dict(kwargs.get("context") or {})
+        understanding = dict(kwargs.get("understanding") or {})
+        attempt = int(kwargs.get("attempt") or 0)
+        state = _state_from_understanding(understanding)
+        if attempt > 0:
+            updated = kf_context_memory.update_structured_state(
+                context,
+                state=state,
+                rewrite_result=understanding,
+            ) or context
+        else:
+            updated = kf_context_memory.start_structured_turn(
+                context,
+                state=state,
+                user_input={
+                    "content": metadata.get("content") or kwargs.get("content") or "",
+                    "created_at": metadata.get("created_at") or time.time(),
+                    "merged_message_count": metadata.get("merged_message_count") or 1,
+                    "msgids": metadata.get("msgids") or [],
+                },
+                rewrite_result=understanding,
+            )
+        return {"context": updated}
+
+    return kf_langgraph_flow.KfProductionFlowDeps(
+        understand_message=_understand_message,
+        record_understanding=_record_understanding_for_langgraph,
+        plan_actions=_plan_actions,
+        execute_tools=_execute_tools,
+        generate_reply_result=_generate_reply_result,
+        retrieve_business_knowledge=_retrieve_business_knowledge_for_langgraph,
+        tool_evidence_summary=_tool_evidence_summary,
+        has_sendable_actions=_has_sendable_actions,
+        merge_preserved_sendable_evidence=_merge_preserved_sendable_evidence,
+    )
+
+
+async def _retrieve_business_knowledge_for_langgraph(
+    *,
+    content: str,
+    context: dict[str, Any],
+    understanding: dict[str, Any],
+    signals: dict[str, Any],
+    inventory_read_context: InventoryReadContext | None = None,
+    retry_reason: str = "",
+) -> dict[str, Any]:
+    effective_query = str(understanding.get("effective_query") or content)
+    intent = _normalize_intent(understanding.get("intent"))
+    cards = business_knowledge.retrieve(
+        query_text="\n".join([effective_query, retry_reason]),
+        intent=intent,
+        signals=signals,
+        limit=settings.kf_agentic_rag_max_evidence,
+    )
+    rule_evidence: dict[str, Any] = {}
+    if signals.get("wants_deposit") or intent == "deposit":
+        rule_evidence["deposit_policy"] = _deposit_policy_evidence()
+    if signals.get("wants_contract_contact") or intent == "contract":
+        rule_evidence["contract_contact"] = CONTACT_NUMBERS
+    if _is_literal_greeting(content) or _is_short_acknowledgement(content):
+        rule_evidence["greeting"] = {
+            "style": "拟人化简短回应",
+            "guide": "引导中介直接发小区、房号、价格、空房、视频或房源表需求。",
+        }
     return {
-        "reply": draft,
-        "draft_reply": str(first.get("draft_reply") or draft),
-        "context": context,
-        "selfcheck": first.get("selfcheck") or {},
-        "needs_planner_retry": False,
-        "planner_retry_reason": retry_reason,
+        "source": "langgraph_business_knowledge",
+        "knowledge_context": business_knowledge.format_cards(cards),
+        "trace": [
+            "business_knowledge_retriever: source=knowledge/kf markdown",
+            f"business_knowledge_retriever: cards={len(cards)}",
+        ],
+        "topics": [card.id for card in cards],
+        "cards": [
+            {
+                "id": card.id,
+                "source": card.source,
+                "score": card.score,
+            }
+            for card in cards
+        ],
+        "rule_evidence": rule_evidence,
+        "inventory_read_context": inventory_read_context.to_log_dict()
+        if inventory_read_context is not None
+        else {},
     }
+
+
+async def _process_text_turn_with_langgraph_production_flow(
+    *,
+    open_kfid: str,
+    external_userid: str,
+    conversation_key: str,
+    content: str,
+    msgids: list[str],
+    generation: int,
+    context: dict[str, Any],
+    signals: dict[str, Any],
+    timer: kf_turn_flow.RagStageTimer,
+    inventory_read_context: InventoryReadContext | None,
+    merged_message_count: int = 1,
+) -> None:
+    flow_state = await kf_langgraph_flow.run_kf_production_flow(
+        _langgraph_production_flow_deps(
+            turn_metadata={
+                "content": content,
+                "created_at": time.time(),
+                "merged_message_count": merged_message_count,
+                "msgids": msgids,
+            }
+        ),
+        content=content,
+        context=context,
+        signals=signals,
+        inventory_read_context=inventory_read_context,
+        timer=timer,
+        conversation_id=conversation_key,
+    )
+    _raise_if_stale_kf_turn(conversation_key, generation)
+    understanding = dict(flow_state.get("understanding") or {})
+    context = dict(flow_state.get("context") or context)
+    if "record_understanding" in list(flow_state.get("trace") or []):
+        context = kf_context_memory.update_structured_state(
+            context,
+            state=_state_from_understanding(understanding),
+            rewrite_result=understanding,
+        ) or context
+        _save_context(open_kfid, external_userid, context)
+
+    planner_result = dict(flow_state.get("planner_result") or {})
+    tool_evidence = dict(flow_state.get("tool_evidence") or {})
+    reply_result = dict(flow_state.get("reply_result") or {})
+    final_reply = str(flow_state.get("final_reply") or "")
+    final_draft_reply = str(flow_state.get("final_draft_reply") or final_reply)
+
+    if flow_state.get("status") == "needs_clarification":
+        reply = str(understanding.get("clarification_text") or "").strip()
+        if not reply:
+            reply = "你把具体小区、房号或预算发我一下，我按最新房源表帮你查准。"
+        clarification_result = await _finalize_clarification_reply(
+            content=content,
+            context=context,
+            understanding=understanding,
+            reply=reply,
+            timer=timer,
+            inventory_read_context=inventory_read_context,
+        )
+        final_reply = _normalize_customer_visible_reply_text_before_selfcheck(
+            str(clarification_result.get("reply") or reply)
+        )
+        final_draft_reply = str(clarification_result.get("draft_reply") or final_reply)
+        context = clarification_result.get("context") or context
+        planner_result = {"actions": ["clarification"], "reply_source": "rewrite_clarification"}
+        tool_evidence = dict(
+            clarification_result.get("tool_evidence")
+            or {
+                "actions": ["clarification"],
+                "deterministic_reply_source": "rewrite_clarification",
+            }
+        )
+        tool_evidence.setdefault("actions", ["clarification"])
+        tool_evidence.setdefault("deterministic_reply_source", "rewrite_clarification")
+        reply_result = clarification_result
+    elif flow_state.get("status") == "planner_rewrite_exhausted":
+        final_reply = ""
+        final_draft_reply = ""
+        tool_evidence.setdefault("actions", [])
+        tool_evidence["suppress_actions"] = True
+        reply_result = {
+            "reply": "",
+            "draft_reply": "",
+            "context": context,
+            "selfcheck": {
+                "status": "retry",
+                "source": "llm1_production_retry_gate",
+                "reason": str(flow_state.get("retry_reason") or "planner_missing_evidence"),
+            },
+            "needs_planner_retry": False,
+            "planner_retry_reason": "",
+            "send_blocked": True,
+        }
+    elif flow_state.get("send_blocked") and not final_reply.strip():
+        final_reply = ""
+        final_draft_reply = str(flow_state.get("final_draft_reply") or "")
+        tool_evidence["suppress_actions"] = True
+        reply_result = {**reply_result, "send_blocked": True}
+    elif _dual_llm_production_enabled() and not final_reply.strip():
+        final_reply = ""
+        final_draft_reply = str(flow_state.get("final_draft_reply") or "")
+        tool_evidence["suppress_actions"] = True
+        reply_result = {
+            **reply_result,
+            "reply": "",
+            "draft_reply": final_draft_reply,
+            "send_blocked": True,
+            "needs_planner_retry": False,
+            "planner_retry_reason": "",
+        }
+    else:
+        final_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_reply)
+        final_draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_draft_reply)
+
+    await kf_send_graph.run_kf_send_graph(
+        kf_send_graph.KfSendGraphDeps(
+            build_audit_artifact=_build_orchestrator_shadow_artifact,
+            send_final_actions=_send_final_actions,
+            reduce_turn_context=kf_context_memory.reduce_turn_context,
+            save_context=_save_context,
+            mark_processed=wecom_kf.state_store.mark_processed,
+            stale_guard=lambda: _raise_if_stale_kf_turn(conversation_key, generation),
+        ),
+        open_kfid=open_kfid,
+        external_userid=external_userid,
+        conversation_key=conversation_key,
+        content=content,
+        msgids=msgids,
+        generation=generation,
+        context=context,
+        understanding=understanding,
+        planner_result=planner_result,
+        tool_evidence=tool_evidence,
+        reply_result=reply_result,
+        final_reply=final_reply,
+        final_draft_reply=final_draft_reply,
+        inventory_read_context=inventory_read_context,
+        graph_state={
+            "trace": list(flow_state.get("trace") or []),
+            "route": flow_state.get("route") or "",
+            "route_reason": flow_state.get("route_reason") or "",
+            "status": flow_state.get("status") or "",
+            "attempt": flow_state.get("attempt") or 0,
+        },
+        timer=timer,
+        conversation_id=f"{conversation_key}:send",
+    )
 
 
 async def _handle_text_message(message: dict[str, Any]) -> None:
@@ -11588,6 +12529,22 @@ async def _process_text_turn(
         context = _remember_inventory_read_context(context, inventory_read_context)
         context = kf_context_memory.append_dialog_message(context, role="user", content=content) or context
         signals = _deterministic_signals(content)
+
+        if _langgraph_production_flow_enabled():
+            await _process_text_turn_with_langgraph_production_flow(
+                open_kfid=open_kfid,
+                external_userid=external_userid,
+                conversation_key=conversation_key,
+                content=content,
+                msgids=msgids,
+                generation=generation,
+                context=context,
+                signals=signals,
+                merged_message_count=len([item for item in pending_items if item.get("content")]),
+                timer=timer,
+                inventory_read_context=inventory_read_context,
+            )
+            return
 
         with timer.stage("rewrite_intent"):
             understanding = await _understand_message(
@@ -11624,9 +12581,18 @@ async def _process_text_turn(
                 inventory_read_context=inventory_read_context,
             )
             reply = _normalize_customer_visible_reply_text_before_selfcheck(
-                str(clarification_result.get("reply") or reply)
+                str(clarification_result.get("reply") or "")
             )
             context = clarification_result.get("context") or context
+            clarification_tool_evidence = dict(
+                clarification_result.get("tool_evidence")
+                or {
+                    "actions": ["clarification"],
+                    "deterministic_reply_source": "rewrite_clarification",
+                }
+            )
+            clarification_tool_evidence.setdefault("actions", ["clarification"])
+            clarification_tool_evidence.setdefault("deterministic_reply_source", "rewrite_clarification")
             _raise_if_stale_kf_turn(conversation_key, generation)
             _build_orchestrator_shadow_artifact(
                 content=content,
@@ -11637,32 +12603,26 @@ async def _process_text_turn(
                 inventory_read_context=inventory_read_context,
                 understanding=understanding,
                 planner_result={"actions": ["clarification"], "reply_source": "rewrite_clarification"},
-                tool_evidence={"actions": ["clarification"], "deterministic_reply_source": "rewrite_clarification"},
+                tool_evidence=clarification_tool_evidence,
                 reply_result=clarification_result,
                 final_reply=reply,
             )
-            clarification_tool_evidence = {
-                "actions": ["clarification"],
-                "deterministic_reply_source": "rewrite_clarification",
-            }
             with timer.stage("send"):
-                context, did_send_clarification, _receipt = await _send_text_with_receipt(
+                send_result = await _send_final_actions(
                     open_kfid=open_kfid,
                     external_userid=external_userid,
                     context=context,
-                    text=reply,
-                    action_id="send-text-clarification",
-                    text_role="clarification",
+                    final_reply=reply,
+                    tool_evidence=clarification_tool_evidence,
                     msgids=msgids,
+                    stale_guard=lambda: _raise_if_stale_kf_turn(conversation_key, generation),
                 )
+            context = send_result.get("context") or context
             context = kf_context_memory.reduce_turn_context(
                 context,
                 understanding=understanding,
                 tool_evidence=clarification_tool_evidence,
-                send_result={
-                    "sent_actions": [{"type": "text", "count": 1}] if did_send_clarification else [],
-                    "context": context,
-                },
+                send_result=send_result,
                 final_package={
                     "draft_reply": str(clarification_result.get("draft_reply") or reply),
                     "final_reply": reply,
@@ -11727,9 +12687,18 @@ async def _process_text_turn(
                         inventory_read_context=inventory_read_context,
                     )
                     reply = _normalize_customer_visible_reply_text_before_selfcheck(
-                        str(clarification_result.get("reply") or reply)
+                        str(clarification_result.get("reply") or "")
                     )
                     context = clarification_result.get("context") or context
+                    clarification_tool_evidence = dict(
+                        clarification_result.get("tool_evidence")
+                        or {
+                            "actions": ["clarification"],
+                            "deterministic_reply_source": "rewrite_clarification",
+                        }
+                    )
+                    clarification_tool_evidence.setdefault("actions", ["clarification"])
+                    clarification_tool_evidence.setdefault("deterministic_reply_source", "rewrite_clarification")
                     _raise_if_stale_kf_turn(conversation_key, generation)
                     _build_orchestrator_shadow_artifact(
                         content=content,
@@ -11740,32 +12709,26 @@ async def _process_text_turn(
                         inventory_read_context=inventory_read_context,
                         understanding=understanding,
                         planner_result={"actions": ["clarification"], "reply_source": "rewrite_clarification"},
-                        tool_evidence={"actions": ["clarification"], "deterministic_reply_source": "rewrite_clarification"},
+                        tool_evidence=clarification_tool_evidence,
                         reply_result=clarification_result,
                         final_reply=reply,
                     )
-                    clarification_tool_evidence = {
-                        "actions": ["clarification"],
-                        "deterministic_reply_source": "rewrite_clarification",
-                    }
                     with timer.stage("send"):
-                        context, did_send_clarification, _receipt = await _send_text_with_receipt(
+                        send_result = await _send_final_actions(
                             open_kfid=open_kfid,
                             external_userid=external_userid,
                             context=context,
-                            text=reply,
-                            action_id="send-text-clarification",
-                            text_role="clarification",
+                            final_reply=reply,
+                            tool_evidence=clarification_tool_evidence,
                             msgids=msgids,
+                            stale_guard=lambda: _raise_if_stale_kf_turn(conversation_key, generation),
                         )
+                    context = send_result.get("context") or context
                     context = kf_context_memory.reduce_turn_context(
                         context,
                         understanding=understanding,
                         tool_evidence=clarification_tool_evidence,
-                        send_result={
-                            "sent_actions": [{"type": "text", "count": 1}] if did_send_clarification else [],
-                            "context": context,
-                        },
+                        send_result=send_result,
                         final_package={
                             "draft_reply": str(clarification_result.get("draft_reply") or reply),
                             "final_reply": reply,
@@ -12075,22 +13038,19 @@ async def _handle_kf_event(payload: dict[str, str]) -> None:
     if not open_kfid or not token:
         return
     messages = await _await_if_needed(wecom_kf.sync_messages(open_kfid, token))
-    text_messages: list[dict[str, Any]] = []
-    for message in messages:
+    dispatch_plan = await _plan_kf_entry_dispatch([dict(message or {}) for message in messages])
+    for message in kf_entry_graph.enter_session_messages_from_dispatch_plan(dispatch_plan):
         try:
-            if is_kf_enter_session_event(message):
-                await _handle_enter_session(message)
-                continue
-            if should_auto_reply_kf_message(message):
-                text_messages.append(message)
+            await _handle_enter_session(message)
         except WeComKfSendLimitError:
             logger.warning("WeCom KF send limit hit for message: %s", message.get("msgid"))
             raise
         except Exception as exc:
             logger.exception("KF message handling failed: %s", exc)
-    if text_messages:
+    text_groups = kf_entry_graph.text_groups_from_dispatch_plan(dispatch_plan)
+    if text_groups:
         try:
-            await _handle_text_messages_batch(text_messages)
+            await _dispatch_kf_text_groups(text_groups)
         except WeComKfSendLimitError:
             logger.warning("WeCom KF send limit hit for text message batch")
             raise
@@ -12171,15 +13131,7 @@ async def sync_feishu_region_inventory(
     dry_run: bool = False,
     sync_media: bool = True,
 ) -> dict[str, Any]:
-    result = await RegionInventorySyncService().sync(dry_run=dry_run, sync_media=sync_media)
-    if result.get("ok") and not dry_run:
-        try:
-            refreshed = await _refresh_inventory()
-            result["rewrite_index"] = refreshed.get("rewrite_index", {})
-        except Exception as exc:
-            logger.exception("rewrite_inventory_index_after_region_sync_failed")
-            result["rewrite_index"] = {"ok": False, "error": str(exc)}
-    return result
+    return await _run_admin_region_inventory_sync_graph(dry_run=dry_run, sync_media=sync_media)
 
 
 @app.post("/feishu/events")
@@ -12248,6 +13200,18 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
         signals=signals,
         inventory_read_context=inventory_read_context,
     )
+    context = kf_context_memory.start_structured_turn(
+        context,
+        state=_state_from_understanding(understanding),
+        user_input={
+            "content": content,
+            "created_at": time.time(),
+            "merged_message_count": 1,
+            "msgids": [],
+        },
+        rewrite_result=understanding,
+    )
+    _save_context("debug", message.user_id or "debug-user", context)
     retry_reason = ""
     planner_result: dict[str, Any] = {}
     tool_evidence: dict[str, Any] = {}
@@ -12273,6 +13237,12 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
                 planner_feedback=planner_feedback,
                 inventory_read_context=inventory_read_context,
             )
+            context = kf_context_memory.update_structured_state(
+                context,
+                state=_state_from_understanding(understanding),
+                rewrite_result=understanding,
+            ) or context
+            _save_context("debug", message.user_id or "debug-user", context)
             if not understanding.get("needs_clarification"):
                 retry_reason = str(planner_feedback["missing_evidence"])
                 continue
@@ -12312,6 +13282,35 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
         reply_result=reply_result,
         final_reply=reply,
     )
+    simulated_sent_actions = []
+    if reply:
+        simulated_sent_actions.append({"type": "text", "count": 1})
+    for key, action_type in (
+        ("inventory_images", "inventory_sheet"),
+        ("image_paths", "image"),
+        ("video_paths", "video"),
+    ):
+        count = len(tool_evidence.get(key) or [])
+        if count:
+            simulated_sent_actions.append({"type": action_type, "count": count})
+    context = kf_context_memory.reduce_turn_context(
+        context,
+        understanding=understanding,
+        tool_evidence=tool_evidence,
+        send_result={
+            "sent_actions": simulated_sent_actions,
+            "context": context,
+            "send_blocked": bool(reply_result.get("send_blocked") or not reply),
+            "debug_simulated": True,
+        },
+        final_package={
+            "draft_reply": str(reply_result.get("draft_reply") or reply),
+            "final_reply": reply,
+            "outbound_package": tool_evidence.get("outbound_package") or {},
+        },
+    )
+    _save_context("debug", message.user_id or "debug-user", context)
+    last_candidate_set = kf_context_memory.last_candidate_set(context)
     return {
         "understanding": understanding,
         "planner_result": planner_result,
@@ -12331,4 +13330,13 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
         "reply": reply,
         "selfcheck": reply_result.get("selfcheck") or {},
         "orchestrator_shadow": orchestrator_shadow,
+        "context_memory": {
+            "last_candidate_count": len(last_candidate_set.get("candidates") or []),
+            "last_candidate_query": last_candidate_set.get("query") or "",
+            "confirmed_room_label": (
+                (context.get("confirmed_room") or {}).get("label")
+                if isinstance(context.get("confirmed_room"), dict)
+                else ""
+            ),
+        },
     }

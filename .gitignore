@@ -14,6 +14,9 @@ qa_artifacts/m0_baseline/
 qa_artifacts/m05a_baseline/
 qa_artifacts/rag_*.json
 qa_artifacts/redacted_*.json
+qa_artifacts/kf_qa_gate_graph_utf8_*.json
+qa_artifacts/server_current_predeploy_utf8_*.json
+qa_artifacts/inventory_cutover_graph_*/
 qa_artifacts/*.log
 server_snapshots/
 .understand-anything/

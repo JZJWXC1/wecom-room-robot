@@ -1,4 +1,13 @@
+from importlib import metadata
+
 from app.config import settings
+
+
+def _installed_version(package_name: str) -> str:
+    try:
+        return metadata.version(package_name)
+    except metadata.PackageNotFoundError:
+        return ""
 
 
 def get_config_status() -> dict:
@@ -45,6 +54,15 @@ def get_config_status() -> dict:
     inventory_image_exists = bool(inventory_images)
     if settings.inventory_source == "local_image" and not inventory_image_exists:
         missing.append("INVENTORY_IMAGE_PATH_FILE")
+    langgraph_installed = bool(_installed_version("langgraph"))
+    langgraph_sqlite_installed = bool(_installed_version("langgraph-checkpoint-sqlite"))
+    langgraph_errors: list[str] = []
+    langgraph_required_for_production = str(settings.kf_dual_llm_mode).strip().lower() == "production"
+    if langgraph_required_for_production and not settings.kf_langgraph_enabled:
+        langgraph_errors.append("KF_LANGGRAPH_ENABLED_REQUIRED_FOR_PRODUCTION")
+    if langgraph_required_for_production and not langgraph_installed:
+        langgraph_errors.append("LANGGRAPH_PACKAGE_REQUIRED_FOR_PRODUCTION")
+    missing.extend(langgraph_errors)
     return {
         "ok": not missing,
         "missing": missing,
@@ -54,6 +72,16 @@ def get_config_status() -> dict:
         "inventory_source": settings.inventory_source,
         "inventory_image_exists": inventory_image_exists,
         "inventory_image_count": len(inventory_images),
+        "langgraph": {
+            "enabled": settings.kf_langgraph_enabled,
+            "required_for_production": langgraph_required_for_production,
+            "errors": langgraph_errors,
+            "installed": langgraph_installed,
+            "version": _installed_version("langgraph"),
+            "sqlite_checkpoint_installed": langgraph_sqlite_installed,
+            "checkpoint_path": str(settings.kf_langgraph_checkpoint_path),
+            "smoke_thread_id": settings.kf_langgraph_smoke_thread_id,
+        },
     }
 
 

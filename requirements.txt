@@ -12,3 +12,5 @@ pydantic-settings==2.9.1
 cryptography==45.0.2
 wecom-aibot-sdk==1.0.7
 imageio-ffmpeg==0.6.0
+langgraph==1.2.7
+langgraph-checkpoint-sqlite==3.1.0

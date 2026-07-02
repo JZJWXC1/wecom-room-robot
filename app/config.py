@@ -134,12 +134,24 @@ class Settings(BaseSettings):
         alias="KF_DUAL_LLM_MODE",
     )
     kf_llm1_production_timeout_seconds: float = Field(
-        default=12.0,
+        default=25.0,
         alias="KF_LLM1_PRODUCTION_TIMEOUT_SECONDS",
     )
     kf_llm2_production_timeout_seconds: float = Field(
-        default=15.0,
+        default=45.0,
         alias="KF_LLM2_PRODUCTION_TIMEOUT_SECONDS",
+    )
+    kf_langgraph_enabled: bool = Field(
+        default=True,
+        alias="KF_LANGGRAPH_ENABLED",
+    )
+    kf_langgraph_checkpoint_path: Path = Field(
+        default=Path("data/kf_langgraph_checkpoints.sqlite"),
+        alias="KF_LANGGRAPH_CHECKPOINT_PATH",
+    )
+    kf_langgraph_smoke_thread_id: str = Field(
+        default="kf-langgraph-smoke",
+        alias="KF_LANGGRAPH_SMOKE_THREAD_ID",
     )
 
     dashscope_api_key: str = Field(default="", alias="DASHSCOPE_API_KEY")

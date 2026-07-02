@@ -173,6 +173,8 @@ Validator / Tool Resolver 回流证据：
 - 需要房源表：包含 send_inventory_sheet；如果同时要视频或看房，再补对应动作。
 - 需要看房、密码、今天能看：包含 search_inventory、context_tools、explain_unavailable_viewing、generate_reply，但不得输出真实密码。
 - 需要免押：包含 send_deposit_policy 和 generate_reply；合同、订房、交定金包含 send_contract_contact 和 generate_reply。
+- “第1套视频/前两套视频/这几套视频/视频/原视频/笔记/视”是视频需求；candidate_set 有效时必须输出 send_video + context_tools + explain_missing_media + generate_reply，不能只输出 continue_search，也不能空 actions。
+- “图片/照片/图”是图片需求；candidate_set 有效时必须输出 send_image + context_tools + explain_missing_media + generate_reply，不能只输出 continue_search，也不能空 actions。
 - production 下 tool_plan.actions 是工具执行的唯一权威；目标明确时必须直接给 actions，不能依赖 task_atoms/task_type 补动作。
 - tool_plan 绝不能输出 reply_text、pre_tool_reply_text、planner_missing_reply 或任何客户可见话术。
 - “第几套/前两套/这几套视频”只有在 candidate_set 存在且编号有效时才能写入 selected_candidate_numbers。
@@ -303,6 +305,8 @@ Validator / Tool Resolver 回传的内部缺失证据：
 - 需要房源表时，tool_plan 只需要 send_inventory_sheet；如果同时还有视频/看房等明确需求，再补对应动作。
 - 需要看房/密码/今天能看时，tool_plan 必须包含 search_inventory、context_tools、explain_unavailable_viewing、generate_reply。
 - 需要免押时，tool_plan 必须包含 send_deposit_policy 和 generate_reply；需要定房/合同/交定金时，必须包含 send_contract_contact 和 generate_reply。
+- “第1套视频/前两套视频/这几套视频/视频/原视频/笔记/视”是视频需求，不能只输出 continue_search 或空 actions。
+- “图片/照片/图”是图片需求，不能只输出 continue_search 或空 actions。
 - “还有哪4套”这类话，candidate_action 必须是 remainder，selected_indices 填未展示候选编号。
 - “万达1500左右有哪些”必须重写为拱墅万达/北部软件园/城北万象城区域 + 1500左右 + 在租房源查询。
 - “一室”默认宽匹配一室和一室一厅；不得追问“一室户还是一室一厅”。“一室带厅/有没有带厅/一室一厅”才精确匹配一室一厅。
@@ -373,7 +377,9 @@ Validator / Tool Resolver 回传的内部缺失证据：
             "价格、房态、密码、链接、素材目标只能来自 ToolEvidenceBundle；证据没有返回就不能写。"
             "房源表、缺素材、免押政策、合同联系、看房联系/密码都会以 evidence_type 或受控 send action 形式提供，"
             "你只能引用这些证据来组织客户可见表达。"
+            "ToolEvidenceBundle 如包含 send_actions，只能把其中既有 action_id 用于 action_captions，不能新增、删除或改目标。"
             "朝南、有电梯、已空出、可养猫、近地铁等普通事实也必须来自 ToolEvidenceBundle，并写入 claims。"
+            "当 ToolEvidenceBundle/candidate_set 有多套候选且本轮是房源筛选或推荐时，reply_text 必须用 1/2/3 编号列出每套的小区+房号，不能只说“有几套/匹配到几套”而不列具体候选。"
             "密码和链接属于高风险内容：不要抄写真值，只引用 evidence_id/slot 让 Sender 按已验证 action 处理。"
             "合同联系电话和看房密码如出现在受控 send action，只写 action_captions 或交给 Sender 按已验证 action 追加授权槽位，不要在 reply_text 里输出手机号或密码真值。"
             "话术要像真实租房客服，短句、自然、直接；不要暴露 listing_id、evidence_id、ToolEvidence、send action 等内部名。"
@@ -421,8 +427,11 @@ ResponseStrategy：
 - 不要输出真实密码、完整手机号、token、URL 真值。
 - 合同联系电话、看房密码必须通过受控 action/evidence slot 表达；LLM2 不能自己写手机号或密码真值。
 - evidence_type=deposit_policy 时可以回答免押条件/服务费；evidence_type=missing_media 时只能说明对应素材缺失，不能承诺稍后补发。
+- evidence_type=selection_error/field_target_error 时，只能自然说明需要客户回有效序号或小区+房号，不能自己改选其它房源。
+- evidence_type=original_video_source/original_video_unavailable 时，只能按证据说明是否有原视频/高清源；没有证据时不能冒充原片或下载链接。
 - evidence_type=inventory_sheet 或已有 send_inventory_sheet 动作时，只说明房源表图片会由动作发送，不要改成纯文字房源表。
 - 受控合同/看房 action 存在时，reply_text 写自然引导，真实手机号/密码由 Sender 按已验证 action 追加授权槽位；你不得直接生成这些真值。
+- 多套候选房源必须编号列出具体小区+房号；如果不准备列出候选，就不要让话术暗示“第几套”可以继续接话。
 - 不要把房号数字当价格，不要新增工具证据外的价格、房态、朝南、有电梯、已空出、可养猫、近地铁等事实。
 - 客户可见话术必须口语化、短句，不出现内部字段名或工具名。
 - 已有媒体 send action 时，reply_text/action_captions 用“这是某某房间的视频/图片。”，不要写稍后、等下、会发你或素材已准备好。

@@ -379,9 +379,95 @@ def _jsonable_structured_value(value: Any) -> Any:
 def room_key_from_row(row: dict[str, Any] | None) -> str:
     if not isinstance(row, dict):
         return ""
-    community = str(row.get("小区") or row.get("社区") or row.get("楼盘") or "").strip()
-    room_no = str(row.get("房号") or row.get("房间号") or row.get("门牌号") or "").strip()
+    community = str(row.get("小区") or row.get("community") or row.get("社区") or row.get("楼盘") or "").strip()
+    room_no = str(row.get("房号") or row.get("room_no") or row.get("room") or row.get("房间号") or row.get("门牌号") or "").strip()
     return f"{community}{room_no}".strip()
+
+
+def _compact_visible_text(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def _row_visible_labels(row: dict[str, Any]) -> list[str]:
+    labels: list[str] = []
+    for raw in (
+        row.get("label"),
+        row.get("key"),
+        room_key_from_row(row),
+    ):
+        label = _compact_visible_text(raw)
+        if label and label not in labels:
+            labels.append(label)
+    community = str(row.get("小区") or row.get("community") or row.get("社区") or row.get("楼盘") or "").strip()
+    room_no = str(row.get("房号") or row.get("room_no") or row.get("room") or row.get("房间号") or row.get("门牌号") or "").strip()
+    if community and room_no:
+        for sep in ("", " ", "-"):
+            label = _compact_visible_text(f"{community}{sep}{room_no}")
+            if label and label not in labels:
+                labels.append(label)
+    if room_no:
+        label = _compact_visible_text(room_no)
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _reorder_candidate_set_by_visible_reply(candidate_set: dict[str, Any], final_reply: str) -> tuple[dict[str, Any], int]:
+    if not candidate_set or not final_reply:
+        return candidate_set, 0
+    rows = [row for row in candidate_set.get("candidates") or [] if isinstance(row, dict)]
+    if len(rows) < 2:
+        visible = _compact_visible_text(final_reply)
+        match_count = 0
+        if rows and visible:
+            match_count = int(any(label and label in visible for label in _row_visible_labels(rows[0])))
+        return candidate_set, match_count
+    visible = _compact_visible_text(final_reply)
+    if not visible:
+        return candidate_set, 0
+    scored: list[tuple[int, int, dict[str, Any]]] = []
+    for index, row in enumerate(rows):
+        positions = [visible.find(label) for label in _row_visible_labels(row) if label and label in visible]
+        scored.append((min(positions) if positions else 10**9, index, row))
+    match_count = sum(1 for position, _, _ in scored if position < 10**9)
+    if not match_count:
+        return candidate_set, 0
+    ordered = [row for _, _, row in sorted(scored, key=lambda item: (item[0], item[1]))]
+    if ordered == rows:
+        return candidate_set, match_count
+    updated = dict(candidate_set)
+    updated["candidates"] = ordered
+    updated["shown_count"] = min(_bounded_int(updated.get("shown_count"), default=len(ordered)), len(ordered))
+    updated["total_count"] = max(_bounded_int(updated.get("total_count"), default=len(ordered)), len(ordered))
+    updated["visible_reply_ordered"] = True
+    return updated, match_count
+
+
+def _row_identity(row: dict[str, Any]) -> str:
+    listing_id = str(row.get("listing_id") or row.get("listingId") or "").strip()
+    if listing_id:
+        return f"id:{listing_id}"
+    room_key = room_key_from_row(row)
+    return f"room:{_compact_visible_text(room_key)}" if room_key else ""
+
+
+def _should_preserve_previous_candidate_set_after_narrow_update(
+    previous_candidate_set: dict[str, Any],
+    candidate_update: dict[str, Any],
+) -> bool:
+    previous_rows = [row for row in previous_candidate_set.get("candidates") or [] if isinstance(row, dict)]
+    update_rows = [row for row in candidate_update.get("candidates") or [] if isinstance(row, dict)]
+    if not previous_rows or not update_rows:
+        return False
+    update_intent = str(candidate_update.get("intent") or "").strip().lower()
+    if update_intent == "media":
+        return True
+    if len(previous_rows) <= 1 or len(update_rows) >= len(previous_rows):
+        return False
+    previous_keys = {_row_identity(row) for row in previous_rows}
+    update_keys = {_row_identity(row) for row in update_rows}
+    update_keys.discard("")
+    return bool(update_keys) and update_keys.issubset(previous_keys)
 
 
 def _listing_id_from_row(row: dict[str, Any]) -> str:
@@ -1385,6 +1471,7 @@ def reduce_turn_context(
 
     # Expire contextual fields before applying this turn's reducer output.
     candidate_set = normalize_last_candidate_set(current.get("last_candidate_set"), now=now)
+    previous_candidate_set = dict(candidate_set) if candidate_set else {}
     if candidate_set:
         current["last_candidate_set"] = candidate_set
     else:
@@ -1413,10 +1500,12 @@ def reduce_turn_context(
         reducer_meta.get("last_candidate_set") or reducer_meta.get("candidate_set"),
         now=now,
     )
+    candidate_update_applied = False
     if candidate_update.get("action") == "clear":
         current.pop("last_candidate_set", None)
     elif candidate_update:
         current["last_candidate_set"] = candidate_update
+        candidate_update_applied = True
 
     confirmed_update = _normalize_reducer_confirmed_room(
         reducer_meta.get("confirmed_room"),
@@ -1486,6 +1575,20 @@ def reduce_turn_context(
 
     final_reply = str(final_package.get("final_reply") or "").strip()
     draft_reply = str(final_package.get("draft_reply") or final_reply).strip()
+    if final_reply and current.get("last_candidate_set"):
+        reordered_candidate_set, visible_candidate_count = _reorder_candidate_set_by_visible_reply(
+            current.get("last_candidate_set") or {},
+            final_reply,
+        )
+        if candidate_update_applied and _should_preserve_previous_candidate_set_after_narrow_update(
+            previous_candidate_set,
+            current.get("last_candidate_set") or {},
+        ):
+            current["last_candidate_set"] = normalize_last_candidate_set(previous_candidate_set, now=now)
+        elif candidate_update_applied and visible_candidate_count <= 0:
+            current.pop("last_candidate_set", None)
+        else:
+            current["last_candidate_set"] = normalize_last_candidate_set(reordered_candidate_set, now=now)
     if final_reply and final_package.get("append_assistant_message", True):
         if any(str(action.get("type") or "") == "text" for action in actions):
             current = append_dialog_message(

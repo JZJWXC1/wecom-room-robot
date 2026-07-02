@@ -1,18 +1,30 @@
 # RAG Rule Ownership
 
-本文更新 M1A 审计后的规则归属，约束后续 Snapshot 修改不绕过 Agentic RAG。
+本文更新 LangGraph 生产链路后的规则归属，约束后续修改不绕过“流程、理解、事实、评估”的 owner 边界。
 
 ## 链路归属
 
 | 阶段 | 当前职责 | Snapshot 后职责 |
 | --- | --- | --- |
-| 问题重写/意图分析 | `_understand_message` 读取库存行和 rewrite index 辅助实体解析 | 锁定 `inventory_snapshot_id`，读取同快照 rewrite index |
-| Planner/工具 | `_plan_actions` 决定 `search_inventory/send_inventory_sheet/explain_unavailable_viewing` 等动作 | Planner 不直接读库存，只声明工具需求 |
-| 工具执行 | `_execute_tools` 调用 `inventory.search/all_rows`、素材库和 viewing 规则证据 | 统一通过 Snapshot Reader 和 viewing tool，所有结果带 snapshot_id |
+| 问题重写/意图分析 | LLM1 / `_understand_message` 只做语义理解、候选引用解析、工具需求声明 | 不生成客户可见话术，不直接判断房源事实 |
+| 流程编排 | `kf_langgraph_flow.StateGraph` 串起理解、路由、工具、业务知识、话术和重试 | 生产模式必须由 LangGraph 管流程；旧 planner/reply 模块已物理删除 |
+| Planner/工具 | LLM1 `task_packet.tool_plan` 声明工具需求，`kf_tool_resolver` 负责执行与绑定 | 房源、素材、价格、水电、看房、房源表事实只能来自工具证据 |
+| 业务问答 | `kf_business_knowledge` / 知识库返回免押、合同、定房、日常问答证据 | LLM 只能基于知识证据润色，不能新增政策事实 |
 | 结构化会话记忆 | `kf_context_memory` 保存候选、确认房源和 query state | 只保存 listing_id、展示摘要、snapshot_id、非敏感状态 |
-| 自检回流 | `agentic_rag.assess_reply` 和本地 selfcheck 拦截错绑、无证据、未问密码 | 校验回复引用的 listing_id 均来自本轮 snapshot；未问密码不得出现密码 |
-| 发送阶段 | `_send_final_actions` 发送文本、图片、视频和房源表 PNG | 房源表 PNG 从同快照 `png/` 读取 |
-| 房源/素材同步 | 现有飞书同步、cache、rewrite index、PNG 分散生成 | Snapshot Builder 统一生成并原子切换 |
+| 自检回流 | 生产只归 `kf_outbound_validation` / `validate_prepared_outbound_package` | `agentic_rag.assess_reply` 只允许留在 shadow/非生产，不再抢生产事实判断 |
+| 发送阶段 | `_send_final_actions` 发送文本、图片、视频和房源表 PNG | 发送动作必须继承工具证据与 validation 结果，不由 LLM 自己新增 |
+| 评估集 | `kf_qa_gate_graph.StateGraph` 编排固定窗口、随机 20 个 10 轮窗口和历史失败回放 | 失败立刻停止，审计代码后再修复；连续 20 个随机窗口通过才算完成 |
+
+## LangGraph 外围生命周期归属
+
+本轮新增的外围 LangGraph 只负责生命周期编排，不新增事实 owner：
+
+- `kf_entry_graph`：企业微信入口消息分类、分组和 dispatch plan。它不生成回复、不查房源、不发送欢迎语。
+- `kf_receipt_graph`：单个发送动作的 context receipt、outbox reserve、execute、receipt record。重复发送判断仍由 `kf_send_receipts` / `kf_outbox` 完成。
+- `inventory_cutover_graph`：本地 primary replay、readiness、rollback rehearsal 和报告。没有 `APPROVE_DEPLOY` 时不得用于线上切换。
+- `release_preflight_graph`：本地测试、QA Gate Graph、配置健康和 release rehearsal。它只做发布门禁，不替代业务评估集。
+
+这些外围图可以中断、阻断、写报告，但不能新增房源事实、素材绑定、房态结论或客户可见话术。
 
 ## 密码规则归属
 

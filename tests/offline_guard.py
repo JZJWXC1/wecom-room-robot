@@ -10,6 +10,7 @@ from typing import Any
 
 SENSITIVE_ENV_KEYS = (
     "DASHSCOPE_API_KEY",
+    "DEEPSEEK_API_KEY",
     "OPENAI_API_KEY",
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
@@ -28,6 +29,11 @@ SENSITIVE_ENV_KEYS = (
     "REMOTE_HOST",
     "SERVER_HOST",
 )
+REAL_LLM_API_ENV_KEYS = {
+    "DASHSCOPE_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENAI_API_KEY",
+}
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 _ACTIVATED = False
@@ -60,6 +66,13 @@ def _record_and_raise(host: Any, port: Any) -> None:
     )
 
 
+def real_llm_api_tests_enabled() -> bool:
+    return (
+        os.environ.get("RUN_ONLINE_QA") == "1"
+        and os.environ.get("RUN_REAL_LLM_API_TESTS") == "1"
+    )
+
+
 def _guarded_create_connection(address: Any, *args: Any, **kwargs: Any) -> Any:
     host, port = address[:2] if isinstance(address, tuple) else (address, "")
     if not _is_local_host(host):
@@ -88,7 +101,10 @@ def activate_offline_test_mode() -> None:
             module_name for module_name in watched_modules if module_name in sys.modules
         ]
 
+    allow_real_llm = real_llm_api_tests_enabled()
     for key in SENSITIVE_ENV_KEYS:
+        if allow_real_llm and key in REAL_LLM_API_ENV_KEYS:
+            continue
         os.environ.pop(key, None)
 
     root = repo_root()
@@ -102,7 +118,7 @@ def activate_offline_test_mode() -> None:
     os.environ.setdefault("MEDIA_ROOT", "media/rooms")
     os.environ.setdefault("KF_DIALOGUE_EVENT_LOG_PATH", "data/test_kf_dialogue_events.jsonl")
 
-    if _ACTIVATED:
+    if _ACTIVATED or allow_real_llm:
         return
     socket.create_connection = _guarded_create_connection
     socket.socket.connect = _guarded_socket_connect

@@ -10,6 +10,7 @@ from app.services.kf_dual_llm_shadow import (
     build_shadow_task_packet,
     compose_shadow_outbound,
 )
+from app.services.kf_outbound_validation import validate_prepared_outbound_package
 
 
 def test_build_shadow_task_packet_supports_multi_task_and_candidate_numbers() -> None:
@@ -90,6 +91,84 @@ def test_compose_shadow_outbound_binds_candidate_numbers_and_video_actions_from_
     assert record["llm2"]["candidate_binding"]["media"][1]["candidate_number"] == 2
     assert record["llm2"]["response_strategy"]["mode"] == "send_media"
     assert record["llm2"]["action_captions"][0]["action_id"] == "send-video-1"
+
+
+def test_media_actions_keep_nonconsecutive_candidate_numbers() -> None:
+    packet = build_shadow_task_packet(
+        {"candidate_numbers": [1, 3], "constraints": {"区域": "石桥"}},
+        {"actions": ["send_video"]},
+        content="筛出来的1和3视频发我",
+        candidate_set={
+            "candidate_set_id": "cset-dual-13",
+            "candidates": [
+                {"candidate_number": 1, "小区": "石桥铭苑", "房号": "6-1102"},
+                {"candidate_number": 2, "小区": "石桥铭苑", "房号": "21-1201A"},
+                {"candidate_number": 3, "小区": "石桥铭苑", "房号": "21-1201B"},
+            ],
+        },
+    )
+    package = compose_shadow_outbound(
+        packet,
+        {
+            "actions": ["send_video"],
+            "target_rows": [
+                {
+                    "candidate_number": 1,
+                    "listing_id": "lst-1",
+                    "小区": "石桥铭苑",
+                    "房号": "6-1102",
+                    "押一付一": "4500",
+                },
+                {
+                    "candidate_number": 3,
+                    "listing_id": "lst-3",
+                    "小区": "石桥铭苑",
+                    "房号": "21-1201B",
+                    "押一付一": "4500",
+                },
+            ],
+            "video_paths": [
+                "room_database/video/石桥铭苑6-1102/demo.mp4",
+                "room_database/video/石桥铭苑21-1201B/demo.mp4",
+            ],
+        },
+        "这是这两套房间的视频。",
+    )
+    evidence_by_id = {item.evidence_id: item for item in package.evidence_bundle.evidence}
+
+    assert [action.action_id for action in package.send_actions] == ["send-video-1", "send-video-3"]
+    assert [action.evidence_id for action in package.send_actions] == ["evd-video-1", "evd-video-3"]
+    assert [caption.action_id for caption in package.action_captions] == ["send-video-1", "send-video-3"]
+    assert evidence_by_id["evd-video-3"].field_values["candidate_number"] == 3
+    assert evidence_by_id["evd-video-3"].metadata["candidate_number"] == 3
+    validation = validate_prepared_outbound_package(package)
+    assert not any(issue.code == "l2.candidate_number_out_of_range" for issue in validation.issues)
+
+
+def test_media_actions_do_not_invent_candidate_number_without_selection() -> None:
+    packet = build_shadow_task_packet(
+        {},
+        {"actions": ["send_video"]},
+        content="棠润府15-2-801B视频发我",
+    )
+    _, _, send_actions = build_program_outbound_contract_inputs(
+        task_packet=packet,
+        tool_evidence={
+            "actions": ["send_video"],
+            "video_paths": ["room_database/video/棠润府15-2-801B/demo.mp4"],
+            "video_rows": [
+                {
+                    "listing_id": "lst-trf-801b",
+                    "小区": "棠润府",
+                    "房号": "15-2-801B",
+                }
+            ],
+        },
+    )
+
+    assert [action.action_id for action in send_actions] == ["send-video-1"]
+    assert "candidate_number" not in send_actions[0].metadata
+    assert "candidate_number" not in send_actions[0].payload
 
 
 def test_continue_search_strategy_records_tool_plan_without_media_decision() -> None:

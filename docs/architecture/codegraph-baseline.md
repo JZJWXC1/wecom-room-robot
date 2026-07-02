@@ -116,7 +116,7 @@ existing/current:
 - LLM 最终自检：`ReplyGenerator.assess_kf_final_reply`
 - 工具后回复生成：LLM2 outbound production/shadow，或 Planner 已提供的 `reply_text` 进入统一自检。
 - RAG 质量规则：`KfAgenticRagService.assess_reply`、`assess_action`
-- 安全兜底：`_safe_fallback_for_intent`、`_final_inventory_evidence_fallback` 等。
+- 安全边界：`kf_outbound_validation`、controlled evidence renderer、发送前 package gate。
 
 当前边界：
 
@@ -180,7 +180,9 @@ existing:
 
 同步链路：
 
-`scripts/sync_feishu_region_inventory.py -> RegionInventorySyncService.sync -> list_bitable_records -> normalize_region_records -> RegionInventorySheetSyncer.sync_target_sheet -> RegionInventoryMediaSyncer.sync_area_media`
+`scripts/sync_feishu_region_inventory.py -> inventory_sync_graph.run_inventory_sync_graph -> RegionInventorySyncService.sync -> list_bitable_records -> normalize_region_records -> RegionInventorySheetSyncer.sync_target_sheet -> RegionInventoryMediaSyncer.sync_area_media`
+
+旧直连链路只保留为显式 `--legacy-sync` 兼容入口，默认脚本和后台 `/admin/feishu/sync-region-inventory` 都由 Inventory Sync Graph 负责阶段顺序、失败即停和 trace。
 
 `scripts/refresh_rag_inventory_cache.py -> InventoryService.refresh -> write_rewrite_inventory_index`
 
@@ -192,7 +194,7 @@ existing/current worktree:
 
 - 固定 QA：`qa_artifacts/run_rag_test_text_window_utf8.py`
 - 多窗口 QA：`qa_artifacts/run_rag_10windows_10turns_utf8.py`
-- 随机保底 QA：`qa_artifacts/run_rag_random_guard_utf8.py`
+- 随机保底 QA 默认入口：`qa_artifacts/run_kf_qa_gate_graph_utf8.py`（内部 random_windows 执行器仍为 `run_rag_random_guard_utf8.py`）
 - 其他场景脚本：`run_rag_3questions_10turns_utf8.py`、`run_rag_5questions_5turns_utf8.py`
 - Offline guard：`tests/offline_guard.py`
 
@@ -398,7 +400,7 @@ proposed:
 
 ### QA runner
 
-- 公开入口：`qa_artifacts/run_rag_test_text_window_utf8.py`、`run_rag_10windows_10turns_utf8.py`、`run_rag_random_guard_utf8.py`。
+- 公开默认入口：`qa_artifacts/run_kf_qa_gate_graph_utf8.py`、`qa_artifacts/run_rag_test_text_window_utf8.py`、`run_rag_10windows_10turns_utf8.py`；`run_rag_random_guard_utf8.py` 保留为 QA Graph 的 random_windows 执行器。
 - 主要调用方：人工/CI。
 - 输入：fixture 问题、离线 stub、offline guard。
 - 输出：QA artifact、质量状态。

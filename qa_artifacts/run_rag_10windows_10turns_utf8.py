@@ -1424,6 +1424,7 @@ async def run_all(
     expected_window_count: int | None = 10,
     min_window_count: int = 1,
     min_turn_count: int = 100,
+    fail_fast_on_problem: bool = False,
 ) -> Path:
     source_windows = windows if windows is not None else WINDOWS
     integrity = chinese_integrity_report(
@@ -1473,6 +1474,7 @@ async def run_all(
             **completion,
             "window_count": len(selected_windows),
             "turn_timeout": turn_timeout,
+            "fail_fast_on_problem": fail_fast_on_problem,
             "timing_summary": timing,
             "quality_status": quality,
             "offline_guard": offline_guard_status(),
@@ -1532,6 +1534,8 @@ async def run_all(
                 turns.append(turn)
                 window_result["context_summary"] = _serialize_context_store(store)
                 write_artifact(False)
+                if fail_fast_on_problem and _is_blocking_turn_problem(turn):
+                    return artifact
     finally:
         main.wecom_kf = originals["wecom_kf"]
         main.wecom_kf_context_store = originals["wecom_kf_context_store"]
@@ -1553,6 +1557,14 @@ async def run_all(
                 break
     write_artifact(completed)
     return artifact
+
+
+def _is_blocking_turn_problem(turn: dict[str, Any]) -> bool:
+    if turn.get("error"):
+        return True
+    problem = turn.get("problem") or {}
+    severity = str(problem.get("severity") or "")
+    return severity in {"high", "medium"}
 
 
 def print_summary(artifact: Path) -> None:

@@ -646,7 +646,7 @@ function Invoke-HistoricalFailureReplay {
 }
 
 function Invoke-RandomGuard {
-    Invoke-QAArtifactRunner -Name "random 10-question guard QA" -Arguments @("qa_artifacts/run_rag_random_guard_utf8.py") -RequireFullSuite
+    Invoke-QAArtifactRunner -Name "random 10-question QA graph" -Arguments @("qa_artifacts/run_kf_qa_gate_graph_utf8.py") -RequireFullSuite
 }
 
 function Invoke-ReleaseRehearsal {
@@ -658,7 +658,8 @@ function Invoke-ReleaseRehearsal {
         "--rehearsal-root",
         $rehearsalRoot,
         "--version",
-        "l4-local-rehearsal"
+        "l4-local-rehearsal",
+        "--legacy-rehearsal"
     )
     $reportPath = Join-Path $rehearsalRoot "release_rehearsal_report.json"
     if (-not (Test-Path $reportPath -PathType Leaf)) {
@@ -759,7 +760,7 @@ if ($Level -eq "L4") {
     Invoke-GateStep "20+ parity QA" { Invoke-Parity20 }
     Invoke-GateStep "real dialogue replay QA" { Invoke-RealDialogueReplay }
     Invoke-GateStep "historical failure replay QA" { Invoke-HistoricalFailureReplay }
-    Invoke-GateStep "random 10-question guard QA" { Invoke-RandomGuard }
+    Invoke-GateStep "random 10-question QA graph" { Invoke-RandomGuard }
     Invoke-GateStep "video upload transcode retry gate" { Invoke-PytestFiles @("tests/test_kf_send_receipt_faults.py") }
     Invoke-GateStep "rollback, cutover and release rehearsal tests" { Invoke-PytestFiles $L4RollbackTests }
     Invoke-GateStep "release/current rehearsal local artifact" { Invoke-ReleaseRehearsal }
