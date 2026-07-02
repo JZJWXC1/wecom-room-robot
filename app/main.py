@@ -8810,8 +8810,17 @@ def _controlled_slot_appendix_from_outbound_package(package: Any) -> str:
             room = str(sensitive_payload.get("room") or "这套房").strip()
             contacts = [str(number) for number in sensitive_payload.get("contact_numbers") or [] if str(number).strip()]
             if contacts:
-                lines.append(f"{room}看房提前联系：{' / '.join(contacts)}")
+                lines.append(f"{_viewing_contact_appendix_label(room)}：{' / '.join(contacts)}")
     return "\n".join(dict.fromkeys(line for line in lines if line)).strip()
+
+
+def _viewing_contact_appendix_label(room: str) -> str:
+    room_label = str(room or "").strip() or "这套房"
+    if room_label == "看房":
+        return "看房提前联系"
+    if room_label == "看房/密码异常":
+        return "看房/密码异常请联系"
+    return f"{room_label}看房提前联系"
 
 
 def _append_controlled_slot_appendix(reply_text: str, appendix: str) -> str:

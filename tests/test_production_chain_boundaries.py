@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -215,6 +216,38 @@ def test_controlled_viewing_contact_keeps_exception_when_user_reports_door_issue
     assert evidence["field_values"]["room"] == "看房/密码异常"
     assert action["sensitive_payload"]["room"] == "看房/密码异常"
     assert action["metadata"]["viewing_exception"] is True
+
+
+def test_controlled_viewing_contact_appendix_does_not_duplicate_plain_viewing_label() -> None:
+    package = SimpleNamespace(
+        send_actions=[
+            SimpleNamespace(
+                action_type="viewing_contact",
+                sensitive_payload={"room": "看房", "contact_numbers": list(main.CONTACT_NUMBERS)},
+            )
+        ]
+    )
+
+    appendix = main._controlled_slot_appendix_from_outbound_package(package)
+
+    assert "看房看房" not in appendix
+    assert appendix.startswith("看房提前联系：")
+
+
+def test_controlled_viewing_contact_appendix_keeps_exception_label_readable() -> None:
+    package = SimpleNamespace(
+        send_actions=[
+            SimpleNamespace(
+                action_type="viewing_contact",
+                sensitive_payload={"room": "看房/密码异常", "contact_numbers": list(main.CONTACT_NUMBERS)},
+            )
+        ]
+    )
+
+    appendix = main._controlled_slot_appendix_from_outbound_package(package)
+
+    assert "异常看房" not in appendix
+    assert appendix.startswith("看房/密码异常请联系：")
 
 
 def test_langgraph_business_knowledge_does_not_call_legacy_rag_retrieve(monkeypatch) -> None:
