@@ -17,6 +17,7 @@ from app.config import settings
 from app.services.config_check import is_missing_or_placeholder
 from app.services.feishu import FeishuClient
 from app.services.fuzzy_match import canonical_community_display, fuzzy_contains_score
+from app.services.inventory_images import inventory_image_glob_paths
 from app.services.inventory_legacy_parser import spreadsheet_values_to_inventory_rows
 from app.services.inventory_query import (
     filter_scored_by_hard_constraints,
@@ -709,7 +710,7 @@ class InventoryService:
         return text
 
     def _image_paths(self) -> list:
-        paths = sorted(settings.room_database_path.parent.glob(settings.inventory_image_glob))
+        paths = inventory_image_glob_paths()
         if not paths and settings.inventory_image_path.exists():
             paths = [settings.inventory_image_path]
         return [path for path in paths if path.is_file()]

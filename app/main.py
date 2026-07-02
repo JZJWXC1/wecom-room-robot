@@ -48,6 +48,7 @@ from app.services.fuzzy_match import (
     normalize_search_text,
 )
 from app.services.inventory import InventoryService
+from app.services.inventory_images import inventory_image_glob_paths
 from app.services.inventory_image_sync import InventoryImageSyncer
 from app.services.inventory_snapshot_shadow import run_inventory_snapshot_shadow
 from app.services.inventory_read_models import (
@@ -2734,7 +2735,7 @@ async def _run_admin_region_inventory_sync_graph(
 
 
 def _current_inventory_images() -> list[Path]:
-    paths = sorted(Path().glob(settings.inventory_image_glob))
+    paths = inventory_image_glob_paths()
     if not paths and settings.inventory_image_path.exists():
         paths = [settings.inventory_image_path]
     if not paths:
