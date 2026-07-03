@@ -2570,17 +2570,54 @@ def test_area_alias_filter_excludes_cross_region_rows() -> None:
         },
         {
             "区域": "拱墅万达\n北部软件园\n城北万象城",
+            "小区": "星桥锦绣嘉苑",
+            "房号": "20-1606A",
+            "户型描述": "一室一厅独立厨卫带阳台",
+            "户型分类": "一室一厅",
+            "押一付一": "1900",
+            "押二付一": "1800",
+            "备注": "水30元/月，电1元/度",
+        },
+        {
+            "区域": "拱墅万达\n北部软件园\n城北万象城",
+            "小区": "小洋坝家园一区",
+            "房号": "6-201C",
+            "户型描述": "朝南一室主卧独卫",
+            "户型分类": "一室",
+            "押一付一": "1600",
+            "押二付一": "1500",
+            "备注": "水30元/月，电1元/度",
+        },
+        {
+            "区域": "拱墅万达\n北部软件园\n城北万象城",
+            "小区": "小洋坝家园二区",
+            "房号": "7-1001E",
+            "户型描述": "一室一厅独立厨卫",
+            "户型分类": "一室一厅",
+            "押一付一": "1800",
+            "押二付一": "1700",
+            "备注": "水30元/月，电1元/度",
+        },
+        {
+            "区域": "拱墅万达\n北部软件园\n城北万象城",
             "小区": "大华海派风景",
             "房号": "6-703-2",
+            "户型描述": "一室朝南主卧独立厨卫",
             "户型分类": "一室",
             "押一付一": "1300",
+            "押二付一": "1200",
             "备注": "水30元/月，电1元/度",
         },
     ]
 
-    filtered = main._filter_rows_by_constraint_proof(rows, {}, query_text="北软附近1800以内的一室还有吗？")
+    filtered = main._filter_rows_by_constraint_proof(rows, {}, query_text="北软附近1800以内的一室还有吗？独卫优先")
 
-    assert [main._row_label(row) for row in filtered] == ["大华海派风景6-703-2"]
+    assert [main._row_label(row) for row in filtered] == [
+        "星桥锦绣嘉苑20-1606A",
+        "小洋坝家园一区6-201C",
+        "小洋坝家园二区7-1001E",
+        "大华海派风景6-703-2",
+    ]
 
 
 def test_refine_followup_filters_within_previous_candidate_region() -> None:
@@ -2641,19 +2678,51 @@ def test_execute_tools_applies_region_whitelist_after_normal_inventory_search(mo
             "押一付一": "2100",
             "押二付一": "1800",
         }
-        right_row = {
-            "区域": "拱墅万达\n北部软件园\n城北万象城",
-            "小区": "大华海派风景",
-            "房号": "6-703-2",
-            "户型分类": "一室",
-            "押一付一": "1300",
-        }
+        expected_rows = [
+            {
+                "区域": "拱墅万达\n北部软件园\n城北万象城",
+                "小区": "星桥锦绣嘉苑",
+                "房号": "20-1606A",
+                "户型描述": "一室一厅独立厨卫带阳台",
+                "户型分类": "一室一厅",
+                "押一付一": "1900",
+                "押二付一": "1800",
+            },
+            {
+                "区域": "拱墅万达\n北部软件园\n城北万象城",
+                "小区": "小洋坝家园一区",
+                "房号": "6-201C",
+                "户型描述": "朝南一室主卧独卫",
+                "户型分类": "一室",
+                "押一付一": "1600",
+                "押二付一": "1500",
+            },
+            {
+                "区域": "拱墅万达\n北部软件园\n城北万象城",
+                "小区": "小洋坝家园二区",
+                "房号": "7-1001E",
+                "户型描述": "一室一厅独立厨卫",
+                "户型分类": "一室一厅",
+                "押一付一": "1800",
+                "押二付一": "1700",
+            },
+            {
+                "区域": "拱墅万达\n北部软件园\n城北万象城",
+                "小区": "大华海派风景",
+                "房号": "6-703-2",
+                "户型描述": "一室朝南主卧独立厨卫",
+                "户型分类": "一室",
+                "押一付一": "1300",
+                "押二付一": "1200",
+            },
+        ]
+        expected_labels = [main._row_label(row) for row in expected_rows]
 
         async def fake_search_rows(context, query, limit=10):
-            return [wrong_row], []
+            return [wrong_row, expected_rows[0], expected_rows[2]], []
 
         async def fake_all_rows(context, limit=500, refresh_if_needed=True):
-            return [wrong_row, right_row], []
+            return [wrong_row, *expected_rows], []
 
         async def fake_metadata(context):
             return {"source": "unit"}
@@ -2664,18 +2733,19 @@ def test_execute_tools_applies_region_whitelist_after_normal_inventory_search(mo
 
         evidence = await main._execute_tools(
             actions=["search_inventory"],
-            content="北软附近1800以内的一室还有吗？",
+            content="北软附近1800以内的一室还有吗？独卫优先",
             context=kf_context_memory.empty_context(),
             understanding={
-                "effective_query": "北软附近1800以内的一室还有吗？",
+                "effective_query": "北软附近1800以内的一室还有吗？独卫优先",
                 "constraint_proof": {},
                 "structured_task": {},
             },
             inventory_read_context=main._local_inventory_read_context("unit"),
         )
 
-        assert [main._row_label(row) for row in evidence["inventory_rows"]] == ["大华海派风景6-703-2"]
-        assert evidence["region_whitelist"]["labels"] == ["大华海派风景6-703-2"]
+        assert [main._row_label(row) for row in evidence["inventory_rows"]] == expected_labels
+        assert evidence["region_whitelist"]["labels"] == expected_labels
+        assert [row["label"] for row in main._tool_evidence_summary(evidence)["tool_candidates"]] == expected_labels
 
     asyncio.run(run_case())
 
