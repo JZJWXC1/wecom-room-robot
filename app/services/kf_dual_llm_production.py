@@ -64,12 +64,14 @@ def _has_greeting_reply_compose_signal(packet: StructuredTaskPacket) -> bool:
     has_reply_signal = False
     for task in packet.tasks or []:
         task_type = str(getattr(task, "task_type", "") or "").strip()
+        if _is_literal_greeting_text(getattr(task, "user_text", "")):
+            return True
         if task_type != "reply_compose_signal":
             continue
         has_reply_signal = True
-        if _is_literal_greeting_text(getattr(task, "user_text", "")):
-            return True
-    return has_reply_signal and _is_literal_greeting_text(getattr(packet, "rewritten_query", ""))
+    return _is_literal_greeting_text(getattr(packet, "rewritten_query", "")) or (
+        has_reply_signal and _is_literal_greeting_text(getattr(packet, "rewritten_query", ""))
+    )
 
 
 def normalize_mode(value: Any) -> str:

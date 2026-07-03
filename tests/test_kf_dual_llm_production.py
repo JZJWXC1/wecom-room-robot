@@ -824,7 +824,8 @@ def test_production_validator_accepts_evidence_bound_viewing_contact_for_passwor
 
         assert package_passed(package)
         assert validation.status == ValidationStatus.PASS
-        assert package.reply_text == "这套看房要先联系确认，我把联系方式发你。"
+        assert package.reply_text == "看房需要联系确认，联系方式如下。"
+        assert package.self_review["reply_text_owner"] == "controlled_template"
 
     asyncio.run(run_case())
 

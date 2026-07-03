@@ -15,6 +15,187 @@ from app.services.kf_llm1_task_packet import (
 from app.services.rule_knowledge import RuleKnowledgeService
 
 
+_LLM2_VISIBLE_TOP_LEVEL_KEYS = (
+    "schema_version",
+    "conversation_id",
+    "turn_id",
+    "case_id",
+    "audience",
+    "inventory_snapshot_id",
+    "candidate_set_id",
+    "tool_name",
+    "source_record_id",
+    "sensitivity",
+    "fetched_at",
+)
+_LLM2_VISIBLE_CANDIDATE_KEYS = (
+    "candidate_number",
+    "listing_id",
+    "evidence_id",
+    "community",
+    "room_no",
+    "title",
+    "rent_pay1",
+    "rent_pay2",
+    "score",
+    "source_kind",
+)
+_LLM2_VISIBLE_EVIDENCE_KEYS = (
+    "conversation_id",
+    "turn_id",
+    "case_id",
+    "inventory_snapshot_id",
+    "candidate_set_id",
+    "listing_id",
+    "evidence_id",
+    "evidence_type",
+    "source_kind",
+    "source_record_id",
+    "sensitivity",
+    "fetched_at",
+    "confidence",
+)
+_LLM2_VISIBLE_FIELD_KEYS = {
+    "listing_id",
+    "candidate_number",
+    "community",
+    "community_name",
+    "小区",
+    "room_no",
+    "room",
+    "房号",
+    "title",
+    "area",
+    "区域",
+    "layout",
+    "layout_description",
+    "户型",
+    "户型分类",
+    "户型描述",
+    "rent_pay1",
+    "rent_pay2",
+    "rent",
+    "押一付一",
+    "押二付一",
+    "utilities",
+    "备注",
+    "room_label",
+    "source_kind",
+    "source_hash",
+    "snapshot_id",
+    "kind",
+    "media_kind",
+    "media_number",
+    "binding_number",
+    "send_channel",
+    "artifact",
+    "error_code",
+    "requested_indices",
+    "candidate_count",
+    "candidate_labels",
+    "requested",
+    "has_original_source",
+    "has_sendable_video",
+    "has_sendable_image",
+    "original_video_path_count",
+    "original_video_urls",
+    "material_page_urls",
+    "field",
+    "missing_target",
+    "requires_customer_room_ref",
+    "resolution",
+    "label",
+    "name",
+    "conditions",
+    "service_fee",
+    "self_check",
+    "availability_status",
+    "availability_summary",
+}
+_LLM2_VISIBLE_METADATA_KEYS = {
+    "candidate_number",
+    "media_number",
+    "binding_number",
+    "source_hash",
+    "error_code",
+    "controlled_error_code",
+}
+
+
+def _llm2_visible_dict(payload: dict[str, Any], keys: tuple[str, ...] | set[str]) -> dict[str, Any]:
+    return {key: safe_artifact_payload(payload.get(key)) for key in keys if key in payload}
+
+
+def _llm2_visible_candidate_set(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result = _llm2_visible_dict(value, _LLM2_VISIBLE_TOP_LEVEL_KEYS)
+    candidates = []
+    for item in value.get("candidates") or []:
+        if isinstance(item, dict):
+            candidates.append(_llm2_visible_dict(item, _LLM2_VISIBLE_CANDIDATE_KEYS))
+    if candidates:
+        result["candidates"] = candidates
+    query_state = value.get("query_state") if isinstance(value.get("query_state"), dict) else {}
+    if query_state:
+        result["query_state"] = safe_artifact_payload(query_state)
+    return result
+
+
+def _llm2_visible_field_values(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): safe_artifact_payload(item)
+        for key, item in value.items()
+        if str(key) in _LLM2_VISIBLE_FIELD_KEYS
+    }
+
+
+def _llm2_visible_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): safe_artifact_payload(item)
+        for key, item in value.items()
+        if str(key) in _LLM2_VISIBLE_METADATA_KEYS
+    }
+
+
+def _llm2_visible_evidence_item(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    result = _llm2_visible_dict(value, _LLM2_VISIBLE_EVIDENCE_KEYS)
+    field_values = _llm2_visible_field_values(value.get("field_values"))
+    if field_values:
+        result["field_values"] = field_values
+    metadata = _llm2_visible_metadata(value.get("metadata"))
+    if metadata:
+        result["metadata"] = metadata
+    return result
+
+
+def _llm2_visible_evidence_bundle(evidence_bundle: dict[str, Any] | None) -> dict[str, Any]:
+    payload = safe_artifact_payload(evidence_bundle or {})
+    if not isinstance(payload, dict):
+        return {}
+    result = _llm2_visible_dict(payload, _LLM2_VISIBLE_TOP_LEVEL_KEYS)
+    field_values = _llm2_visible_field_values(payload.get("field_values"))
+    if field_values:
+        result["field_values"] = field_values
+    candidate_set = _llm2_visible_candidate_set(payload.get("candidate_set"))
+    if candidate_set:
+        result["candidate_set"] = candidate_set
+    evidence_items = []
+    for item in payload.get("evidence") or []:
+        visible_item = _llm2_visible_evidence_item(item)
+        if visible_item:
+            evidence_items.append(visible_item)
+    if evidence_items:
+        result["evidence"] = evidence_items
+    return result
+
+
 class ReplyGenerator:
     def __init__(
         self,
@@ -366,7 +547,7 @@ Validator / Tool Resolver 回传的内部缺失证据：
                 "source": "missing_llm_key",
             }
         safe_task = safe_artifact_payload(task_packet or {})
-        safe_evidence = safe_artifact_payload(evidence_bundle or {})
+        safe_evidence = _llm2_visible_evidence_bundle(evidence_bundle or {})
         safe_strategy = safe_artifact_payload(response_strategy or {})
         system_prompt = (
             f"你是租房客服 Agentic RAG 的 LLM2 outbound {mode_label}，只负责怎么说。"

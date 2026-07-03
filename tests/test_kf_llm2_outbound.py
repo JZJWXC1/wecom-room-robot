@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
+from app.services import kf_dual_llm_production
 from app.services.kf_contracts import (
     CandidateItem,
     CandidateSet,
@@ -140,6 +142,64 @@ def test_production_contract_retries_when_llm2_omits_visible_reply_for_evidence(
     assert package.reply_text == ""
     assert "llm2_output_missing_visible_reply" in package.self_review["retry_reason"]
     assert [action.action_id for action in package.send_actions] == ["send-video-1"]
+
+
+def test_deterministic_fallback_oralizes_inventory_candidates_without_raw_candidate_rows() -> None:
+    packet = StructuredTaskPacket(
+        conversation_id="conv-candidate",
+        turn_id="turn-candidate",
+        case_id="case-candidate",
+        inventory_snapshot_id="snap-candidate",
+        candidate_set_id="cand-candidate",
+        response_strategy=ResponseStrategy.ANSWER,
+        tasks=[
+            TaskAtom(
+                task_id="task-candidate",
+                task_type="inventory_search",
+                user_text="1 and 3 still available?",
+                required_tools=["inventory.search"],
+            )
+        ],
+    )
+    bundle = ToolEvidenceBundle(
+        conversation_id="conv-candidate",
+        turn_id="turn-candidate",
+        case_id="case-candidate",
+        inventory_snapshot_id="snap-candidate",
+        candidate_set_id="cand-candidate",
+        tool_name="llm2.test.candidate",
+        evidence=[
+            EvidenceItem(
+                evidence_id="evd-candidate-1",
+                listing_id="lst-candidate-1",
+                inventory_snapshot_id="snap-candidate",
+                evidence_type="inventory_candidate",
+                summary="候选1 TestGarden 1-101 租金2500",
+                field_values={
+                    "community": "TestGarden",
+                    "room_no": "1-101",
+                    "layout_description": "one bedroom",
+                    "rent_pay1": 2500,
+                },
+                metadata={"candidate_number": 1},
+            )
+        ],
+    )
+
+    package = compose_kf_outbound(
+        packet,
+        bundle,
+        ResponseStrategy.ANSWER,
+        llm_output={},
+        allow_deterministic_fallback=True,
+    )
+    validation = validate_prepared_outbound_package(package)
+
+    assert package.reply_text.startswith("我按房源表查到这几套：")
+    assert "候选1" not in package.reply_text
+    assert "TestGarden" in package.reply_text
+    assert "1-101" in package.reply_text
+    assert validation.status == ValidationStatus.PASS
 
 
 def test_deterministic_fallback_replies_to_short_acknowledgement_signal() -> None:
@@ -470,7 +530,7 @@ def test_deterministic_llm2_fallback_prioritizes_viewing_guidance_over_listing_s
                 evidence_id="evd-controlled-viewing-guidance-1",
                 listing_id="lst-1102",
                 evidence_type="viewing_guidance",
-                summary="石桥铭苑6-1102 可以按看房方式自助查看；具体开门信息按受控通道单独确认。",
+                summary="石桥铭苑6-1102 可以按看房方式自助查看；具体开门信息需要单独确认。",
                 field_values={"room": "石桥铭苑6-1102", "has_password": True, "needs_contact": False},
                 metadata={"controlled_channel": "viewing_guidance", "evidence_bound": True},
             ),
@@ -491,6 +551,118 @@ def test_deterministic_llm2_fallback_prioritizes_viewing_guidance_over_listing_s
     assert validation.status == ValidationStatus.PASS
     assert "看房方式" in package.reply_text
     assert "押一付一4800" not in package.reply_text
+
+
+def test_deterministic_llm2_fallback_oralizes_selection_error_for_customer() -> None:
+    packet = StructuredTaskPacket(
+        conversation_id="conv-selection-error",
+        turn_id="turn-selection-error",
+        case_id="case-selection-error",
+        inventory_snapshot_id="snap-selection-error",
+        response_strategy=ResponseStrategy.SEND_MEDIA,
+        tasks=[
+            TaskAtom(
+                task_id="task-image",
+                task_type="send_image",
+                user_text="不是3号，是第二套图片",
+                required_tools=["media.image"],
+            )
+        ],
+    )
+    bundle = ToolEvidenceBundle(
+        conversation_id="conv-selection-error",
+        turn_id="turn-selection-error",
+        case_id="case-selection-error",
+        inventory_snapshot_id="snap-selection-error",
+        tool_name="llm2.test.selection_error",
+        evidence=[
+            EvidenceItem(
+                evidence_id="evd-target-selection-error-1",
+                evidence_type="selection_error",
+                summary="客户选择了第2套，但没有可用候选。",
+                field_values={
+                    "error_code": "selection_error",
+                    "requested_indices": [2],
+                    "candidate_count": 0,
+                    "reason": "missing_current_candidate_set",
+                },
+                metadata={"controlled_error_code": "selection_error"},
+            )
+        ],
+        raw_tool_result={"actions": ["search_inventory", "context_tools", "send_image", "explain_missing_media"]},
+    )
+
+    package = compose_kf_outbound(
+        packet,
+        bundle,
+        ResponseStrategy.SEND_MEDIA,
+        llm_output={},
+        send_actions=[],
+        allow_deterministic_fallback=True,
+    )
+    validation = validate_prepared_outbound_package(package, task_packet=packet)
+
+    assert validation.status == ValidationStatus.PASS
+    assert "第2套" in package.reply_text
+    assert "图片" in package.reply_text
+    assert "客户选择了" not in package.reply_text
+    assert "工具未绑定" not in package.reply_text
+    assert "上一轮只有" not in package.reply_text
+
+
+def test_deterministic_llm2_fallback_oralizes_price_selection_error_by_task_type() -> None:
+    packet = StructuredTaskPacket(
+        conversation_id="conv-price-selection-error",
+        turn_id="turn-price-selection-error",
+        case_id="case-price-selection-error",
+        inventory_snapshot_id="snap-price-selection-error",
+        response_strategy=ResponseStrategy.ANSWER,
+        tasks=[
+            TaskAtom(
+                task_id="task-price",
+                task_type="inventory_search",
+                user_text="这两套哪个价格低一点？",
+                required_tools=["inventory.search"],
+            )
+        ],
+    )
+    bundle = ToolEvidenceBundle(
+        conversation_id="conv-price-selection-error",
+        turn_id="turn-price-selection-error",
+        case_id="case-price-selection-error",
+        inventory_snapshot_id="snap-price-selection-error",
+        tool_name="llm2.test.price_selection_error",
+        evidence=[
+            EvidenceItem(
+                evidence_id="evd-target-selection-error-1",
+                evidence_type="selection_error",
+                summary="客户选择了第1套和第2套，但没有可用候选。",
+                field_values={
+                    "error_code": "selection_error",
+                    "requested_indices": [1, 2],
+                    "candidate_count": 0,
+                    "reason": "missing_current_candidate_set",
+                },
+                metadata={"controlled_error_code": "selection_error"},
+            )
+        ],
+        raw_tool_result={"actions": ["search_inventory", "generate_reply"]},
+    )
+
+    package = compose_kf_outbound(
+        packet,
+        bundle,
+        ResponseStrategy.ANSWER,
+        llm_output={},
+        send_actions=[],
+        allow_deterministic_fallback=True,
+    )
+    validation = validate_prepared_outbound_package(package, task_packet=packet)
+
+    assert validation.status == ValidationStatus.PASS
+    assert "比较价格" in package.reply_text
+    assert "素材" not in package.reply_text
+    assert "客户选择了" not in package.reply_text
 
 
 def test_non_media_controlled_action_ignores_unknown_llm2_caption_id() -> None:
@@ -562,6 +734,199 @@ def test_non_media_controlled_action_ignores_unknown_llm2_caption_id() -> None:
     assert package.claims == []
     assert package.action_captions == []
     assert validation.status == ValidationStatus.PASS
+
+
+def test_controlled_contract_action_uses_template_reply_not_llm_promise() -> None:
+    packet = StructuredTaskPacket(
+        conversation_id="conv-contract-contact",
+        turn_id="turn-contract-contact",
+        case_id="case-contract-contact",
+        inventory_snapshot_id="snap-contract-contact",
+        response_strategy=ResponseStrategy.TOOL_FIRST,
+        tasks=[
+            TaskAtom(
+                task_id="task-contract-contact",
+                task_type="contract_contact",
+                user_text="我要订房，合同怎么签",
+                required_tools=["business.contract_contact"],
+            )
+        ],
+    )
+    evidence_id = "evd-controlled-contract-contact-1"
+    action_id = "send-controlled-contract-contact-1"
+    bundle = ToolEvidenceBundle(
+        conversation_id="conv-contract-contact",
+        turn_id="turn-contract-contact",
+        case_id="case-contract-contact",
+        inventory_snapshot_id="snap-contract-contact",
+        tool_name="llm2.test.contract_contact",
+        evidence=[
+            EvidenceItem(
+                evidence_id=evidence_id,
+                evidence_type="contract_contact",
+                summary="合同、定金和订房需要发联系方式。",
+                field_values={"slot": "contract_contact"},
+                metadata={"controlled_channel": "contract_contact", "evidence_bound": True},
+            )
+        ],
+    )
+
+    package = compose_kf_outbound(
+        packet,
+        bundle,
+        ResponseStrategy.TOOL_FIRST,
+        llm_output={
+            "reply_text": "好的，马上为您安排合同签约事宜。专属顾问会尽快联系您确认细节。",
+            "self_review": {"status": "pass"},
+        },
+        send_actions=[
+            SendAction(
+                action_id=action_id,
+                action_type="contract_contact",
+                evidence_id=evidence_id,
+                metadata={"controlled_channel": "contract_contact", "evidence_bound": True},
+            )
+        ],
+        allow_deterministic_fallback=False,
+    )
+    validation = validate_prepared_outbound_package(package, task_packet=packet)
+
+    assert package.reply_text == "合同、定金和订房联系方式如下。"
+    assert "马上" not in package.reply_text
+    assert "安排" not in package.reply_text
+    assert "专属顾问" not in package.reply_text
+    assert package.self_review["reply_text_owner"] == "controlled_template"
+    assert package.send_actions[0].action_type == "contract_contact"
+    assert validation.status == ValidationStatus.PASS
+
+
+def test_payment_options_question_uses_tool_template_for_both_price_fields() -> None:
+    packet = StructuredTaskPacket(
+        conversation_id="conv-payment-options",
+        turn_id="turn-payment-options",
+        case_id="case-payment-options",
+        inventory_snapshot_id="snap-payment-options",
+        response_strategy=ResponseStrategy.ANSWER,
+        tasks=[
+            TaskAtom(
+                task_id="task-payment-options",
+                task_type="inventory_search",
+                user_text="那两套押一押二分别多少？",
+                required_tools=["inventory.search"],
+            )
+        ],
+    )
+    bundle = ToolEvidenceBundle(
+        conversation_id="conv-payment-options",
+        turn_id="turn-payment-options",
+        case_id="case-payment-options",
+        inventory_snapshot_id="snap-payment-options",
+        tool_name="llm2.test.payment_options",
+        evidence=[
+            EvidenceItem(
+                evidence_id="evd-jt",
+                listing_id="lst-jt",
+                evidence_type="inventory_listing",
+                summary="骏塘名庭8-1101A 押一付一1500 押二付一1300",
+                field_values={
+                    "community": "骏塘名庭",
+                    "room_no": "8-1101A",
+                    "rent_pay1": 1500,
+                    "rent_pay2": 1300,
+                },
+            ),
+            EvidenceItem(
+                evidence_id="evd-wq",
+                listing_id="lst-wq",
+                evidence_type="inventory_listing",
+                summary="琬秋铭府3-702A 押一付一1900 押二付一1700",
+                field_values={
+                    "community": "琬秋铭府",
+                    "room_no": "3-702A",
+                    "rent_pay1": 1900,
+                    "rent_pay2": 1700,
+                },
+            ),
+        ],
+    )
+
+    package = compose_kf_outbound(
+        packet,
+        bundle,
+        ResponseStrategy.ANSWER,
+        llm_output={
+            "reply_text": "好的，这两套的押二付一价格分别是：骏塘名庭1300元，琬秋铭府1700元。",
+            "self_review": {"status": "pass"},
+        },
+        send_actions=[],
+        allow_deterministic_fallback=False,
+    )
+
+    assert "押一付一1500元/月" in package.reply_text
+    assert "押二付一1300元/月" in package.reply_text
+    assert "押一付一1900元/月" in package.reply_text
+    assert "押二付一1700元/月" in package.reply_text
+    assert package.self_review["reply_text_owner"] == "controlled_template"
+    assert package.self_review["controlled_reply_template"] == "payment_options_reply"
+
+
+def test_original_video_request_without_source_uses_no_source_template() -> None:
+    packet = StructuredTaskPacket(
+        conversation_id="conv-original-video",
+        turn_id="turn-original-video",
+        case_id="case-original-video",
+        inventory_snapshot_id="snap-original-video",
+        response_strategy=ResponseStrategy.SEND_MEDIA,
+        tasks=[
+            TaskAtom(
+                task_id="task-original-video",
+                task_type="send_video",
+                user_text="原视频发我",
+                required_tools=["media.video"],
+            )
+        ],
+    )
+    bundle = ToolEvidenceBundle(
+        conversation_id="conv-original-video",
+        turn_id="turn-original-video",
+        case_id="case-original-video",
+        inventory_snapshot_id="snap-original-video",
+        tool_name="llm2.test.original_video",
+        evidence=[
+            EvidenceItem(
+                evidence_id="evd-video-sq",
+                listing_id="lst-sq",
+                evidence_type="video",
+                summary="石桥铭苑6-1102 企业微信可发送视频",
+                field_values={"community": "石桥铭苑", "room_no": "6-1102"},
+            )
+        ],
+        raw_tool_result={
+            "original_video_request": {
+                "requested": True,
+                "has_original_source": False,
+                "reason": "当前素材库只提供企业微信可发送视频，没有单独的原视频/高清下载链接证据。",
+            }
+        },
+    )
+
+    package = compose_kf_outbound(
+        packet,
+        bundle,
+        ResponseStrategy.SEND_MEDIA,
+        llm_output={
+            "reply_text": "这是石桥铭苑6-1102的原视频。",
+            "action_captions": [{"action_id": "send-video-1", "text": "这是石桥铭苑6-1102的视频。"}],
+            "self_review": {"status": "pass"},
+        },
+        send_actions=[SendAction(action_id="send-video-1", action_type="video", evidence_id="evd-video-sq")],
+        allow_deterministic_fallback=False,
+    )
+
+    assert package.reply_text == "目前工具证据里没有原视频/高清下载链接；这套企业微信可发送视频如下。"
+    assert "的原视频" not in package.reply_text
+    assert package.self_review["controlled_reply_template"] == "original_video_no_source_reply"
+    assert package.send_actions[0].action_type == "video"
 
 
 def test_deterministic_llm2_fallback_prioritizes_deposit_policy_over_listing_summary() -> None:
@@ -659,6 +1024,46 @@ def test_deterministic_llm2_fallback_replies_for_greeting_compose_signal() -> No
     assert package.answered_task_ids == ["task-greeting"]
     assert "小区" in package.reply_text
     assert "视频" in package.reply_text
+
+
+def test_production_greeting_uses_controlled_renderer_even_with_reply_text_task() -> None:
+    class ReplyGeneratorShouldNotRun:
+        async def compose_kf_outbound_production(self, **kwargs):
+            raise AssertionError("literal greeting must use controlled renderer before free LLM2")
+
+    async def run_case() -> None:
+        packet = StructuredTaskPacket(
+            conversation_id="conv-greeting-production",
+            turn_id="turn-greeting-production",
+            case_id="case-greeting-production",
+            inventory_snapshot_id="snap-greeting-production",
+            response_strategy=ResponseStrategy.ANSWER,
+            rewritten_query="你好，在吗",
+            tasks=[
+                TaskAtom(
+                    task_id="task-greeting",
+                    task_type="reply_text",
+                    user_text="你好，在吗",
+                    required_tools=["reply.compose"],
+                )
+            ],
+        )
+
+        package = await kf_dual_llm_production.compose_production_outbound_package(
+            reply_generator=ReplyGeneratorShouldNotRun(),
+            task_packet=packet,
+            tool_evidence={"actions": ["generate_reply"]},
+            draft_reply="",
+            planner_result={"actions": ["generate_reply"]},
+            reply_result={},
+        )
+
+        assert package.reply_source == kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+        assert "稍后" not in package.reply_text
+        assert "小区" in package.reply_text
+        assert "视频" in package.reply_text
+
+    asyncio.run(run_case())
 
 
 def test_production_requires_llm2_action_captions_for_media_actions() -> None:

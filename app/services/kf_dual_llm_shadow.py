@@ -942,6 +942,7 @@ def _rule_evidence_items(task_packet: StructuredTaskPacket, evidence: dict[str, 
                 summary=(
                     "免押是支付宝无忧住芝麻信用评估，不是免费免押；"
                     "符合风控后需支付押金金额 5.5%-8% 的免押服务费。"
+                    "客户可以打开支付宝：我的 - 芝麻信用 - 我的 - 信用额度 - 租房板块申请额度，有额度再继续走免押流程。"
                 ),
                 source_kind="rule_evidence",
                 source_record_id=_stable_hash(deposit_policy),

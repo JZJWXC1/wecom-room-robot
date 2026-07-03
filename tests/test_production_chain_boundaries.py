@@ -268,6 +268,7 @@ def test_langgraph_business_knowledge_does_not_call_legacy_rag_retrieve(monkeypa
         assert "deposit_waiver" in result["topics"]
         assert "无忧住" in result["knowledge_context"]
         assert result["rule_evidence"]["deposit_policy"]["name"] == "支付宝无忧住信用免押"
+        assert "租房板块申请额度" in result["rule_evidence"]["deposit_policy"]["self_check"]["customer_phrase"]
 
     asyncio.run(run_case())
 

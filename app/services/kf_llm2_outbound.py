@@ -179,6 +179,14 @@ def compose_kf_outbound(
     claims = claim_items or _default_claims(packet, bundle)
     action_captions = caption_result.items or _default_action_captions(packet, trusted_actions, evidence_by_id, _candidate_labels_by_listing(bundle))
     reply_text = _normalize_inventory_sheet_only_reply_text(reply_text, trusted_actions, evidence_by_id)
+    reply_text, price_reply_template = _normalize_requested_payment_options_reply_text(reply_text, packet, bundle)
+    reply_text, original_video_reply_template = _normalize_original_video_reply_text(
+        reply_text,
+        packet,
+        bundle,
+        trusted_actions,
+    )
+    reply_text, controlled_reply_template = _normalize_controlled_slot_reply_text(reply_text, trusted_actions)
     answered_task_ids = _answered_task_ids(packet, output.get("answered_task_ids"), claims, trusted_actions, bool(reply_text))
     self_review = _success_review(
         output_review,
@@ -186,6 +194,7 @@ def compose_kf_outbound(
         ignored_llm_send_actions=ignored_llm_send_actions,
         claim_count=len(claims),
         action_count=len(trusted_actions),
+        controlled_reply_template=controlled_reply_template or original_video_reply_template or price_reply_template,
     )
 
     return PreparedOutboundPackage(
@@ -277,6 +286,144 @@ def _normalize_inventory_sheet_only_reply_text(
     if "房源表" in text or "空房表" in text or "库存表" in text:
         return reply_text
     return "房源表图片发你了，你可以让客户先整体看一下。"
+
+
+def _normalize_controlled_slot_reply_text(reply_text: str, actions: list[SendAction]) -> tuple[str, str]:
+    controlled_types = {str(action.action_type or "").strip() for action in actions}
+    controlled_types &= CONTROLLED_SLOT_ACTION_TYPES
+    if not controlled_types:
+        return reply_text, ""
+
+    parts: list[str] = []
+    if "contract_contact" in controlled_types:
+        parts.append("合同、定金和订房联系方式如下。")
+
+    has_viewing_password = "viewing_password" in controlled_types
+    has_viewing_contact = "viewing_contact" in controlled_types
+    if has_viewing_password and has_viewing_contact:
+        parts.append("看房密码和联系方式如下。")
+    elif has_viewing_password:
+        parts.append("看房密码如下。")
+    elif has_viewing_contact:
+        parts.append("看房需要联系确认，联系方式如下。")
+
+    if not parts:
+        return reply_text, ""
+    template = "controlled_slot_reply"
+    return "".join(parts), template
+
+
+def _normalize_requested_payment_options_reply_text(
+    reply_text: str,
+    packet: StructuredTaskPacket,
+    bundle: ToolEvidenceBundle,
+) -> tuple[str, str]:
+    task_text = _packet_task_search_text(packet)
+    wants_pay1 = any(marker in task_text for marker in ("押一", "押1", "pay1", "rent_pay1"))
+    wants_pay2 = any(marker in task_text for marker in ("押二", "押2", "pay2", "rent_pay2"))
+    if not (wants_pay1 and wants_pay2):
+        return reply_text, ""
+    rows = _payment_option_rows(bundle)
+    if not rows:
+        return reply_text, ""
+    lines: list[str] = []
+    for index, row in enumerate(rows[:8], start=1):
+        label = str(row.get("label") or "").strip() or f"第{index}套"
+        rent_pay1 = str(row.get("rent_pay1") or "").strip()
+        rent_pay2 = str(row.get("rent_pay2") or "").strip()
+        parts: list[str] = []
+        if rent_pay1:
+            parts.append(f"押一付一{rent_pay1}元/月")
+        if rent_pay2:
+            parts.append(f"押二付一{rent_pay2}元/月")
+        if not parts:
+            continue
+        lines.append(f"{index}. {label}：{'，'.join(parts)}")
+    if not lines:
+        return reply_text, ""
+    return "这几套价格如下：\n" + "\n".join(lines), "payment_options_reply"
+
+
+def _normalize_original_video_reply_text(
+    reply_text: str,
+    packet: StructuredTaskPacket,
+    bundle: ToolEvidenceBundle,
+    actions: list[SendAction],
+) -> tuple[str, str]:
+    task_text = _packet_task_search_text(packet)
+    if not any(marker in task_text for marker in ("原视频", "原片", "高清", "源文件", "下载链接", "太糊", "模糊", "保存", "转发")):
+        return reply_text, ""
+    if _bundle_has_original_video_source(bundle):
+        return reply_text, ""
+    has_video_action = any(str(action.action_type or "").strip() == "video" for action in actions)
+    if has_video_action:
+        return "目前工具证据里没有原视频/高清下载链接；这套企业微信可发送视频如下。", "original_video_no_source_reply"
+    return "目前工具证据里没有原视频/高清下载链接。你回房源序号或小区+房号后，我再按素材库查。", "original_video_no_source_reply"
+
+
+def _bundle_has_original_video_source(bundle: ToolEvidenceBundle) -> bool:
+    raw = bundle.raw_tool_result if isinstance(bundle.raw_tool_result, dict) else {}
+    for key in ("original_video_paths", "original_video_urls", "material_page_urls"):
+        if raw.get(key):
+            return True
+    for item in bundle.evidence:
+        evidence_type = str(item.evidence_type or "").strip().lower()
+        if evidence_type in {"original_video", "original_video_url", "material_page", "material_page_url"}:
+            return True
+        values = dict(item.field_values or {})
+        metadata = dict(item.metadata or {})
+        for payload in (values, metadata):
+            if payload.get("original_video_url") or payload.get("material_page_url") or payload.get("original_video_path"):
+                return True
+    return False
+
+
+def _payment_option_rows(bundle: ToolEvidenceBundle) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def append_row(*, key: str, label: str, rent_pay1: Any, rent_pay2: Any) -> None:
+        safe_label = str(label or "").strip()
+        safe_pay1 = _digits_text(rent_pay1)
+        safe_pay2 = _digits_text(rent_pay2)
+        if not safe_label or (not safe_pay1 and not safe_pay2):
+            return
+        row_key = key or safe_label
+        if row_key in seen:
+            return
+        seen.add(row_key)
+        rows.append({"label": safe_label, "rent_pay1": safe_pay1, "rent_pay2": safe_pay2})
+
+    for item in bundle.evidence:
+        evidence_type = str(item.evidence_type or "").strip()
+        if evidence_type not in {"inventory_listing", "inventory_candidate"}:
+            continue
+        values = dict(item.field_values or {})
+        label = _evidence_room_label(item)
+        append_row(
+            key=str(item.listing_id or item.evidence_id or "").strip(),
+            label=label,
+            rent_pay1=values.get("rent_pay1") or values.get("rent_yayi") or values.get("押一付一"),
+            rent_pay2=values.get("rent_pay2") or values.get("rent_yaer") or values.get("押二付一"),
+        )
+    if rows or not bundle.candidate_set:
+        return rows
+    for candidate in bundle.candidate_set.candidates:
+        append_row(
+            key=str(candidate.listing_id or candidate.candidate_number or "").strip(),
+            label=_candidate_room_label(candidate),
+            rent_pay1=getattr(candidate, "rent_pay1", None),
+            rent_pay2=getattr(candidate, "rent_pay2", None),
+        )
+    return rows
+
+
+def _digits_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(r"[1-9]\d{2,5}", text)
+    return match.group(0) if match else text
 
 
 def _send_actions_from_bundle(packet: StructuredTaskPacket, bundle: ToolEvidenceBundle) -> list[SendAction]:
@@ -379,10 +526,10 @@ def _is_short_acknowledgement_text(text: str) -> bool:
 def _has_greeting_reply_compose_signal(packet: StructuredTaskPacket) -> bool:
     for task in packet.tasks or []:
         task_type = str(getattr(task, "task_type", "") or "").strip()
-        if task_type != "reply_compose_signal":
-            continue
         if _is_literal_greeting_text(getattr(task, "user_text", "")):
             return True
+        if task_type != "reply_compose_signal":
+            continue
     return _is_literal_greeting_text(getattr(packet, "rewritten_query", ""))
 
 
@@ -422,6 +569,12 @@ def _default_reply_text(
     prioritized = _priority_evidence_reply_text(packet, bundle)
     if prioritized:
         return prioritized
+    target_error_reply = _target_error_reply_text(packet, bundle)
+    if target_error_reply:
+        return target_error_reply
+    inventory_candidate_reply = _inventory_candidate_reply_text(bundle)
+    if inventory_candidate_reply:
+        return inventory_candidate_reply
     for item in bundle.evidence:
         if item.summary:
             return item.summary
@@ -435,6 +588,32 @@ def _default_reply_text(
     ):
         return "我按这个条件查了，最新房源表里暂时没有匹配的房源。你可以放宽预算、区域或户型，我再帮你筛。"
     return ""
+
+
+def _inventory_candidate_reply_text(bundle: ToolEvidenceBundle) -> str:
+    items = [
+        item
+        for item in bundle.evidence
+        if str(item.evidence_type or "").strip() == "inventory_candidate"
+    ]
+    if not items:
+        return ""
+    lines: list[str] = []
+    for index, item in enumerate(items[:8], start=1):
+        values = item.field_values if isinstance(item.field_values, dict) else {}
+        label = _evidence_room_label(item)
+        layout = str(values.get("layout_description") or values.get("layout") or "").strip()
+        rent_pay1 = str(values.get("rent_pay1") or "").strip()
+        rent_pay2 = str(values.get("rent_pay2") or "").strip()
+        parts = [part for part in (label, layout) if part]
+        if rent_pay1:
+            parts.append(f"押一付一{rent_pay1}")
+        if rent_pay2:
+            parts.append(f"押二付一{rent_pay2}")
+        if not parts:
+            parts.append(str(item.summary or "").strip() or "这套房源")
+        lines.append(f"{index}. {'，'.join(parts)}")
+    return "我按房源表查到这几套：" + "；".join(lines) + "。"
 
 
 def _priority_evidence_reply_text(packet: StructuredTaskPacket, bundle: ToolEvidenceBundle) -> str:
@@ -451,8 +630,64 @@ def _priority_evidence_reply_text(packet: StructuredTaskPacket, bundle: ToolEvid
     for evidence_type in preferred_types:
         for item in bundle.evidence:
             if str(item.evidence_type or "").strip() == evidence_type and str(item.summary or "").strip():
-                return str(item.summary or "").strip()
+                summary = str(item.summary or "").strip()
+                if evidence_type == "deposit_policy" and "信用额度" not in summary and "租房板块" not in summary:
+                    summary += "客户可以打开支付宝：我的 - 芝麻信用 - 我的 - 信用额度 - 租房板块申请额度，有额度再继续走免押流程。"
+                return summary
     return ""
+
+
+def _target_error_reply_text(packet: StructuredTaskPacket, bundle: ToolEvidenceBundle) -> str:
+    blocked_action = _unbound_target_action_phrase(packet)
+    for item in bundle.evidence:
+        evidence_type = str(item.evidence_type or "").strip()
+        values = item.field_values if isinstance(item.field_values, dict) else {}
+        if evidence_type == "selection_error":
+            indices = [
+                int(index)
+                for index in values.get("requested_indices") or []
+                if str(index).isdigit() and int(index) > 0
+            ]
+            selected_text = "、".join(f"第{index}套" for index in indices) or "这个序号"
+            return (
+                f"我这边没法按{selected_text}准确定位，先不{blocked_action}。"
+                "你发小区+房号，或者让我重新列一遍后再按序号发。"
+            )
+        if evidence_type == "missing_target":
+            return (
+                f"我这边还没定位到具体房源，先不{blocked_action}。"
+                "你发小区+房号，或者让我重新列一遍后再按序号发。"
+            )
+        if evidence_type == "field_target_error":
+            field = str(values.get("field") or _requested_media_name(packet) or "这个信息").strip()
+            if str(values.get("reason") or "") == "original_video_followup_missing_stable_video_target":
+                return "我这边还没定位到要继续追的那套视频，先不发原视频。你回房源序号或小区+房号后，我再按素材库查。"
+            return f"我这边还没定位到具体房源，先不发{field}。你发小区+房号，或者让我重新列一遍后再按序号查。"
+    return ""
+
+
+def _unbound_target_action_phrase(packet: StructuredTaskPacket) -> str:
+    task_text = _packet_task_search_text(packet)
+    if any(marker in task_text for marker in ("send_image", "image", "图片", "照片")):
+        return "发图片"
+    if any(marker in task_text for marker in ("send_video", "video", "视频", "原视频", "高清")):
+        return "发视频"
+    if any(marker in task_text for marker in ("水电", "水费", "电费", "utility")):
+        return "核对水电"
+    if any(marker in task_text for marker in ("价格", "租金", "多少钱", "哪个低", "哪套低", "更低", "便宜", "押一付一", "押二付一", "price", "rent")):
+        return "比较价格"
+    if any(marker in task_text for marker in ("看房", "密码", "门锁", "viewing")):
+        return "说看房方式"
+    return "查这个信息"
+
+
+def _requested_media_name(packet: StructuredTaskPacket) -> str:
+    task_text = _packet_task_search_text(packet)
+    if any(marker in task_text for marker in ("send_image", "image", "图片", "照片")):
+        return "图片"
+    if any(marker in task_text for marker in ("send_video", "video", "视频", "原视频", "高清")):
+        return "视频"
+    return "素材"
 
 
 def _packet_task_search_text(packet: StructuredTaskPacket) -> str:
@@ -856,11 +1091,11 @@ def _default_action_captions(
 
 def _default_caption_text(action: SendAction, index: int) -> str:
     if action.action_type == "contract_contact":
-        return "合同、定金和订房联系方式已由受控通道绑定。"
+        return "合同、定金和订房联系方式已确认。"
     if action.action_type == "viewing_password":
-        return "看房密码已由受控通道绑定。"
+        return "看房密码已确认。"
     if action.action_type == "viewing_contact":
-        return "看房联系号码已由受控通道绑定。"
+        return "看房联系号码已确认。"
     if action.action_type == "video":
         return f"这是第 {index} 个房间的视频。"
     if action.action_type == "image":
@@ -1025,6 +1260,7 @@ def _success_review(
     ignored_llm_send_actions: bool,
     claim_count: int,
     action_count: int,
+    controlled_reply_template: str = "",
 ) -> dict[str, Any]:
     review = safe_artifact_payload(dict(output_review or {}))
     review["status"] = "pass"
@@ -1034,6 +1270,9 @@ def _success_review(
     review["ignored_llm_send_actions"] = ignored_llm_send_actions
     review["claim_count"] = claim_count
     review["send_action_count"] = action_count
+    if controlled_reply_template:
+        review["controlled_reply_template"] = controlled_reply_template
+        review["reply_text_owner"] = "controlled_template"
     return review
 
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 from app.config import settings
-from app.services.llm import ReplyGenerator
+from app.services.llm import ReplyGenerator, _llm2_visible_evidence_bundle
 
 
 def test_build_kf_task_packet_production_missing_key_is_hard_gate(monkeypatch) -> None:
@@ -215,6 +216,55 @@ def test_compose_kf_outbound_shadow_prompt_requires_oralized_media_tense(monkeyp
     assert "已有媒体 send action" in user_prompt
     assert "evidence_type=missing_media" in user_prompt
     assert "只改话术，不改 claims/send action/action_id/evidence_ref" in user_prompt
+
+
+def test_llm2_visible_evidence_bundle_drops_free_text_summary_and_keeps_fields() -> None:
+    visible = _llm2_visible_evidence_bundle(
+        {
+            "tool_name": "dual_llm_shadow.evidence_adapter",
+            "raw_tool_result": {"planner_reply_result": "不能进入 LLM2"},
+            "candidate_set": {
+                "candidates": [
+                    {
+                        "candidate_number": 1,
+                        "community": "棠润府",
+                        "room_no": "15-2-801B",
+                        "rent_pay1": 3800,
+                        "debug_reason": "内部调试原因",
+                    }
+                ]
+            },
+            "evidence": [
+                {
+                    "evidence_id": "evd-video-1",
+                    "evidence_type": "video",
+                    "summary": "棠润府15-2-801B 视频素材已匹配，可通过受控通道发送，booking deterministic。",
+                    "field_values": {
+                        "community": "棠润府",
+                        "room_no": "15-2-801B",
+                        "rent_pay1": 3800,
+                        "debug_reason": "内部调试原因",
+                    },
+                    "metadata": {
+                        "candidate_number": 1,
+                        "free_text_reason": "受控渠道",
+                    },
+                }
+            ],
+        }
+    )
+
+    dumped = json.dumps(visible, ensure_ascii=False)
+    assert "summary" not in dumped
+    assert "raw_tool_result" not in dumped
+    assert "planner_reply_result" not in dumped
+    assert "受控通道" not in dumped
+    assert "booking" not in dumped
+    assert "deterministic" not in dumped
+    assert "debug_reason" not in dumped
+    assert visible["candidate_set"]["candidates"][0]["community"] == "棠润府"
+    assert visible["evidence"][0]["field_values"]["rent_pay1"] == 3800
+    assert visible["evidence"][0]["metadata"] == {"candidate_number": 1}
 
 
 def test_settings_support_deepseek_provider_without_changing_stage_contract(monkeypatch) -> None:
