@@ -161,14 +161,18 @@ async def run_gate(
     async def fixed_windows(**_kwargs: Any) -> dict[str, Any]:
         if skip_fixed:
             return _passed_skipped("fixed_windows", "--skip-fixed")
-        artifact = await run_all(turn_timeout=turn_timeout, fail_fast_on_problem=True)
+        artifact = await run_all(turn_timeout=turn_timeout, fail_fast_on_problem=fail_fast)
         return _artifact_result(artifact, stage="fixed_windows")
 
     async def random_windows(**kwargs: Any) -> dict[str, Any]:
         if skip_random:
             return _passed_skipped("random_windows", "--skip-random")
         stage_seed = int(kwargs.get("seed") or seed or 0)
-        artifact = await run_random_guard(seed=stage_seed or None, turn_timeout=turn_timeout)
+        artifact = await run_random_guard(
+            seed=stage_seed or None,
+            turn_timeout=turn_timeout,
+            fail_fast_on_problem=fail_fast,
+        )
         return _artifact_result(artifact, stage="random_windows")
 
     async def historical_failures(**_kwargs: Any) -> dict[str, Any]:
@@ -197,7 +201,7 @@ async def run_gate(
             expected_window_count=None,
             min_window_count=1,
             min_turn_count=1,
-            fail_fast_on_problem=True,
+            fail_fast_on_problem=fail_fast,
         )
         return _artifact_result(artifact, stage="historical_failures")
 

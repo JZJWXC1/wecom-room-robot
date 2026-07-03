@@ -603,7 +603,12 @@ def _apply_tool_coverage_gate(artifact_path: Path) -> Path:
     return artifact_path
 
 
-async def run_random_guard(*, seed: int | None = None, turn_timeout: float = 90) -> Path:
+async def run_random_guard(
+    *,
+    seed: int | None = None,
+    turn_timeout: float = 90,
+    fail_fast_on_problem: bool = True,
+) -> Path:
     windows = generate_random_guard_windows(seed=seed)
     coverage = coverage_report(windows)
     integrity = chinese_integrity_report(
@@ -624,7 +629,7 @@ async def run_random_guard(*, seed: int | None = None, turn_timeout: float = 90)
         required_tokens=(),
         expected_window_count=RANDOM_GUARD_WINDOW_COUNT,
         min_turn_count=RANDOM_GUARD_WINDOW_COUNT * RANDOM_GUARD_TURNS_PER_WINDOW,
-        fail_fast_on_problem=True,
+        fail_fast_on_problem=fail_fast_on_problem,
     )
     return _apply_tool_coverage_gate(artifact_path)
 
@@ -643,6 +648,7 @@ if __name__ == "__main__":
             run_random_guard(
                 seed=args.seed or None,
                 turn_timeout=args.turn_timeout,
+                fail_fast_on_problem=True,
             )
         )
     except ArtifactWriteError as error:

@@ -198,6 +198,69 @@ def test_qa_gate_can_continue_when_fail_fast_disabled_but_final_status_blocks() 
     run(run_case())
 
 
+def test_qa_gate_cli_no_fail_fast_reaches_all_stage_runners(monkeypatch, tmp_path: Path) -> None:
+    async def run_case() -> None:
+        captured: dict[str, bool] = {}
+        historical_fixture = tmp_path / "historical.json"
+        historical_fixture.write_text(
+            json.dumps(
+                {"windows": [{"id": "historical", "turns": ["历史失败回放"]}]},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        def write_artifact(name: str) -> Path:
+            path = tmp_path / f"{name}.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "summary": {},
+                        "quality_status": {
+                            "passed": True,
+                            "high_count": 0,
+                            "medium_count": 0,
+                            "infrastructure_error": False,
+                        },
+                        "completed": True,
+                        "full_suite_completed": True,
+                        "expected_case_count": 1,
+                        "actual_window_count": 1,
+                        "actual_case_count": 1,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            return path
+
+        async def fake_run_all(**kwargs: Any) -> Path:
+            stage = str(kwargs.get("artifact_prefix") or "fixed")
+            captured[stage] = bool(kwargs["fail_fast_on_problem"])
+            return write_artifact(stage)
+
+        async def fake_random_guard(**kwargs: Any) -> Path:
+            captured["random"] = bool(kwargs["fail_fast_on_problem"])
+            return write_artifact("random")
+
+        monkeypatch.setattr(qa_gate_cli, "run_all", fake_run_all)
+        monkeypatch.setattr(qa_gate_cli, "run_random_guard", fake_random_guard)
+
+        result = await qa_gate_cli.run_gate(
+            seed=11,
+            fail_fast=False,
+            historical_fixture=historical_fixture,
+            require_historical=True,
+        )
+
+        assert result["status"] == "passed"
+        assert captured["fixed"] is False
+        assert captured["random"] is False
+        assert captured["rag_historical_failure_graph_utf8"] is False
+
+    run(run_case())
+
+
 def test_qa_gate_graph_cli_writes_artifact_in_skip_mode() -> None:
     completed = subprocess.run(
         [

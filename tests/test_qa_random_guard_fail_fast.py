@@ -92,6 +92,48 @@ def test_random_guard_runner_stops_after_first_blocking_problem(
     run(run_case())
 
 
+def test_random_guard_runner_can_collect_all_problems_when_fail_fast_disabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    async def run_case() -> None:
+        artifact = tmp_path / "random_guard.json"
+        captured: dict[str, Any] = {}
+
+        async def fake_run_all(**kwargs: Any) -> Path:
+            captured.update(kwargs)
+            artifact.write_text(
+                json.dumps(
+                    {
+                        "quality_status": {"passed": True, "business_failures": []},
+                        "summary": {},
+                        "windows": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            return artifact
+
+        monkeypatch.setattr(random_guard, "coverage_report", lambda *args, **kwargs: {"passed": True})
+        monkeypatch.setattr(random_guard, "chinese_integrity_report", lambda *args, **kwargs: {"passed": True})
+        monkeypatch.setattr(random_guard, "generate_random_guard_windows", lambda seed=None: [])
+        monkeypatch.setattr(random_guard, "run_all", fake_run_all)
+        monkeypatch.setattr(random_guard, "_apply_tool_coverage_gate", lambda path: path)
+
+        result = await random_guard.run_random_guard(
+            seed=9,
+            turn_timeout=12,
+            fail_fast_on_problem=False,
+        )
+
+        assert result == artifact
+        assert captured["fail_fast_on_problem"] is False
+        assert captured["turn_timeout"] == 12
+
+    run(run_case())
+
+
 def test_random_guard_tool_invocation_coverage_requires_core_broker_tools() -> None:
     windows = [
         {
