@@ -870,6 +870,69 @@ def test_payment_options_question_uses_tool_template_for_both_price_fields() -> 
     assert package.self_review["controlled_reply_template"] == "payment_options_reply"
 
 
+def test_budget_match_by_pay2_must_disclose_payment_tier_for_w01t2_xingqiao() -> None:
+    packet = StructuredTaskPacket(
+        conversation_id="conv-w01t2-xingqiao",
+        turn_id="turn-w01t2-xingqiao",
+        case_id="case-w01t2-xingqiao",
+        inventory_snapshot_id="snap-w01t2-xingqiao",
+        response_strategy=ResponseStrategy.ANSWER,
+        rewritten_query="北软附近1800以内的一室还有吗？独卫优先",
+        tasks=[
+            TaskAtom(
+                task_id="task-w01t2-search",
+                task_type="inventory_search",
+                user_text="北软附近1800以内的一室还有吗？独卫优先",
+                constraints={
+                    "area": "拱墅万达\n北部软件园\n城北万象城",
+                    "budget_range": [0, 1800],
+                    "layout": "一室",
+                },
+                required_tools=["inventory.search"],
+            )
+        ],
+    )
+    bundle = ToolEvidenceBundle(
+        conversation_id="conv-w01t2-xingqiao",
+        turn_id="turn-w01t2-xingqiao",
+        case_id="case-w01t2-xingqiao",
+        inventory_snapshot_id="snap-w01t2-xingqiao",
+        tool_name="llm2.test.w01t2_xingqiao",
+        evidence=[
+            EvidenceItem(
+                evidence_id="evd-xingqiao",
+                listing_id="lst-xingqiao-20-1606a",
+                evidence_type="inventory_candidate",
+                summary="星桥锦绣嘉苑20-1606A 押一付一1900 押二付一1800",
+                field_values={
+                    "community": "星桥锦绣嘉苑",
+                    "room_no": "20-1606A",
+                    "layout_description": "一室一厅独立厨卫带阳台",
+                    "rent_pay1": 1900,
+                    "rent_pay2": 1800,
+                },
+            )
+        ],
+    )
+
+    package = compose_kf_outbound(
+        packet,
+        bundle,
+        ResponseStrategy.ANSWER,
+        llm_output={
+            "reply_text": "星桥锦绣嘉苑20-1606A在1800以内，可以给客户看。",
+            "self_review": {"status": "pass"},
+        },
+        send_actions=[],
+        allow_deterministic_fallback=False,
+    )
+
+    assert "押二付一1800" in package.reply_text
+    assert "押一付一1900" in package.reply_text
+    assert package.self_review["reply_text_owner"] == "controlled_template"
+    assert package.self_review["controlled_reply_template"] == "budget_payment_disclosure_reply"
+
+
 def test_original_video_request_without_source_uses_no_source_template() -> None:
     packet = StructuredTaskPacket(
         conversation_id="conv-original-video",

@@ -14794,6 +14794,104 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("直接说这套", result["reply"])
         self.assertNotIn("回序号", result["reply"])
 
+    async def test_production_pay2_budget_match_discloses_payment_tier_in_visible_reply(self) -> None:
+        row = {
+            "listing_id": "lst-xingqiao-20-1606a",
+            "小区": "星桥锦绣嘉苑",
+            "房号": "20-1606A",
+            "户型分类": "一室一厅",
+            "户型描述": "一室一厅独立厨卫带阳台",
+            "押一付一": "1900",
+            "押二付一": "1800",
+            "备注": "水30/月，电1元/度",
+        }
+        task_packet = build_kf_task_packet_shadow(
+            {
+                "rewritten_query": "北软附近1800以内的一室还有吗？独卫优先",
+                "task_atoms": [
+                    {
+                        "task_id": "task-w01t2-search",
+                        "task_type": "inventory_search",
+                        "user_text": "北软附近1800以内的一室还有吗？独卫优先",
+                        "constraints": {
+                            "area": "拱墅万达\n北部软件园\n城北万象城",
+                            "budget_range": [0, 1800],
+                            "layout": "一室",
+                        },
+                        "required_tools": ["inventory.search"],
+                    }
+                ],
+                "tool_plan": {"actions": ["search_inventory", "generate_reply"]},
+                "response_strategy": {"mode": "answer"},
+            },
+            content="北软附近1800以内的一室还有吗？独卫优先",
+            source_label="llm1_production",
+            mode="production",
+        ).packet.to_safe_dict()
+
+        class FakeReplyGenerator:
+            async def compose_kf_outbound_production(self, **kwargs):
+                return {
+                    "reply_text": "星桥锦绣嘉苑20-1606A在1800以内，可以给客户看。",
+                    "claims": [],
+                    "action_captions": [],
+                    "self_review": {"status": "pass"},
+                }
+
+            async def assess_kf_final_reply(self, **kwargs):
+                raise AssertionError("production should rely on kf_outbound_validation")
+
+        class FakeRag:
+            async def retrieve_for_reply(self, **kwargs):
+                raise AssertionError("production inventory reply must not enter legacy RAG retrieve")
+
+            def assess_reply(self, **kwargs):
+                raise AssertionError("production inventory reply must not enter legacy RAG selfcheck")
+
+        originals = {
+            "mode": main.settings.kf_dual_llm_mode,
+            "reply_generator": main.reply_generator,
+            "agentic_rag": main.agentic_rag,
+        }
+        main.settings.kf_dual_llm_mode = "production"
+        main.reply_generator = FakeReplyGenerator()
+        main.agentic_rag = FakeRag()
+        try:
+            result = await main._generate_reply_result(
+                content="北软附近1800以内的一室还有吗？独卫优先",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "北软附近1800以内的一室还有吗？独卫优先",
+                    "constraint_proof": {
+                        "intent": "inventory",
+                        "area": "拱墅万达\n北部软件园\n城北万象城",
+                        "budget_range": [0, 1800],
+                        "layout": "一室",
+                    },
+                    "structured_task": {"intent": "inventory"},
+                    "llm1_task_packet": task_packet,
+                },
+                tool_evidence={
+                    "actions": ["search_inventory", "generate_reply"],
+                    "inventory_rows": [row],
+                },
+                planner_result={"actions": ["search_inventory", "generate_reply"], "reply_text": ""},
+            )
+        finally:
+            main.settings.kf_dual_llm_mode = originals["mode"]
+            main.reply_generator = originals["reply_generator"]
+            main.agentic_rag = originals["agentic_rag"]
+
+        self.assertFalse(result["needs_planner_retry"])
+        self.assertIn("星桥锦绣嘉苑20-1606A", result["reply"])
+        self.assertIn("押二付一1800", result["reply"])
+        self.assertIn("押一付一1900", result["reply"])
+        self.assertEqual(
+            result["selfcheck"]["rule"]["source"],
+            "kf_outbound_validation",
+        )
+
     async def test_inventory_evidence_is_safe_fallback_after_selfcheck_retry(self) -> None:
         class FakeReplyGenerator:
             async def generate(self, *args, **kwargs):

@@ -180,6 +180,11 @@ def compose_kf_outbound(
     action_captions = caption_result.items or _default_action_captions(packet, trusted_actions, evidence_by_id, _candidate_labels_by_listing(bundle))
     reply_text = _normalize_inventory_sheet_only_reply_text(reply_text, trusted_actions, evidence_by_id)
     reply_text, price_reply_template = _normalize_requested_payment_options_reply_text(reply_text, packet, bundle)
+    reply_text, budget_payment_reply_template = _normalize_budget_payment_disclosure_reply_text(
+        reply_text,
+        packet,
+        bundle,
+    )
     reply_text, original_video_reply_template = _normalize_original_video_reply_text(
         reply_text,
         packet,
@@ -194,7 +199,12 @@ def compose_kf_outbound(
         ignored_llm_send_actions=ignored_llm_send_actions,
         claim_count=len(claims),
         action_count=len(trusted_actions),
-        controlled_reply_template=controlled_reply_template or original_video_reply_template or price_reply_template,
+        controlled_reply_template=(
+            controlled_reply_template
+            or original_video_reply_template
+            or budget_payment_reply_template
+            or price_reply_template
+        ),
     )
 
     return PreparedOutboundPackage(
@@ -342,6 +352,127 @@ def _normalize_requested_payment_options_reply_text(
     if not lines:
         return reply_text, ""
     return "这几套价格如下：\n" + "\n".join(lines), "payment_options_reply"
+
+
+def _normalize_budget_payment_disclosure_reply_text(
+    reply_text: str,
+    packet: StructuredTaskPacket,
+    bundle: ToolEvidenceBundle,
+) -> tuple[str, str]:
+    budget_range = _packet_budget_range(packet)
+    if len(budget_range) != 2:
+        return reply_text, ""
+    low, high = budget_range
+    disclosure_rows: list[dict[str, str]] = []
+    for row in _payment_option_rows(bundle)[:8]:
+        pay1 = _int_or_none(row.get("rent_pay1"))
+        pay2 = _int_or_none(row.get("rent_pay2"))
+        if pay2 is None or not (low <= pay2 <= high):
+            continue
+        if pay1 is not None and low <= pay1 <= high:
+            continue
+        label = str(row.get("label") or "").strip()
+        if not label:
+            continue
+        disclosure_rows.append(
+            {
+                "label": label,
+                "rent_pay1": str(row.get("rent_pay1") or "").strip(),
+                "rent_pay2": str(row.get("rent_pay2") or "").strip(),
+            }
+        )
+    if not disclosure_rows:
+        return reply_text, ""
+    missing_rows = [
+        row
+        for row in disclosure_rows
+        if not _reply_mentions_payment_scope(reply_text, row["label"], row["rent_pay2"])
+    ]
+    if not missing_rows:
+        return reply_text, ""
+    lines = []
+    for row in missing_rows:
+        pay2 = row["rent_pay2"]
+        pay1 = row["rent_pay1"]
+        suffix = f"，押一付一{pay1}元/月" if pay1 else ""
+        lines.append(f"{row['label']}是押二付一{pay2}元/月在预算内{suffix}")
+    note = "付款档说明：" + "；".join(lines) + "。"
+    text = str(reply_text or "").strip()
+    if not text:
+        return note, "budget_payment_disclosure_reply"
+    return f"{text}\n{note}", "budget_payment_disclosure_reply"
+
+
+def _reply_mentions_payment_scope(reply_text: str, label: str, rent_pay2: str) -> bool:
+    text = str(reply_text or "")
+    amount = str(rent_pay2 or "").strip()
+    if amount and re.search(rf"押二付一\s*{re.escape(amount)}", text):
+        return True
+    if amount and label and label in text:
+        label_index = text.find(label)
+        window = text[label_index : label_index + 80]
+        return "押二付一" in window and amount in window
+    return False
+
+
+def _packet_budget_range(packet: StructuredTaskPacket) -> list[int]:
+    payloads: list[Any] = [
+        packet.inherited_constraints,
+        packet.replaced_constraints,
+        packet.rewritten_query,
+    ]
+    for task in packet.tasks:
+        payloads.append(task.constraints)
+        payloads.append(task.user_text)
+    for payload in payloads:
+        budget = _coerce_budget_range(payload)
+        if len(budget) == 2:
+            return budget
+    return []
+
+
+def _coerce_budget_range(value: Any) -> list[int]:
+    if isinstance(value, dict):
+        for key in ("budget_range", "price_range", "budget", "预算"):
+            if key in value:
+                budget = _coerce_budget_range(value.get(key))
+                if len(budget) == 2:
+                    return budget
+        return []
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        low = _int_or_none(value[0])
+        high = _int_or_none(value[1])
+        if high is None:
+            return []
+        if low is None:
+            low = 0
+        return sorted([low, high])
+    text = str(value or "")
+    if not text:
+        return []
+    range_match = re.search(r"([1-9]\d{2,5})\s*(?:-|到|至|~|～)\s*([1-9]\d{2,5})", text)
+    if range_match:
+        return sorted([int(range_match.group(1)), int(range_match.group(2))])
+    upper_match = re.search(r"([1-9]\d{2,5})\s*(?:以内|以下|内|之内)", text)
+    if upper_match:
+        return [0, int(upper_match.group(1))]
+    budget_match = re.search(r"(?:预算|租金|价格)[^\d]{0,8}([1-9]\d{2,5})", text)
+    if budget_match:
+        return [0, int(budget_match.group(1))]
+    return []
+
+
+def _int_or_none(value: Any) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.search(r"[1-9]\d{2,5}", text)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
 
 
 def _normalize_original_video_reply_text(
