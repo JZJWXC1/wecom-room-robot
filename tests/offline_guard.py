@@ -41,6 +41,9 @@ _BLOCKED_NETWORK_CALLS: list[dict[str, Any]] = []
 _PRE_ACTIVATION_IMPORTS: list[str] | None = None
 _ORIGINAL_CREATE_CONNECTION = socket.create_connection
 _ORIGINAL_SOCKET_CONNECT = socket.socket.connect
+_OFFLINE_INVENTORY_SHEET_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
 
 
 class OfflineNetworkError(RuntimeError):
@@ -71,6 +74,17 @@ def real_llm_api_tests_enabled() -> bool:
         os.environ.get("RUN_ONLINE_QA") == "1"
         and os.environ.get("RUN_REAL_LLM_API_TESTS") == "1"
     )
+
+
+def _ensure_offline_inventory_sheet_fixture(root: Path) -> Path:
+    import base64
+
+    base_dir = Path(os.environ.get("TEMP") or root / "data")
+    path = base_dir / "wecom_room_robot_offline_inventory_sheet.png"
+    if not path.is_file() or path.stat().st_size == 0:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(base64.b64decode(_OFFLINE_INVENTORY_SHEET_PNG_BASE64))
+    return path
 
 
 def _guarded_create_connection(address: Any, *args: Any, **kwargs: Any) -> Any:
@@ -115,6 +129,7 @@ def activate_offline_test_mode() -> None:
     os.environ.setdefault("INVENTORY_CACHE_META_PATH", "data/test_inventory_cache_meta.json")
     os.environ.setdefault("REWRITE_INVENTORY_INDEX_PATH", "tests/fixtures/qa/test_rewrite_inventory_index.json")
     os.environ.setdefault("ROOM_DATABASE_PATH", "room_database")
+    os.environ.setdefault("INVENTORY_IMAGE_GLOB", str(_ensure_offline_inventory_sheet_fixture(root)))
     os.environ.setdefault("MEDIA_ROOT", "media/rooms")
     os.environ.setdefault("KF_DIALOGUE_EVENT_LOG_PATH", "data/test_kf_dialogue_events.jsonl")
 

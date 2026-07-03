@@ -260,6 +260,23 @@ def test_legacy_sheet_artifact_keeps_existing_paths(tmp_path: Path) -> None:
     assert result.evidence[0].safe_filename == "inventory_01.png"
 
 
+def test_legacy_sheet_artifact_reports_missing_png_error() -> None:
+    async def refresh():
+        return {"ok": True}
+
+    result = run(
+        sheet_artifacts_for_context(
+            context=legacy_context(),
+            refresh_func=refresh,
+            list_paths_func=lambda: [],
+        )
+    )
+
+    assert result.paths == ()
+    assert result.evidence == ()
+    assert result.error["code"] == REASON_SHEET_ARTIFACT_MISSING
+
+
 def test_legacy_shadow_sheet_does_not_read_snapshot_provider(tmp_path: Path) -> None:
     png = tmp_path / "inventory_01.png"
     png.write_bytes(b"png")

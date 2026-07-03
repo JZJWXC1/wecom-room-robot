@@ -8548,6 +8548,50 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifact["source_kind"], evidence["inventory_read_context"]["source_kind"])
         self.assertEqual(artifact["safe_filename"], "inventory_01.png")
 
+    async def test_send_inventory_sheet_missing_artifact_records_replayable_error(self) -> None:
+        async def fake_refresh():
+            return {"ok": True}
+
+        def fake_current_images():
+            return []
+
+        originals = {
+            "_refresh_current_inventory_images_for_sheet": main._refresh_current_inventory_images_for_sheet,
+            "_current_inventory_images": main._current_inventory_images,
+        }
+        main._refresh_current_inventory_images_for_sheet = fake_refresh
+        main._current_inventory_images = fake_current_images
+        try:
+            evidence = await main._execute_tools(
+                actions=["send_inventory_sheet"],
+                content="房源表发我",
+                context=kf_context_memory.empty_context(),
+                understanding={
+                    "intent": "inventory_sheet",
+                    "effective_query": "房源表发我",
+                    "query_state": {"intent": "inventory_sheet"},
+                    "constraint_proof": {"wants_inventory_sheet": True},
+                    "structured_task": {
+                        "tool_requirements": {"needs_inventory_sheet": True}
+                    },
+                },
+            )
+        finally:
+            for name, value in originals.items():
+                setattr(main, name, value)
+
+        summary = main._tool_evidence_summary(evidence)
+
+        self.assertEqual(evidence["inventory_images"], [])
+        self.assertEqual(
+            evidence["inventory_sheet_artifact_error"]["code"],
+            "sheet_artifact_missing",
+        )
+        self.assertEqual(
+            summary["inventory_sheet_artifact_error"]["code"],
+            "sheet_artifact_missing",
+        )
+
     async def test_execute_tools_does_not_fallback_search_when_candidate_index_out_of_range(self) -> None:
         class FakeInventory:
             @property

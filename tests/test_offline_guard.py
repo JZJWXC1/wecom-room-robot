@@ -27,6 +27,14 @@ def test_sensitive_environment_is_cleared_before_app_imports() -> None:
         assert key not in os.environ
 
 
+def test_offline_guard_provides_inventory_sheet_png_fixture() -> None:
+    path = os.environ.get("INVENTORY_IMAGE_GLOB")
+
+    assert path
+    payload = open(path, "rb").read(8)
+    assert payload == b"\x89PNG\r\n\x1a\n"
+
+
 def test_external_network_is_blocked_with_stack_and_target() -> None:
     with pytest.raises(OfflineNetworkError) as exc:
         socket.create_connection(("dashscope.aliyuncs.com", 443), timeout=0.01)

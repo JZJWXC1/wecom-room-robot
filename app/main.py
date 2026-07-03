@@ -7152,7 +7152,10 @@ async def _execute_tools(
                 item.to_dict() for item in sheet_result.evidence
             ]
             if sheet_result.error:
-                evidence["inventory_image_error"] = str(sheet_result.error.get("message") or sheet_result.error)
+                artifact_error = dict(sheet_result.error)
+                evidence["inventory_image_error"] = str(artifact_error.get("message") or artifact_error)
+                if not sheet_result.paths:
+                    evidence["inventory_sheet_artifact_error"] = artifact_error
         except InventoryReadError as exc:
             logger.warning("inventory sheet artifact blocked by read context: %s", exc.to_dict())
             evidence["inventory_sheet_artifact_error"] = exc.to_dict()

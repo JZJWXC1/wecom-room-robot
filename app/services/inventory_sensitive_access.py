@@ -353,6 +353,11 @@ class LegacyInventorySheetArtifactProvider:
                 "message": str(exc),
             }
         paths = tuple(Path(path) for path in self.list_paths_func())
+        if not paths and not error:
+            error = {
+                "code": REASON_SHEET_ARTIFACT_MISSING,
+                "message": "legacy inventory sheet PNG artifact is missing",
+            }
         evidence = tuple(_artifact_evidence_for_path(context, path) for path in paths)
         return InventorySheetArtifactResult(paths=paths, evidence=evidence, error=sanitize_for_log(error))
 

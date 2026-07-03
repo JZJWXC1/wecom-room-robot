@@ -234,6 +234,24 @@ def test_random_guard_tool_coverage_ignores_generic_count_without_tool_evidence(
     assert "房源表图片" not in hits
 
 
+def test_random_guard_tool_coverage_rejects_inventory_sheet_error_without_artifact() -> None:
+    turn = {
+        "turn": 1,
+        "user": "房源表发我",
+        "tool": {
+            "actions": ["send_inventory_sheet", "generate_reply"],
+            "inventory_image_count": 0,
+            "inventory_sheet_artifact_evidence_count": 0,
+            "inventory_sheet_artifact_error": {"code": "sheet_artifact_missing"},
+        },
+        "send": {"sent_actions": [{"type": "text", "count": 1}]},
+    }
+
+    hits = random_guard._tool_category_hits(turn)
+
+    assert "房源表图片" not in hits
+
+
 def test_random_guard_tool_coverage_counts_missing_image_evidence() -> None:
     turn = {
         "turn": 1,
