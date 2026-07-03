@@ -182,6 +182,14 @@ async def _resolve_targets_node(state: KfMediaBindingGraphState) -> dict[str, An
         [row for row in evidence.get("inventory_rows") or rows if isinstance(row, dict)]
     )
     evidence["target_rows"] = target_rows
+    if target_rows:
+        evidence["allowed_rooms"] = _allowed_rooms_evidence(
+            deps,
+            target_rows=target_rows,
+            selected_indices=selected_indices,
+        )
+    else:
+        evidence.pop("allowed_rooms", None)
 
     query_state = dict((state.get("understanding") or {}).get("query_state") or {})
     if target_rows and query_state.get("pending_media_target_bound"):
@@ -419,6 +427,40 @@ def _collect_result_parts(value: Any) -> tuple[list[Path], list[dict[str, Any]],
         [str(item).strip() for item in missing or [] if str(item).strip()],
         dict(sync_result or {}),
     )
+
+
+def _allowed_rooms_evidence(
+    deps: KfMediaBindingGraphDeps,
+    *,
+    target_rows: list[dict[str, Any]],
+    selected_indices: list[int],
+) -> dict[str, Any]:
+    rows = [row for row in deps.rows_with_listing_ids(target_rows) if isinstance(row, dict)]
+    labels = _unique_nonempty(deps.row_labeler(row) for row in rows)
+    return {
+        "source": "kf_tool_resolver.target_rows",
+        "count": len(rows),
+        "listing_ids": _unique_nonempty(deps.row_listing_id(row) for row in rows),
+        "labels": labels,
+        "room_keys": _unique_nonempty(_media_room_key(label) for label in labels),
+        "selected_indices": [int(item) for item in selected_indices if isinstance(item, int)],
+    }
+
+
+def _media_room_key(value: str) -> str:
+    return "".join(str(value or "").strip().lower().split())
+
+
+def _unique_nonempty(values: Any) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
 def _resolution_to_dict(value: Any) -> dict[str, Any]:

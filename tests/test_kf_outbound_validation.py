@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from app.services.kf_contracts import (
     ActionCaption,
     CandidateItem,
@@ -262,6 +264,112 @@ def test_l2_treats_reply_compose_signal_as_answered_by_visible_text() -> None:
     assert "l2.task_not_answered" not in _codes(result)
 
 
+def test_l2_blocks_utility_task_when_reply_only_lists_inventory() -> None:
+    task_packet = StructuredTaskPacket(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        tasks=[
+            TaskAtom(
+                task_id="task-utility",
+                task_type="inventory_search",
+                user_text="1号那套水电怎么收？",
+                required_tools=["inventory.search"],
+            )
+        ],
+    )
+    package = _base_package()
+    package.reply_text = "我按房源表查到这套：星河苑1-101，押一付一4200。"
+    package.evidence_bundle.evidence[0].metadata = {
+        "field_values": {"备注": "水30/月，电1元/度", "room_no": "1-101", "community": "星河苑"}
+    }
+
+    result = validate_prepared_outbound_package(package, task_packet=task_packet)
+
+    assert "l2.task_not_answered" in _codes(result)
+
+
+def test_l2_allows_utility_task_with_explicit_missing_utility_note() -> None:
+    task_packet = StructuredTaskPacket(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        tasks=[
+            TaskAtom(
+                task_id="task-utility",
+                task_type="inventory_search",
+                user_text="这套水电怎么算？",
+                required_tools=["inventory.search"],
+            )
+        ],
+    )
+    package = _base_package()
+    package.reply_text = "星河苑1-101房源备注里暂时没有水电信息，我先不编。"
+    package.evidence_bundle.evidence[0].metadata = {"field_values": {"room_no": "1-101", "community": "星河苑"}}
+    package.claims = []
+
+    result = validate_prepared_outbound_package(package, task_packet=task_packet)
+
+    assert result.status == ValidationStatus.PASS
+    assert "l2.task_not_answered" not in _codes(result)
+
+
+def test_l2_blocks_deposit_condition_without_selfcheck_path() -> None:
+    task_packet = StructuredTaskPacket(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        tasks=[TaskAtom(task_id="task-deposit", task_type="deposit_policy", user_text="能免押吗？")],
+    )
+    package = PreparedOutboundPackage(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        reply_text="支持支付宝无忧住信用免押，需要芝麻分符合风控。你可以先在支付宝里查下自己有没有租房免押额度。",
+    )
+
+    result = validate_prepared_outbound_package(package, task_packet=task_packet)
+
+    assert "l2.task_not_answered" in _codes(result)
+
+
+def test_l2_blocks_deposit_condition_that_only_mentions_rent_channel_without_selfcheck_action() -> None:
+    task_packet = StructuredTaskPacket(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        tasks=[TaskAtom(task_id="task-deposit", task_type="deposit_policy", user_text="能免押吗？")],
+    )
+    package = PreparedOutboundPackage(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        reply_text=(
+            "支持支付宝无忧住信用免押，需要芝麻分符合风控，"
+            "且支付宝租房板块有可用额度。符合条件需支付5.5%-8%的服务费。"
+        ),
+    )
+
+    result = validate_prepared_outbound_package(package, task_packet=task_packet)
+
+    assert "l2.task_not_answered" in _codes(result)
+
+
+def test_l2_allows_deposit_condition_with_selfcheck_path() -> None:
+    task_packet = StructuredTaskPacket(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        tasks=[TaskAtom(task_id="task-deposit", task_type="deposit_policy", user_text="能免押吗？")],
+    )
+    package = PreparedOutboundPackage(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        reply_text=(
+            "免押走支付宝无忧住芝麻信用评估。"
+            "客户可以打开支付宝：我的 - 芝麻信用 - 我的 - 信用额度 - 租房板块申请额度，有额度再继续走免押流程。"
+        ),
+    )
+
+    result = validate_prepared_outbound_package(package, task_packet=task_packet)
+
+    assert result.status == ValidationStatus.PASS
+    assert "l2.task_not_answered" not in _codes(result)
+
+
 def test_l2_ignores_embedded_confirmed_room_fields_when_classifying_task_kind() -> None:
     package = _base_package()
     package.reply_text = "杨家新雅苑36-1-1102是100方三房两卫，客厅带阳台。"
@@ -401,6 +509,18 @@ def test_l3_checks_action_caption_tense_and_internal_words_without_blocking_fact
     }.issubset(_codes(result))
 
 
+def test_l3_rewrites_media_sending_claim_without_media_action() -> None:
+    package = _base_package()
+    package.reply_text = "马上把1号和3号房源的视频发您。"
+    package.send_actions = []
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.REWRITE_REQUIRED
+    assert result.facts_passed is True
+    assert "l3.action_tense_error" in _codes(result)
+
+
 def test_l3_rewrites_generic_waiting_reply_without_blocking_facts() -> None:
     package = _base_package()
     package.reply_text = "我先帮您确认一下最新房态，避免发错，稍后给您回复。"
@@ -411,6 +531,93 @@ def test_l3_rewrites_generic_waiting_reply_without_blocking_facts() -> None:
     assert result.facts_passed is True
     assert result.send_allowed is False
     assert "l3.generic_waiting_reply" in _codes(result)
+
+
+def test_l3_rewrites_filter_count_contradiction() -> None:
+    package = _base_package()
+    package.reply_text = (
+        "根据你独立厨房或独卫优先的需求，目前匹配到3套："
+        "1. 骏塘名庭8-1101A；2. 琬秋铭府3-702A；3. 京漾东韵府4-2-601D暂不满足独立厨卫条件，已剔除。"
+    )
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.REWRITE_REQUIRED
+    assert "l3.filter_contradiction" in _codes(result)
+
+
+def test_l3_rewrites_filter_count_contradiction_with_demonstrative_count() -> None:
+    package = _base_package()
+    package.reply_text = (
+        "按您独立厨房或独卫的优先要求，目前匹配到这3套："
+        "1. 骏塘名庭8-1101A；2. 琬秋铭府3-702A；3. 京漾东韵府4-2-601D暂不满足独立厨卫条件，已剔除。"
+    )
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.REWRITE_REQUIRED
+    assert "l3.filter_contradiction" in _codes(result)
+
+
+@pytest.mark.parametrize(
+    "reply_text",
+    [
+        "合同联系人已通过系统发送，请注意查收。",
+        "合同、定金和订房联系方式已由受控通道绑定。",
+        "合同联系人信息已通过受控渠道发送给您，请注意查收。",
+        "我已为您安排专属联系通道。",
+    ],
+)
+def test_l3_rewrites_customer_visible_channel_leakage(reply_text: str) -> None:
+    package = _base_package()
+    package.reply_text = reply_text
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.REWRITE_REQUIRED
+    assert result.facts_passed is True
+    assert result.send_allowed is False
+    assert "l3.forbidden_human_phrase" in _codes(result)
+
+
+@pytest.mark.parametrize(
+    "reply_text",
+    [
+        "工具未绑定，暂时无法发送图片。",
+        "上一轮只有 0 套候选，请重新选择。",
+        "上一轮只有 3 套候选，请重新选择。",
+        "候选1 京漾东韵府 4-2-601D 租金1700",
+        "星桥锦绣嘉苑20-1606A:图片 暂未找到可发送图片。",
+        "客户要查询星河苑1-101的视频。",
+        "客户选择了第1套。",
+    ],
+)
+def test_l3_rewrites_outbound_forbidden_incident_phrases(reply_text: str) -> None:
+    package = _base_package()
+    package.reply_text = reply_text
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.REWRITE_REQUIRED
+    assert result.facts_passed is True
+    assert result.send_allowed is False
+    assert "l3.outbound_forbidden_incident_phrase" in _codes(result)
+
+
+def test_l3_rewrites_outbound_forbidden_incident_phrase_in_action_caption() -> None:
+    package = _base_package()
+    package.reply_text = ""
+    package.send_actions = [SendAction(action_id="send-image", action_type="image", evidence_id="evd-1")]
+    package.action_captions = [
+        ActionCaption(action_id="send-image", action_type="image", text="星桥锦绣嘉苑20-1606A:图片 暂未找到可发送图片。"),
+    ]
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.REWRITE_REQUIRED
+    assert result.facts_passed is True
+    assert result.send_allowed is False
+    assert "l3.outbound_forbidden_incident_phrase" in _codes(result)
 
 
 def test_l3_allows_partial_missing_media_reply_when_evidence_exists() -> None:

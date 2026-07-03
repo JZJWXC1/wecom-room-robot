@@ -95,6 +95,7 @@ def resolve_tool_targets(
     candidate_rows = _candidate_rows(safe_context)
     confirmed_context = _confirmed_row(safe_context) or _confirmed_row_from_understanding(safe_understanding)
     has_media_action = any(action in actions for action in ("send_image", "send_video"))
+    pending_video_selection_context = pending_video if "send_video" in actions else {}
     can_bind_media_candidate_context = bool(
         has_media_action
         and candidate_rows
@@ -139,8 +140,8 @@ def resolve_tool_targets(
     if (
         selected_indices
         and not candidate_rows
-        and not pending_video_rows
-        and not pending_video
+        and not (pending_video_rows if "send_video" in actions else [])
+        and not pending_video_selection_context
         and not confirmed_context
         and not _room_refs_from_text(original_room_text)
     ):
@@ -240,7 +241,7 @@ def resolve_tool_targets(
         target_rows=target_rows,
         candidate_rows=candidate_rows,
         inventory_rows=rows,
-        pending_video=pending_video,
+        pending_video=pending_video_selection_context,
         current_selection_text=original_room_text,
         proof=proof,
         original_video_target_error=original_video_target_error,
@@ -545,6 +546,17 @@ def _candidate_selection_count_from_text(text: str) -> int:
         if word in value:
             return count
     return 0
+
+
+def _is_plural_context_selection_text(text: str) -> bool:
+    value = str(text or "")
+    if _candidate_selection_count_from_text(value) <= 1:
+        return False
+    if re.search(r"第\s*[一二三四五六七八九1-9]", value):
+        return False
+    if re.search(r"(?<!\d)[1-9]\s*(?:和|跟|、|,|，)", value):
+        return False
+    return True
 
 
 def _selection_indices_from_text(text: str, *, limit: int = DEFAULT_TARGET_LIMIT) -> list[int]:
@@ -948,7 +960,7 @@ def _field_followup_label(text: str) -> str:
         return "价格"
     if any(word in value for word in ("户型", "装修", "特点")):
         return "户型"
-    if any(word in value for word in ("图片", "照片", "视频")):
+    if any(word in value for word in ("图片", "照片", "视频", "笔记", "素材")):
         return "素材"
     return "这个信息"
 
@@ -986,6 +998,8 @@ def _has_bound_room_field_followup(text: str) -> bool:
             "图片",
             "照片",
             "视频",
+            "笔记",
+            "素材",
         )
     )
 
@@ -1236,7 +1250,7 @@ def _target_rows_from_understanding(
     if selected:
         if not candidates:
             if (
-                selected == [1]
+                (selected == [1] or _is_plural_context_selection_text(current_text or query_text))
                 and confirmed
                 and not wants_media
                 and _should_bind_confirmed_room_context(understanding, query_text)
@@ -1565,7 +1579,7 @@ def _recent_assistant_mentioned_rows(
     if not rows:
         return []
     query = str(query_text or "")
-    if not any(word in query for word in ("视频", "图片", "照片", "素材", "原视频", "高清", "糊", "清楚", "源文件", "保存", "转发")):
+    if not any(word in query for word in ("视频", "图片", "照片", "素材", "笔记", "原视频", "高清", "糊", "清楚", "源文件", "保存", "转发")):
         return []
     label_rows = [(_row_label(row), row) for row in rows if _row_label(row)]
     if any(word in query for word in ("原视频", "高清", "糊", "清楚", "源文件", "保存", "转发")):

@@ -167,6 +167,95 @@ def test_viewing_password_followup_binds_confirmed_room_without_context_pronoun(
     assert result.candidate_binding["status"] == "bound"
 
 
+def test_note_followup_binds_confirmed_room_as_video_material_request() -> None:
+    confirmed_row = {
+        "listing_id": "lst-longyin",
+        "小区": "白田畈龙吟府",
+        "房号": "4-902B",
+    }
+    context = {"confirmed_room": {"label": "白田畈龙吟府4-902B", "row": confirmed_row}}
+
+    result = resolve_tool_targets(
+        actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+        content="笔记发我",
+        understanding={
+            "intent": "media",
+            "constraint_proof": {"wants_video": True},
+            "structured_task": {
+                "original_text": "笔记发我",
+                "tool_requirements": {"needs_video": True},
+            },
+        },
+        context=context,
+        inventory_rows=[],
+        target_limit=5,
+    )
+
+    assert result.target_rows == [confirmed_row]
+    assert result.selection_error == {}
+    assert result.candidate_binding["status"] == "bound"
+    assert result.candidate_binding["source"] == "confirmed_room"
+
+
+def test_plural_price_comparison_uses_confirmed_room_when_only_one_room_is_contextual() -> None:
+    confirmed_row = {
+        "listing_id": "lst-shiqiao",
+        "小区": "石桥铭苑",
+        "房号": "21-1201A",
+        "押一付一": "4500",
+    }
+    context = {"confirmed_room": {"label": "石桥铭苑21-1201A", "row": confirmed_row}}
+
+    result = resolve_tool_targets(
+        actions=["search_inventory", "generate_reply"],
+        content="这两套哪个价格低一点？",
+        understanding={
+            "intent": "production_llm1",
+            "constraint_proof": {"wants_price": True},
+            "structured_task": {
+                "original_text": "这两套哪个价格低一点？",
+                "tool_requirements": {"needs_inventory_search": True},
+            },
+        },
+        context=context,
+        inventory_rows=[],
+        target_limit=5,
+    )
+
+    assert result.target_rows == [confirmed_row]
+    assert result.selection_error == {}
+    assert result.candidate_binding["status"] == "bound"
+
+
+def test_explicit_media_indices_still_require_candidate_context_despite_confirmed_room() -> None:
+    confirmed_row = {
+        "listing_id": "lst-shiqiao",
+        "小区": "石桥铭苑",
+        "房号": "21-1201A",
+    }
+    context = {"confirmed_room": {"label": "石桥铭苑21-1201A", "row": confirmed_row}}
+
+    result = resolve_tool_targets(
+        actions=["search_inventory", "send_video", "generate_reply"],
+        content="筛出来的1和3视频发我",
+        understanding={
+            "intent": "production_llm1",
+            "constraint_proof": {"wants_video": True},
+            "structured_task": {
+                "original_text": "筛出来的1和3视频发我",
+                "tool_requirements": {"needs_video": True},
+            },
+        },
+        context=context,
+        inventory_rows=[],
+        target_limit=5,
+    )
+
+    assert result.target_rows == []
+    assert result.selection_error["reason"] == "missing_current_candidate_set"
+    assert result.selection_error["requested_indices"] == [1, 3]
+
+
 def test_field_followup_binds_confirmed_room_from_llm1_task_constraints() -> None:
     confirmed_row = {
         "listing_id": "lst-yangjia",
@@ -308,10 +397,38 @@ def test_selected_media_request_does_not_bind_confirmed_room_without_candidate_s
     assert result.candidate_binding["status"] == "error"
 
 
+def test_selected_image_request_does_not_treat_pending_video_as_candidate_context() -> None:
+    result = resolve_tool_targets(
+        actions=["search_inventory", "context_tools", "send_image", "explain_missing_media", "generate_reply"],
+        content="不是3号，是第二套图片",
+        understanding={
+            "constraint_proof": {"wants_image": True},
+            "structured_task": {
+                "original_text": "不是3号，是第二套图片",
+                "tool_requirements": {"needs_image": True},
+            },
+        },
+        context={},
+        inventory_rows=[],
+        pending_video={"labels": ["石桥铭苑21-1201A"], "requested_count": 1},
+        pending_video_rows=[{"小区": "石桥铭苑", "房号": "21-1201A"}],
+        target_limit=5,
+    )
+
+    assert result.target_rows == []
+    assert result.selection_error["reason"] == "missing_current_candidate_set"
+    assert result.selection_error["requested_indices"] == [2]
+    assert result.candidate_binding["status"] == "error"
+
+
 def test_media_followup_restore_predicate_only_allows_short_context_requests() -> None:
     short_followup = {
         "constraint_proof": {"wants_video": True},
         "structured_task": {"original_text": "有视频就先发视频。"},
+    }
+    note_followup = {
+        "constraint_proof": {"wants_video": True},
+        "structured_task": {"original_text": "笔记发我"},
     }
     scoped_request = {
         "constraint_proof": {"wants_video": True, "communities": ["星桥锦绣嘉苑"]},
@@ -321,6 +438,11 @@ def test_media_followup_restore_predicate_only_allows_short_context_requests() -
     assert _should_restore_candidate_rows_for_media_followup(
         content="有视频就先发视频。",
         understanding=short_followup,
+        actions=["search_inventory", "send_video", "generate_reply"],
+    )
+    assert _should_restore_candidate_rows_for_media_followup(
+        content="笔记发我",
+        understanding=note_followup,
         actions=["search_inventory", "send_video", "generate_reply"],
     )
     assert not _should_restore_candidate_rows_for_media_followup(

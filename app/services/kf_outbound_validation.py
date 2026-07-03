@@ -150,6 +150,11 @@ CANDIDATE_NUMBER_KEYS = ("candidate_number", "candidate_no", "candidate_index", 
 MEDIA_VIDEO_MARKERS = ("video", "send_video", "room_video", "视频")
 MEDIA_IMAGE_MARKERS = ("image", "photo", "picture", "send_image", "图片", "照片")
 MEDIA_SHEET_MARKERS = ("sheet", "inventory_sheet", "房源表", "表格")
+UTILITY_MARKERS = ("utility", "utilities", "水电", "水费", "电费", "水电费", "民用水电")
+UTILITY_MISSING_MARKERS = ("暂无", "暂时没", "暂未", "没有", "未提供", "没写", "没标", "备注里暂时没有", "具体房源")
+DEPOSIT_MARKERS = ("deposit", "免押", "无忧住", "押金", "芝麻信用")
+DEPOSIT_CONDITION_MARKERS = ("能免押", "能不能免押", "可以免押", "支不支持免押", "免押条件", "免押金要什么条件")
+DEPOSIT_SELFCHECK_MARKERS = ("自查", "信用额度", "租房板块申请额度", "申请额度", "支付宝：我的", "支付宝-我的", "支付宝 我的")
 
 URL_PATTERN = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
 PASSWORD_CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])\d{3,8}#(?![A-Za-z0-9])")
@@ -159,8 +164,15 @@ INTERNAL_LEAK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 TEMPLATE_PATTERN = re.compile(r"(?:XX|某某|某小区|某房号|TODO|\{\{|\}\}|<小区>|<房号>|例如某套|示例房源)")
-FUTURE_SEND_PATTERN = re.compile(r"(?:稍后|等下|待会|晚点|之后).{0,8}(?:发|传)|(?:可以|能|会).{0,4}发你")
-PAST_SENT_PATTERN = re.compile(r"(?:已发|发你了|已经发|给你发过去了|这是.{0,16}(?:视频|图片|房源表))")
+IMMEDIATE_MEDIA_SEND_CLAIM = (
+    r"(?:马上|现在|这就|立即).{0,24}(?:(?:发|发送|传).{0,12}(?:视频|图片|照片|素材)|(?:视频|图片|照片|素材).{0,8}(?:发|发送|传))"
+)
+FUTURE_SEND_PATTERN = re.compile(
+    rf"(?:稍后|等下|待会|晚点|之后).{{0,8}}(?:发|传)|(?:可以|能|会).{{0,4}}发你|{IMMEDIATE_MEDIA_SEND_CLAIM}"
+)
+PAST_SENT_PATTERN = re.compile(
+    rf"(?:已发|已发送|已经发|已经发送|发你了|发给你了|给你发过去了|正在发送|发送中|这是.{{0,16}}(?:视频|图片|房源表)|{IMMEDIATE_MEDIA_SEND_CLAIM})"
+)
 MISSING_MEDIA_PATTERN = re.compile(r"(?:暂无|没有|没找到|暂时没|暂未(?:找到)?).{0,8}(?:视频|图片|照片)")
 GENERIC_WAITING_PATTERN = re.compile(
     r"(?:我先帮[你您]?(?:确认|核实)|先(?:帮[你您]?)?(?:确认|核实)|稍后(?:再)?(?:给[你您])?(?:回复|答复)|"
@@ -168,7 +180,20 @@ GENERIC_WAITING_PATTERN = re.compile(
 )
 HARD_FORBIDDEN_HUMAN_PATTERN = re.compile(
     r"(?:作为(?:一个)?AI|系统显示|根据上下文|无法完成该请求|马上通知[你您]|稍后(?:会)?通知[你您]|稍后(?:会)?为[你您]推送|"
-    r"有新(?:房源|资源)(?:会)?第一时间通知)",
+    r"稍后(?:会|将)?.{0,16}(?:发|发送|给|安排)|稍等.{0,12}(?:同步|确认|回复|发)|"
+    r"有新(?:房源|资源)(?:会)?第一时间通知|通过系统|受控通道|受控渠道|专属联系通道|联系通道)",
+)
+OUTBOUND_FORBIDDEN_INCIDENT_PATTERN = re.compile(r"(?:工具未绑定|上一轮只有\s*\d+\s*套候选|客户(?:要查询|选择了))")
+RAW_CANDIDATE_ROW_PATTERN = re.compile(
+    r"(?:^|[\n\r。；;])\s*候选\s*\d+\s+[^，。；;\n\r:：]{2,40}\s+[\w一二三四五六七八九十栋幢单元座楼室-]+"
+    r"(?:\s|，|,|、).{0,60}(?:租金|押一付一|押二付一|价格|月租)\s*\d+",
+    re.IGNORECASE,
+)
+MISSING_MEDIA_TEMPLATE_PATTERN = re.compile(
+    r"[^，。；;\n\r:：]{2,40}[:：]\s*(?:图片|照片|视频)\s*(?:暂无|没有|没找到|暂时没|暂未(?:找到)?).{0,12}(?:可发送)?(?:视频|图片|照片)"
+)
+FILTER_CONTRADICTION_PATTERN = re.compile(
+    r"(?:匹配到|查到|有)\s*(?:这|以下|共|约)?\s*[\d一二三四五六七八九十]+\s*套.{0,200}(?:不满足|已剔除|剔除)"
 )
 
 
@@ -529,8 +554,30 @@ def _validate_l3_text(
         issues.append(
             _issue(ValidationLevel.L3, "l3.forbidden_human_phrase", "Reply contains a hard-forbidden customer-service phrase; regenerate wording only.", path)
         )
+    if (
+        OUTBOUND_FORBIDDEN_INCIDENT_PATTERN.search(text)
+        or RAW_CANDIDATE_ROW_PATTERN.search(text)
+        or MISSING_MEDIA_TEMPLATE_PATTERN.search(text)
+    ):
+        issues.append(
+            _issue(
+                ValidationLevel.L3,
+                "l3.outbound_forbidden_incident_phrase",
+                "Reply contains forbidden internal incident wording; regenerate wording only.",
+                path,
+            )
+        )
     if TEMPLATE_PATTERN.search(text):
         issues.append(_issue(ValidationLevel.L3, "l3.template_talk", "Reply contains placeholder or template wording; regenerate wording only.", path))
+    if FILTER_CONTRADICTION_PATTERN.search(text):
+        issues.append(
+            _issue(
+                ValidationLevel.L3,
+                "l3.filter_contradiction",
+                "Reply says rooms match while also saying one listed room is excluded; regenerate wording only.",
+                path,
+            )
+        )
     if GENERIC_WAITING_PATTERN.search(text):
         issues.append(
             _issue(ValidationLevel.L3, "l3.generic_waiting_reply", "Reply is a generic waiting/confirmation fallback; regenerate wording only.", path)
@@ -780,6 +827,10 @@ def _task_is_answered(task: Any, package: PreparedOutboundPackage, indexes: _Pac
         ) or _has_target_error_answer(package, indexes)
     if _contains_any(task_text, MEDIA_SHEET_MARKERS):
         return any(_is_sheet_action(action) for action in package.send_actions)
+    if _contains_any(task_text, UTILITY_MARKERS):
+        return _has_utility_answer(package, indexes)
+    if _contains_any(task_text, DEPOSIT_MARKERS):
+        return _has_deposit_answer(task_text, package)
     if _mentions_password(task_text):
         return any(_is_password_action(action) for action in package.send_actions) or any(
             _mentions_password(_claim_visible_payload(claim)) for claim in package.claims
@@ -788,6 +839,62 @@ def _task_is_answered(task: Any, package: PreparedOutboundPackage, indexes: _Pac
             indexes,
         )
     return bool((package.reply_text or "").strip()) or bool(package.claims) or bool(package.send_actions)
+
+
+def _has_deposit_answer(task_text: str, package: PreparedOutboundPackage) -> bool:
+    visible_text = "\n".join(
+        item
+        for item in [
+            str(package.reply_text or "").strip(),
+            *(str(_claim_visible_payload(claim) or "") for claim in package.claims),
+        ]
+        if item
+    )
+    if not visible_text:
+        return False
+    if not _contains_any(visible_text, DEPOSIT_MARKERS):
+        return False
+    if _contains_any(task_text, DEPOSIT_CONDITION_MARKERS):
+        return "支付宝" in visible_text and _contains_any(visible_text, DEPOSIT_SELFCHECK_MARKERS)
+    return True
+
+
+def _has_utility_answer(package: PreparedOutboundPackage, indexes: _PackageIndexes) -> bool:
+    visible_text = "\n".join(
+        item
+        for item in [
+            str(package.reply_text or "").strip(),
+            *(str(_claim_visible_payload(claim) or "") for claim in package.claims),
+        ]
+        if item
+    )
+    if not visible_text:
+        return False
+    if not any(marker in visible_text for marker in ("水电", "水费", "电费", "水", "电")):
+        return False
+    evidence_texts: list[str] = []
+    for evidence in indexes.evidence_by_id.values():
+        field_values = _evidence_field_values(evidence)
+        for key, value in field_values.items():
+            key_text = str(key or "")
+            value_text = str(value or "").strip()
+            if not value_text:
+                continue
+            if any(marker in key_text for marker in ("水电", "水费", "电费", "备注", "utility")):
+                evidence_texts.append(value_text)
+        summary = str(evidence.summary or "").strip()
+        if any(marker in summary for marker in UTILITY_MARKERS):
+            evidence_texts.append(summary)
+    evidence_texts = list(dict.fromkeys(text for text in evidence_texts if text))
+    if not evidence_texts:
+        return any(marker in visible_text for marker in UTILITY_MISSING_MARKERS)
+    for value in evidence_texts:
+        if value in visible_text:
+            return True
+        numbers = re.findall(r"\d+(?:\.\d+)?", value)
+        if numbers and all(number in visible_text for number in numbers[:3]):
+            return True
+    return any(marker in visible_text for marker in UTILITY_MISSING_MARKERS)
 
 
 def _has_missing_media_answer(package: PreparedOutboundPackage, *, expected_kind: str) -> bool:

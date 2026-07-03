@@ -143,6 +143,9 @@ def test_media_binding_graph_resolves_targets_and_collects_media_evidence() -> N
         evidence = result["evidence"]
         assert result["trace"] == ["media_binding:resolve_targets", "media_binding:collect_media"]
         assert [row["candidate_number"] for row in evidence["target_rows"]] == [1, 2]
+        assert evidence["allowed_rooms"]["source"] == "kf_tool_resolver.target_rows"
+        assert evidence["allowed_rooms"]["listing_ids"] == ["lst-a", "lst-b"]
+        assert evidence["allowed_rooms"]["selected_indices"] == [1, 2]
         assert evidence["image_paths"] == [str(Path("C:/tmp/room-a.jpg"))]
         assert evidence["video_paths"] == [str(Path("C:/tmp/room-a.mp4"))]
         assert evidence["missing_media"] == [
@@ -177,7 +180,11 @@ def test_media_binding_graph_selection_error_clears_media_outputs() -> None:
             actions=["send_video", "generate_reply"],
             content="第一套视频发我",
             inventory_rows=[{"listing_id": "lst-a", "小区": "星桥锦绣嘉苑", "房号": "20-1606A"}],
-            base_evidence={"image_paths": ["old.jpg"], "video_paths": ["old.mp4"]},
+            base_evidence={
+                "allowed_rooms": {"listing_ids": ["stale-lst"]},
+                "image_paths": ["old.jpg"],
+                "video_paths": ["old.mp4"],
+            },
         )
 
         evidence = result["evidence"]
@@ -185,6 +192,7 @@ def test_media_binding_graph_selection_error_clears_media_outputs() -> None:
         assert evidence["selection_error"]["reason"] == "missing_current_candidate_set"
         assert evidence["inventory_rows"] == []
         assert evidence["target_rows"] == []
+        assert "allowed_rooms" not in evidence
         assert evidence["image_paths"] == []
         assert evidence["video_paths"] == []
 
