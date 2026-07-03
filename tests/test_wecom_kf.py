@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -767,6 +768,112 @@ def test_production_llm1_inventory_tool_plan_remembers_candidate_set() -> None:
     )
 
 
+def test_single_result_broad_inventory_query_remembers_candidate_set() -> None:
+    assert main._should_remember_candidate_set(
+        content="石桥4800左右有两室整租吗？",
+        understanding={
+            "intent": "production_llm1",
+            "tool_plan": {"actions": ["search_inventory", "generate_reply"]},
+            "constraint_proof": {"area": "石桥", "budget_range": [4300, 5000], "layout": "两室"},
+        },
+        rows=[
+            {"小区": "石桥铭苑", "房号": "21-1201A"},
+        ],
+    )
+
+
+def test_short_media_followup_terms_are_not_treated_as_community_mentions() -> None:
+    assert main._possible_community_mentions("笔记发我") == []
+    assert main._possible_community_mentions("图片也发一个") == []
+    assert main._possible_community_mentions("这两套哪个价格低一点？") == []
+    assert main._has_bound_room_field_followup("笔记发我")
+    assert main._has_bound_room_field_followup("图片也发一个")
+    assert main._has_bound_room_field_followup("这两套哪个价格低一点？")
+    assert main._possible_community_mentions("星桥锦绣嘉苑视频") == ["星桥锦绣嘉苑"]
+    assert not main._has_bound_room_field_followup("星桥锦绣嘉苑视频")
+
+
+def test_note_followup_prefers_confirmed_room_over_candidate_set(tmp_path: Path) -> None:
+    async def run_case() -> None:
+        confirmed = {
+            "listing_id": "lst-longyin",
+            "小区": "白田畈龙吟府",
+            "房号": "4-902B",
+        }
+        other = {
+            "listing_id": "lst-xingqiao",
+            "小区": "星桥锦绣嘉苑",
+            "房号": "20-1606A",
+        }
+        video_path = tmp_path / "longyin.mp4"
+        video_path.write_bytes(b"video")
+
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return []
+
+        class FakeMediaStore:
+            def media_manifest_evidence_for_listing(self, listing_id: str) -> list[dict]:
+                return []
+
+            def list_room_database_videos(self, label: str, limit: int = 5) -> list[Path]:
+                return [video_path] if label == "白田畈龙吟府4-902B" else []
+
+            def list_room_database_images(self, label: str, limit: int = 5) -> list[Path]:
+                return []
+
+            def original_video_sources_for_listings(self, listing_ids: list[str]) -> dict:
+                return {}
+
+            def original_video_sources_for_paths(self, paths: list[Path]) -> dict:
+                return {}
+
+        original_inventory = main.inventory
+        original_media_store = main.media_store
+        main.inventory = FakeInventory()
+        main.media_store = FakeMediaStore()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "query": "北软一室",
+                "candidates": [confirmed, other],
+                "shown_count": 2,
+                "total_count": 2,
+            }
+            context["confirmed_room"] = {
+                "row": confirmed,
+                "label": "白田畈龙吟府4-902B",
+            }
+
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "context_tools", "send_video", "explain_missing_media", "generate_reply"],
+                content="笔记发我",
+                context=context,
+                understanding={
+                    "intent": "production_llm1",
+                    "constraint_proof": {"wants_video": True},
+                    "structured_task": {
+                        "original_text": "笔记发我",
+                        "tool_requirements": {"needs_video": True},
+                    },
+                },
+            )
+        finally:
+            main.inventory = original_inventory
+            main.media_store = original_media_store
+
+        assert [main._row_label(row) for row in evidence["target_rows"]] == ["白田畈龙吟府4-902B"]
+        assert evidence["video_paths"] == [str(video_path)]
+        assert "candidate_context_cleared" not in evidence
+        assert "clear_room_context" not in (evidence.get("memory_reducer") or {})
+
+    asyncio.run(run_case())
+
+
 def test_llm2_production_retry_payload_redacts_unknown_reason_and_intent() -> None:
     sensitive_text = "客户原文 sk-test-secret token=abc123 https://example.test/base?api_key=abc123"
 
@@ -1354,7 +1461,7 @@ def test_llm2_production_second_retry_blocks_instead_of_grounded_inventory_rows(
     asyncio.run(run_case())
 
 
-def test_llm2_production_banned_visible_reply_rewrites_instead_of_legacy_fallback(monkeypatch) -> None:
+def test_llm2_production_literal_greeting_uses_controlled_renderer(monkeypatch) -> None:
     async def run_case() -> None:
         task_packet = build_kf_task_packet_shadow(
             {
@@ -1377,12 +1484,7 @@ def test_llm2_production_banned_visible_reply_rewrites_instead_of_legacy_fallbac
 
         class FakeReplyGenerator:
             async def compose_kf_outbound_production(self, **kwargs):
-                return {
-                    "reply_text": "我先帮您确认一下最新房态，稍后给您准确回复。",
-                    "claims": [],
-                    "action_captions": [],
-                    "self_review": {"status": "pass"},
-                }
+                raise AssertionError("literal greeting must not enter free LLM2 wording")
 
             async def assess_kf_final_reply(self, **kwargs):
                 raise AssertionError("production must not call final LLM selfcheck for this gate")
@@ -1412,12 +1514,11 @@ def test_llm2_production_banned_visible_reply_rewrites_instead_of_legacy_fallbac
 
         assert result["reply"]
         assert "你好" in result["reply"]
+        assert "稍后" not in result["reply"]
         assert result["selfcheck"]["status"] == "pass"
         assert result["needs_planner_retry"] is False
         assert tool_evidence["deterministic_reply_source"] == main.kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
-        first_validation = tool_evidence["dual_llm_production"]["llm2"]["attempts"][0]["outbound_validation"]
-        assert first_validation["status"] == "rewrite_required"
-        assert any(issue["code"] == "l3.generic_waiting_reply" for issue in first_validation["issues"])
+        assert tool_evidence["dual_llm_production"]["llm2"]["reply_source"] == "kf_llm2_controlled_evidence_renderer"
         assert "outbound_package" in tool_evidence
 
     asyncio.run(run_case())
@@ -1599,7 +1700,7 @@ def test_controlled_password_reply_stays_out_of_internal_artifacts_and_final_llm
             main.settings.kf_dual_llm_mode = original_mode
 
         assert result["reply"].strip()
-        assert result["reply"].startswith("这套看房方式我发你，密码按下面这条为准。")
+        assert result["reply"].startswith("看房密码如下。")
         assert password_canary in result["reply"]
         assert result["selfcheck"]["llm"]["source"] == "llm_selfcheck_skipped_by_kf_outbound_validation"
         assert tool_evidence["dual_llm_production"]["llm2"]["outbound_validation"]["status"] == "pass"
@@ -1958,11 +2059,10 @@ def test_production_controlled_channels_cover_contract_password_deposit_and_view
             assert "稍后给您准确回复" not in result["reply"]
 
         assert "18758141785" in contract_result["reply"]
-        assert contract_result["reply"].startswith("这单可以直接走定房和电子合同。")
-        assert "电子合同" in contract_result["reply"]
+        assert contract_result["reply"].startswith("合同、定金和订房联系方式如下。")
         assert "联系方式：" in contract_result["reply"]
         assert "101004#" in password_result["reply"]
-        assert password_result["reply"].startswith("这套看房方式我发你。")
+        assert password_result["reply"].startswith("看房密码如下。")
         assert "18758141785" in password_result["reply"]
         assert "支付宝无忧住" in deposit_result["reply"]
         assert "5.5%-8%" in deposit_result["reply"]
@@ -1985,13 +2085,13 @@ def test_outbound_validation_allows_password_only_when_user_asked_and_evidence_b
             EvidenceItem(
                 evidence_id="evd-controlled-viewing-password-1",
                 evidence_type="viewing_password",
-                summary="石桥铭苑6-1102 的看房密码已由受控通道绑定。",
+                summary="石桥铭苑6-1102 的看房密码已确认。",
                 metadata={"controlled_channel": "viewing_password", "evidence_bound": True},
             )
         ]
     )
     package = PreparedOutboundPackage(
-        reply_text="看房密码由受控通道发送。",
+        reply_text="看房密码已确认。",
         evidence_bundle=evidence_bundle,
         send_actions=[
             SendAction(
@@ -2437,12 +2537,300 @@ def test_production_visible_reply_owner_gate_blocks_non_llm2_text() -> None:
                 }
             },
         )
+        fallback_payload = main._production_controlled_tool_fallback_package_payload(
+            reply_text="房源我查到了，但本地暂时没找到视频：大华海派风景6-703-2。",
+            reason="controlled renderer could not compose missing media package",
+            attempt="missing_media_tool_fallback",
+        )
+        fallback_allowed = main._production_visible_reply_owner_gate(
+            draft_reply=fallback_payload["reply_text"],
+            deterministic_reply_source=main.kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE,
+            tool_evidence={"llm2_production_outbound_package": fallback_payload},
+        )
     finally:
         main.settings.kf_dual_llm_mode = original_mode
 
     assert blocked["status"] == "retry"
     assert blocked["retry_target"] == "llm1_tools"
     assert allowed["status"] == "pass"
+    assert fallback_allowed["status"] == "pass"
+    assert fallback_payload["reply_text_present"] is True
+
+
+def test_area_alias_filter_excludes_cross_region_rows() -> None:
+    rows = [
+        {
+            "区域": "东新园\n杭氧\n新天地",
+            "小区": "白田畈龙吟府",
+            "房号": "4-902B",
+            "户型分类": "一室",
+            "押一付一": "2100",
+            "押二付一": "1800",
+            "备注": "水30元/月，电1元/度",
+        },
+        {
+            "区域": "拱墅万达\n北部软件园\n城北万象城",
+            "小区": "大华海派风景",
+            "房号": "6-703-2",
+            "户型分类": "一室",
+            "押一付一": "1300",
+            "备注": "水30元/月，电1元/度",
+        },
+    ]
+
+    filtered = main._filter_rows_by_constraint_proof(rows, {}, query_text="北软附近1800以内的一室还有吗？")
+
+    assert [main._row_label(row) for row in filtered] == ["大华海派风景6-703-2"]
+
+
+def test_refine_followup_filters_within_previous_candidate_region() -> None:
+    now = time.time()
+    context = {
+        "last_candidate_set": {
+            "query": "皋塘东站附近2600以内的一室有没有？",
+            "created_at": now,
+            "expires_at": now + 3600,
+            "shown_count": 3,
+            "total_count": 3,
+            "candidates": [
+                {
+                    "区域": "闸弄口\n新塘\n元宝塘\n东站",
+                    "小区": "京漾东韵府",
+                    "房号": "4-2-601D",
+                    "户型分类": "一室",
+                    "户型描述": "朝南带阳台单间",
+                    "押一付一": "1700",
+                },
+                {
+                    "区域": "闸弄口\n新塘\n元宝塘\n东站",
+                    "小区": "骏塘名庭",
+                    "房号": "8-1101A",
+                    "户型分类": "一室",
+                    "户型描述": "独立厨卫",
+                    "押一付一": "1500",
+                },
+                {
+                    "区域": "闸弄口\n新塘\n元宝塘\n东站",
+                    "小区": "琬秋铭府",
+                    "房号": "3-702A",
+                    "户型分类": "一室",
+                    "户型描述": "朝南带阳台独立厨卫",
+                    "押一付一": "1900",
+                },
+            ],
+        }
+    }
+
+    refined = main._refine_rows_within_candidate_context(
+        content="独立厨房或者独卫优先",
+        context=context,
+        proof={"area": "闸弄口\n新塘\n元宝塘\n东站"},
+        query_text="闸弄口 新塘 元宝塘 东站 2600以内 一室 独立厨房或者独卫优先",
+    )
+
+    assert [main._row_label(row) for row in refined] == ["骏塘名庭8-1101A", "琬秋铭府3-702A"]
+
+
+def test_execute_tools_applies_region_whitelist_after_normal_inventory_search(monkeypatch) -> None:
+    async def run_case() -> None:
+        wrong_row = {
+            "区域": "东新园\n杭氧\n新天地",
+            "小区": "白田畈龙吟府",
+            "房号": "4-902B",
+            "户型分类": "一室",
+            "押一付一": "2100",
+            "押二付一": "1800",
+        }
+        right_row = {
+            "区域": "拱墅万达\n北部软件园\n城北万象城",
+            "小区": "大华海派风景",
+            "房号": "6-703-2",
+            "户型分类": "一室",
+            "押一付一": "1300",
+        }
+
+        async def fake_search_rows(context, query, limit=10):
+            return [wrong_row], []
+
+        async def fake_all_rows(context, limit=500, refresh_if_needed=True):
+            return [wrong_row, right_row], []
+
+        async def fake_metadata(context):
+            return {"source": "unit"}
+
+        monkeypatch.setattr(main, "_inventory_search_rows_for_context", fake_search_rows)
+        monkeypatch.setattr(main, "_inventory_all_rows_for_context", fake_all_rows)
+        monkeypatch.setattr(main, "_inventory_metadata_for_read_context", fake_metadata)
+
+        evidence = await main._execute_tools(
+            actions=["search_inventory"],
+            content="北软附近1800以内的一室还有吗？",
+            context=kf_context_memory.empty_context(),
+            understanding={
+                "effective_query": "北软附近1800以内的一室还有吗？",
+                "constraint_proof": {},
+                "structured_task": {},
+            },
+            inventory_read_context=main._local_inventory_read_context("unit"),
+        )
+
+        assert [main._row_label(row) for row in evidence["inventory_rows"]] == ["大华海派风景6-703-2"]
+        assert evidence["region_whitelist"]["labels"] == ["大华海派风景6-703-2"]
+
+    asyncio.run(run_case())
+
+
+def test_execute_tools_refines_within_previous_candidates_after_search(monkeypatch) -> None:
+    async def run_case() -> None:
+        now = time.time()
+        context = kf_context_memory.empty_context()
+        context["last_candidate_set"] = {
+            "query": "皋塘东站附近2600以内的一室有没有？",
+            "created_at": now,
+            "expires_at": now + 3600,
+            "shown_count": 3,
+            "total_count": 3,
+            "candidates": [
+                {
+                    "区域": "闸弄口\n新塘\n元宝塘\n东站",
+                    "小区": "京漾东韵府",
+                    "房号": "4-2-601D",
+                    "户型分类": "一室",
+                    "户型描述": "朝南带阳台单间",
+                    "押一付一": "1700",
+                },
+                {
+                    "区域": "闸弄口\n新塘\n元宝塘\n东站",
+                    "小区": "骏塘名庭",
+                    "房号": "8-1101A",
+                    "户型分类": "一室",
+                    "户型描述": "独立厨卫",
+                    "押一付一": "1500",
+                },
+                {
+                    "区域": "闸弄口\n新塘\n元宝塘\n东站",
+                    "小区": "琬秋铭府",
+                    "房号": "3-702A",
+                    "户型分类": "一室",
+                    "备注": "独卫，水电按房源备注",
+                    "押一付一": "1900",
+                },
+            ],
+        }
+        cross_region_row = {
+            "区域": "拱墅万达\n北部软件园\n城北万象城",
+            "小区": "棠润府",
+            "房号": "10-1004C",
+            "户型分类": "一室一厅",
+            "户型描述": "独立厨卫",
+            "押一付一": "2600",
+        }
+
+        async def fake_search_rows(context, query, limit=10):
+            return [cross_region_row], []
+
+        async def fake_all_rows(context, limit=500, refresh_if_needed=True):
+            return [cross_region_row], []
+
+        async def fake_metadata(context):
+            return {"source": "unit"}
+
+        monkeypatch.setattr(main, "_inventory_search_rows_for_context", fake_search_rows)
+        monkeypatch.setattr(main, "_inventory_all_rows_for_context", fake_all_rows)
+        monkeypatch.setattr(main, "_inventory_metadata_for_read_context", fake_metadata)
+
+        evidence = await main._execute_tools(
+            actions=["search_inventory"],
+            content="独立厨房或者独卫优先",
+            context=context,
+            understanding={
+                "effective_query": "闸弄口 新塘 元宝塘 东站 2600以内 一室 独立厨房或者独卫优先",
+                "constraint_proof": {"area": "闸弄口\n新塘\n元宝塘\n东站"},
+                "structured_task": {},
+            },
+            inventory_read_context=main._local_inventory_read_context("unit"),
+        )
+
+        assert [main._row_label(row) for row in evidence["inventory_rows"]] == ["骏塘名庭8-1101A", "琬秋铭府3-702A"]
+        assert evidence["refine_within_candidates"]["source"] == "last_candidate_set"
+
+    asyncio.run(run_case())
+
+
+def test_controlled_evidence_reply_answers_utilities_from_target_row() -> None:
+    row = {
+        "小区": "石桥铭苑",
+        "房号": "21-1201A",
+        "备注": "水30/月，电1元/度",
+    }
+
+    reply = main._controlled_evidence_reply_from_tools(
+        content="1号那套水电怎么收？",
+        understanding={
+            "constraint_proof": {"wants_utilities": True},
+            "structured_task": {"tool_requirements": {"needs_utilities": True}},
+        },
+        tool_evidence={
+            "actions": ["search_inventory"],
+            "target_rows": [row],
+        },
+    )
+
+    assert "石桥铭苑21-1201A水电：水30/月，电1元/度" in reply
+
+
+def test_customer_visible_reply_normalization_removes_future_viewing_channel_talk() -> None:
+    reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+        "骏塘名庭8-1101A目前还没空出，但可以预约看房——我已帮您触发看房联系通道，稍后会把具体安排发您。\n看房提前联系：18758141785"
+    )
+
+    assert "稍后会" not in reply
+    assert "联系通道" not in reply
+    assert "触发" not in reply
+    assert "看房提前联系：18758141785" in reply
+
+
+def test_customer_visible_reply_normalization_expands_deposit_selfcheck_path() -> None:
+    reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+        "支持支付宝无忧住信用免押，需要芝麻分≥550。你可以先在支付宝里查下自己有没有租房免押额度。"
+    )
+
+    assert "信用额度" in reply
+    assert "租房板块申请额度" in reply
+
+
+def test_customer_visible_reply_normalization_removes_future_send_and_duplicate_video() -> None:
+    reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+        "这是星桥锦绣嘉苑20-1606A的视频视频。稍后将把联系方式发给你。20-1606A看房密码需联系确认，今天是否能看房也请稍等我帮您同步。"
+    )
+
+    assert "视频视频" not in reply
+    assert "稍后将" not in reply
+    assert "稍等" not in reply
+    assert "视频" in reply
+
+
+def test_customer_visible_reply_normalization_removes_immediate_future_action_promises() -> None:
+    reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+        "20-1606B暂无视频，我马上同步其他信息。\n"
+        "麻烦您发小区名和房号，我马上查图发您。\n"
+        "客户看中哪一套？我马上把合同、定金和订房的联系方式发给你。\n"
+        "你发一下小区名和房号，我马上给你找对应视频。"
+    )
+
+    assert "马上同步" not in reply
+    assert "马上查图发" not in reply
+    assert "马上把合同" not in reply
+    assert "马上给你找" not in reply
+    assert "你发小区+房号后，我再按工具查图片" in reply
+    assert "合同、定金和订房的联系方式如下" in reply
+    assert "我再按工具查对应视频" in reply
+
+
+def test_customer_visible_format_failures_flag_immediate_future_action_promises() -> None:
+    failures = main._customer_visible_format_failures("我马上查图发您。我马上给你找对应视频。")
+
+    assert any("马上动作承诺" in item for item in failures)
 
 
 def test_generate_reply_result_production_missing_task_packet_retries_without_planner_text(monkeypatch) -> None:
@@ -3011,6 +3399,7 @@ def test_send_videos_production_uses_manifest_evidence_in_receipt(monkeypatch) -
                     rows=[row],
                     tool_evidence={
                         "video_paths": [str(video_path)],
+                        "allowed_rooms": {"listing_ids": [listing_id], "source": "unit"},
                         "video_rows": [row],
                         "video_media_manifest_evidence": [media_evidence],
                     },
@@ -3033,6 +3422,70 @@ def test_send_videos_production_uses_manifest_evidence_in_receipt(monkeypatch) -
             assert receipt["source_hash"] == manifest_source_hash
             assert receipt["sha256"] == video_sha
             assert receipt["metadata"]["media_evidence_profile"] == "media_manifest.production_read.v1"
+
+    asyncio.run(run_case())
+
+
+def test_send_videos_production_blocks_manifest_room_outside_allowed_rooms(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.texts: list[str] = []
+                self.videos: list[str] = []
+
+            def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+                self.texts.append(text)
+                return {"errcode": 0}
+
+            def send_video(self, open_kfid: str, external_userid: str, path: Path) -> dict:
+                self.videos.append(str(path))
+                return {"errcode": 0, "msgid": "video-1"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "room_database"
+            listing_id = generate_listing_id("Test", "1-101")
+            video_path = root / "video" / listing_id / "exact.mp4"
+            video_path.parent.mkdir(parents=True)
+            video_path.write_bytes(b"video")
+            _manifest, media_evidence = _write_manifest_evidence_for_send(root, listing_id, video_path, MEDIA_KIND_VIDEO)
+            row = {"listing_id": listing_id}
+            fake = FakeWeComKf()
+            original_wecom = main.wecom_kf
+            original_mode = main.settings.kf_dual_llm_mode
+            previous_room_database_path = main.settings.room_database_path
+            main.wecom_kf = fake
+            main.settings.kf_dual_llm_mode = "production"
+            main.settings.room_database_path = root
+            try:
+                sent, context = await main._send_videos_with_receipts(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=kf_context_memory.empty_context(),
+                    paths=[str(video_path)],
+                    rows=[row],
+                    tool_evidence={
+                        "video_paths": [str(video_path)],
+                        "allowed_rooms": {"listing_ids": ["other-listing"], "source": "unit"},
+                        "video_rows": [row],
+                        "video_media_manifest_evidence": [media_evidence],
+                    },
+                    captions=["caption should not send"],
+                    action_ids=["pkg-video-1"],
+                    caption_ids=["cap-video-1"],
+                    require_captions=True,
+                )
+            finally:
+                main.wecom_kf = original_wecom
+                main.settings.kf_dual_llm_mode = original_mode
+                main.settings.room_database_path = previous_room_database_path
+
+            assert fake.texts == []
+            assert fake.videos == []
+            assert sent == [{"type": "video_blocked", "path": str(video_path), "reason": "room_not_allowed_for_media_send"}]
+            receipt = context["send_receipts"]["receipts"][-1]
+            assert receipt["status"] == "failed"
+            assert receipt["metadata"]["blocked"] is True
+            assert receipt["metadata"]["allowed_rooms_required"] is True
 
     asyncio.run(run_case())
 
@@ -3115,6 +3568,7 @@ def test_send_images_production_uses_exact_manifest_evidence_in_receipt(monkeypa
                     rows=[row],
                     tool_evidence={
                         "image_paths": [str(image_path)],
+                        "allowed_rooms": {"listing_ids": [listing_id], "source": "unit"},
                         "image_rows": [row],
                         "image_media_manifest_evidence": [media_evidence],
                     },
@@ -3134,6 +3588,61 @@ def test_send_images_production_uses_exact_manifest_evidence_in_receipt(monkeypa
             assert receipt["sha256"] == media_evidence["sha256"]
             assert receipt["media_id"] == media_evidence["media_id"]
             assert receipt["metadata"]["media_evidence_profile"] == "media_manifest.production_read.v1"
+
+    asyncio.run(run_case())
+
+
+def test_send_images_production_blocks_manifest_room_outside_allowed_rooms(monkeypatch) -> None:
+    async def run_case() -> None:
+        class FakeWeComKf:
+            def __init__(self) -> None:
+                self.images: list[str] = []
+
+            def send_image(self, open_kfid: str, external_userid: str, path: Path) -> dict:
+                self.images.append(str(path))
+                return {"errcode": 0, "msgid": "image-1"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "room_database"
+            listing_id = generate_listing_id("Test", "1-101")
+            image_path = root / "images" / listing_id / "exact.jpg"
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(b"image")
+            _manifest, media_evidence = _write_manifest_evidence_for_send(root, listing_id, image_path, MEDIA_KIND_IMAGE)
+            row = {"listing_id": listing_id}
+            fake = FakeWeComKf()
+            original_wecom = main.wecom_kf
+            original_mode = main.settings.kf_dual_llm_mode
+            previous_room_database_path = main.settings.room_database_path
+            main.wecom_kf = fake
+            main.settings.kf_dual_llm_mode = "production"
+            main.settings.room_database_path = root
+            try:
+                sent, context = await main._send_images_with_receipts(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=kf_context_memory.empty_context(),
+                    paths=[str(image_path)],
+                    rows=[row],
+                    tool_evidence={
+                        "image_paths": [str(image_path)],
+                        "allowed_rooms": {"listing_ids": ["other-listing"], "source": "unit"},
+                        "image_rows": [row],
+                        "image_media_manifest_evidence": [media_evidence],
+                    },
+                    require_media_manifest=True,
+                )
+            finally:
+                main.wecom_kf = original_wecom
+                main.settings.kf_dual_llm_mode = original_mode
+                main.settings.room_database_path = previous_room_database_path
+
+            assert fake.images == []
+            assert sent == [{"type": "image_blocked", "path": str(image_path), "reason": "room_not_allowed_for_media_send"}]
+            receipt = context["send_receipts"]["receipts"][-1]
+            assert receipt["status"] == "failed"
+            assert receipt["metadata"]["blocked"] is True
+            assert receipt["metadata"]["allowed_rooms_required"] is True
 
     asyncio.run(run_case())
 
@@ -7808,6 +8317,66 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(canary, dumped)
         self.assertEqual(summary["inventory_rows"][0]["has_viewing"], "True")
         self.assertNotIn(canary, summary["inventory_rows"][0]["viewing_summary"])
+
+    def test_tool_evidence_summary_records_replayable_candidate_details(self) -> None:
+        row = {
+            "\u533a\u57df": "闸弄口\n新塘\n元宝塘\n东站",
+            "\u5c0f\u533a": "骏塘名庭",
+            "\u623f\u53f7": "8-1101A",
+            "\u6237\u578b\u5206\u7c7b": "一室独立厨卫",
+            "\u62bc\u4e00\u4ed8\u4e00": "1500",
+            "\u62bc\u4e8c\u4ed8\u4e00": "1400",
+            "\u770b\u623f\u65b9\u5f0f\u5bc6\u7801": "W04T2_SECRET#",
+        }
+
+        summary = main._tool_evidence_summary(
+            {
+                "actions": ["search_inventory", "generate_reply"],
+                "inventory_rows": [row],
+                "region_whitelist": {
+                    "area": "闸弄口\n新塘\n元宝塘\n东站",
+                    "source": "area_scope",
+                    "row_count": 2,
+                    "labels": ["骏塘名庭8-1101A", "琬秋铭府3-702A"],
+                },
+                "refine_within_candidates": {
+                    "source": "last_candidate_set",
+                    "row_count": 2,
+                    "labels": ["骏塘名庭8-1101A", "琬秋铭府3-702A"],
+                },
+            }
+        )
+
+        dumped = json.dumps(summary, ensure_ascii=False)
+        self.assertNotIn("W04T2_SECRET#", dumped)
+        self.assertEqual(summary["inventory_rows"][0]["source_stage"], "inventory_search")
+        self.assertEqual(summary["inventory_rows"][0]["区域组"], ["闸弄口", "新塘", "元宝塘", "东站"])
+        self.assertEqual(summary["inventory_rows"][0]["小区"], "骏塘名庭")
+        self.assertEqual(summary["inventory_rows"][0]["房号"], "8-1101A")
+        self.assertEqual(summary["inventory_rows"][0]["押一付一"], "1500")
+        self.assertEqual(summary["inventory_rows"][0]["押二付一"], "1400")
+        self.assertEqual(summary["tool_candidates"][0]["来源阶段"], "inventory_search")
+        self.assertEqual(summary["region_whitelist"]["row_count"], 2)
+        self.assertEqual(summary["refine_within_candidates"]["row_count"], 2)
+
+    def test_context_candidate_summary_keeps_area_for_replayable_refine(self) -> None:
+        row = {
+            "\u533a\u57df": "闸弄口\n新塘\n元宝塘\n东站",
+            "\u5c0f\u533a": "琬秋铭府",
+            "\u623f\u53f7": "3-702A",
+            "\u6237\u578b\u63cf\u8ff0": "一室朝南带阳台独立厨卫",
+            "\u6237\u578b\u5206\u7c7b": "一室",
+            "\u62bc\u4e00\u4ed8\u4e00": "1900",
+            "\u62bc\u4e8c\u4ed8\u4e00": "1700",
+        }
+
+        candidate = kf_context_memory.summarize_row(row)
+        summary = main._tool_evidence_summary({"inventory_rows": [candidate]})
+
+        self.assertEqual(candidate["区域"], "闸弄口\n新塘\n元宝塘\n东站")
+        self.assertEqual(candidate["户型分类"], "一室")
+        self.assertEqual(summary["tool_candidates"][0]["区域组"], ["闸弄口", "新塘", "元宝塘", "东站"])
+        self.assertEqual(summary["tool_candidates"][0]["layout"], "一室")
 
     async def test_video_action_does_not_create_viewing_instruction_evidence(self) -> None:
         canary = "M1D2B1_VIDEO_SECRET#"
@@ -12486,6 +13055,36 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("上一轮没有可用候选编号", reply)
 
+    def test_deposit_policy_reply_outranks_stale_selection_error(self) -> None:
+        reply = main._controlled_evidence_reply_from_tools(
+            content="能免押吗？",
+            understanding={
+                "intent": "production_llm1",
+                "constraint_proof": {"wants_deposit": True, "selected_indices": [1]},
+                "structured_task": {
+                    "tool_requirements": {"needs_deposit_policy": True},
+                },
+            },
+            tool_evidence={
+                "actions": ["search_inventory", "send_deposit_policy", "generate_reply"],
+                "selection_error": {
+                    "reason": "missing_current_candidate_set",
+                    "requested_indices": [1],
+                    "candidate_count": 0,
+                },
+                "candidate_binding": {
+                    "status": "error",
+                    "selected_indices": [1],
+                    "candidate_count": 0,
+                },
+                "rule_evidence": {"deposit_policy": main._deposit_policy_evidence()},
+            },
+        )
+
+        self.assertIn("支付宝无忧住", reply)
+        self.assertIn("5.5%-8%", reply)
+        self.assertNotIn("上一轮没有可用候选编号", reply)
+
     def test_pending_video_continue_normalizes_rewrite_task(self) -> None:
         context = kf_context_memory.remember_pending_video_sends(
             kf_context_memory.empty_context(),
@@ -12880,6 +13479,54 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("东新园、杭氧、新天地", reply)
         self.assertIn("一室、一室一厅", reply)
         self.assertIn("新柠长木府2-702B", reply)
+
+    def test_customer_visible_reply_normalization_removes_controlled_channel_leakage(self) -> None:
+        reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+            "定金和合同相关事宜，稍后会通过受控通道发送给您。已为您安排专属联系通道，联系方式通过系统发给您。联系方式：18758141785。"
+        )
+
+        self.assertNotIn("受控通道", reply)
+        self.assertNotIn("稍后会通过", reply)
+        self.assertNotIn("专属联系通道", reply)
+        self.assertNotIn("通过系统", reply)
+        self.assertIn("联系方式：18758141785", reply)
+
+    def test_customer_visible_reply_normalization_removes_system_send_leakage(self) -> None:
+        reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+            "合同联系人已通过系统发送，请注意查收。\n联系方式：18758141785 / 13282125992 / 19941091943"
+        )
+
+        self.assertNotIn("通过系统", reply)
+        self.assertNotIn("系统发送", reply)
+        self.assertIn("合同联系人已发", reply)
+        self.assertIn("联系方式：18758141785", reply)
+
+    def test_customer_visible_reply_normalization_removes_controlled_channel_synonym_and_future_send(self) -> None:
+        reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+            "合同联系人信息已通过受控渠道发送给您，请注意查收。\n合同、定金和订房的事，我已帮您对接好，稍后会把联系方式发给您。"
+        )
+
+        self.assertNotIn("受控渠道", reply)
+        self.assertNotIn("通过受控", reply)
+        self.assertNotIn("稍后会", reply)
+        self.assertIn("合同联系人信息已发给您", reply)
+        self.assertIn("联系方式发给您", reply)
+
+    def test_customer_visible_reply_normalization_rewrites_booking_english(self) -> None:
+        reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+            "好的，已为您准备好订房所需的合同、定金和 booking 联系方式。"
+        )
+
+        self.assertNotIn("booking", reply.lower())
+        self.assertIn("订房联系方式", reply)
+
+    def test_customer_visible_reply_normalization_maps_note_to_video_wording(self) -> None:
+        reply = main._normalize_customer_visible_reply_text_before_selfcheck(
+            "这是白田畈龙吟府4-902B的房源笔记。"
+        )
+
+        self.assertNotIn("笔记", reply)
+        self.assertIn("视频", reply)
 
     def test_customer_visible_reply_normalization_preserves_inventory_list_newline(self) -> None:
         reply = main._normalize_customer_visible_reply_text_before_selfcheck(
@@ -15271,6 +15918,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result["needs_planner_retry"])
         self.assertIn("免押走支付宝无忧住", result["reply"])
+        self.assertIn("信用额度", result["reply"])
+        self.assertIn("租房板块申请额度", result["reply"])
         self.assertIn("水电要按具体房源备注查", result["reply"])
         self.assertIn("小区+房号", result["reply"])
 
@@ -15299,6 +15948,36 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["intent"], "contract")
         self.assertFalse(result["needs_clarification"])
         self.assertTrue(result["query_state"]["wants_contract_contact"])
+
+    def test_contact_followup_promotes_contract_contact_signal(self) -> None:
+        context = kf_context_memory.empty_context()
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="user",
+            content="客户想定，合同怎么签？",
+        )
+        context = kf_context_memory.append_dialog_message(
+            context,
+            role="assistant",
+            content="合同、定金和订房相关事宜，请联系：18758141785 / 13282125992 / 19941091943",
+        )
+        signals = main._deterministic_signals("好，联系谁？")
+
+        self.assertTrue(signals["wants_contract_contact"])
+        updated = main._apply_contextual_contract_contact_signal("好，联系谁？", context, signals)
+
+        self.assertTrue(updated["wants_contract_contact"])
+
+    def test_plain_ack_without_contact_words_does_not_promote_contact_signal(self) -> None:
+        signals = main._deterministic_signals("好的")
+        updated = main._apply_contextual_contract_contact_signal(
+            "好的",
+            kf_context_memory.empty_context(),
+            signals,
+        )
+
+        self.assertFalse(updated["wants_contract_contact"])
+        self.assertNotIn("contextual_contract_contact_followup", updated)
 
     def test_outbound_package_selfcheck_rejects_payment_field_semantic_error(self) -> None:
         result = main._outbound_package_selfcheck(
@@ -16501,6 +17180,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                         "inventory_images": [str(sheet_path)],
                         "video_rows": [row],
                         "image_rows": [row],
+                        "allowed_rooms": {"listing_ids": [listing_id], "source": "unit"},
                         "video_media_manifest_evidence": [video_evidence],
                         "image_media_manifest_evidence": [image_evidence],
                         "llm2_production_outbound_package": {
@@ -16632,6 +17312,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                     tool_evidence={
                         "video_paths": [str(video_path)],
                         "video_rows": [{"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}],
+                        "allowed_rooms": {"listing_ids": [listing_id], "source": "unit"},
                         "video_media_manifest_evidence": [evidence],
                         "llm2_production_outbound_package": {
                             "reply_text": "PACKAGE 正文。",

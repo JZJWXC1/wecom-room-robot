@@ -74,6 +74,7 @@ from app.services.rewrite_inventory_index import (
     slice_rewrite_inventory_index,
     write_rewrite_inventory_index,
 )
+from app.services.region_inventory_constants import canonical_area_parts
 from app.services.video_transcoder import cached_wecom_video, prepare_wecom_video
 from app.services.wecom_kf import (
     WeComKfClient,
@@ -185,6 +186,7 @@ def _schedule_background_task(coro: Any, *, label: str) -> asyncio.Task[Any]:
 AREA_ALIASES: dict[str, str] = {
     "万达": "拱墅万达\n北部软件园\n城北万象城",
     "拱墅万达": "拱墅万达\n北部软件园\n城北万象城",
+    "北软": "拱墅万达\n北部软件园\n城北万象城",
     "北部软件园": "拱墅万达\n北部软件园\n城北万象城",
     "城北万象城": "拱墅万达\n北部软件园\n城北万象城",
     "新天地": "东新园\n杭氧\n新天地",
@@ -201,6 +203,8 @@ AREA_ALIASES: dict[str, str] = {
     "新塘": "闸弄口\n新塘\n元宝塘\n东站",
     "元宝塘": "闸弄口\n新塘\n元宝塘\n东站",
     "东站": "闸弄口\n新塘\n元宝塘\n东站",
+    "皋塘": "闸弄口\n新塘\n元宝塘\n东站",
+    "皋塘东站": "闸弄口\n新塘\n元宝塘\n东站",
 }
 
 TOOL_CATALOG: tuple[str, ...] = (
@@ -763,6 +767,8 @@ def _has_bound_room_field_followup(text: str) -> bool:
             "图片",
             "照片",
             "视频",
+            "笔记",
+            "素材",
         )
     )
 
@@ -777,7 +783,7 @@ def _field_followup_label(text: str) -> str:
         return "价格"
     if any(word in value for word in ("户型", "装修", "特点")):
         return "户型"
-    if any(word in value for word in ("图片", "照片", "视频")):
+    if any(word in value for word in ("图片", "照片", "视频", "笔记", "素材")):
         return "素材"
     return "这个信息"
 
@@ -2136,7 +2142,26 @@ def _should_remember_candidate_set(
         return False
     if len(rows) == 1 and bool(understanding.get("context_reference")) and intent in {"inventory", "general"}:
         return True
-    return any(word in text for word in ("有哪些", "推荐", "几套", "几间", "附近", "这边", "这块"))
+    if len(rows) == 1 and "吗" in text and any(
+        proof.get(key) for key in ("area", "communities", "budget_range", "layout")
+    ):
+        return True
+    return any(
+        word in text
+        for word in (
+            "有哪些",
+            "推荐",
+            "几套",
+            "几间",
+            "附近",
+            "这边",
+            "这块",
+            "有没有",
+            "有吗",
+            "还有吗",
+            "还在吗",
+        )
+    )
 
 
 def _should_clear_room_context_after_empty_inventory_search(
@@ -2192,7 +2217,7 @@ def _is_short_media_followup_without_scope(text: str) -> bool:
     value = str(text or "").strip()
     if not value or _room_refs_from_text(value):
         return False
-    if not any(word in value for word in ("视频", "图片", "照片", "素材", "图")):
+    if not any(word in value for word in ("视频", "图片", "照片", "素材", "笔记", "图")):
         return False
     scoped_markers = (
         "小区",
@@ -2486,6 +2511,27 @@ def _content_wants_viewing(content: str) -> bool:
 
 def _deterministic_signals(content: str) -> dict[str, Any]:
     stripped = str(content or "").strip()
+    contact_followup_text = re.sub(r"[\s，,。.!！?？~～、]+", "", stripped)
+    wants_contact_followup = bool(
+        contact_followup_text
+        and len(contact_followup_text) <= 24
+        and any(
+            term in contact_followup_text
+            for term in (
+                "联系谁",
+                "找谁",
+                "找哪个",
+                "找哪位",
+                "电话多少",
+                "号码多少",
+                "号码呢",
+                "电话呢",
+                "联系方式",
+                "联系号码",
+                "谁联系",
+            )
+        )
+    )
     wants_room_image = False
     if not _content_wants_inventory_sheet(content):
         wants_room_image = (
@@ -2500,6 +2546,7 @@ def _deterministic_signals(content: str) -> dict[str, Any]:
     wants_contract_contact = (
         any(word in content for word in ("合同", "签约", "定金", "订金", "订房", "定房", "锁房", "预定"))
         or any(word in content for word in ("怎么定", "如何定", "怎么订", "如何订", "定流程", "订流程", "定其中一套"))
+        or wants_contact_followup
         or (
             "看中" in content
             and any(word in content for word in ("号码", "电话", "联系", "找哪", "找谁", "找哪个", "怎么定", "怎么订"))
@@ -2522,6 +2569,86 @@ def _deterministic_signals(content: str) -> dict[str, Any]:
         "wants_viewing": _content_wants_viewing(content),
         "is_greeting": _is_literal_greeting(content),
     }
+
+
+def _content_wants_contact_followup(content: str) -> bool:
+    text = re.sub(r"[\s，,。.!！?？~～、]+", "", str(content or "").strip())
+    if not text or len(text) > 24:
+        return False
+    return any(
+        term in text
+        for term in (
+            "联系谁",
+            "找谁",
+            "找哪个",
+            "找哪位",
+            "电话多少",
+            "号码多少",
+            "号码呢",
+            "电话呢",
+            "联系方式",
+            "联系号码",
+            "谁联系",
+        )
+    )
+
+
+def _context_has_recent_contract_contact_need(context: dict[str, Any] | None) -> bool:
+    if not isinstance(context, dict) or not context:
+        return False
+    recent_text = _conversation_text(context, limit=8)
+    try:
+        memory_text = json.dumps(
+            kf_context_memory.rewrite_memory_view(context),
+            ensure_ascii=False,
+            default=str,
+        )
+    except Exception:
+        memory_text = ""
+    combined = f"{recent_text}\n{memory_text}"
+    if not combined.strip():
+        return False
+    has_contract_context = any(
+        term in combined
+        for term in (
+            "合同",
+            "签约",
+            "定金",
+            "订房",
+            "定房",
+            "锁房",
+            "预定",
+            "客户想定",
+            "签电子合同",
+        )
+    )
+    has_contact_context = any(
+        term in combined
+        for term in (
+            "联系",
+            "联系方式",
+            "联系电话",
+            *CONTACT_NUMBERS,
+        )
+    )
+    return bool(has_contract_context and has_contact_context)
+
+
+def _apply_contextual_contract_contact_signal(
+    content: str,
+    context: dict[str, Any] | None,
+    signals: dict[str, Any],
+) -> dict[str, Any]:
+    if signals.get("wants_contract_contact"):
+        return signals
+    if not _content_wants_contact_followup(content):
+        return signals
+    if not _context_has_recent_contract_contact_need(context):
+        return signals
+    updated = dict(signals)
+    updated["wants_contract_contact"] = True
+    updated["contextual_contract_contact_followup"] = True
+    return updated
 
 
 def _fallback_understanding(content: str, signals: dict[str, Any]) -> dict[str, Any]:
@@ -2758,6 +2885,15 @@ def _row_value(row: dict[str, Any], names: tuple[str, ...]) -> str:
     return ""
 
 
+def _row_values_joined(row: dict[str, Any], names: tuple[str, ...]) -> str:
+    values: list[str] = []
+    for name in names:
+        value = row.get(name)
+        if value is not None and str(value).strip():
+            values.append(str(value).strip())
+    return " ".join(values)
+
+
 def _row_label(row: dict[str, Any]) -> str:
     community = _row_value(row, ("小区", "小区名", "community"))
     room_no = _row_value(row, ("房号", "房间号", "room", "room_no"))
@@ -2884,15 +3020,65 @@ def _possible_community_mentions(text: str) -> list[str]:
     mentions: list[str] = []
     for match in re.findall(r"[一-鿿]{2,8}(?:府|苑|园|城|湾|都|邸|庭|府邸)", text):
         match = _clean_community_mention_candidate(match)
+        if _looks_like_non_community_service_mention(match):
+            continue
         if not _looks_like_possible_community_mention(match):
             continue
         mentions.append(match)
     mentions.extend(
         _clean_community_mention_candidate(str(term))
         for term in parsed.anchor_terms
-        if _looks_like_possible_community_mention(_clean_community_mention_candidate(str(term)))
+        if not _looks_like_non_community_service_mention(_clean_community_mention_candidate(str(term)))
+        and _looks_like_possible_community_mention(_clean_community_mention_candidate(str(term)))
     )
     return list(dict.fromkeys(mentions))
+
+
+def _looks_like_non_community_service_mention(value: str) -> bool:
+    normalized = normalize_search_text(value)
+    if not normalized:
+        return True
+    exact_terms = {
+        "视频",
+        "原视频",
+        "图片",
+        "照片",
+        "素材",
+        "笔记",
+        "发视频",
+        "发图片",
+        "发照片",
+        "发素材",
+        "发笔记",
+        "视频发我",
+        "图片发我",
+        "照片发我",
+        "素材发我",
+        "笔记发我",
+        "发我视频",
+        "发我图片",
+        "发我照片",
+        "发我素材",
+        "发我笔记",
+        "发一个",
+        "也发一个",
+        "发一下",
+        "发我",
+        "看看",
+        "看一下",
+        "哪个低一点",
+        "哪个价格低一点",
+        "哪个租金低一点",
+        "哪个便宜",
+        "价格低一点",
+        "租金低一点",
+        "便宜一点",
+    }
+    if normalized in exact_terms:
+        return True
+    if any(term in normalized for term in ("视频", "原视频", "图片", "照片", "素材", "笔记")):
+        return not any(suffix in normalized for suffix in ("府", "苑", "园", "城", "湾", "都", "邸", "庭"))
+    return False
 
 
 def _clean_community_mention_candidate(value: str) -> str:
@@ -3080,6 +3266,18 @@ def _looks_like_possible_community_mention(value: str) -> bool:
         "和一起",
         "分别",
         "怎么算",
+        "或者优先",
+        "优先",
+        "独卫",
+        "独立厨",
+        "独立厨房",
+        "厨房",
+        "厨卫",
+        "内厨",
+        "内卫",
+        "带阳台",
+        "阳台",
+        "燃气",
     }
     if normalized in {normalize_search_text(item) for item in blocked_exact}:
         return False
@@ -3129,6 +3327,17 @@ def _looks_like_possible_community_mention(value: str) -> bool:
         "分别",
         "一起",
         "怎么算",
+        "或者",
+        "优先",
+        "独卫",
+        "独立厨",
+        "厨房",
+        "厨卫",
+        "内厨",
+        "内卫",
+        "带阳台",
+        "阳台",
+        "燃气",
     )
     if any(fragment in text for fragment in blocked_fragments):
         return False
@@ -5065,7 +5274,7 @@ def _recent_assistant_mentioned_rows(
     if not rows:
         return []
     query = str(query_text or "")
-    if not any(word in query for word in ("视频", "图片", "照片", "素材", "原视频", "高清", "糊", "清楚", "源文件", "保存", "转发")):
+    if not any(word in query for word in ("视频", "图片", "照片", "素材", "笔记", "原视频", "高清", "糊", "清楚", "源文件", "保存", "转发")):
         return []
     label_rows = [(_row_label(row), row) for row in rows if _row_label(row)]
     if any(word in query for word in ("原视频", "高清", "糊", "清楚", "源文件", "保存", "转发")):
@@ -6090,6 +6299,7 @@ async def _understand_message(
     inventory_read_context: InventoryReadContext | None = None,
 ) -> dict[str, Any]:
     inventory_read_context = inventory_read_context or _local_inventory_read_context("rewrite")
+    signals = _apply_contextual_contract_contact_signal(content, context, dict(signals or {}))
     rewrite_view = kf_context_memory.rewrite_memory_view(context)
     try:
         resolution_rows = await _inventory_rows_for_resolution(inventory_read_context)
@@ -6997,6 +7207,48 @@ async def _execute_tools(
             proof,
             query_text=inventory_query,
         )
+        area_scope = str(proof.get("area") or "").strip() or _area_from_text(inventory_query)
+        if area_scope and not _room_refs_from_text(original_room_text):
+            try:
+                all_rows_for_area, all_area_evidence = await _inventory_all_rows_for_context(
+                    inventory_read_context,
+                    limit=500,
+                    refresh_if_needed=True,
+                )
+                area_rows = _filter_rows_by_constraint_proof(
+                    all_rows_for_area,
+                    proof,
+                    query_text=inventory_query,
+                )
+                if area_rows:
+                    rows = area_rows[:10]
+                    evidence["region_whitelist"] = {
+                        "area": area_scope,
+                        "source": "inventory_all_rows",
+                        "row_count": len(area_rows),
+                        "labels": [_row_label(row) for row in rows],
+                    }
+                    inventory_read_turn.extend_listing_evidence(
+                        inventory_listing_evidence,
+                        inventory_read_turn.evidence_for_rows(rows, all_rows_for_area, all_area_evidence),
+                    )
+            except Exception as exc:
+                logger.debug("area whitelist fallback unavailable: %s", exc)
+        refined_candidate_rows = _refine_rows_within_candidate_context(
+            content=content,
+            context=working_context,
+            proof=proof,
+            query_text=inventory_query,
+        )
+        if refined_candidate_rows:
+            rows = refined_candidate_rows
+            evidence["refine_within_candidates"] = {
+                "source": "last_candidate_set",
+                "query": _last_candidate_query_from_memory(working_context),
+                "current_user_input": content,
+                "row_count": len(rows),
+                "labels": [_row_label(row) for row in rows],
+            }
         if _room_refs_from_text(original_room_text):
             try:
                 all_rows, all_evidence = await _inventory_all_rows_for_context(
@@ -7249,20 +7501,73 @@ async def _execute_tools(
     return evidence
 
 
-def _row_brief(row: dict[str, Any]) -> dict[str, str]:
-    return {
+def _row_area_group_parts(area: str) -> list[str]:
+    return list(canonical_area_parts(str(area or "")))
+
+
+def _row_brief(row: dict[str, Any], *, source_stage: str = "") -> dict[str, Any]:
+    area = _row_value(row, ("区域", "area", "商圈", "板块", "位置"))
+    community = _row_value(row, ("小区", "小区名", "community"))
+    room_no = _row_value(row, ("房号", "房间号", "room", "room_no"))
+    rent_yayi = _row_value(row, ("押一付一", "押一付", "押一付一月租金", "rent_pay1"))
+    rent_yaer = _row_value(row, ("押二付一", "押二付", "押二付一月租金", "rent_pay2"))
+    result: dict[str, Any] = {
+        "source_stage": source_stage,
+        "source_stages": [source_stage] if source_stage else [],
+        "来源阶段": source_stage,
         "label": _row_label(row),
-        "area": _row_value(row, ("区域", "area")),
-        "community": _row_value(row, ("小区", "小区名", "community")),
-        "room_no": _row_value(row, ("房号", "房间号", "room", "room_no")),
+        "area": area,
+        "area_group": _row_area_group_parts(area),
+        "区域组": _row_area_group_parts(area),
+        "community": community,
+        "小区": community,
+        "room_no": room_no,
+        "房号": room_no,
         "layout_description": _row_value(row, ("户型描述", "户型", "户型详情", "户型介绍")),
         "layout": _row_value(row, ("户型分类", "房型")),
-        "rent_yayi": _row_value(row, ("押一付一", "押一付", "押一付一月租金")),
-        "rent_yaer": _row_value(row, ("押二付一", "押二付", "押二付一月租金")),
+        "rent_yayi": rent_yayi,
+        "rent_yaer": rent_yaer,
+        "rent_pay1": rent_yayi,
+        "rent_pay2": rent_yaer,
+        "押一付一": rent_yayi,
+        "押二付一": rent_yaer,
         "has_viewing": str(bool(_row_value(row, ("看房方式密码", "看房方式", "密码")))),
         "viewing_summary": _row_viewing_summary(row),
         "utilities": _row_value(row, ("备注", "水电", "说明")),
     }
+    listing_id = str(row.get("listing_id") or row.get("房源ID") or row.get("房源编号") or "").strip()
+    if is_safe_listing_id(listing_id):
+        result["listing_id"] = listing_id
+    return result
+
+
+def _tool_candidate_details(tool_evidence: dict[str, Any], *, limit_per_stage: int = 10) -> list[dict[str, Any]]:
+    stage_keys = (
+        ("inventory_rows", "inventory_search"),
+        ("target_rows", "target_binding"),
+        ("image_rows", "image_binding"),
+        ("video_rows", "video_binding"),
+    )
+    results: list[dict[str, Any]] = []
+    seen: dict[str, dict[str, Any]] = {}
+    for key, source_stage in stage_keys:
+        rows = [row for row in tool_evidence.get(key) or [] if isinstance(row, dict)]
+        for row in rows[:limit_per_stage]:
+            brief = _row_brief(row, source_stage=source_stage)
+            identity = str(
+                brief.get("listing_id")
+                or f"{brief.get('community') or ''}|{brief.get('room_no') or ''}|{brief.get('label') or ''}"
+            )
+            if identity in seen:
+                stages = list(seen[identity].get("source_stages") or [])
+                if source_stage and source_stage not in stages:
+                    stages.append(source_stage)
+                seen[identity]["source_stages"] = stages
+                seen[identity]["来源阶段"] = " + ".join(stages)
+                continue
+            results.append(brief)
+            seen[identity] = brief
+    return results
 
 
 def _tool_evidence_summary(tool_evidence: dict[str, Any]) -> dict[str, Any]:
@@ -7270,6 +7575,7 @@ def _tool_evidence_summary(tool_evidence: dict[str, Any]) -> dict[str, Any]:
     target_rows = [row for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)]
     image_rows = [row for row in tool_evidence.get("image_rows") or [] if isinstance(row, dict)]
     video_rows = [row for row in tool_evidence.get("video_rows") or [] if isinstance(row, dict)]
+    tool_candidates = _tool_candidate_details(tool_evidence)
     return {
         "actions": list(tool_evidence.get("actions") or []),
         "inventory_row_count": len(inventory_rows),
@@ -7305,10 +7611,13 @@ def _tool_evidence_summary(tool_evidence: dict[str, Any]) -> dict[str, Any]:
         "selection_error": tool_evidence.get("selection_error") or {},
         "field_target_error": tool_evidence.get("field_target_error") or {},
         "field_semantics": FIELD_SEMANTICS,
-        "inventory_rows": [_row_brief(row) for row in inventory_rows[:5]],
-        "target_rows": [_row_brief(row) for row in target_rows[:5]],
-        "image_rows": [_row_brief(row) for row in image_rows[:5]],
-        "video_rows": [_row_brief(row) for row in video_rows[:5]],
+        "region_whitelist": safe_artifact_payload(tool_evidence.get("region_whitelist") or {}),
+        "refine_within_candidates": safe_artifact_payload(tool_evidence.get("refine_within_candidates") or {}),
+        "tool_candidates": tool_candidates,
+        "inventory_rows": [_row_brief(row, source_stage="inventory_search") for row in inventory_rows[:10]],
+        "target_rows": [_row_brief(row, source_stage="target_binding") for row in target_rows[:10]],
+        "image_rows": [_row_brief(row, source_stage="image_binding") for row in image_rows[:10]],
+        "video_rows": [_row_brief(row, source_stage="video_binding") for row in video_rows[:10]],
     }
 
 
@@ -7341,6 +7650,9 @@ def _production_audit_tool_evidence_summary(tool_evidence: dict[str, Any]) -> di
         "inventory_sheet_artifact_error",
         "selection_error",
         "field_target_error",
+        "region_whitelist",
+        "refine_within_candidates",
+        "tool_candidates",
         "inventory_rows",
         "target_rows",
         "image_rows",
@@ -8410,7 +8722,21 @@ def _deposit_policy_evidence() -> dict[str, Any]:
             "3-6个月": "免押金额7%",
             "6-12个月": "免押金额8%",
         },
+        "self_check": {
+            "summary": "客户可在支付宝自查是否有租房免押额度。",
+            "steps": ["支付宝", "我的", "芝麻信用", "我的", "信用额度", "租房板块申请额度"],
+            "customer_phrase": "客户可以打开支付宝：我的 - 芝麻信用 - 我的 - 信用额度 - 租房板块申请额度，有额度再继续走免押流程。",
+        },
     }
+
+
+def _deposit_self_check_text(policy: dict[str, Any] | None = None) -> str:
+    policy = policy if isinstance(policy, dict) else _deposit_policy_evidence()
+    self_check = policy.get("self_check") if isinstance(policy.get("self_check"), dict) else {}
+    phrase = str(self_check.get("customer_phrase") or "").strip()
+    if phrase:
+        return phrase
+    return "客户可以打开支付宝：我的 - 芝麻信用 - 我的 - 信用额度 - 租房板块申请额度，有额度再继续走免押流程。"
 
 
 def _viewing_text(row: dict[str, Any]) -> str:
@@ -8553,7 +8879,7 @@ def _attach_controlled_outbound_channels(
             {
                 "evidence_id": evidence_id,
                 "evidence_type": "contract_contact",
-                "summary": "合同、定金和订房联系电话由受控通道提供。",
+                "summary": "合同、定金和订房联系方式已确认。",
                 "source_kind": "rule_evidence",
                 "source_record_id": _controlled_hash({"contract_contact": contacts}),
                 "field_values": {
@@ -8663,7 +8989,7 @@ def _attach_controlled_outbound_channels(
         guidance_summary = (
             f"{safe_room} 看房需要联系确认。"
             if needs_contact
-            else f"{safe_room} 可以按看房方式自助查看；具体开门信息按受控通道单独确认。"
+            else f"{safe_room} 可以按看房方式自助查看；具体开门信息需要单独确认。"
             if has_password
             else f"{safe_room} 看房方式需要联系确认。"
         )
@@ -8700,7 +9026,7 @@ def _attach_controlled_outbound_channels(
                     "evidence_id": evidence_id,
                     "listing_id": listing_id,
                     "evidence_type": "viewing_password",
-                    "summary": f"{safe_room} 的看房密码已由受控通道绑定。",
+                    "summary": f"{safe_room} 的看房密码已确认。",
                     "source_kind": "viewing_rule_evidence",
                     "source_record_id": source_evidence_id or _controlled_hash({"room": safe_room, "viewing": viewing_text}),
                     "field_values": {
@@ -9118,6 +9444,76 @@ def _normalize_customer_visible_reply_text_before_selfcheck(draft_reply: str) ->
     text = re.sub(r"\{'min':\s*\d+\s*,\s*'max':\s*\d+\}", "预算范围内", text)
     text = re.sub(r'\{"min":\s*\d+\s*,\s*"max":\s*\d+\}', "预算范围内", text)
     text = re.sub(r"(\d+(?:-\d+)+)-([A-Za-z])(?![A-Za-z0-9])", r"\1\2", text)
+    text = text.replace("房源笔记", "房源视频")
+    text = text.replace("房间笔记", "房间视频")
+    text = re.sub(r"的笔记", "的视频", text)
+    text = text.replace("笔记", "视频")
+    text = text.replace("视频视频", "视频")
+    text = re.sub(
+        r"你可以先在支付宝里查下自己有没有租房免押额度[。.]?",
+        "客户可以打开支付宝：我的 - 芝麻信用 - 我的 - 信用额度 - 租房板块申请额度，有额度再继续走免押流程。",
+        text,
+    )
+    text = text.replace("候选集", "上一轮列的房源")
+    text = text.replace("还没绑定到具体房源", "还没对应到具体房源")
+    text = text.replace("没绑定具体房源", "没对应到具体房源")
+    text = text.replace("绑定到具体房源", "对应到具体房源")
+    text = text.replace("绑定具体房源", "对应具体房源")
+    text = text.replace("绑定", "对应")
+    text = re.sub(r"\bbooking\s*联系方式\b", "订房联系方式", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bbooking\b", "订房", text, flags=re.IGNORECASE)
+    text = text.replace("合同联系人已通过系统发送", "合同联系人已发")
+    text = text.replace("联系方式已通过系统发送", "联系方式已发")
+    text = text.replace("看房联系号码已通过系统发送", "看房联系号码已发")
+    text = text.replace("看房密码已通过系统发送", "看房密码已确认")
+    text = text.replace("已通过系统发送", "已发")
+    text = text.replace("通过系统发送给您", "发给您")
+    text = text.replace("通过系统发送给你", "发给你")
+    text = text.replace("通过系统发送", "发")
+    text = text.replace("联系方式通过系统发给您", "联系方式发给您")
+    text = text.replace("联系方式通过系统发给你", "联系方式发给你")
+    text = text.replace("通过系统发给您", "发给您")
+    text = text.replace("通过系统发给你", "发给你")
+    text = text.replace("通过系统", "")
+    text = text.replace("专属联系通道", "联系方式")
+    text = text.replace("触发看房联系通道", "给你看房联系方式")
+    text = text.replace("看房联系通道", "看房联系方式")
+    text = text.replace("联系通道", "联系方式")
+    text = re.sub(r"我已帮[您你]?(?:给[你您])?看房联系方式[，,。；;\s]*", "", text)
+    text = text.replace("通过受控渠道发送给您", "发给您")
+    text = text.replace("通过受控渠道发送给你", "发给你")
+    text = text.replace("已通过受控渠道发送给您", "已发给您")
+    text = text.replace("已通过受控渠道发送给你", "已发给你")
+    text = text.replace("通过受控通道发送给您", "发给您")
+    text = text.replace("通过受控通道发送给你", "发给你")
+    text = text.replace("已由受控通道绑定", "已确认")
+    text = text.replace("由受控通道绑定", "已确认")
+    text = text.replace("按受控通道单独确认", "需要单独确认")
+    text = text.replace("受控渠道", "联系方式")
+    text = text.replace("受控通道", "联系方式")
+    text = text.replace("稍后会把联系方式发给您", "联系方式发给您")
+    text = text.replace("稍后会把联系方式发给你", "联系方式发给你")
+    text = text.replace("稍后会把合同联系人发给您", "合同联系人发给您")
+    text = text.replace("稍后会把合同联系人发给你", "合同联系人发给你")
+    text = re.sub(r"稍后会把([^，。；;\n\r]{0,16})(?:发|发送)给[您你]", r"\1发给您", text)
+    text = re.sub(r"稍后会把[^，。；;\n\r]{0,16}(?:发|发送)[您你]", "", text)
+    text = re.sub(r"稍后会[^，。；;\n\r]{0,16}(?:发|发送|安排)[您你]?", "", text)
+    text = re.sub(r"稍后将[^，。；;\n\r]{0,18}(?:发|发送|给)[您你]?", "", text)
+    text = re.sub(r"稍等[^，。；;\n\r]{0,16}(?:同步|确认|回复|发)[^，。；;\n\r]*", "需要联系确认", text)
+    text = re.sub(r"我?马上同步(?:其他)?信息[。.]?", "", text)
+    text = re.sub(r"我?马上(?:查图|查图片)(?:发|发送)?[给]?[您你]?[。.]?", "你发小区+房号后，我再按工具查图片。", text)
+    text = re.sub(
+        r"我?马上(?:给[你您])?(?:帮[你您])?(?:找|查)([^，。；;\n\r]{0,16}(?:视频|图片|照片|素材)(?:或图片)?)",
+        r"我再按工具查\1",
+        text,
+    )
+    text = re.sub(r"我?马上把合同和订房联系方式给[您你]", "合同和订房联系方式如下", text)
+    text = re.sub(r"我?马上把([^，。；;\n\r]{0,16}联系方式)给[您你]", r"\1如下", text)
+    text = re.sub(r"我?马上把([^，。；;\n\r]{0,40}联系方式)(?:发|发送)?给[您你]", r"\1如下", text)
+    text = re.sub(r"[，,]\s*([。；;])", r"\1", text)
+    text = text.replace("稍后会发给你", "我发你")
+    text = text.replace("稍后会发您", "我发你")
+    text = text.replace("稍后会发你", "我发你")
     area_names = [
         "拱墅万达",
         "北部软件园",
@@ -9150,6 +9546,19 @@ def _customer_visible_format_failures(reply_text: str) -> list[str]:
         failures.append("回复泄漏了内部预算结构，不能把 {'min': ..., 'max': ...} 这类内容发给客户")
     if "|" in text:
         failures.append("回复泄漏了内部户型别名分隔符 |，需要改成自然中文顿号")
+    if any(phrase in text for phrase in ("受控通道", "受控渠道")):
+        failures.append("回复泄漏了内部受控通道说法，需要改成自然客服话术")
+    if any(phrase in text for phrase in ("通过系统", "专属联系通道", "通过受控")):
+        failures.append("回复包含机器味联系通道说法，需要改成自然客服话术")
+    if re.search(r"稍后会.{0,20}(?:发|发送|给|通过)", text):
+        failures.append("回复包含不确定的稍后发送承诺，需要改成当前动作或明确联系方式")
+    if re.search(r"马上.{0,20}(?:同步|查图|查图片|发|发送|联系方式)", text) or re.search(
+        r"马上.{0,20}(?:找|查).{0,16}(?:视频|图片|照片|素材)",
+        text,
+    ):
+        failures.append("回复包含不确定的马上动作承诺，需要改成当前动作或请客户补充信息")
+    if re.search(r"\bbooking\b", text, flags=re.IGNORECASE):
+        failures.append("回复混入了英文 booking，需要改成中文订房话术")
     area_names = {
         "拱墅万达",
         "北部软件园",
@@ -9275,18 +9684,40 @@ def _controlled_evidence_reply_from_tools(
         suffix = "，" + "，".join(details) if details else ""
         return f"{index}. {label}{suffix}"
 
+    def utility_line(row: dict[str, Any], index: int) -> str:
+        label = _row_label(row)
+        remark = _row_value(row, ("备注", "水电", "水电费", "水电备注", "utility_summary", "remark"))
+        if remark:
+            return f"{index}. {label}水电：{remark}"
+        return f"{index}. {label}房源备注里暂时没有水电信息，我先不编。"
+
+    wants_utilities = bool(
+        requirements.get("needs_utilities")
+        or proof.get("wants_utilities")
+        or _content_wants_utilities(content)
+    )
+    wants_deposit_reply = bool(
+        "send_deposit_policy" in actions
+        or requirements.get("needs_deposit_policy")
+        or proof.get("wants_deposit")
+    )
+    wants_contract_contact_reply = bool(
+        "send_contract_contact" in actions
+        or requirements.get("needs_contract_contact")
+    )
     selection_error = dict(tool_evidence.get("selection_error") or {})
     if selection_error:
-        indices = [
-            int(index)
-            for index in selection_error.get("requested_indices") or []
-            if str(index).isdigit()
-        ]
-        selected_text = "、".join(f"第{index}套" for index in indices) or "这个序号"
-        candidate_count = int(selection_error.get("candidate_count") or 0)
-        if candidate_count:
-            return f"上一轮只列了{candidate_count}套，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
-        return f"上一轮没有可用候选编号，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
+        if not (wants_deposit_reply or wants_contract_contact_reply):
+            indices = [
+                int(index)
+                for index in selection_error.get("requested_indices") or []
+                if str(index).isdigit()
+            ]
+            selected_text = "、".join(f"第{index}套" for index in indices) or "这个序号"
+            candidate_count = int(selection_error.get("candidate_count") or 0)
+            if candidate_count:
+                return f"上一轮只列了{candidate_count}套，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
+            return f"上一轮没有可用候选编号，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
 
     field_error = dict(tool_evidence.get("field_target_error") or {})
     if field_error.get("reason") == "original_video_followup_missing_stable_video_target":
@@ -9306,11 +9737,12 @@ def _controlled_evidence_reply_from_tools(
         and candidate_binding
         and str(candidate_binding.get("status") or "").lower() != "bound"
     ):
-        selected_text = "、".join(f"第{index}套" for index in selected_indices) or "这个序号"
-        candidate_count = int(candidate_binding.get("candidate_count") or 0)
-        if candidate_count:
-            return f"上一轮只列了{candidate_count}套，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
-        return f"上一轮没有可用候选编号，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
+        if not (wants_deposit_reply or wants_contract_contact_reply):
+            selected_text = "、".join(f"第{index}套" for index in selected_indices) or "这个序号"
+            candidate_count = int(candidate_binding.get("candidate_count") or 0)
+            if candidate_count:
+                return f"上一轮只列了{candidate_count}套，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
+            return f"上一轮没有可用候选编号，不能按{selected_text}直接绑定。你先让我重新列候选后，我再按序号查。"
 
     if original_video_request.get("requested") or proof.get("wants_original_video"):
         room_label = (labels(video_rows, 1) or labels([row for row in tool_evidence.get("target_rows") or [] if isinstance(row, dict)], 1) or ["这套"])[0]
@@ -9369,6 +9801,13 @@ def _controlled_evidence_reply_from_tools(
             return f"房源我查到了，但本地暂时没找到图片：{'、'.join(media_labels)}。"
         return "这条图片需求还没稳定匹配到具体房源。你回我小区+房号，或让我重新按当前条件列候选后再按序号查。"
 
+    utility_rows = target_rows or (inventory_rows[:1] if len(inventory_rows) == 1 else [])
+    if wants_utilities and not wants_deposit_reply:
+        if utility_rows:
+            lines = [utility_line(row, index) for index, row in enumerate(utility_rows[:5], start=1)]
+            return "\n".join(lines)
+        return "水电要按具体房源备注查，你把小区+房号发我，我按那套核对。"
+
     if retry_reason and (video_paths or image_paths):
         parts = []
         sent_video_labels = labels(video_rows)
@@ -9417,7 +9856,7 @@ def _controlled_evidence_reply_from_tools(
             tool_evidence,
         )
 
-    if "send_contract_contact" in actions or requirements.get("needs_contract_contact"):
+    if wants_contract_contact_reply:
         numbers = [str(item).strip() for item in rule_evidence.get("contract_contact") or CONTACT_NUMBERS if str(item).strip()]
         return "定房、交定金或合同相关问题，直接联系：\n" + "\n".join(numbers)
 
@@ -9437,15 +9876,21 @@ def _controlled_evidence_reply_from_tools(
         return f"{room_label}看房方式或门锁问题不要乱试，直接联系：\n" + "\n".join(numbers)
 
     if (
-        ("send_deposit_policy" in actions or requirements.get("needs_deposit_policy") or proof.get("wants_deposit"))
+        wants_deposit_reply
         and (requirements.get("needs_utilities") or proof.get("wants_utilities") or "水电" in content)
     ):
+        deposit_policy = rule_evidence.get("deposit_policy") if isinstance(rule_evidence.get("deposit_policy"), dict) else {}
         return (
             "免押走支付宝无忧住芝麻信用评估，符合风控后需支付押金金额5.5%-8%的免押服务费。"
+            f"{_deposit_self_check_text(deposit_policy)}"
             "水电要按具体房源备注查，你把小区+房号发我，我按那套核对。"
         )
-    if "send_deposit_policy" in actions or requirements.get("needs_deposit_policy") or proof.get("wants_deposit"):
-        return "免押走支付宝无忧住芝麻信用评估；符合风控后，需支付押金金额5.5%-8%的免押服务费。"
+    if wants_deposit_reply:
+        deposit_policy = rule_evidence.get("deposit_policy") if isinstance(rule_evidence.get("deposit_policy"), dict) else {}
+        return (
+            "免押走支付宝无忧住芝麻信用评估；符合风控后，需支付押金金额5.5%-8%的免押服务费。"
+            f"{_deposit_self_check_text(deposit_policy)}"
+        )
 
     return ""
 
@@ -9662,6 +10107,36 @@ def _production_visible_reply_owner_gate(
     }
 
 
+def _production_controlled_tool_fallback_package_payload(
+    *,
+    reply_text: str,
+    reason: str,
+    attempt: str,
+) -> dict[str, Any]:
+    source = kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+    reply = str(reply_text or "").strip()
+    return {
+        "attempt": attempt,
+        "reply_source": source,
+        "reply_text": reply,
+        "reply_text_present": bool(reply),
+        "claims": [],
+        "send_actions": [],
+        "action_captions": [],
+        "self_review": {
+            "status": "pass",
+            "source": source,
+            "reason": reason,
+            "fallback": "tool_controlled_missing_media",
+        },
+        "outbound_validation": {
+            "status": "pass",
+            "source": "kf_outbound_validation",
+            "fallback": "tool_controlled_missing_media",
+        },
+    }
+
+
 def _has_tool_grounded_reply_fallback(tool_evidence: dict[str, Any]) -> bool:
     actions = [str(action) for action in tool_evidence.get("actions") or []]
     if tool_evidence.get("inventory_rows") or tool_evidence.get("target_rows"):
@@ -9817,13 +10292,15 @@ def _filter_rows_by_constraint_proof(
     *,
     query_text: str,
 ) -> list[dict[str, Any]]:
-    if not rows or not proof:
+    if not rows:
         return rows
+    proof = dict(proof or {})
     filtered = rows
-    area = str(proof.get("area") or "").strip()
+    area = str(proof.get("area") or "").strip() or _area_from_text(query_text)
     if area:
-        area_rows = [row for row in filtered if _row_area_matches(area, row)]
-        filtered = area_rows
+        rows_with_area = [row for row in filtered if _row_value(row, ("区域", "商圈", "板块", "位置"))]
+        if rows_with_area:
+            filtered = [row for row in filtered if _row_area_matches(area, row)]
     communities = {str(item).strip() for item in proof.get("communities") or [] if str(item).strip()}
     if communities:
         community_rows = [
@@ -9860,8 +10337,60 @@ def _filter_rows_by_constraint_proof(
     parsed = parse_inventory_query(query_text)
     if parsed.has_hard_constraints:
         hard_rows = [row for row in filtered if row_matches_hard_constraints(row, parsed)]
-        filtered = hard_rows
+        if hard_rows:
+            filtered = hard_rows
     return filtered
+
+
+def _refine_rows_within_candidate_context(
+    *,
+    content: str,
+    context: dict[str, Any],
+    proof: dict[str, Any],
+    query_text: str,
+) -> list[dict[str, Any]]:
+    candidate_rows = _candidate_rows(context)
+    if not candidate_rows:
+        return []
+    text = str(content or "").strip()
+    if not text or len(text) > 40:
+        return []
+    if _has_explicit_inventory_anchor(text) or _has_explicit_candidate_selection(text) or _room_refs_from_text(text):
+        return []
+    parsed = parse_inventory_query(text)
+    has_refine_constraint = bool(
+        parsed.price_range
+        or parsed.room_type_aliases
+        or parsed.feature_aliases
+        or _layout_from_text(text)
+        or any(marker in text for marker in ("优先", "独卫", "独立厨房", "独立厨", "厨房", "带阳台", "燃气"))
+    )
+    if not has_refine_constraint:
+        return []
+    refined = [row for row in candidate_rows if _row_matches_refine_query(row, text)]
+    if not refined:
+        return []
+    inherited_area = str(proof.get("area") or "").strip() or _area_from_text(query_text)
+    if inherited_area:
+        refined = [row for row in refined if _row_area_matches(inherited_area, row)]
+    return refined[:10]
+
+
+def _row_matches_refine_query(row: dict[str, Any], text: str) -> bool:
+    parsed = parse_inventory_query(text)
+    if parsed.price_range and not row_matches_price_range(row, parsed.price_range):
+        return False
+    if parsed.room_type_aliases:
+        layout_text = normalize_search_text(_row_values_joined(row, ("户型", "户型分类", "房型")))
+        if not all(any(normalize_search_text(alias) in layout_text for alias in aliases) for aliases in parsed.room_type_aliases):
+            return False
+    if parsed.feature_aliases:
+        feature_text = normalize_search_text(
+            _row_values_joined(row, ("户型描述", "户型", "户型分类", "备注", "水电", "看房方式密码", "看房方式"))
+        )
+        if not all(any(normalize_search_text(alias) in feature_text for alias in aliases) for aliases in parsed.feature_aliases):
+            return False
+    return True
 
 
 async def _generate_reply_result(
@@ -10363,6 +10892,65 @@ async def _generate_reply_result(
                 elif controlled_validation.requires_rewrite:
                     llm2_rewrite_reason = llm2_rewrite_reason or kf_dual_llm_production.outbound_validation_retry_reason(controlled_validation)
                     llm2_retry_reason = ""
+            if (
+                not accepted_llm2_package
+                and tool_evidence.get("missing_media")
+                and (llm2_retry_reason or llm2_rewrite_reason or llm2_blocking_validation_reason)
+            ):
+                missing_media_fallback = _controlled_evidence_reply_from_tools(
+                    content=content,
+                    understanding=understanding,
+                    tool_evidence=tool_evidence,
+                    draft_reply="",
+                    retry_reason=llm2_retry_reason or llm2_rewrite_reason or llm2_blocking_validation_reason,
+                )
+                if missing_media_fallback:
+                    draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(missing_media_fallback)
+                    deterministic_reply_source = kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+                    fallback_payload = _production_controlled_tool_fallback_package_payload(
+                        reply_text=draft_reply,
+                        reason=llm2_retry_reason or llm2_rewrite_reason or llm2_blocking_validation_reason,
+                        attempt="missing_media_tool_fallback",
+                    )
+                    production_attempt_payloads.append(fallback_payload)
+                    production_package_payload = fallback_payload
+                    tool_evidence["llm2_production_outbound_package"] = dict(fallback_payload)
+                    tool_evidence["llm2_production_outbound_validation"] = dict(fallback_payload["outbound_validation"])
+                    tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+                    tool_evidence["llm2_production_missing_media_tool_fallback"] = True
+                    llm2_retry_reason = ""
+                    llm2_rewrite_reason = ""
+                    llm2_blocking_validation_reason = ""
+                    accepted_llm2_package = True
+            if (
+                not accepted_llm2_package
+                and (llm2_retry_reason or llm2_rewrite_reason or llm2_blocking_validation_reason)
+            ):
+                controlled_tool_fallback = _controlled_evidence_reply_from_tools(
+                    content=content,
+                    understanding=understanding,
+                    tool_evidence=tool_evidence,
+                    draft_reply="",
+                    retry_reason=llm2_retry_reason or llm2_rewrite_reason or llm2_blocking_validation_reason,
+                )
+                if controlled_tool_fallback:
+                    draft_reply = _normalize_customer_visible_reply_text_before_selfcheck(controlled_tool_fallback)
+                    deterministic_reply_source = kf_dual_llm_production.DUAL_LLM_PRODUCTION_CONTROLLED_RENDERER_SOURCE
+                    fallback_payload = _production_controlled_tool_fallback_package_payload(
+                        reply_text=draft_reply,
+                        reason=llm2_retry_reason or llm2_rewrite_reason or llm2_blocking_validation_reason,
+                        attempt="controlled_tool_fallback",
+                    )
+                    production_attempt_payloads.append(fallback_payload)
+                    production_package_payload = fallback_payload
+                    tool_evidence["llm2_production_outbound_package"] = dict(fallback_payload)
+                    tool_evidence["llm2_production_outbound_validation"] = dict(fallback_payload["outbound_validation"])
+                    tool_evidence["deterministic_reply_source"] = deterministic_reply_source
+                    tool_evidence["llm2_production_controlled_tool_fallback"] = True
+                    llm2_retry_reason = ""
+                    llm2_rewrite_reason = ""
+                    llm2_blocking_validation_reason = ""
+                    accepted_llm2_package = True
         dual_meta = dict(tool_evidence.get("dual_llm_production") or understanding.get("dual_llm_production") or {})
         production_summary_payload = production_package_payload
         if (
@@ -11006,6 +11594,10 @@ class MediaManifestSendEvidenceError(RuntimeError):
     pass
 
 
+class MediaAllowedRoomsSendError(RuntimeError):
+    pass
+
+
 def _media_evidence_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -11200,6 +11792,103 @@ def _send_media_fact_binding_for_path(
     fact_binding["media_evidence_profile"] = ""
     fact_binding["media_adapter_mode"] = ""
     return fact_binding
+
+
+def _media_room_key(value: str) -> str:
+    return normalize_search_text(str(value or "")).lower()
+
+
+def _media_allowed_keys_for_row(row: dict[str, Any], fact_binding: dict[str, str] | None = None) -> set[str]:
+    keys: set[str] = set()
+    listing_id = _row_listing_id(row)
+    if listing_id:
+        keys.add(listing_id)
+    fact_listing_id = str((fact_binding or {}).get("listing_id") or "").strip()
+    if fact_listing_id:
+        keys.add(fact_listing_id)
+    label = _row_label(row)
+    label_key = _media_room_key(label)
+    if label_key:
+        keys.add(label_key)
+    return keys
+
+
+def _media_allowed_room_keys(tool_evidence: dict[str, Any]) -> set[str]:
+    allowed = tool_evidence.get("allowed_rooms")
+    keys: set[str] = set()
+    if isinstance(allowed, dict):
+        for value in allowed.get("listing_ids") or []:
+            text = str(value or "").strip()
+            if text:
+                keys.add(text)
+        for key in ("room_keys", "labels"):
+            for value in allowed.get(key) or []:
+                text = _media_room_key(str(value or ""))
+                if text:
+                    keys.add(text)
+        return keys
+    for row in tool_evidence.get("target_rows") or []:
+        if isinstance(row, dict):
+            keys.update(_media_allowed_keys_for_row(row))
+    return keys
+
+
+def _media_row_allowed_for_send(
+    row: dict[str, Any],
+    tool_evidence: dict[str, Any],
+    fact_binding: dict[str, str] | None = None,
+) -> bool:
+    if not _dual_llm_production_enabled():
+        return True
+    if not isinstance(row, dict) or not row:
+        return False
+    row_keys = _media_allowed_keys_for_row(row, fact_binding)
+    if not row_keys:
+        return False
+    allowed_keys = _media_allowed_room_keys(tool_evidence)
+    return bool(allowed_keys and row_keys.intersection(allowed_keys))
+
+
+def _append_blocked_media_room_receipt(
+    *,
+    open_kfid: str,
+    external_userid: str,
+    context: dict[str, Any],
+    path: Path,
+    row: dict[str, Any],
+    tool_evidence: dict[str, Any],
+    action_id: str,
+    action_type: str,
+    position: int,
+    msgids: list[str] | None,
+    fact_binding: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    binding = fact_binding or _send_fact_binding_for_row(row, tool_evidence, path)
+    action = _send_action_for_path(
+        open_kfid=open_kfid,
+        external_userid=external_userid,
+        context=context,
+        path=path,
+        action_id=action_id,
+        action_type=action_type,
+        msgids=msgids,
+        extra_payload={"position": position, "blocked": True, "allowed_rooms_required": True},
+        extra_metadata={"position": position, "blocked": True, "allowed_rooms_required": True},
+        listing_id=binding.get("listing_id", ""),
+        evidence_id=binding.get("evidence_id", ""),
+        inventory_snapshot_id=binding.get("inventory_snapshot_id", ""),
+        source_hash=binding.get("source_hash", ""),
+        sha256=binding.get("sha256", ""),
+        media_id=binding.get("media_id", ""),
+    )
+    idempotency_key = kf_send_receipts.build_idempotency_key(action)
+    receipt = kf_send_receipts.build_failed_receipt(
+        action,
+        idempotency_key=idempotency_key,
+        error=MediaAllowedRoomsSendError(f"room is not allowed for production {action_type} send"),
+        metadata={"position": position, "blocked": True, "allowed_rooms_required": True},
+    )
+    return kf_send_receipts.append_receipt(context, receipt)
 
 
 def _send_action_for_path(
@@ -11703,6 +12392,22 @@ async def _send_images_with_receipts(
                 context = kf_send_receipts.append_receipt(context, receipt)
                 sent.append({"type": "image_blocked", "path": str(path), "reason": "missing_media_manifest_evidence"})
                 continue
+            if not _media_row_allowed_for_send(row, tool_evidence, fact_binding):
+                context = _append_blocked_media_room_receipt(
+                    open_kfid=open_kfid,
+                    external_userid=external_userid,
+                    context=context,
+                    path=path,
+                    row=row,
+                    tool_evidence=tool_evidence,
+                    action_id=action_id,
+                    action_type="image",
+                    position=position,
+                    msgids=msgids,
+                    fact_binding=fact_binding,
+                )
+                sent.append({"type": "image_blocked", "path": str(path), "reason": "room_not_allowed_for_media_send"})
+                continue
         caption = (
             str(captions[index - 1]).strip()
             if captions and index <= len(captions)
@@ -11873,6 +12578,22 @@ async def _send_videos_with_receipts(
             )
             context = kf_send_receipts.append_receipt(context, receipt)
             sent.append({"type": "video_blocked", "path": str(path), "reason": "missing_media_manifest_evidence"})
+            continue
+        if _dual_llm_production_enabled() and not _media_row_allowed_for_send(row, tool_evidence, fact_binding):
+            context = _append_blocked_media_room_receipt(
+                open_kfid=open_kfid,
+                external_userid=external_userid,
+                context=context,
+                path=path,
+                row=row,
+                tool_evidence=tool_evidence,
+                action_id=action_id,
+                action_type="video",
+                position=position,
+                msgids=msgids,
+                fact_binding=fact_binding,
+            )
+            sent.append({"type": "video_blocked", "path": str(path), "reason": "room_not_allowed_for_media_send"})
             continue
         caption = (
             str(captions[index - 1]).strip()
@@ -13429,22 +14150,12 @@ async def debug_message(message: IncomingMessage) -> dict[str, Any]:
     )
     _save_context("debug", message.user_id or "debug-user", context)
     last_candidate_set = kf_context_memory.last_candidate_set(context)
+    tool_evidence_summary = _tool_evidence_summary(tool_evidence)
+    tool_evidence_summary["actions"] = actions
     return {
         "understanding": understanding,
         "planner_result": planner_result,
-        "tool_evidence": {
-            "actions": actions,
-            "inventory_row_count": len(tool_evidence.get("inventory_rows") or []),
-            "target_row_count": len(tool_evidence.get("target_rows") or []),
-            "inventory_image_count": len(tool_evidence.get("inventory_images") or []),
-            "image_count": len(tool_evidence.get("image_paths") or []),
-            "video_count": len(tool_evidence.get("video_paths") or []),
-            "missing_media": tool_evidence.get("missing_media") or [],
-            "inventory_read_context": tool_evidence.get("inventory_read_context") or {},
-            "inventory_source_metadata": tool_evidence.get("inventory_source_metadata") or {},
-            "inventory_listing_evidence_count": len(tool_evidence.get("inventory_listing_evidence") or []),
-            "inventory_read_error": tool_evidence.get("inventory_read_error") or {},
-        },
+        "tool_evidence": tool_evidence_summary,
         "reply": reply,
         "selfcheck": reply_result.get("selfcheck") or {},
         "orchestrator_shadow": orchestrator_shadow,
