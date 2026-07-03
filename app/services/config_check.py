@@ -1,6 +1,7 @@
 from importlib import metadata
 
 from app.config import settings
+from app.services.inventory_images import inventory_image_glob_paths
 
 
 def _installed_version(package_name: str) -> str:
@@ -48,7 +49,7 @@ def get_config_status() -> dict:
         for key, value in fields.items()
         if is_missing_or_placeholder(value)
     ]
-    inventory_images = sorted(settings.room_database_path.parent.glob(settings.inventory_image_glob))
+    inventory_images = inventory_image_glob_paths()
     if not inventory_images and settings.inventory_image_path.exists():
         inventory_images = [settings.inventory_image_path]
     inventory_image_exists = bool(inventory_images)

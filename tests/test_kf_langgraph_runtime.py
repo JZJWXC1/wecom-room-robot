@@ -65,6 +65,18 @@ def test_config_status_marks_missing_langgraph_package_unhealthy_in_production(m
     assert status["ok"] is False
 
 
+def test_config_status_accepts_absolute_inventory_image_glob(monkeypatch, tmp_path) -> None:
+    png = tmp_path / "inventory_01.png"
+    png.write_bytes(b"png")
+    monkeypatch.setattr(config_check.settings, "inventory_image_glob", str(png))
+    monkeypatch.setattr(config_check.settings, "inventory_image_path", tmp_path / "missing.png")
+
+    status = config_check.get_config_status()
+
+    assert status["inventory_image_exists"] is True
+    assert status["inventory_image_count"] == 1
+
+
 def test_sqlite_checkpointer_can_persist_smoke_graph(tmp_path) -> None:
     checkpointer = kf_langgraph_runtime.build_sqlite_checkpointer(
         tmp_path / "checkpoints.sqlite"
