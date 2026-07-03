@@ -649,11 +649,16 @@ def _media_request_without_stable_listing_id(
     wants_video = bool(proof.get("wants_video") or proof.get("wants_original_video")) or any(
         word in user_text for word in ("视频", "原视频", "高清", "清楚一点", "源文件")
     )
+    wants_inventory_sheet = bool(proof.get("wants_inventory_sheet")) or "房源表" in user_text
     wants_image = bool(proof.get("wants_image")) or any(word in user_text for word in ("图片", "图也发", "照片"))
     video_count = _int_count(tool.get("video_count") or bot.get("video_count"))
     image_count = _int_count(tool.get("image_count"))
     if wants_image and not image_count:
-        image_count = _int_count(bot.get("image_count"))
+        bot_image_count = _int_count(bot.get("image_count"))
+        inventory_sheet_count = _int_count(tool.get("inventory_image_count"))
+        actions = {str(item).strip() for item in tool.get("actions") or []}
+        if not (wants_inventory_sheet and inventory_sheet_count > 0 and "send_inventory_sheet" in actions):
+            image_count = bot_image_count
     video_listing_ids = [str(item).strip() for item in tool.get("video_listing_ids") or [] if str(item).strip()]
     image_listing_ids = [str(item).strip() for item in tool.get("image_listing_ids") or [] if str(item).strip()]
     if wants_video and video_count > 0 and len(video_listing_ids) < video_count:

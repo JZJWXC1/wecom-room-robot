@@ -316,6 +316,38 @@ def test_random_guard_tool_coverage_counts_missing_image_evidence() -> None:
     assert "房间图片" in hits
 
 
+def test_inventory_sheet_image_does_not_require_room_listing_id() -> None:
+    problem = runner._media_request_without_stable_listing_id(
+        "房源表发我一张图片版。",
+        {"wants_inventory_sheet": True, "wants_image": False},
+        {"image_count": 1},
+        {
+            "actions": ["send_inventory_sheet", "generate_reply"],
+            "inventory_image_count": 1,
+            "image_count": 0,
+            "image_listing_ids": [],
+        },
+    )
+
+    assert problem == ""
+
+
+def test_room_image_still_requires_stable_listing_id() -> None:
+    problem = runner._media_request_without_stable_listing_id(
+        "第一套图片也发一下。",
+        {"wants_image": True},
+        {"image_count": 1},
+        {
+            "actions": ["send_image", "generate_reply"],
+            "inventory_image_count": 0,
+            "image_count": 0,
+            "image_listing_ids": [],
+        },
+    )
+
+    assert "缺少稳定 listing_id" in problem
+
+
 def test_random_guard_tool_coverage_gate_marks_incomplete_pass_artifact_failed(tmp_path: Path) -> None:
     artifact = tmp_path / "random_guard_pass_without_tools.json"
     payload = {
