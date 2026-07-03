@@ -16,7 +16,9 @@ from app.services.inventory_snapshot_shadow import InventorySnapshotShadowCoordi
 from app.services.region_inventory_constants import (
     AREA_ALIAS_DEFINITIONS,
     AreaAliasDefinition,
+    active_area_alias_groups,
     area_alias_index_entries,
+    canonical_area_parts,
     validate_area_alias_definitions,
 )
 from app.services.rewrite_inventory_index import (
@@ -115,6 +117,9 @@ def strip_llm_shadow_only_blocks(lines: list[str]) -> list[str]:
             continue
         if line.startswith("    async def compose_kf_outbound_shadow("):
             skip_until = "    async def assess_kf_final_reply("
+            continue
+        if line.startswith("_LLM2_VISIBLE_TOP_LEVEL_KEYS = ("):
+            skip_until = "class ReplyGenerator:"
             continue
 
         result.append(line)
@@ -254,6 +259,14 @@ def test_legacy_default_aliases_are_shared_api_projection() -> None:
     assert DEFAULT_AREA_ALIASES == expected
     assert DEFAULT_AREA_ALIASES["新填地"] == DONGXIN_AREA
     assert DEFAULT_AREA_ALIASES["东新"] == DONGXIN_AREA
+
+
+def test_active_area_alias_groups_are_shared_judge_scale() -> None:
+    groups = active_area_alias_groups()
+
+    assert groups["北软"] == ("拱墅万达", "北部软件园", "城北万象城")
+    assert groups["皋塘"] == ("闸弄口", "新塘", "元宝塘", "东站")
+    assert canonical_area_parts("闸弄口\n新塘 元宝塘  东站") == ("闸弄口", "新塘", "元宝塘", "东站")
 
 
 def test_area_alias_coverage_validator_is_clean() -> None:

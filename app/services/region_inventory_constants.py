@@ -105,9 +105,15 @@ def canonical_area_title(canonical_area: str) -> str:
     return CANONICAL_AREA_TITLES.get(canonical, canonical)
 
 
+def canonical_area_parts(canonical_area: Any) -> tuple[str, ...]:
+    canonical = normalize_area_alias_text(canonical_area)
+    return tuple(part for part in canonical.split(" ") if part)
+
+
 AREA_ALIAS_DEFINITIONS: tuple[AreaAliasDefinition, ...] = (
     AreaAliasDefinition("万达", "拱墅万达 北部软件园 城北万象城", "business_shorthand"),
     AreaAliasDefinition("拱墅万达", "拱墅万达 北部软件园 城北万象城", "canonical_component"),
+    AreaAliasDefinition("北软", "拱墅万达 北部软件园 城北万象城", "business_shorthand"),
     AreaAliasDefinition("北部软件园", "拱墅万达 北部软件园 城北万象城", "canonical_component"),
     AreaAliasDefinition("城北万象城", "拱墅万达 北部软件园 城北万象城", "canonical_component"),
     AreaAliasDefinition("拱墅万达 北部软件园 城北万象城", "拱墅万达 北部软件园 城北万象城", "canonical_area"),
@@ -129,6 +135,8 @@ AREA_ALIAS_DEFINITIONS: tuple[AreaAliasDefinition, ...] = (
     AreaAliasDefinition("东新 杭氧 新天地", "东新园 杭氧 新天地", "canonical_area_variant"),
     AreaAliasDefinition("东新园 杭氧 新天地", "东新园 杭氧 新天地", "canonical_area"),
     AreaAliasDefinition("东站", "闸弄口 新塘 元宝塘 东站", "canonical_component"),
+    AreaAliasDefinition("皋塘", "闸弄口 新塘 元宝塘 东站", "business_shorthand"),
+    AreaAliasDefinition("皋塘东站", "闸弄口 新塘 元宝塘 东站", "business_shorthand"),
     AreaAliasDefinition("闸弄口", "闸弄口 新塘 元宝塘 东站", "canonical_component"),
     AreaAliasDefinition("新塘", "闸弄口 新塘 元宝塘 东站", "canonical_component"),
     AreaAliasDefinition("元宝塘", "闸弄口 新塘 元宝塘 东站", "canonical_component"),
@@ -139,6 +147,9 @@ AREA_ALIAS_DEFINITIONS: tuple[AreaAliasDefinition, ...] = (
 REQUIRED_ACTIVE_AREA_ALIASES = {
     "新填地": "东新园 杭氧 新天地",
     "东新": "东新园 杭氧 新天地",
+    "北软": "拱墅万达 北部软件园 城北万象城",
+    "皋塘": "闸弄口 新塘 元宝塘 东站",
+    "皋塘东站": "闸弄口 新塘 元宝塘 东站",
 }
 
 
@@ -162,6 +173,17 @@ def area_alias_index_entries(
                 items.append(definition)
     entries = [item.to_index_entry() for item in items]
     return sorted(entries, key=lambda item: (str(item["normalized_alias"]), str(item["alias"])))
+
+
+def active_area_alias_groups(
+    definitions: tuple[AreaAliasDefinition, ...] | list[AreaAliasDefinition] = AREA_ALIAS_DEFINITIONS,
+    *,
+    extra_aliases: Mapping[str, str] | None = None,
+) -> dict[str, tuple[str, ...]]:
+    return {
+        str(item["alias"]): canonical_area_parts(item.get("canonical_area") or item.get("canonical"))
+        for item in area_alias_index_entries(definitions, extra_aliases=extra_aliases)
+    }
 
 
 def active_area_title_alias_map(
