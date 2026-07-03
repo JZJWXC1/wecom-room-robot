@@ -464,6 +464,8 @@ def _should_preserve_previous_candidate_set_after_narrow_update(
         return True
     if len(previous_rows) <= 1 or len(update_rows) >= len(previous_rows):
         return False
+    if len(update_rows) > 1:
+        return False
     previous_keys = {_row_identity(row) for row in previous_rows}
     update_keys = {_row_identity(row) for row in update_rows}
     update_keys.discard("")
@@ -500,13 +502,18 @@ def summarize_row(row: dict[str, Any] | None) -> dict[str, Any]:
     summary = {
         "listing_id": _listing_id_from_row(row),
         "key": room_key_from_row(row),
+        "area": str(row.get("区域") or row.get("area") or row.get("商圈") or row.get("板块") or "").strip(),
+        "区域": str(row.get("区域") or row.get("area") or row.get("商圈") or row.get("板块") or "").strip(),
         "community": str(row.get("小区") or row.get("社区") or row.get("楼盘") or "").strip(),
         "小区": str(row.get("小区") or row.get("社区") or row.get("楼盘") or "").strip(),
         "room_no": str(row.get("房号") or row.get("房间号") or row.get("门牌号") or "").strip(),
         "房号": str(row.get("房号") or row.get("房间号") or row.get("门牌号") or "").strip(),
         "layout": str(row.get("户型") or row.get("户型描述") or "").strip(),
         "户型": str(row.get("户型") or row.get("户型描述") or "").strip(),
+        "layout_description": str(row.get("户型描述") or row.get("户型") or "").strip(),
+        "户型描述": str(row.get("户型描述") or row.get("户型") or "").strip(),
         "layout_type": str(row.get("户型分类") or "").strip(),
+        "户型分类": str(row.get("户型分类") or "").strip(),
         "rent_one": str(row.get("押一付一") or row.get("押一") or "").strip(),
         "押一付一": str(row.get("押一付一") or row.get("押一") or "").strip(),
         "rent_two": str(row.get("押二付一") or row.get("押二") or "").strip(),

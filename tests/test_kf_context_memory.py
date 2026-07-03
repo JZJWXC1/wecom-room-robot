@@ -114,6 +114,51 @@ def test_recent_context_loads_from_store_and_deletes_expired_context() -> None:
     assert store.deleted == [key]
 
 
+def test_reduce_turn_context_keeps_multi_row_refined_candidate_set() -> None:
+    previous_context = kf_context_memory.empty_context(now=lambda: 10)
+    previous_context["last_candidate_set"] = {
+        "query": "皋塘东站2600内一室",
+        "intent": "inventory",
+        "candidates": [
+            {"listing_id": "lst-jt", "小区": "骏塘名庭", "房号": "8-1101A"},
+            {"listing_id": "lst-jy", "小区": "京漾东韵府", "房号": "4-2-601D"},
+            {"listing_id": "lst-wq", "小区": "琬秋铭府", "房号": "3-702A"},
+        ],
+        "shown_count": 3,
+        "total_count": 3,
+        "created_at": 10,
+        "expires_at": 3600,
+    }
+
+    reduced = kf_context_memory.reduce_turn_context(
+        previous_context,
+        understanding={"intent": "inventory"},
+        tool_evidence={
+            "memory_reducer": {
+                "last_candidate_set": {
+                    "query": "独立厨卫优先",
+                    "intent": "inventory",
+                    "candidates": [
+                        {"listing_id": "lst-jt", "小区": "骏塘名庭", "房号": "8-1101A"},
+                        {"listing_id": "lst-wq", "小区": "琬秋铭府", "房号": "3-702A"},
+                    ],
+                    "shown_count": 2,
+                    "total_count": 2,
+                }
+            }
+        },
+        final_package={
+            "final_reply": "根据独立厨卫优先的需求，筛选出2套：1. 骏塘名庭 8-1101A；2. 琬秋铭府 3-702A。",
+        },
+        now=lambda: 20,
+    )
+
+    candidates = reduced["last_candidate_set"]["candidates"]
+    assert [row["listing_id"] for row in candidates] == ["lst-jt", "lst-wq"]
+    assert reduced["last_candidate_set"]["shown_count"] == 2
+    assert reduced["last_candidate_set"]["total_count"] == 2
+
+
 def test_save_context_persists_only_safe_summary_without_customer_id_or_secrets() -> None:
     raw_customer_id = "wm_CUSTOMER_CANARY_12345678901234567890"
     synthetic_phone = "19900009999"
