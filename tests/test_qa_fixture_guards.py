@@ -173,6 +173,8 @@ def _assert_existence_gate_probes(rows: list[dict[str, str]]) -> None:
     # 房号级探针:小区必须存在(探针保持锋利),该房号必须不存在
     assert ROOM_LEVEL_PROBE[0] in communities
     assert ROOM_LEVEL_PROBE not in labels
+    # 探针房号全局不存在(任何小区都不得有此房号,机器判分按房号 token 匹配)
+    assert all(row["房号"] != ROOM_LEVEL_PROBE[1] for row in rows)
     # 错别字小区探针:整小区不得存在
     assert TYPO_COMMUNITY_PROBE not in communities
     # 语义反转纪念探针:整小区不得存在
@@ -271,3 +273,69 @@ def test_generator_rejects_source_hash_mismatch(tmp_path: Path) -> None:
             tmp_path / "out" / "fixture.csv",
             tmp_path / "out" / "provenance.json",
         )
+
+
+def test_existence_probe_constants_locked_between_runner_and_guards() -> None:
+    from qa_artifacts import run_rag_10windows_10turns_utf8 as runner
+
+    assert runner.EXISTENCE_PROBE_ROOM_LABEL == "".join(ROOM_LEVEL_PROBE)
+    assert runner.EXISTENCE_PROBE_ROOM_NO == ROOM_LEVEL_PROBE[1]
+    assert runner.EXISTENCE_PROBE_TYPO_COMMUNITY == TYPO_COMMUNITY_PROBE
+    window_ids = [window["id"] for window in runner.WINDOWS]
+    assert "existence_gate_gaotang" in window_ids
+    existence_turns = "\n".join(
+        turn
+        for window in runner.WINDOWS
+        if window["id"] == "existence_gate_gaotang"
+        for turn in window["turns"]
+    )
+    assert runner.EXISTENCE_PROBE_ROOM_LABEL in existence_turns
+    assert runner.EXISTENCE_PROBE_TYPO_COMMUNITY in existence_turns
+    assert runner.EXPECTED_FULL_WINDOW_COUNT == len(runner.WINDOWS)
+
+
+def test_existence_probe_problem_flags_hallucinated_binding() -> None:
+    from qa_artifacts import run_rag_10windows_10turns_utf8 as runner
+
+    reason = runner._existence_probe_problem(
+        "皋塘运都9-402B这套还在吗？客户存了个旧房源链接。",
+        ["皋塘运都9-402B"],
+        "在的，这套还在租。",
+    )
+
+    assert "存在性探针被绑定" in reason
+
+
+def test_existence_probe_problem_flags_confirmation_without_correction() -> None:
+    from qa_artifacts import run_rag_10windows_10turns_utf8 as runner
+
+    reason = runner._existence_probe_problem(
+        "那客户记的9-402B到底有没有？帮我再确认一遍。",
+        [],
+        "在的，可以看，视频发你。",
+    )
+
+    assert "未做反问纠偏" in reason
+
+
+def test_existence_probe_problem_accepts_correction_reply() -> None:
+    from qa_artifacts import run_rag_10windows_10turns_utf8 as runner
+
+    assert (
+        runner._existence_probe_problem(
+            "皋塘运都9-402B这套还在吗？",
+            [],
+            "你说的9-402B没有查到，皋塘运都现在在租的是16-1-2206，要不要看这套？",
+        )
+        == ""
+    )
+    assert (
+        runner._existence_probe_problem(
+            "高塘运都是不是也有房子？客户发来这个名字。",
+            [],
+            "没有高塘运都这个小区，你说的应该是皋塘运都，在租的是16-1-2206。",
+        )
+        == ""
+    )
+    # 非探针轮不触发
+    assert runner._existence_probe_problem("新天地4000左右两室有吗？", [], "有的，发你两套。") == ""

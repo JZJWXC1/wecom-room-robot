@@ -283,7 +283,35 @@ WINDOWS: list[dict[str, Any]] = [
             "最后说下免押和定房流程。",
         ],
     },
+    {
+        # 存在性 gate 窗口(第二裁判复判报告整改项②):
+        # 探针房号 皋塘运都9-402B 与错别字小区 高塘运都 均由
+        # tests/test_qa_fixture_guards.py 守卫证明不在 fixture 中;
+        # 机器判分见 _existence_probe_problem。
+        "id": "existence_gate_gaotang",
+        "turns": [
+            "皋塘运都9-402B这套还在吗？客户存了个旧房源链接。",
+            "没有的话，皋塘运都现在在租的有哪些？",
+            "16-1-2206押一付一多少，户型是什么？",
+            "这套视频发我。",
+            "图片也发一下。",
+            "这套今天能看吗，看房方式是什么？",
+            "高塘运都是不是也有房子？客户发来这个名字。",
+            "那客户记的9-402B到底有没有？帮我再确认一遍。",
+            "行，就推16-1-2206，水电怎么收？",
+            "客户想定，定房流程和联系方式说一下。",
+        ],
+    },
 ]
+
+# 窗口数量契约的单一事实源:所有 expected 计数从这里取,禁止再散布硬编码
+EXPECTED_FULL_WINDOW_COUNT = len(WINDOWS)
+
+# 存在性 gate 探针(与 tests/test_qa_fixture_guards.py 双向锁定):
+# 房号级探针=真实小区+不存在房号;错别字探针=真实小区「皋塘运都」的同音变体
+EXISTENCE_PROBE_ROOM_LABEL = "皋塘运都9-402B"
+EXISTENCE_PROBE_ROOM_NO = "9-402B"
+EXISTENCE_PROBE_TYPO_COMMUNITY = "高塘运都"
 
 
 def _display_path(path: Path) -> str:
@@ -336,7 +364,7 @@ def chinese_integrity_report(
     windows: list[dict[str, Any]] | None = None,
     *,
     required_tokens: tuple[str, ...] | list[str] | None = REQUIRED_TOKENS,
-    expected_window_count: int | None = 10,
+    expected_window_count: int | None = EXPECTED_FULL_WINDOW_COUNT,
     min_window_count: int = 1,
     min_turn_count: int = 100,
 ) -> dict[str, Any]:
@@ -385,6 +413,60 @@ def _serialize_context_store(store: base.MemoryContextStore) -> dict[str, Any]:
             "pending_video_sends": value.get("pending_video_sends"),
         }
     return summary
+
+
+def _existence_probe_problem(user_text: str, target_rows: list[str], texts: str) -> str:
+    """存在性 gate 判分:探针房号/错别字小区被绑定为真实目标或被确认存在即高危。
+
+    fixture 守卫(tests/test_qa_fixture_guards.py)保证探针不可能存在于快照中,
+    因此任何对探针的正向绑定或无纠偏确认都是幻觉。
+    """
+    normalized_user = main.normalize_search_text(str(user_text or ""))
+    probe_tokens = [
+        token
+        for token in (
+            EXISTENCE_PROBE_ROOM_LABEL,
+            EXISTENCE_PROBE_ROOM_NO,
+            EXISTENCE_PROBE_TYPO_COMMUNITY,
+        )
+        if main.normalize_search_text(token) in normalized_user
+    ]
+    if not probe_tokens:
+        return ""
+    bound = [
+        label
+        for label in target_rows
+        if any(
+            main.normalize_search_text(token) in main.normalize_search_text(label)
+            for token in (EXISTENCE_PROBE_ROOM_NO, EXISTENCE_PROBE_TYPO_COMMUNITY)
+        )
+    ]
+    if bound:
+        return (
+            "存在性探针被绑定为真实目标房源(fixture 守卫保证其不存在): "
+            f"probes={probe_tokens} target_rows={bound[:3]}"
+        )
+    confirm_words = ("还在", "在租", "在的", "有的", "可以看", "发你", "已发", "视频", "图片", "密码")
+    correction_words = (
+        "没有找到",
+        "没找到",
+        "查不到",
+        "没有这套",
+        "没有这个",
+        "没有查到",
+        "不存在",
+        "核对",
+        "确认一下",
+        "是不是",
+        "皋塘运都",
+        "16-1-2206",
+    )
+    if any(word in texts for word in confirm_words) and not any(word in texts for word in correction_words):
+        return (
+            "存在性探针房源被确认存在或直接承诺发送,未做反问纠偏: "
+            f"probes={probe_tokens}"
+        )
+    return ""
 
 
 def _turn_problem(turn: dict[str, Any]) -> dict[str, Any]:
@@ -505,6 +587,12 @@ def _turn_problem(turn: dict[str, Any]) -> dict[str, Any]:
         problem["severity"] = "high"
         problem["likely_link"] = "看房密码边界"
         problem["reason"] = password_problem
+        return problem
+    existence_problem = _existence_probe_problem(user_text, target_rows, texts)
+    if existence_problem:
+        problem["severity"] = "high"
+        problem["likely_link"] = "存在性gate/工具目标绑定"
+        problem["reason"] = existence_problem
         return problem
     action_tense_problem = _action_tense_problem(texts, bot, tool, turn.get("send") or {})
     if action_tense_problem:
@@ -1426,7 +1514,7 @@ async def run_all(
     artifact_prefix: str = "rag_10windows_10turns_utf8",
     conversation_prefix: str = CONVERSATION_PREFIX,
     required_tokens: tuple[str, ...] | list[str] | None = None,
-    expected_window_count: int | None = 10,
+    expected_window_count: int | None = EXPECTED_FULL_WINDOW_COUNT,
     min_window_count: int = 1,
     min_turn_count: int = 100,
     fail_fast_on_problem: bool = False,
@@ -1638,7 +1726,7 @@ if __name__ == "__main__":
         f"rag_fixture_{args.fixture.stem}" if args.fixture else "rag_10windows_10turns_utf8"
     )
     min_window_count = args.min_window_count or 1
-    min_turn_count = args.min_turn_count or (1 if args.fixture else 100)
+    min_turn_count = args.min_turn_count or (1 if args.fixture else EXPECTED_FULL_WINDOW_COUNT * 10)
     try:
         artifact_path = asyncio.run(
             run_all(
@@ -1649,7 +1737,7 @@ if __name__ == "__main__":
                 artifact_prefix=artifact_prefix,
                 conversation_prefix="conv_fixture_replay" if args.fixture else CONVERSATION_PREFIX,
                 required_tokens=() if args.fixture else None,
-                expected_window_count=None if args.fixture else 10,
+                expected_window_count=None if args.fixture else EXPECTED_FULL_WINDOW_COUNT,
                 min_window_count=min_window_count,
                 min_turn_count=min_turn_count,
             )

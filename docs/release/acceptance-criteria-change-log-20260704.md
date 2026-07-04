@@ -26,9 +26,30 @@
   含密码脱敏），签名随快照更新。
 - P0-2 用服务器最新缓存重新生成时，实体锚点若因房源上下架变化而失效，按本台账流程更新。
 
-## 待办登记（批4/批5）
+## P0-1 批4 口径变更（验收剧本：存在性 gate 窗口）
 
-- 精确集合断言评估（用户裁决追加）：新 fixture 落地后，评估把孤儿工作包发现的零成本断言
-  （免押费率梯度、免押自查路径）纳入精确断言范围，结论记录于批4 台账。
-- 验收剧本补皋塘组窗口与存在性 gate 窗口（探针=皋塘运都9-402B）；
-  验收摘要引用 `test_inventory_cache_provenance.json` 的 `source_snapshot_time`。
+| 测试/口径 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `qa_artifacts/run_rag_10windows_10turns_utf8.py` WINDOWS | 10 窗口，无存在性 gate 场景（复判报告整改项②） | 11 窗口：新增 `existence_gate_gaotang`（10 轮），探针=皋塘运都9-402B（房号级）+高塘运都（错别字小区级） | 复判报告："不存在房源必须反问并给近似候选"整轮未测；探针与 fixture 守卫双向锁定 |
+| 机器判分 `_turn_problem` | 无存在性判分规则 | 新增 `_existence_probe_problem`：探针被绑定为真实目标 → high；探针被确认存在/承诺发送且无纠偏词 → high | 存在性 gate 必须机器可判，不依赖人工扫描 |
+| 窗口数量契约 | 硬编码 `10` 散布 3 处 | `EXPECTED_FULL_WINDOW_COUNT = len(WINDOWS)` 单一事实源 | 防止后续加窗时漏改计数 |
+| `tests/fixtures/qa/test_text_full_utf8.json` | 100 问 | 110 问（前 100 问与旧版逐字一致，纯追加） | 与 WINDOWS 常量一致性由 `test_fixture_questions_match_windows_constant_without_importing_source_script` 强制 |
+| `tests/test_qa_fixture_guards.py` 新增 4 项 | 无 | 探针常量 runner↔守卫双向锁定；判分规则三态单测（幻觉绑定/无纠偏确认/正确纠偏）；探针房号全局不存在（任何小区不得有 9-402B） | 探针语义漂移即测试失败 |
+
+注：模块名 `run_rag_10windows_10turns_utf8` 为历史名称，实际窗口数以 `EXPECTED_FULL_WINDOW_COUNT` 为准（改名会破坏既有 artifact 溯源链，不改）。
+
+## 免押断言纳入精确断言范围的评估结论（用户裁决追加项，批4 落卷）
+
+- **已覆盖、无需新增**：免押费率区间（5.5%-8%）与自查路径（支付宝→芝麻信用→信用额度→租房板块）
+  在 fix 受控模板中已实现（`app/main.py` `_deposit_policy_evidence`/`_deposit_self_check_text`），
+  且已有 pytest 锚定：`test_llm1_controlled_contracts.py:458`、`test_wecom_kf.py:2068/2868-2869`、
+  `test_production_chain_boundaries.py:271`、`test_kf_outbound_validation.py:343/363`。
+- **非零成本、归孤儿包采纳评审（结构债 2026-07-06）**：三档费率梯度按问句差异化输出
+  （3个月5.5%/3-6个月7%/6-12个月8%，fix 只输出区间话术）、server QA runner 的
+  免押 gate（`expected_deposit_fee_rate_tiers`/`expected_deposit_selfcheck_path`）与
+  重复外发动作检测——需重新实现+测试，严禁 apply 孤儿 patch。
+
+## 待办登记（批5）
+
+- 验收摘要/manifest 引用 `test_inventory_cache_provenance.json` 的
+  `source_snapshot_time` 与 `fixture_version`（裁决 ②a 的摘要侧落地）。
