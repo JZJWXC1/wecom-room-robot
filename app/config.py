@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     wecom_kf_context_path: Path = Path("data/wecom_kf_context.json")
     wecom_kf_sync_limit: int = 100
     wecom_kf_sync_max_pages: int = 3
+    # msgid 认领窗口(秒):sync 拉取到消息即认领,窗口内平台重推同一 msgid
+    # 不再进入处理;窗口必须覆盖单条消息最坏处理时长(LLM 重试链上限),
+    # 轮次失败未 mark_processed 时过期自动放行,等平台重推补处理。
+    wecom_kf_msgid_claim_ttl_seconds: float = Field(
+        default=300.0,
+        alias="WECOM_KF_MSGID_CLAIM_TTL_SECONDS",
+    )
     wecom_kf_welcome_interval_seconds: int = Field(
         default=600,
         alias="WECOM_KF_WELCOME_INTERVAL_SECONDS",

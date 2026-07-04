@@ -1,3 +1,4 @@
+import asyncio
 import json
 import mimetypes
 import time
@@ -31,11 +32,11 @@ class WeComKfStateStore:
 
     def load(self) -> dict[str, Any]:
         if not self.path.exists():
-            return {"cursor": "", "processed_msgids": [], "welcome_sent_at": {}}
+            return {"cursor": "", "processed_msgids": [], "welcome_sent_at": {}, "inflight_msgids": {}}
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"cursor": "", "processed_msgids": [], "welcome_sent_at": {}}
+            return {"cursor": "", "processed_msgids": [], "welcome_sent_at": {}, "inflight_msgids": {}}
         welcome_sent_at: dict[str, float] = {}
         for key, value in (data.get("welcome_sent_at") or {}).items():
             if not key:
@@ -44,10 +45,19 @@ class WeComKfStateStore:
                 welcome_sent_at[kf_context_memory.safe_context_storage_key(str(key))] = float(value)
             except (TypeError, ValueError):
                 continue
+        inflight_msgids: dict[str, float] = {}
+        for key, value in (data.get("inflight_msgids") or {}).items():
+            if not key:
+                continue
+            try:
+                inflight_msgids[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
         return {
             "cursor": str(data.get("cursor", "")),
             "processed_msgids": list(data.get("processed_msgids") or []),
             "welcome_sent_at": welcome_sent_at,
+            "inflight_msgids": inflight_msgids,
         }
 
     def save_cursor(self, cursor: str) -> None:
@@ -67,7 +77,47 @@ class WeComKfStateStore:
         msgids = [item for item in state.get("processed_msgids", []) if item != msgid]
         msgids.append(msgid)
         state["processed_msgids"] = msgids[-self.max_msgids :]
+        inflight = dict(state.get("inflight_msgids") or {})
+        inflight.pop(msgid, None)
+        state["inflight_msgids"] = inflight
         self._write(state)
+
+    def claim_many(
+        self,
+        msgids: list[str],
+        *,
+        ttl_seconds: float,
+        now: float | None = None,
+    ) -> set[str]:
+        # 幂等认领:同一 msgid 在认领窗口内只放行一次(含同批重复)。
+        # 认领在 mark_processed 时转正;轮次失败/进程崩溃不转正,窗口
+        # 过期后平台重推仍可重新处理,消息不会永久丢失。
+        wanted = [str(item or "").strip() for item in msgids]
+        wanted = [item for item in wanted if item]
+        if not wanted:
+            return set()
+        stamp = float(now if now is not None else time.time())
+        state = self.load()
+        processed = set(state.get("processed_msgids") or [])
+        inflight: dict[str, float] = {}
+        for key, value in (state.get("inflight_msgids") or {}).items():
+            try:
+                claimed_at = float(value)
+            except (TypeError, ValueError):
+                continue
+            if key and stamp - claimed_at < float(ttl_seconds):
+                inflight[str(key)] = claimed_at
+        granted: set[str] = set()
+        for msgid in wanted:
+            if msgid in processed or msgid in inflight:
+                continue
+            inflight[msgid] = stamp
+            granted.add(msgid)
+        state["inflight_msgids"] = dict(
+            sorted(inflight.items(), key=lambda item: float(item[1] or 0))[-self.max_msgids :]
+        )
+        self._write(state)
+        return granted
 
     def last_welcome_sent_at(self, conversation_key: str) -> float:
         if not conversation_key:
@@ -243,6 +293,17 @@ class WeComKfClient:
         self._token_expire_at: float = 0
         self.state_store = state_store or WeComKfStateStore()
         self.last_next_cursor: str = ""
+        self._sync_lock: asyncio.Lock | None = None
+        self._sync_lock_loop: asyncio.AbstractEventLoop | None = None
+
+    def _get_sync_lock(self) -> asyncio.Lock:
+        # asyncio.Lock 绑定首次使用的事件循环;测试逐用例新建循环,
+        # 按当前循环惰性重建,生产单循环下等价于固定锁。
+        loop = asyncio.get_running_loop()
+        if self._sync_lock is None or self._sync_lock_loop is not loop:
+            self._sync_lock = asyncio.Lock()
+            self._sync_lock_loop = loop
+        return self._sync_lock
 
     @property
     def crypto(self) -> WeComCrypto:
@@ -268,20 +329,34 @@ class WeComKfClient:
         return {child.tag: child.text or "" for child in root}
 
     async def sync_messages(self, open_kfid: str, token: str) -> list[dict[str, Any]]:
-        state = self.state_store.load()
-        cursor = str(state.get("cursor", ""))
-        messages, next_cursor = await self._sync_message_pages(open_kfid, token, cursor)
-        if not messages and token:
-            messages, next_cursor = await self._sync_message_pages(open_kfid, "", cursor)
-        self.last_next_cursor = next_cursor
-        if next_cursor:
-            self.state_store.save_cursor(next_cursor)
+        # 平台回调是至少一次投递:整个"读游标-拉取-存游标-认领"临界区
+        # 串行化,避免并发回调都从旧游标拉到同一批消息;认领窗口再拦掉
+        # 跨批重推与同批分页重叠的重复 msgid(生产实证 2026-07-04 16:01
+        # 同一 msgid 完整处理两次、房源表图片重复外发)。
+        async with self._get_sync_lock():
+            state = self.state_store.load()
+            cursor = str(state.get("cursor", ""))
+            messages, next_cursor = await self._sync_message_pages(open_kfid, token, cursor)
+            if not messages and token:
+                messages, next_cursor = await self._sync_message_pages(open_kfid, "", cursor)
+            self.last_next_cursor = next_cursor
+            if next_cursor:
+                self.state_store.save_cursor(next_cursor)
 
-        return [
-            message
-            for message in messages
-            if not self.state_store.is_processed(str(message.get("msgid", "")))
-        ]
+            granted = self.state_store.claim_many(
+                [str(message.get("msgid", "")) for message in messages],
+                ttl_seconds=settings.wecom_kf_msgid_claim_ttl_seconds,
+            )
+            emitted: set[str] = set()
+            fresh: list[dict[str, Any]] = []
+            for message in messages:
+                msgid = str(message.get("msgid", ""))
+                if msgid:
+                    if msgid not in granted or msgid in emitted:
+                        continue
+                    emitted.add(msgid)
+                fresh.append(message)
+            return fresh
 
     async def _sync_message_pages(
         self,

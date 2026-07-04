@@ -338,6 +338,7 @@ async def _restart_kf_turn(
             for item in pending
             if str(item.get("msgid") or "").strip()
         }
+        appended_new = False
         for item in new_items:
             msgid = str(item.get("msgid") or "").strip()
             content = str(item.get("content") or "").strip()
@@ -346,9 +347,19 @@ async def _restart_kf_turn(
             if msgid and msgid in seen_msgids:
                 continue
             pending.append(item)
+            appended_new = True
             if msgid:
                 seen_msgids.add(msgid)
         if not pending:
+            return
+        active_task = kf_turn_tasks.get(conversation_key)
+        if not appended_new and active_task is not None and not active_task.done():
+            # 平台重推同一 msgid 不是客户追问:重启会取消在跑轮次并整轮
+            # 重放同一内容,造成双倍 LLM 消耗与重复外发,原轮次继续即可。
+            logger.info(
+                "KF duplicate delivery ignored; turn already in flight: %s",
+                _mask_identifier(conversation_key),
+            )
             return
         generation = kf_turn_generations.get(conversation_key, 0) + 1
         kf_turn_generations[conversation_key] = generation
