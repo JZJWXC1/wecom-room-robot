@@ -1,1 +1,1 @@
-﻿/opt/wecom-room-robot/releases/20260704-dedup-media-links-191731
+﻿/opt/wecom-room-robot/releases/20260705-constraint-backstop-005839
