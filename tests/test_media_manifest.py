@@ -299,8 +299,9 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             target_root = Path(directory)
+            client = FakeDriveClient(tree, payloads)
             adapter = FeishuDriveMediaManifestAdapter(
-                client=FakeDriveClient(tree, payloads),
+                client=client,
                 listing_ids=[first_listing, second_listing],
                 target_root=target_root,
             )
@@ -317,9 +318,9 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(report.ambiguous_items[0]["ambiguity"])
             self.assertTrue(report.ambiguous_items[0]["candidate_only"])
             self.assertFalse(report.ambiguous_items[0]["send_ready"])
-            isolated_path = Path(report.isolated_items[0]["target_path"])
-            self.assertTrue(isolated_path.is_file())
-            self.assertIn("_manual_review", isolated_path.parts)
+            self.assertEqual(report.isolated_items[0]["bucket"], "ambiguous")
+            self.assertEqual(report.isolated_items[0]["reason"], "multiple_listing_ids")
+            self.assertEqual(client.downloaded_tokens, [])
 
     async def test_orphan_media_with_fuzzy_candidate_only_enters_manual_report(self) -> None:
         listing_id = generate_listing_id("测试花园", "1-101A")
@@ -330,8 +331,9 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
         }
 
         with tempfile.TemporaryDirectory() as directory:
+            client = FakeDriveClient(tree, payloads)
             adapter = FeishuDriveMediaManifestAdapter(
-                client=FakeDriveClient(tree, payloads),
+                client=client,
                 listing_ids=[listing_id],
                 listing_labels={listing_id: "测试花园1-101A"},
                 target_root=Path(directory),
@@ -351,7 +353,12 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(report.fuzzy_candidates[0]["confidence"], 1.0)
             self.assertTrue(report.fuzzy_candidates[0]["candidates"][0]["candidate_only"])
             self.assertFalse(report.fuzzy_candidates[0]["candidates"][0]["send_ready"])
-            self.assertTrue(Path(report.isolated_items[0]["target_path"]).is_file())
+            self.assertEqual(report.isolated_items[0]["bucket"], "orphan")
+            self.assertEqual(report.isolated_items[0]["reason"], "missing_listing_id")
+            self.assertEqual(client.downloaded_tokens, [])
+            self.assertFalse(report.publish_ready)
+            self.assertIn({"reason": "no_bound_items"}, report.publish_blockers)
+            self.assertFalse(report.ready)
             self.assertEqual(
                 MediaManifestShadowAdapter(manifest, local_root=Path(directory)).evidence_for_listing(listing_id),
                 [],
@@ -404,6 +411,116 @@ class MediaManifestFoundationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(item.send_ready)
                 self.assertTrue(Path(item.local_path).is_file())
             self.assertTrue(MediaManifest.read_json(manifest_path).has_wecom_sendable_video(listing_id))
+
+    async def test_media_wrapper_folder_layer_is_transparent_for_binding(self) -> None:
+        listing_id = generate_listing_id("长浜龙吟轩", "11-1603")
+        payloads = {"video-token": b"wrapped-video"}
+        tree = {
+            "root": [folder("房源素材", "wrapper-folder")],
+            "wrapper-folder": [folder("东新园 杭氧 新天地", "area-folder")],
+            "area-folder": [folder("长浜龙吟轩11-1603", "room-folder")],
+            "room-folder": [file_item("lv_0_20260627144514.mp4", "video-token", payloads)],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            target_root = Path(directory) / "room_database"
+            adapter = FeishuDriveMediaManifestAdapter(
+                client=FakeDriveClient(tree, payloads),
+                listing_ids=[listing_id],
+                listing_labels={listing_id: "长浜龙吟轩11-1603"},
+                target_root=target_root,
+            )
+
+            manifest, report = await adapter.sync_from_drive(root_folder_token="root")
+
+            self.assertEqual(report.orphan_items, [])
+            self.assertEqual(len(manifest.videos_for_listing(listing_id)), 1)
+            source_path = report.bound_items[0]["source_path"]
+            self.assertNotIn("房源素材", source_path)
+            self.assertTrue(source_path.startswith("东新园 杭氧 新天地/"))
+
+    async def test_wrapper_duplicate_source_paths_bind_once_and_skip_duplicate(self) -> None:
+        listing_id = generate_listing_id("长浜龙吟轩", "11-1603")
+        payloads = {"video-token": b"same-video", "video-token-copy": b"same-video"}
+        tree = {
+            "root": [
+                folder("东新园 杭氧 新天地", "area-folder"),
+                folder("房源素材", "wrapper-folder"),
+            ],
+            "area-folder": [folder("长浜龙吟轩11-1603", "room-folder")],
+            "room-folder": [file_item("lv_0_20260627144514.mp4", "video-token", payloads)],
+            "wrapper-folder": [folder("东新园 杭氧 新天地", "wrapped-area-folder")],
+            "wrapped-area-folder": [folder("长浜龙吟轩11-1603", "wrapped-room-folder")],
+            "wrapped-room-folder": [
+                file_item("lv_0_20260627144514.mp4", "video-token-copy", payloads)
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            target_root = Path(directory) / "room_database"
+            adapter = FeishuDriveMediaManifestAdapter(
+                client=FakeDriveClient(tree, payloads),
+                listing_ids=[listing_id],
+                listing_labels={listing_id: "长浜龙吟轩11-1603"},
+                target_root=target_root,
+            )
+
+            manifest, report = await adapter.sync_from_drive(root_folder_token="root")
+
+            self.assertEqual(len(manifest.videos_for_listing(listing_id)), 1)
+            self.assertEqual(len(report.bound_items), 1)
+            duplicate_skips = [
+                item for item in report.skipped if item["reason"] == "duplicate_source_path"
+            ]
+            self.assertEqual(len(duplicate_skips), 1)
+            self.assertEqual(
+                duplicate_skips[0]["source_path"],
+                report.bound_items[0]["source_path"],
+            )
+
+    async def test_publish_gate_blocks_on_failed_but_not_on_orphan(self) -> None:
+        listing_id = generate_listing_id("长浜龙吟轩", "11-1603")
+        payloads = {
+            "video-token": b"bound-video",
+            "orphan-token": b"orphan-video",
+        }
+        tree = {
+            "root": [
+                folder("东新园 杭氧 新天地", "area-folder"),
+            ],
+            "area-folder": [
+                folder("长浜龙吟轩11-1603", "room-folder"),
+                folder("历史小区9-901", "stale-room-folder"),
+            ],
+            "room-folder": [file_item("lv_0_20260627144514.mp4", "video-token", payloads)],
+            "stale-room-folder": [file_item("历史小区9-901-图片01.jpg", "orphan-token", payloads)],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = FakeDriveClient(tree, payloads)
+            adapter = FeishuDriveMediaManifestAdapter(
+                client=client,
+                listing_ids=[listing_id],
+                listing_labels={listing_id: "长浜龙吟轩11-1603"},
+                target_root=Path(directory) / "room_database",
+            )
+
+            manifest, report = await adapter.sync_from_drive(
+                root_folder_token="root",
+                expected_kinds=[],
+            )
+
+            # 孤儿存在但不阻塞发布:发布门只看下载失败与绑定为空。
+            self.assertEqual(len(report.orphan_items), 1)
+            self.assertFalse(report.ready)
+            self.assertTrue(report.publish_ready)
+            self.assertEqual(report.quarantine_count, 1)
+            # 孤儿不下载:只下载了绑定素材。
+            self.assertEqual(client.downloaded_tokens, ["video-token"])
+            # 下载失败仍然阻塞发布。
+            report.failed.append({"source_path": "x", "reason": "boom"})
+            self.assertFalse(report.publish_ready)
+            self.assertEqual(report.publish_blockers[0]["reason"], "sync_failed")
 
     async def test_duplicate_listing_label_folder_does_not_bind_send_ready_media(self) -> None:
         first_listing = generate_listing_id("重复花园", "1-101A")

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from app.services.region_inventory_constants import (
     DEFAULT_AREA_DRIVE_FOLDER_NAMES,
+    MEDIA_WRAPPER_FOLDER_NAMES,
     NOTE_ALIASES,
     NOT_RENTING_WORDS,
     ROOM_REFERENCE_RE,
@@ -80,6 +81,11 @@ def folder_match_key(value: str) -> str:
         )
     )
     return re.sub(r"[\s\-:：，,。.!！?？]+", "", cleaned)
+
+
+def is_media_wrapper_folder(name: str) -> bool:
+    key = folder_match_key(name)
+    return bool(key) and any(key == folder_match_key(wrapper) for wrapper in MEDIA_WRAPPER_FOLDER_NAMES)
 
 
 def media_file_match_key(value: str) -> str:

@@ -771,10 +771,14 @@ def test_region_inventory_refresh_media_manifest_keeps_previous_manifest_when_de
     assert "11-1603" not in manifest_path.read_text(encoding="utf-8")
 
 
-def test_region_inventory_degraded_candidate_manifest_keeps_review_files(
+def test_region_inventory_missing_kind_publishes_and_quarantines_missing(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
+    # 口径变更(2026-07-05):期望素材缺失不再阻塞整份清单发布,
+    # 已绑定素材照常发布,缺失进隔离台账。
+    import json
+
     import scripts.sync_feishu_region_inventory as script
     from app.services.media_manifest import MediaManifestProductionAdapter
 
@@ -808,18 +812,226 @@ def test_region_inventory_degraded_candidate_manifest_keeps_review_files(
 
     result = asyncio.run(script.refresh_media_manifest(rows))
     listing_ids, _labels = script.media_manifest_context_for_rows(rows)
-    candidate_evidence = MediaManifestProductionAdapter.from_path(
-        Path(result["candidate_path"]),
+    evidence = MediaManifestProductionAdapter.from_path(
+        tmp_path / "room_database" / "media_manifest.json",
+        local_root=tmp_path / "room_database",
     ).evidence_for_listing(listing_ids[0])
 
-    assert result["ok"] is False
-    assert result["status"] == "degraded"
+    assert result["ok"] is True
+    assert result["published"] is True
+    assert result["ready"] is False
+    assert result["status"] == "published_with_quarantine"
+    assert result["blocking_count"] == 0
+    assert result["quarantine_count"] == 1
     assert result["report"]["missing_sample"][0]["missing_kinds"] == ["image"]
-    assert not (tmp_path / "room_database" / "media_manifest.json").exists()
-    assert Path(result["candidate_files_path"]).is_dir()
-    assert len(candidate_evidence) == 1
-    assert candidate_evidence[0].media_type == "video"
-    assert Path(candidate_evidence[0].local_path).is_file()
+    assert result["candidate_path"] == ""
+    assert len(evidence) == 1
+    assert evidence[0].media_type == "video"
+    assert Path(evidence[0].local_path).is_file()
+    ledger = json.loads(Path(result["quarantine_path"]).read_text(encoding="utf-8"))
+    assert ledger["missing_count"] == 1
+    assert ledger["missing"][0]["missing_kinds"] == ["image"]
+
+
+def test_region_inventory_orphan_publishes_with_quarantine_ledger_without_download(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # 口径变更(2026-07-05):历史房源孤儿素材不阻塞发布、不再下载,
+    # 明细进 _manual_review/media_manifest_quarantine.json。
+    import json
+
+    import scripts.sync_feishu_region_inventory as script
+    from app.services.media_manifest import MediaManifestProductionAdapter
+
+    rows = [{"小区": "长浜龙吟轩", "房号": "11-1603"}]
+    payloads = {"video-token": b"bound-video", "orphan-token": b"stale-room-image"}
+    tree = {
+        "root": [{"name": "东新园 杭氧 新天地", "type": "folder", "token": "area"}],
+        "area": [
+            {"name": "长浜龙吟轩11-1603", "type": "folder", "token": "room"},
+            {"name": "华丰欣苑20-2-802", "type": "folder", "token": "stale-room"},
+        ],
+        "room": [
+            {
+                "name": "lv_0_20260627144514.mp4",
+                "type": "file",
+                "token": "video-token",
+                "size": len(payloads["video-token"]),
+            }
+        ],
+        "stale-room": [
+            {
+                "name": "华丰欣苑20-2-802-图片14.jpg",
+                "type": "file",
+                "token": "orphan-token",
+                "size": len(payloads["orphan-token"]),
+            }
+        ],
+    }
+    downloaded_tokens: list[str] = []
+
+    class FakeFeishuClient:
+        async def list_folder_files(self, folder_token: str) -> list[dict[str, Any]]:
+            return list(tree.get(folder_token, []))
+
+        async def download_file(self, file_token: str, target_path: Path) -> Path:
+            downloaded_tokens.append(file_token)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(payloads[file_token])
+            return target_path
+
+    monkeypatch.setattr(script, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(script.settings, "room_database_path", tmp_path / "room_database")
+    monkeypatch.setattr(script.settings, "feishu_region_sync_target_drive_folder_token", "root")
+
+    result = asyncio.run(script.refresh_media_manifest(rows))
+    listing_ids, _labels = script.media_manifest_context_for_rows(rows)
+    evidence = MediaManifestProductionAdapter.from_path(
+        tmp_path / "room_database" / "media_manifest.json",
+        local_root=tmp_path / "room_database",
+    ).evidence_for_listing(listing_ids[0])
+
+    assert result["ok"] is True
+    assert result["status"] == "published_with_quarantine"
+    assert result["blocking_count"] == 0
+    assert result["report"]["orphan_count"] == 1
+    assert downloaded_tokens == ["video-token"]
+    assert len(evidence) == 1
+    ledger = json.loads(Path(result["quarantine_path"]).read_text(encoding="utf-8"))
+    assert ledger["orphan_count"] == 1
+    assert ledger["orphan_items"][0]["source_path"].endswith("华丰欣苑20-2-802-图片14.jpg")
+    assert ledger["orphan_items"][0]["reason"] == "missing_listing_id"
+
+
+def test_region_inventory_quarantined_listing_revives_after_row_added(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # 翰皋名府8-1403 时间线固化:素材先于房源表行到达时先进隔离台账,
+    # 行补入后下一轮同步自动重绑定并发布,无需人工搬运。
+    import json
+
+    import scripts.sync_feishu_region_inventory as script
+    from app.services.media_manifest import MediaManifestProductionAdapter
+
+    payloads = {"video-token": b"anchor-video", "new-image-token": b"new-room-image"}
+    tree = {
+        "root": [{"name": "闸弄口 新塘 元宝塘 东站", "type": "folder", "token": "area"}],
+        "area": [
+            {"name": "骏塘名庭8-1101A", "type": "folder", "token": "anchor-room"},
+            {"name": "翰皋名府8-1403", "type": "folder", "token": "new-room"},
+        ],
+        "anchor-room": [
+            {
+                "name": "lv_0_20260627144514.mp4",
+                "type": "file",
+                "token": "video-token",
+                "size": len(payloads["video-token"]),
+            }
+        ],
+        "new-room": [
+            {
+                "name": "翰皋名府8-1403-图片01.jpg",
+                "type": "file",
+                "token": "new-image-token",
+                "size": len(payloads["new-image-token"]),
+            }
+        ],
+    }
+
+    class FakeFeishuClient:
+        async def list_folder_files(self, folder_token: str) -> list[dict[str, Any]]:
+            return list(tree.get(folder_token, []))
+
+        async def download_file(self, file_token: str, target_path: Path) -> Path:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(payloads[file_token])
+            return target_path
+
+    monkeypatch.setattr(script, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(script.settings, "room_database_path", tmp_path / "room_database")
+    monkeypatch.setattr(script.settings, "feishu_region_sync_target_drive_folder_token", "root")
+
+    anchor_row = {"小区": "骏塘名庭", "房号": "8-1101A"}
+    new_row = {"小区": "翰皋名府", "房号": "8-1403"}
+
+    first = asyncio.run(script.refresh_media_manifest([anchor_row]))
+    assert first["ok"] is True
+    assert first["status"] == "published_with_quarantine"
+    first_ledger = json.loads(Path(first["quarantine_path"]).read_text(encoding="utf-8"))
+    assert first_ledger["orphan_items"][0]["source_path"].endswith("翰皋名府8-1403-图片01.jpg")
+
+    second = asyncio.run(script.refresh_media_manifest([anchor_row, new_row]))
+    listing_ids, _labels = script.media_manifest_context_for_rows([anchor_row, new_row])
+    new_listing_id = listing_ids[1]
+    evidence = MediaManifestProductionAdapter.from_path(
+        tmp_path / "room_database" / "media_manifest.json",
+        local_root=tmp_path / "room_database",
+    ).evidence_for_listing(new_listing_id)
+
+    assert second["ok"] is True
+    assert second["status"] == "ready"
+    assert second["quarantine_count"] == 0
+    assert second["quarantine_path"] == ""
+    # 隔离台账随孤儿清零而移除,不留陈旧记录。
+    assert not (tmp_path / "room_database" / "_manual_review" / "media_manifest_quarantine.json").exists()
+    assert len(evidence) == 1
+    assert evidence[0].media_type == "image"
+    assert Path(evidence[0].local_path).is_file()
+
+
+def test_region_inventory_publish_removes_stale_candidate_artifacts(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    # 降级时代遗留的候选清单与候选文件在恢复发布后必须清理,
+    # 防止运维把已发布素材误读为仍被隔离。
+    import scripts.sync_feishu_region_inventory as script
+
+    rows = [{"小区": "长浜龙吟轩", "房号": "11-1603"}]
+    payloads = {"video-token": b"publish-video"}
+    tree = {
+        "root": [{"name": "东新园 杭氧 新天地", "type": "folder", "token": "area"}],
+        "area": [{"name": "长浜龙吟轩11-1603", "type": "folder", "token": "room"}],
+        "room": [
+            {
+                "name": "lv_0_20260627144514.mp4",
+                "type": "file",
+                "token": "video-token",
+                "size": len(payloads["video-token"]),
+            }
+        ],
+    }
+
+    class FakeFeishuClient:
+        async def list_folder_files(self, folder_token: str) -> list[dict[str, Any]]:
+            return list(tree.get(folder_token, []))
+
+        async def download_file(self, file_token: str, target_path: Path) -> Path:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.write_bytes(payloads[file_token])
+            return target_path
+
+    room_database = tmp_path / "room_database"
+    manual_review = room_database / "_manual_review"
+    stale_candidate = manual_review / "media_manifest_candidate.json"
+    stale_files_dir = manual_review / "media_manifest_candidate_files" / "images" / "lst_deadbeefdeadbeef"
+    stale_files_dir.mkdir(parents=True, exist_ok=True)
+    stale_candidate.write_text("{}", encoding="utf-8")
+    (stale_files_dir / "old.jpg").write_bytes(b"stale")
+
+    monkeypatch.setattr(script, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(script.settings, "room_database_path", room_database)
+    monkeypatch.setattr(script.settings, "feishu_region_sync_target_drive_folder_token", "root")
+
+    result = asyncio.run(script.refresh_media_manifest(rows))
+
+    assert result["ok"] is True
+    assert result["status"] == "ready"
+    assert (room_database / "media_manifest.json").is_file()
+    assert not stale_candidate.exists()
+    assert not (manual_review / "media_manifest_candidate_files").exists()
 
 
 def test_region_inventory_ready_publish_failure_keeps_old_manifest_and_files(

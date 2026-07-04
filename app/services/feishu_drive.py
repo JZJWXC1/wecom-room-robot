@@ -12,6 +12,7 @@ from app.services.feishu_base import (
     VIDEO_EXTENSIONS,
     is_deleted_note_error,
 )
+from app.services.region_inventory_utils import is_media_wrapper_folder
 
 
 class FeishuDriveMixin:
@@ -698,10 +699,17 @@ class FeishuDriveMixin:
             token = str(item.get("token") or item.get("file_token") or "")
             if item_type == "folder":
                 if token:
+                    # 纯包装目录(如"房源素材")不进入镜像路径,避免云盘整体包一层时
+                    # 服务器长出 video/房源素材/<区域>/ 双层树(2026-07-01 实证)。
+                    child_parts = (
+                        folder_parts
+                        if is_media_wrapper_folder(name)
+                        else folder_parts + [self._safe_path_part(name)]
+                    )
                     await self._sync_folder(
                         token,
                         target_root,
-                        folder_parts + [self._safe_path_part(name)],
+                        child_parts,
                         downloaded,
                         skipped,
                         media_kind=media_kind,

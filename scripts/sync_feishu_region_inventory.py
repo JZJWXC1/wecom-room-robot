@@ -194,17 +194,28 @@ def missing_media_for_expected_rows(
 
 
 def media_manifest_ready(report: MediaBindingReport) -> bool:
-    return report.ready
+    # 发布门:只有"清单本体不可信"(下载失败/绑定为空)才拦发布;
+    # 孤儿/模糊/歧义/缺失是观察指标,进隔离台账不阻塞。
+    return report.publish_ready
 
 
 def media_manifest_blocking_count(report: MediaBindingReport) -> int:
-    return (
-        len(report.failed)
-        + len(report.missing)
-        + len(report.ambiguous_items)
-        + len(report.orphan_items)
-        + len(report.fuzzy_candidates)
-    )
+    return len(report.publish_blockers)
+
+
+def build_media_quarantine_ledger(report: MediaBindingReport) -> dict[str, Any]:
+    return {
+        "schema_version": "media_manifest_quarantine.v1",
+        "generated_at": report.generated_at,
+        "orphan_count": len(report.orphan_items),
+        "fuzzy_candidate_count": len(report.fuzzy_candidates),
+        "ambiguous_count": len(report.ambiguous_items),
+        "missing_count": len(report.missing),
+        "orphan_items": report.orphan_items,
+        "fuzzy_candidates": report.fuzzy_candidates,
+        "ambiguous_items": report.ambiguous_items,
+        "missing": report.missing,
+    }
 
 
 def compact_media_binding_report(report: MediaBindingReport) -> dict[str, Any]:
@@ -283,6 +294,30 @@ def _copy_file_atomically(source_path: Path, target_path: Path) -> None:
             temp_path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def _write_json_atomically(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _cleanup_stale_candidate_artifacts(candidate_path: Path, candidate_root: Path) -> None:
+    # 正式清单发布成功后,历史降级轮留下的候选清单与候选文件已经过期,
+    # 留着会误导运维把"已发布素材"当成仍被隔离(翰皋名府8-1403 实例)。
+    try:
+        candidate_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if candidate_root.is_dir():
+        shutil.rmtree(candidate_root, ignore_errors=True)
 
 
 def _write_manifest_atomically(manifest: Any, manifest_path: Path) -> None:
@@ -389,8 +424,9 @@ async def refresh_media_manifest(rows: list[dict[str, Any]]) -> dict[str, Any]:
             expected_kinds=[],
         )
         report.missing = missing_media_for_expected_rows(manifest, expected_by_listing)
-        ready = media_manifest_ready(report)
-        if ready:
+        published = media_manifest_ready(report)
+        quarantine_path = settings.room_database_path / "_manual_review" / "media_manifest_quarantine.json"
+        if published:
             manifest = publish_media_manifest_snapshot(
                 manifest=manifest,
                 staging_root=staging_root,
@@ -399,6 +435,7 @@ async def refresh_media_manifest(rows: list[dict[str, Any]]) -> dict[str, Any]:
             )
             report.manifest_path = str(manifest_path)
             candidate_output = ""
+            _cleanup_stale_candidate_artifacts(candidate_path, candidate_root)
         else:
             manifest = publish_media_manifest_snapshot(
                 manifest=manifest,
@@ -409,13 +446,27 @@ async def refresh_media_manifest(rows: list[dict[str, Any]]) -> dict[str, Any]:
             )
             report.manifest_path = str(candidate_path)
             candidate_output = str(candidate_path)
+        if report.quarantine_count:
+            _write_json_atomically(build_media_quarantine_ledger(report), quarantine_path)
+        else:
+            try:
+                quarantine_path.unlink(missing_ok=True)
+            except OSError:
+                pass
         report_summary = compact_media_binding_report(report)
+    if published:
+        status = "ready" if report.ready else "published_with_quarantine"
+    else:
+        status = "failed" if report.failed else "degraded"
     return {
-        "ok": ready,
+        "ok": published,
         "generated": report.ok,
-        "ready": ready,
-        "status": "ready" if ready else ("failed" if report.failed else "degraded"),
+        "published": published,
+        "ready": report.ready,
+        "status": status,
         "blocking_count": media_manifest_blocking_count(report),
+        "quarantine_count": report.quarantine_count,
+        "quarantine_path": str(quarantine_path) if report.quarantine_count else "",
         "path": str(manifest_path),
         "candidate_path": candidate_output,
         "candidate_files_path": str(candidate_root) if candidate_output else "",

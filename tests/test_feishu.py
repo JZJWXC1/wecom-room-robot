@@ -709,6 +709,95 @@ class FeishuClientTests(unittest.IsolatedAsyncioTestCase):
             settings.feishu_app_id = previous_app_id
             settings.feishu_app_secret = previous_secret
 
+    async def test_sync_drive_media_treats_wrapper_folder_as_transparent(self) -> None:
+        previous_app_id = settings.feishu_app_id
+        previous_secret = settings.feishu_app_secret
+        try:
+            settings.feishu_app_id = "cli_xxx"
+            settings.feishu_app_secret = "secret_xxx"
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.path.endswith("/auth/v3/tenant_access_token/internal"):
+                    return httpx.Response(
+                        200,
+                        json={"code": 0, "tenant_access_token": "tenant_token"},
+                    )
+                if request.url.path.endswith("/drive/v1/files"):
+                    folder_token = request.url.params.get("folder_token")
+                    if folder_token == "root":
+                        return httpx.Response(
+                            200,
+                            json={
+                                "code": 0,
+                                "data": {
+                                    "files": [
+                                        {
+                                            "name": "房源素材",
+                                            "type": "folder",
+                                            "token": "wrapper_folder",
+                                        }
+                                    ],
+                                    "has_more": False,
+                                },
+                            },
+                        )
+                    if folder_token == "wrapper_folder":
+                        return httpx.Response(
+                            200,
+                            json={
+                                "code": 0,
+                                "data": {
+                                    "files": [
+                                        {
+                                            "name": "小洋坝三区12-1003-2",
+                                            "type": "folder",
+                                            "token": "folder_1",
+                                        }
+                                    ],
+                                    "has_more": False,
+                                },
+                            },
+                        )
+                    if folder_token == "folder_1":
+                        return httpx.Response(
+                            200,
+                            json={
+                                "code": 0,
+                                "data": {
+                                    "files": [
+                                        {
+                                            "name": "看房视频.mp4",
+                                            "type": "file",
+                                            "token": "video_token",
+                                        }
+                                    ],
+                                    "has_more": False,
+                                },
+                            },
+                        )
+                if request.url.path.endswith("/drive/v1/files/video_token/download"):
+                    return httpx.Response(200, content=b"video")
+                raise AssertionError(f"Unexpected request: {request.url}")
+
+            with tempfile.TemporaryDirectory() as directory:
+                target_root = Path(directory) / "room_database"
+                client = FeishuClient(transport=httpx.MockTransport(handler))
+                result = await client.sync_drive_media(
+                    folder_token="root",
+                    target_root=target_root,
+                )
+
+                self.assertEqual(len(result["downloaded"]), 1)
+                # 包装层透明:镜像路径不得长出 video/房源素材/ 双层树。
+                self.assertFalse((target_root / "video" / "房源素材").exists())
+                self.assertEqual(
+                    (target_root / "video" / "小洋坝三区12-1003-2" / "看房视频.mp4").read_bytes(),
+                    b"video",
+                )
+        finally:
+            settings.feishu_app_id = previous_app_id
+            settings.feishu_app_secret = previous_secret
+
     async def test_sync_drive_media_skips_existing_local_file(self) -> None:
         previous_app_id = settings.feishu_app_id
         previous_secret = settings.feishu_app_secret

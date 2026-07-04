@@ -20,3 +20,22 @@
 遗留（挂后续批次）：compose 层 guard（`kf_llm2_outbound` 接入 guard_reasons，走 failure_package 重试，离 LLM2 最近但需松动 main 验收门口径）；判分层户型一致性（5w50 runner 仿区域一致性判分 + 本地 `_constraint_consistency_selfcheck` 平移 `_layout_field_consistency_failures`）；L1 claim 值核验只读 legacy_unknown_fields 而非一等 field/value 的键位缺口为独立 bug，回归面大，单列评估。
 
 不部署、不 push。
+
+## 生产故障修复批（批15）：媒体清单发布策略（送达门与观察门分离）
+
+背景：wecom-room-robot-feishu-region-sync 自 07-01 19:01 连续失败、media_manifest.json 停更（root cause 与取证见 docs/DECISIONS.md 批15 条目）。核心口径变更：发布阻塞条件从"orphan/fuzzy/missing/ambiguous 全为零"收敛为"下载失败非空或绑定为空"。
+
+| 测试/口径 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `refresh_media_manifest` 发布门 | 任一 orphan/fuzzy/missing/ambiguous 即整份清单降级进 `_manual_review` 候选区，正式 media_manifest.json 不更新 | 只有 `report.failed` 非空或绑定为空才降级；已绑定素材照常发布，孤儿/模糊/歧义/缺失进持久隔离台账 `_manual_review/media_manifest_quarantine.json` | 素材库天然含历史房源（741/1070 为存量孤儿），孤儿是稳态；生产读取器本就只放行精确绑定条目，全阻塞是重复防线且导致 manifest 永不更新（07-01 起线上实证） |
+| 结果契约（state/report） | `ok`=`ready`=完全干净；`status`∈ready/degraded/failed；`blocking_count`=failed+missing+ambiguous+orphan+fuzzy | `ok`=`published`（是否发布）；`ready`=完全干净（纯观察）；`status` 新增 `published_with_quarantine`；`blocking_count`=发布阻塞数（failed 条数+空绑定）；新增 `quarantine_count`/`quarantine_path` | 送达门与观察门分离后 ok 语义跟发布走；graph/systemd 以 ok 判成败，发布成功即绿 |
+| `tests/test_inventory_snapshot_m1c2.py::test_region_inventory_degraded_candidate_manifest_keeps_review_files` | 期望素材缺失（missing）→ ok=False、status=degraded、候选区留档 | 改名 `test_region_inventory_missing_kind_publishes_and_quarantines_missing`：缺失不阻塞，已绑定视频照常发布（ok=True、status=published_with_quarantine、blocking_count=0、quarantine_count=1），缺失明细进隔离台账 | 单行缺素材不应扣住其余 34 行的已绑定素材；缺失仍可见（台账+report.missing_sample） |
+| 隔离项落盘方式（`FeishuDriveMediaManifestAdapter._isolate_item`） | 每个孤儿/歧义文件下载到 staging 临时目录 `_manual_review/<bucket>/`（随 TemporaryDirectory 销毁，零留痕），`isolated_items[].target_path` 指向已销毁路径 | 不下载，只记 `{source_path, bucket, reason}`；持久明细由同步脚本写 `media_manifest_quarantine.json`；`test_ambiguous_directory_is_isolated_and_not_bound`/`test_orphan_media_with_fuzzy_candidate_only_enters_manual_report` 的 target_path 文件断言改为台账记录+零下载断言 | 旧行为纯耗带宽（每轮约 70% 下载量为孤儿）且无审计价值；台账才是失败可见 |
+| 云盘"房源素材"包装层 | 包装层进入 source_path/镜像路径（07-01 服务器长出 video/房源素材/ 双层树的成因） | 视为透明层（清单 walk 与旧版 `_sync_folder` 镜像一致），叠加 source_path 去重（`duplicate_source_path` 进 skipped）；新增正反用例锁定 | 共享常量 MEDIA_WRAPPER_FOLDER_NAMES 单一来源；云盘整体包一层/迁移半途双层并存均不再破坏绑定与镜像 |
+| Settings 未知 env 键（批15附） | pydantic-settings 默认 extra="forbid"：.env 先于代码新增键 → 所有进程 extra_forbidden 崩溃（07-04 19:00 实证） | extra="ignore"：未知键忽略，配置先行不再致命；新增 tests/test_config_env_tolerance.py 锁定 | 配置与部署顺序解耦；typo 兜底=字段默认值+部署后 UnattendedCheck |
+
+既有语义零变更：绑定判定（显式 lst_id/精确标签/模糊只出候选不绑定）、生产读取器 send_ready 条件、候选区降级路径（真降级时仍写候选清单+候选文件）、发布原子性与失败保旧清单行为均未动。
+
+验证：全量 pytest + 离线 gate 结果见本文件后续更新与 DECISIONS.md 批15 条目。
+
+不部署、不 push（部署与线上验证等用户 APPROVE_DEPLOY）。

@@ -14,7 +14,11 @@ from app.services.inventory_snapshot_models import (
     is_safe_listing_id,
     now_utc_iso,
 )
-from app.services.region_inventory_utils import folder_match_key, safe_name
+from app.services.region_inventory_utils import (
+    folder_match_key,
+    is_media_wrapper_folder,
+    safe_name,
+)
 
 
 MEDIA_MANIFEST_SCHEMA_VERSION = "media_manifest.v2"
@@ -490,10 +494,37 @@ class MediaBindingReport:
             and not self.fuzzy_candidates
         )
 
+    @property
+    def publish_blockers(self) -> list[dict[str, Any]]:
+        # 发布门只拦"清单本体不可信"的两种情形:下载/遍历失败、绑定为空。
+        # 孤儿/模糊/歧义/缺失是观察指标:生产读取器只放行精确绑定条目,
+        # 它们本就到不了客户,不应反过来扣住已绑定素材的发布。
+        blockers: list[dict[str, Any]] = [
+            {"reason": "sync_failed", "detail": dict(item)} for item in self.failed
+        ]
+        if not self.bound_items:
+            blockers.append({"reason": "no_bound_items"})
+        return blockers
+
+    @property
+    def publish_ready(self) -> bool:
+        return not self.publish_blockers
+
+    @property
+    def quarantine_count(self) -> int:
+        return (
+            len(self.missing)
+            + len(self.ambiguous_items)
+            + len(self.orphan_items)
+            + len(self.fuzzy_candidates)
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
             "ready": self.ready,
+            "publish_ready": self.publish_ready,
+            "quarantine_count": self.quarantine_count,
             "generated_at": self.generated_at,
             "listing_ids": self.listing_ids,
             "bound_count": len(self.bound_items),
@@ -759,6 +790,7 @@ class FeishuDriveMediaManifestAdapter:
         }
         self._listing_ids_by_exact_label = self._build_exact_label_index()
         self.quarantine_dir = quarantine_dir or target_root / "_manual_review"
+        self._seen_source_paths: set[str] = set()
 
     async def sync_from_drive(
         self,
@@ -769,6 +801,7 @@ class FeishuDriveMediaManifestAdapter:
     ) -> tuple[MediaManifest, MediaBindingReport]:
         if not root_folder_token:
             raise ValueError("root_folder_token is required")
+        self._seen_source_paths = set()
         report = MediaBindingReport(listing_ids=self.listing_ids)
         items: list[MediaItem] = []
         await self._walk_drive(root_folder_token, [], items, report)
@@ -792,7 +825,10 @@ class FeishuDriveMediaManifestAdapter:
             token = _item_token(item)
             if item_type == "folder":
                 if token:
-                    await self._walk_drive(token, path_parts + [name], items, report)
+                    # 纯包装目录(如"房源素材")视为透明层:不进入 source_path,
+                    # 目录树被整体包一层时绑定与去重结果保持不变。
+                    child_parts = path_parts if is_media_wrapper_folder(name) else path_parts + [name]
+                    await self._walk_drive(token, child_parts, items, report)
                 else:
                     report.skipped.append(
                         {
@@ -812,6 +848,11 @@ class FeishuDriveMediaManifestAdapter:
     ) -> None:
         name = _item_name(item)
         source_path = _source_path(path_parts, name)
+        if source_path in self._seen_source_paths:
+            # 包装层与原层并存(迁移半途)时同一素材会出现两份,只消费第一份。
+            report.skipped.append({"source_path": source_path, "reason": "duplicate_source_path"})
+            return
+        self._seen_source_paths.add(source_path)
         kind = _media_kind(item, path_parts)
         if not kind:
             report.skipped.append({"source_path": source_path, "reason": "unsupported_media_type"})
@@ -877,13 +918,13 @@ class FeishuDriveMediaManifestAdapter:
         }
         if len(listing_ids) > 1:
             report.ambiguous_items.append(record)
-            await self._isolate_item(item, "ambiguous", source_path, report)
+            self._isolate_item("ambiguous", source_path, str(record["reason"]), report)
             return
 
         if unknown_ids:
             record["reason"] = "unknown_listing_id"
             report.orphan_items.append(record)
-            await self._isolate_item(item, "orphan", source_path, report)
+            self._isolate_item("orphan", source_path, str(record["reason"]), report)
             return
 
         report.orphan_items.append(record)
@@ -906,7 +947,7 @@ class FeishuDriveMediaManifestAdapter:
                     "reason": "fuzzy_candidate_only_not_bound",
                 }
             )
-        await self._isolate_item(item, "orphan", source_path, report)
+        self._isolate_item("orphan", source_path, str(record["reason"]), report)
 
     async def _bind_item(
         self,
@@ -1025,32 +1066,21 @@ class FeishuDriveMediaManifestAdapter:
             )
             return None
 
-    async def _isolate_item(
+    def _isolate_item(
         self,
-        item: dict[str, Any],
         bucket: str,
         source_path: str,
+        reason: str,
         report: MediaBindingReport,
     ) -> None:
-        token = _item_token(item)
-        name = safe_name(_item_name(item))
-        if not token or not _has_downloadable_media_file(item, _media_kind(item, [])):
-            report.isolated_items.append(
-                {
-                    "source_path": source_path,
-                    "bucket": bucket,
-                    "reason": "not_downloaded",
-                }
-            )
-            return
-        marker = hashlib.sha256(source_path.encode("utf-8")).hexdigest()[:10]
-        target_path = self.quarantine_dir / bucket / f"{marker}_{name}"
-        synced = await self._sync_file(item, target_path, source_path, report)
+        # 隔离只记台账不下载:旧实现把每个孤儿文件下载进随 staging 临时目录
+        # 销毁的隔离区,零留痕纯耗带宽;审计明细由同步脚本持久化到
+        # _manual_review/media_manifest_quarantine.json。
         report.isolated_items.append(
             {
                 "source_path": source_path,
                 "bucket": bucket,
-                "target_path": str(target_path) if synced else "",
+                "reason": reason,
             }
         )
 
