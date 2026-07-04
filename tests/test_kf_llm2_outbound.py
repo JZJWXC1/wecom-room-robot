@@ -1264,3 +1264,79 @@ def test_compose_kf_outbound_retries_when_caption_invents_fact_outside_action_ev
     assert package.action_captions == []
     assert "caption_1_unsupported_plain_fact:south_orientation" in package.self_review["retry_reason"]
     assert "caption_1_unsupported_plain_fact:elevator" in package.self_review["retry_reason"]
+
+
+def test_multi_page_inventory_sheet_captions_are_numbered() -> None:
+    # 回归(2026-07-04 生产实测反馈):两页房源表各配一条相同的"这是房源表。"
+    # 被客户读成重复发送;多页时必须逐页编号,单页口径不变。
+    packet = StructuredTaskPacket(
+        conversation_id="conv-sheet2",
+        turn_id="turn-sheet2",
+        case_id="case-sheet2",
+        inventory_snapshot_id="snap-sheet",
+        candidate_set_id="",
+        response_strategy=ResponseStrategy.SEND_MEDIA,
+        tasks=[
+            TaskAtom(
+                task_id="task-sheet2",
+                task_type="send_inventory_sheet",
+                user_text="发最新房源表图片，不要文字列表",
+                required_tools=["inventory.sheet_artifact"],
+            )
+        ],
+    )
+    bundle = ToolEvidenceBundle(
+        conversation_id="conv-sheet2",
+        turn_id="turn-sheet2",
+        case_id="case-sheet2",
+        inventory_snapshot_id="snap-sheet",
+        candidate_set_id="",
+        tool_name="llm2.test.sheet",
+        evidence=[
+            EvidenceItem(
+                evidence_id="evd-sheet-1",
+                inventory_snapshot_id="snap-sheet",
+                evidence_type="inventory_sheet",
+                summary="最新房源表 PNG 第 1 页",
+                source_record_id="room_database/inventory_01.png",
+            ),
+            EvidenceItem(
+                evidence_id="evd-sheet-2",
+                inventory_snapshot_id="snap-sheet",
+                evidence_type="inventory_sheet",
+                summary="最新房源表 PNG 第 2 页",
+                source_record_id="room_database/inventory_02.png",
+            ),
+        ],
+    )
+    actions = [
+        SendAction(
+            conversation_id="conv-sheet2",
+            turn_id="turn-sheet2",
+            case_id="case-sheet2",
+            inventory_snapshot_id="snap-sheet",
+            evidence_id=f"evd-sheet-{page}",
+            action_id=f"send-inventory-sheet-{page}",
+            action_type="image",
+            metadata={"evidence_type": "inventory_sheet"},
+        )
+        for page in (1, 2)
+    ]
+
+    package = compose_kf_outbound(
+        packet,
+        bundle,
+        ResponseStrategy.SEND_MEDIA,
+        llm_output={
+            "reply_text": "这是这几套对应的图片。",
+            "action_captions": [
+                {"action_id": "send-inventory-sheet-1", "text": "这是房源表。"},
+                {"action_id": "send-inventory-sheet-2", "text": "这是房源表。"},
+            ],
+            "self_review": {"status": "pass", "reason": ""},
+        },
+        send_actions=actions,
+    )
+
+    caption_texts = [caption.text for caption in package.action_captions]
+    assert caption_texts == ["这是房源表第1张，共2张。", "这是房源表第2张，共2张。"]

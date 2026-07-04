@@ -178,6 +178,7 @@ def compose_kf_outbound(
 
     claims = claim_items or _default_claims(packet, bundle)
     action_captions = caption_result.items or _default_action_captions(packet, trusted_actions, evidence_by_id, _candidate_labels_by_listing(bundle))
+    action_captions = _normalize_inventory_sheet_captions(action_captions, trusted_actions, evidence_by_id)
     reply_text = _normalize_inventory_sheet_only_reply_text(reply_text, trusted_actions, evidence_by_id)
     reply_text, price_reply_template = _normalize_requested_payment_options_reply_text(reply_text, packet, bundle)
     reply_text, budget_payment_reply_template = _normalize_budget_payment_disclosure_reply_text(
@@ -1190,10 +1191,25 @@ def _default_action_captions(
     candidate_labels: dict[str, str],
 ) -> list[ActionCaption]:
     captions: list[ActionCaption] = []
+    # 多页房源表逐页编号:两页都写"这是房源表。"会被客户读成重复发送
+    # (2026-07-04 生产实测反馈),标注"第N张,共M张"消除歧义。
+    sheet_action_ids = [
+        action.action_id
+        for action in send_actions
+        if action.action_type == "image"
+        and (evidence_by_id.get(action.evidence_id) or None) is not None
+        and evidence_by_id[action.evidence_id].evidence_type == "inventory_sheet"
+    ]
+    sheet_total = len(sheet_action_ids)
     for index, action in enumerate(send_actions, start=1):
         evidence = evidence_by_id.get(action.evidence_id)
         if action.action_type == "text" or action.action_type in CONTROLLED_SLOT_ACTION_TYPES:
             continue
+        sheet_sequence = (
+            (sheet_action_ids.index(action.action_id) + 1, sheet_total)
+            if sheet_total > 1 and action.action_id in sheet_action_ids
+            else None
+        )
         label = _candidate_label_for_action(action, evidence, candidate_labels)
         captions.append(
             ActionCaption(
@@ -1209,7 +1225,7 @@ def _default_action_captions(
                 caption_id=f"caption-{action.action_id}",
                 action_id=action.action_id,
                 action_type=action.action_type,
-                text=_oralized_action_text(action, evidence, index, label),
+                text=_oralized_action_text(action, evidence, index, label, sheet_sequence=sheet_sequence),
                 display_order=index,
                 metadata={
                     "source": "tool_evidence",
@@ -1218,6 +1234,43 @@ def _default_action_captions(
             )
         )
     return captions
+
+
+def _inventory_sheet_action_ids(
+    send_actions: list[SendAction],
+    evidence_by_id: dict[str, EvidenceItem],
+) -> list[str]:
+    return [
+        action.action_id
+        for action in send_actions
+        if action.action_type == "image"
+        and evidence_by_id.get(action.evidence_id) is not None
+        and evidence_by_id[action.evidence_id].evidence_type == "inventory_sheet"
+    ]
+
+
+def _normalize_inventory_sheet_captions(
+    captions: list[ActionCaption],
+    send_actions: list[SendAction],
+    evidence_by_id: dict[str, EvidenceItem],
+) -> list[ActionCaption]:
+    # 多页房源表 caption 受控归一:LLM2 对每页都写"这是房源表。"会被客户读成
+    # 重复发送(2026-07-04 生产实测反馈),多页时统一替换为逐页编号文案;
+    # 单页保持原口径,与 reply_text 的房源表归一同哲学。
+    sheet_action_ids = _inventory_sheet_action_ids(send_actions, evidence_by_id)
+    total = len(sheet_action_ids)
+    if total <= 1:
+        return captions
+    normalized: list[ActionCaption] = []
+    for caption in captions:
+        if caption.action_id in sheet_action_ids:
+            ordinal = sheet_action_ids.index(caption.action_id) + 1
+            normalized.append(
+                caption.model_copy(update={"text": f"这是房源表第{ordinal}张，共{total}张。"})
+            )
+        else:
+            normalized.append(caption)
+    return normalized
 
 
 def _default_caption_text(action: SendAction, index: int) -> str:
@@ -1234,7 +1287,14 @@ def _default_caption_text(action: SendAction, index: int) -> str:
     return f"发送动作 {index}"
 
 
-def _oralized_action_text(action: SendAction, evidence: EvidenceItem | None, index: int, candidate_label: str = "") -> str:
+def _oralized_action_text(
+    action: SendAction,
+    evidence: EvidenceItem | None,
+    index: int,
+    candidate_label: str = "",
+    *,
+    sheet_sequence: tuple[int, int] | None = None,
+) -> str:
     label = _evidence_room_label(evidence) or _action_room_label(action) or candidate_label
     if action.action_type in {"contract_contact", "viewing_password", "viewing_contact"}:
         return evidence.summary if evidence and evidence.summary else _default_caption_text(action, index)
@@ -1242,6 +1302,8 @@ def _oralized_action_text(action: SendAction, evidence: EvidenceItem | None, ind
         return f"这是{label}房间的视频。" if label else _default_caption_text(action, index)
     if action.action_type == "image":
         if evidence and evidence.evidence_type == "inventory_sheet":
+            if sheet_sequence and sheet_sequence[1] > 1:
+                return f"这是房源表第{sheet_sequence[0]}张，共{sheet_sequence[1]}张。"
             return "这是房源表。"
         return f"这是{label}房间的图片。" if label else _default_caption_text(action, index)
     return _default_caption_text(action, index)
