@@ -137,12 +137,15 @@ def resolve_tool_targets(
         "inventory_labels": [_row_label(row) for row in rows[:10]],
     }
 
+    # 契约(docs/rag-rule-ownership.md): candidate_binding 只能绑定显式候选集。
+    # 无候选集时,待发素材仅在覆盖全部序号时可作选择上下文;单套 confirmed room
+    # 只能满足单一序号选择,复数选择必须报 missing_current_candidate_set 反问。
+    pending_rows_for_selection = pending_video_rows if "send_video" in actions else []
     if (
         selected_indices
         and not candidate_rows
-        and not (pending_video_rows if "send_video" in actions else [])
-        and not pending_video_selection_context
-        and not confirmed_context
+        and not _pending_rows_cover_selection(selected_indices, pending_rows_for_selection)
+        and not (confirmed_context and len(_positive_selected_indices(selected_indices)) == 1)
         and not _room_refs_from_text(original_room_text)
     ):
         selection_error = {
@@ -200,6 +203,7 @@ def resolve_tool_targets(
         and "send_video" in actions
         and proof.get("wants_original_video")
         and pending_video_rows
+        and _pending_rows_cover_selection(selected_indices, pending_video_rows)
     ):
         target_rows = _enforce_target_rows_community_constraints(pending_video_rows, pending_video_rows, proof)
         inventory_rows_override = list(target_rows)
@@ -548,15 +552,40 @@ def _candidate_selection_count_from_text(text: str) -> int:
     return 0
 
 
-def _is_plural_context_selection_text(text: str) -> bool:
-    value = str(text or "")
-    if _candidate_selection_count_from_text(value) <= 1:
+def _positive_selected_indices(selected_indices: list[int] | None) -> set[int]:
+    return {index for index in selected_indices or [] if isinstance(index, int) and index > 0}
+
+
+def _pending_rows_cover_selection(
+    selected_indices: list[int] | None,
+    pending_rows: list[dict[str, Any]] | None,
+) -> bool:
+    # 待发素材行只有在数量足以覆盖显式序号选择时,才允许充当选择上下文:
+    # 复数序号(如[1,2])不可能由单条待发记录正确满足,半桶水绑定即幻觉绑定。
+    rows = [row for row in pending_rows or [] if isinstance(row, dict)]
+    if not rows:
         return False
-    if re.search(r"第\s*[一二三四五六七八九1-9]", value):
+    positive = _positive_selected_indices(selected_indices)
+    if not positive:
+        return True
+    return len(rows) >= len(positive)
+
+
+def _pending_video_covers_selection(
+    selected_indices: list[int] | None,
+    pending_video: dict[str, Any] | None,
+) -> bool:
+    labels = [
+        str(label).strip()
+        for label in (pending_video or {}).get("labels") or []
+        if str(label).strip()
+    ]
+    if not labels:
         return False
-    if re.search(r"(?<!\d)[1-9]\s*(?:和|跟|、|,|，)", value):
-        return False
-    return True
+    positive = _positive_selected_indices(selected_indices)
+    if not positive:
+        return True
+    return len(labels) >= len(positive)
 
 
 def _selection_indices_from_text(text: str, *, limit: int = DEFAULT_TARGET_LIMIT) -> list[int]:
@@ -1249,8 +1278,10 @@ def _target_rows_from_understanding(
 
     if selected:
         if not candidates:
+            # 单套 confirmed room 只能满足单一序号的字段追问;复数选择(这两套/1和2)
+            # 语义上不可能由单套满足,一律走 selection_error 反问重列候选。
             if (
-                (selected == [1] or _is_plural_context_selection_text(current_text or query_text))
+                selected == [1]
                 and confirmed
                 and not wants_media
                 and _should_bind_confirmed_room_context(understanding, query_text)
@@ -1690,7 +1721,11 @@ def _selection_error(
         and selection_current_text_norm
         and any(community in selection_current_text_norm for community in selection_proof_communities)
     )
-    selection_has_prior_context = bool(candidate_rows or pending_video)
+    # 待发素材只有覆盖全部显式序号时才算有效选择上下文,否则不得抑制
+    # missing_current_candidate_set(半桶水覆盖会让复数选择静默降级成单套)。
+    selection_has_prior_context = bool(
+        candidate_rows or _pending_video_covers_selection(selected_indices, pending_video)
+    )
     missing_candidate_selection_context = bool(
         selected_indices
         and not selection_has_prior_context

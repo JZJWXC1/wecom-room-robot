@@ -490,6 +490,11 @@ def _requested_features(text: str) -> tuple[list[tuple[str, ...]], list[str]]:
 
 
 def _anchor_terms(text: str, room_refs: tuple[str, ...], room_type_labels: tuple[str, ...]) -> list[str]:
+    # 注意:直接删成空串会把两侧残句拼接成伪词(如"如果还没空出来"摘掉"空出"后
+    # 拼出"如果还没来")。这些伪词不得单独作为清空候选上下文的依据——
+    # 消费端见 app/main.py:_has_vocabulary_backed_inventory_anchor 的词表校验。
+    # 改为空格占位会让短语碎片通过下游 2-8 字过滤(实测破坏既有小区提及契约),
+    # 分词口径的彻底修复归入记忆生命周期重构批次。
     cleaned = text
     for ref in room_refs:
         cleaned = cleaned.replace(ref, "")

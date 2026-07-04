@@ -2204,7 +2204,7 @@ def _should_clear_room_context_after_empty_inventory_search(
         return False
     if _looks_like_new_scoped_inventory_query(query_text, proof):
         return True
-    if _has_explicit_inventory_anchor(query_text):
+    if _has_vocabulary_backed_inventory_anchor(query_text):
         return True
     if requirements.get("needs_inventory_search") and any(
         word in query_text for word in ("有哪些", "还有", "有没有", "推荐", "预算", "左右", "以下", "以内")
@@ -4346,6 +4346,58 @@ def _has_explicit_inventory_anchor(text: str) -> bool:
     if parsed.room_refs or _area_alias_hits(text):
         return True
     return bool(_possible_community_mentions(text))
+
+
+def _known_inventory_community_names() -> list[str]:
+    try:
+        index = load_rewrite_inventory_index()
+    except Exception:
+        return []
+    names: list[str] = []
+    for item in (index or {}).get("communities") or []:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+        else:
+            name = str(item or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _community_mention_matches_known_inventory(mention: str, communities: list[str]) -> bool:
+    text = _clean_community_mention_candidate(str(mention or ""))
+    if not text or not communities:
+        return False
+    normalized = normalize_search_text(text)
+    for community in communities:
+        canonical = str(community or "").strip()
+        if not canonical:
+            continue
+        if canonical in text or text in canonical:
+            return True
+        canonical_norm = normalize_search_text(canonical)
+        if canonical_norm and normalized and (canonical_norm in normalized or normalized in canonical_norm):
+            return True
+        if COMMUNITY_DISPLAY_ALIASES.get(text) == canonical or COMMUNITY_DISPLAY_ALIASES.get(normalized) == canonical:
+            return True
+    return bool(_similar_community_options(text, communities))
+
+
+def _has_vocabulary_backed_inventory_anchor(text: str) -> bool:
+    # 清空候选上下文的空搜结论只吃强证据锚点:房号、区域别名、或命中已知小区词表
+    # (含别名与近似纠偏)的小区提及。纯文本启发式析出的口语片段(如"如果还没空出来"
+    # 被误析出的伪词)不足以证明这是一次新的库存查询,不得据此清空既有候选集。
+    parsed = parse_inventory_query(text)
+    if parsed.room_refs or _area_alias_hits(text):
+        return True
+    mentions = _possible_community_mentions(text)
+    if not mentions:
+        return False
+    communities = _known_inventory_community_names()
+    return any(
+        _community_mention_matches_known_inventory(mention, communities)
+        for mention in mentions
+    )
 
 
 def _memory_search_context(rewrite_view: dict[str, Any]) -> dict[str, Any]:

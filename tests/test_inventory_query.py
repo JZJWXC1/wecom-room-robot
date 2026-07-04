@@ -169,3 +169,15 @@ def test_new_anchor_outside_rows_detects_new_query_not_old_candidates() -> None:
 
     assert has_new_anchor_outside_rows("杨家府视频有没有", old_candidates)
     assert not has_new_anchor_outside_rows("东站这些视频有没有", old_candidates)
+
+
+def test_anchor_terms_fabrication_is_documented_known_behavior() -> None:
+    # 已知行为留痕(shiqiao_whole_rent 窗口第5次复发的根因之一):摘除通用词
+    # "空出"时直接删成空串,会把"如果还没空出来"拼接成伪词"如果还没来"。
+    # 该伪词不得作为清空候选上下文的依据——由 app/main.py 的
+    # _has_vocabulary_backed_inventory_anchor 词表校验拦截(见 test_wecom_kf.py)。
+    # 分词口径的彻底修复归入记忆生命周期重构批次;本用例锁定现状,改动分词时必须同步评审消费端。
+    query = parse_inventory_query("如果还没空出来，还能约看吗？")
+
+    assert query.anchor_terms == ("如果还没来", "还能约看")
+    assert query.room_refs == ()

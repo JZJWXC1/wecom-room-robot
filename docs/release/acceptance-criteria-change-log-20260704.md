@@ -60,3 +60,16 @@
 | `run_kf_qa_gate_graph_utf8` gate release summary | `usable_for_release` = full_suite_completed + 计数吻合 | 新增 `data_provenance_ok`（两个必跑阶段各自 summary.data_provenance.ok 的合取）并入 `usable_for_release`；透出 `fixed_data_provenance`/`random_data_provenance`；跳过的阶段豁免（由 full_suite_completed 拦截，不重复扣分） | 裁决 ②a 在 gate 聚合层的同口径强制：任一必跑阶段缺出处，整卷不可放行 |
 | `tests/test_qa_fixture_guards.py` 新增 4 项 | 无 | 已提交 fixture 出处声明成立（`declares_committed_fixture`）；哈希失配拒绝（`rejects_fixture_hash_mismatch`）；server_cache 声明同步时间（`server_cache_declares_sync_time`）；缓存 meta 缺失不放行（`server_cache_missing_meta_is_not_ok`） | 出处核验逻辑的四态守卫，干净检出可跑 |
 | `tests/test_qa_utf8_inputs.py` / `tests/test_kf_qa_gate_graph.py` | 三态单测与 gate helper 不感知出处 | 三态单测补出处字段；新增"无出处不得放行"（`machine_summary_requires_data_provenance_for_release`）与"阶段出处失配整卷不放行"（`qa_gate_cli_artifact_not_release_usable_without_stage_data_provenance`） | 摘要层与 gate 层的负向用例，防止条件被静默移除 |
+
+## P0-2 部署前修复批（批6）：候选集清空与幻觉绑定收口
+
+背景：P0-2 部署预检的离线 gate（换血 fixture 首次全量跑动）在 `shiqiao_whole_rent` 第 8 轮抓到 high——候选集被第 6 轮伪锚点误清后，序号 [1,2] 的原视频请求经待发视频单行记录半桶水绑定到单套（清空 bug 家族第 5 次复发 + 幻觉绑定）。310 用例中此为唯一违规；第 11 窗存在性 gate 首次真实跑动 10 轮零问题，random 200 例全绿。
+
+| 测试/口径 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `tests/test_kf_tool_resolver.py::test_plural_price_comparison_uses_confirmed_room_when_only_one_room_is_contextual`（更名为 `..._with_only_confirmed_room_returns_selection_error`） | 复数比较（"这两套哪个价格低"）在候选集缺失时可由单套 confirmed room 绑定作答 | `selection_error=missing_current_candidate_set` 反问重列候选 | 与判分锚"复数序号目标不完整=high"（`tests/test_qa_utf8_inputs.py` 三态）及 `docs/rag-rule-ownership.md`"candidate_binding 只能绑定显式候选集"裁决直接矛盾；判分锚不得放宽，且单套价格回答两套比较属事实性误导 |
+| 清空决策锚点口径（行为修复随记） | `_should_clear_room_context_after_empty_inventory_search` 的锚点分支接受纯文本启发式析出的任意提及（伪词"如果还没来"也算显式锚点） | 改用 `_has_vocabulary_backed_inventory_anchor`：房号/区域别名不变；小区提及必须命中已知小区词表（rewrite 索引 communities，含别名与近似纠偏） | 修错误证据而非给 clear 加例外；错别字小区（高塘运都）经近似纠偏仍命中词表，存在性 gate 语义不变；真实新查询空搜照常清空（正向用例锁定） |
+| resolver 选择上下文口径（行为修复随记） | 入口守卫对 pending_video/confirmed room 无条件旁路；`wants_original_video`+pending 非空即绑定并覆盖检索行；pending 任意非空即抑制 selection_error | 待发素材仅在数量覆盖全部显式序号时可作选择上下文；单套 confirmed room 仅可满足单一序号；复数选择缺候选集一律 `missing_current_candidate_set` | 向 `docs/rag-rule-ownership.md` 契约收敛（移除 85e864f1 遗留旁路），杜绝半桶水绑定类幻觉 |
+| 新增回归用例 | 无 | resolver 3 项（复数序号+pending 单行不绑/无序号续发仍绑/复数指代+单套 confirmed 不绑）；记忆 2 项（看房追问空搜不清空/已知小区空搜仍清空）；词表锚点 1 项（伪词拒绝+真实/错别字小区放行）；分词伪词现状留痕 1 项 | 结构债"先固化回归用例再动刀"的前置固化（清空 bug 家族 + 本次窗口时间线） |
+
+注：`_anchor_terms` 分词伪造（删词拼接伪词）尝试过空格占位修复，实测破坏既有小区提及契约（短语碎片通过 2-8 字过滤），已回滚并以 `test_anchor_terms_fabrication_is_documented_known_behavior` 锁定现状；分词口径的彻底修复归入记忆生命周期单 owner 重构批次（结构债 2026-07-05）。

@@ -197,7 +197,12 @@ def test_note_followup_binds_confirmed_room_as_video_material_request() -> None:
     assert result.candidate_binding["source"] == "confirmed_room"
 
 
-def test_plural_price_comparison_uses_confirmed_room_when_only_one_room_is_contextual() -> None:
+def test_plural_price_comparison_with_only_confirmed_room_returns_selection_error() -> None:
+    # 口径变更(P0-2 部署批,台账 20260704):原契约允许"这两套哪个价格低"由
+    # 单套 confirmed room 绑定作答,与判分锚"复数序号目标不完整=high"
+    # (tests/test_qa_utf8_inputs.py)及 docs/rag-rule-ownership.md 的
+    # "candidate_binding 只能绑定显式候选集"裁决直接矛盾——单套价格无法回答
+    # 两套比较,必须反问重列候选。
     confirmed_row = {
         "listing_id": "lst-shiqiao",
         "小区": "石桥铭苑",
@@ -222,9 +227,10 @@ def test_plural_price_comparison_uses_confirmed_room_when_only_one_room_is_conte
         target_limit=5,
     )
 
-    assert result.target_rows == [confirmed_row]
-    assert result.selection_error == {}
-    assert result.candidate_binding["status"] == "bound"
+    assert result.target_rows == []
+    assert result.selection_error["reason"] == "missing_current_candidate_set"
+    assert result.selection_error["requested_indices"] == [1, 2]
+    assert result.candidate_binding["status"] == "error"
 
 
 def test_explicit_media_indices_still_require_candidate_context_despite_confirmed_room() -> None:
@@ -450,3 +456,97 @@ def test_media_followup_restore_predicate_only_allows_short_context_requests() -
         understanding=scoped_request,
         actions=["search_inventory", "send_video", "generate_reply"],
     )
+
+
+def test_plural_indices_with_single_pending_video_label_return_selection_error() -> None:
+    # 回归(shiqiao_whole_rent turn8):候选集被清空后,序号[1,2]的原视频请求
+    # 不得由仅剩 1 条的待发视频记录半桶水绑定成单套(幻觉绑定)。
+    pending_row = {"listing_id": "lst-shiqiao-b", "小区": "石桥铭苑", "房号": "21-1201A"}
+
+    result = resolve_tool_targets(
+        actions=["search_inventory", "send_video", "generate_reply"],
+        content="这两套有没有原视频或者高清点的？",
+        understanding={
+            "intent": "media",
+            "context_reference": True,
+            "constraint_proof": {
+                "selected_indices": [1, 2],
+                "wants_video": True,
+                "wants_original_video": True,
+            },
+            "structured_task": {
+                "original_text": "这两套有没有原视频或者高清点的？",
+                "tool_requirements": {"needs_video": True},
+            },
+        },
+        context={},
+        inventory_rows=[
+            {"candidate_number": 1, "listing_id": "lst-shiqiao-a", "小区": "石桥铭苑", "房号": "6-1102"},
+            {"candidate_number": 2, "listing_id": "lst-shiqiao-b", "小区": "石桥铭苑", "房号": "21-1201A"},
+        ],
+        pending_video={"labels": ["石桥铭苑21-1201A"], "requested_count": 2},
+        pending_video_rows=[pending_row],
+        target_limit=5,
+    )
+
+    assert result.target_rows == []
+    assert result.inventory_rows_override == []
+    assert result.selection_error["reason"] == "missing_current_candidate_set"
+    assert result.selection_error["requested_indices"] == [1, 2]
+    assert result.candidate_binding["status"] == "error"
+
+
+def test_pending_video_continuation_without_indices_still_binds_pending_rows() -> None:
+    # 正向保护:无显式序号的原视频跟进,仍应绑定待发视频记录(合法续发场景)。
+    pending_row = {"listing_id": "lst-shiqiao-b", "小区": "石桥铭苑", "房号": "21-1201A"}
+
+    result = resolve_tool_targets(
+        actions=["search_inventory", "send_video", "generate_reply"],
+        content="有原视频吗？发我一下。",
+        understanding={
+            "intent": "media",
+            "context_reference": True,
+            "constraint_proof": {"wants_video": True, "wants_original_video": True},
+            "structured_task": {
+                "original_text": "有原视频吗？发我一下。",
+                "tool_requirements": {"needs_video": True},
+            },
+        },
+        context={},
+        inventory_rows=[],
+        pending_video={"labels": ["石桥铭苑21-1201A"], "requested_count": 1},
+        pending_video_rows=[pending_row],
+        target_limit=5,
+    )
+
+    assert result.target_rows == [pending_row]
+    assert result.selection_error == {}
+    assert result.candidate_binding["status"] == "bound"
+    assert result.candidate_binding["source"] == "pending_video_labels"
+
+
+def test_plural_context_selection_with_only_confirmed_room_returns_selection_error() -> None:
+    # 回归:复数指代选择(这两套)不可能由单套 confirmed room 满足,
+    # 候选集缺失时必须报 missing_current_candidate_set 反问,不得降级绑单套。
+    confirmed_row = {"listing_id": "lst-shiqiao-b", "小区": "石桥铭苑", "房号": "21-1201A"}
+
+    result = resolve_tool_targets(
+        actions=["search_inventory", "generate_reply"],
+        content="这两套哪套水电更划算？",
+        understanding={
+            "intent": "inventory",
+            "context_reference": True,
+            "constraint_proof": {"selected_indices": [1, 2]},
+            "structured_task": {
+                "original_text": "这两套哪套水电更划算？",
+                "tool_requirements": {"needs_utilities": True},
+            },
+        },
+        context={"confirmed_room": {"label": "石桥铭苑21-1201A", "row": confirmed_row}},
+        inventory_rows=[],
+        target_limit=5,
+    )
+
+    assert result.target_rows == []
+    assert result.selection_error["reason"] == "missing_current_candidate_set"
+    assert result.selection_error["requested_indices"] == [1, 2]

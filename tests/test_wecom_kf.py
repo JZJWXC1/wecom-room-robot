@@ -793,6 +793,19 @@ def test_short_media_followup_terms_are_not_treated_as_community_mentions() -> N
     assert not main._has_bound_room_field_followup("星桥锦绣嘉苑视频")
 
 
+def test_vocabulary_backed_anchor_rejects_pseudo_terms_but_keeps_real_communities() -> None:
+    # 回归(shiqiao_whole_rent turn6):"如果还没空出来"被分词伪造出"如果还没来",
+    # 旧口径将其当作显式库存锚点,空搜后误清候选集(清空bug第5次复发)。
+    # 词表校验口径:清空决策只认命中已知小区词表(含别名/近似纠偏)的提及。
+    assert not main._has_vocabulary_backed_inventory_anchor("如果还没空出来，还能约看吗？")
+    # 真实小区(fixture 词表内)仍是显式锚点——真实新查询空搜后照常清空。
+    assert main._has_vocabulary_backed_inventory_anchor("京漾东韵府有房吗？")
+    # 错别字小区(高塘运都→皋塘运都)经近似纠偏命中词表,保持存在性gate语义不变。
+    assert main._has_vocabulary_backed_inventory_anchor("高塘运都有房吗？")
+    # 房号与区域别名与旧口径一致,仍是强锚点。
+    assert main._has_vocabulary_backed_inventory_anchor("皋塘运都9-402B还在吗")
+
+
 def test_note_followup_prefers_confirmed_room_over_candidate_set(tmp_path: Path) -> None:
     async def run_case() -> None:
         confirmed = {
@@ -8727,6 +8740,131 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_evidence["video_paths"], [])
         self.assertEqual(second_evidence["selection_error"]["reason"], "missing_current_candidate_set")
         self.assertEqual(second_evidence["selection_error"]["requested_indices"], [1, 2])
+
+    async def test_viewing_policy_followup_empty_search_keeps_candidate_set(self) -> None:
+        # 回归(shiqiao_whole_rent turn6,清空bug第5次复发):看房政策类追问
+        # ("如果还没空出来，还能约看吗？")被伪锚点"如果还没来"误判为新库存查询,
+        # 空搜后清掉候选集与 confirmed_room,导致后续序号选择失去上下文。
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return []
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "query": "石桥 5000左右 两室 整租",
+                "candidates": [
+                    {"candidate_number": 1, "小区": "石桥铭苑", "房号": "6-1102"},
+                    {"candidate_number": 2, "小区": "石桥铭苑", "房号": "21-1201A"},
+                ],
+                "shown_count": 2,
+                "total_count": 2,
+            }
+            context["confirmed_room"] = {
+                "row": {"小区": "石桥铭苑", "房号": "6-1102"},
+                "label": "石桥铭苑6-1102",
+            }
+
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "generate_reply"],
+                content="如果还没空出来，还能约看吗？",
+                context=context,
+                understanding={
+                    "intent": "general",
+                    "effective_query": "如果还没空出来，还能约看吗？",
+                    "rewritten_query": "如果还没空出来，还能约看吗？",
+                    "constraint_proof": {"intent": "general"},
+                    "structured_task": {
+                        "original_text": "如果还没空出来，还能约看吗？",
+                        "tool_requirements": {
+                            "needs_inventory_search": True,
+                            "needs_viewing_policy": True,
+                        },
+                    },
+                },
+            )
+            context = kf_context_memory.reduce_turn_context(
+                context,
+                understanding={
+                    "intent": "general",
+                    "effective_query": "如果还没空出来，还能约看吗？",
+                    "query_state": {"intent": "general"},
+                },
+                tool_evidence=evidence,
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertNotIn("clear_room_context", evidence.get("memory_reducer") or {})
+        self.assertNotIn("candidate_context_cleared", evidence)
+        self.assertIn("last_candidate_set", context)
+        self.assertEqual(
+            [candidate["房号"] for candidate in context["last_candidate_set"]["candidates"]],
+            ["6-1102", "21-1201A"],
+        )
+        self.assertIn("confirmed_room", context)
+        self.assertEqual(context["confirmed_room"]["label"], "石桥铭苑6-1102")
+
+    async def test_known_community_empty_search_still_clears_stale_candidates(self) -> None:
+        # 正向保护:命中已知小区词表的新查询空搜后,仍必须清掉 stale 候选集
+        # (词表校验只挡伪锚点,不放宽真实新查询的清空口径)。
+        class FakeInventory:
+            @property
+            def cache_meta(self) -> dict:
+                return {"source": "test_property"}
+
+            async def search(self, query: str, limit: int = 10) -> list[dict]:
+                return []
+
+        original_inventory = main.inventory
+        main.inventory = FakeInventory()
+        try:
+            context = kf_context_memory.empty_context()
+            context["last_candidate_set"] = {
+                "query": "石桥 5000左右 两室 整租",
+                "candidates": [
+                    {"candidate_number": 1, "小区": "石桥铭苑", "房号": "6-1102"},
+                    {"candidate_number": 2, "小区": "石桥铭苑", "房号": "21-1201A"},
+                ],
+                "shown_count": 2,
+                "total_count": 2,
+            }
+
+            evidence = await main._execute_tools(
+                actions=["search_inventory", "generate_reply"],
+                content="京漾东韵府有房吗？",
+                context=context,
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "京漾东韵府有房吗？",
+                    "rewritten_query": "京漾东韵府在租房源",
+                    "constraint_proof": {"communities": ["京漾东韵府"]},
+                    "structured_task": {
+                        "original_text": "京漾东韵府有房吗？",
+                        "tool_requirements": {"needs_inventory_search": True},
+                    },
+                },
+            )
+            context = kf_context_memory.reduce_turn_context(
+                context,
+                understanding={
+                    "intent": "inventory",
+                    "effective_query": "京漾东韵府有房吗？",
+                    "query_state": {"intent": "inventory"},
+                },
+                tool_evidence=evidence,
+            )
+        finally:
+            main.inventory = original_inventory
+
+        self.assertIn("clear_room_context", evidence.get("memory_reducer") or {})
+        self.assertNotIn("last_candidate_set", context)
 
     async def test_empty_contextual_comparison_query_keeps_candidate_set(self) -> None:
         class FakeInventory:
