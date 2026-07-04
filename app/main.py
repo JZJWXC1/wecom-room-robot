@@ -4412,6 +4412,89 @@ def _has_vocabulary_backed_inventory_anchor(text: str) -> bool:
     )
 
 
+def _backstop_production_constraint_inheritance(
+    *,
+    content: str,
+    result: dict[str, Any],
+    rewrite_view: dict[str, Any],
+) -> dict[str, Any]:
+    # production 理解兜底安全阀(归属:问题理解/意图继承阶段,LLM1 仍是 owner):
+    # LLM1 提示词契约要求追问轮继承上一轮区域/户型、只替换本轮明确改动项
+    # (app/services/llm.py),但真实模型偶发违约——2026-07-04 生产实证
+    # "5000以上的有吗"丢失"新天地+两室"继承,全表裸搜出皋塘组一室一厅并
+    # 幻觉措辞为"新天地的两室"。本安全阀只在【库存检索意图+proof 无任何
+    # 范围约束+本轮无显式锚点+无序号选择】时,用 LLM1 packet 声明的继承
+    # 约束与会话记忆(_memory_search_context)补齐空槽,绝不覆盖 LLM1 明确
+    # 给出或明确 clear 的项,并落 constraint_inheritance_backstop 证据标记。
+    tool_plan = dict(result.get("tool_plan") or {})
+    actions = [str(action) for action in tool_plan.get("actions") or []]
+    if "search_inventory" not in actions:
+        return result
+    proof = dict(result.get("constraint_proof") or {})
+    if proof.get("area") or proof.get("communities") or proof.get("room_refs") or proof.get("layout"):
+        return result
+    if result.get("selected_indices"):
+        return result
+    text = str(content or "")
+    if _room_refs_from_text(text) or _has_vocabulary_backed_inventory_anchor(text):
+        # 带显式新锚点的新查询不得注入旧约束(_should_drop_unasked_* 契约)。
+        # 用词表校验版判定:纯文本启发式会把"5000以上的有吗"析出伪锚点(批6 同款问题)。
+        return result
+    packet = dict(result.get("llm1_task_packet") or {})
+    cleared_keys = {str(key).strip() for key in packet.get("cleared_constraint_keys") or []}
+    inherited = dict(packet.get("inherited_constraints") or {})
+    replaced = dict(packet.get("replaced_constraints") or {})
+    memory = _memory_search_context(rewrite_view)
+
+    def _slot_value(key: str, *fallbacks: Any) -> Any:
+        if key in cleared_keys:
+            return None
+        for value in (replaced.get(key), inherited.get(key), *fallbacks):
+            if value not in (None, "", [], {}):
+                return value
+        return None
+
+    filled: dict[str, Any] = {}
+    area = str(_slot_value("area", memory.get("area")) or "").strip()
+    layout = str(_slot_value("layout", memory.get("layout")) or "").strip()
+    current_budget = _budget_range_from_text(text)
+    budget = (
+        current_budget
+        or _coerce_budget_range(_slot_value("budget_range", None))
+        or _coerce_budget_range(memory.get("budget_range"))
+    )
+    if not area:
+        # 没有可继承的区域约束时不做任何注入,保持 LLM1 结论原样。
+        return result
+    proof["area"] = area
+    filled["area"] = area
+    if layout:
+        proof["layout"] = layout
+        filled["layout"] = layout
+    if budget:
+        proof["budget_range"] = list(budget)
+        filled["budget_range"] = list(budget)
+    result["constraint_proof"] = proof
+    marker = {
+        "stage": "production_understanding_backstop",
+        "reason": "llm1_packet_missing_scope_for_contextual_inventory_followup",
+        "filled": filled,
+        "sources": {
+            "packet_inherited": bool(inherited),
+            "packet_replaced": bool(replaced),
+            "memory": {key: value for key, value in memory.items() if key in ("area", "layout", "budget_range")},
+            "current_text_budget": bool(current_budget),
+        },
+    }
+    result["constraint_inheritance_backstop"] = marker
+    result.setdefault("structured_task", {})["constraint_inheritance_backstop"] = marker
+    logger.info(
+        "KF production constraint inheritance backstop: %s",
+        json.dumps(marker, ensure_ascii=False),
+    )
+    return result
+
+
 def _memory_search_context(rewrite_view: dict[str, Any]) -> dict[str, Any]:
     sources: list[dict[str, Any]] = []
     for record in reversed(list(rewrite_view.get("recent_turn_records") or [])):
@@ -6407,6 +6490,11 @@ async def _understand_message(
             rewrite_view=rewrite_view,
             inventory_index=inventory_index,
             inventory_read_context=inventory_read_context,
+        )
+        result = _backstop_production_constraint_inheritance(
+            content=content,
+            result=result,
+            rewrite_view=rewrite_view,
         )
         result = _force_pending_media_target_task(
             content,

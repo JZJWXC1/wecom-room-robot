@@ -406,17 +406,27 @@ def _looks_like_price_range_ref(ref: str) -> bool:
     return len(left) >= 3 and len(right) >= 3
 
 
+# "X以上/超过X"开区间的上限哨兵:行价格为3-5位数,99999覆盖全表。
+PRICE_OPEN_UPPER_BOUND = 99999
+
+
 def _requested_price_range(text: str) -> tuple[int, int] | None:
     text = _mask_room_refs_for_price_parse(text)
     range_match = re.search(r"(\d{3,5})\s*(?:到|至|-|~|～)\s*(\d{3,5})", text)
     if range_match:
         low, high = sorted((int(range_match.group(1)), int(range_match.group(2))))
         return (low, high)
-    if not any(marker in text for marker in ("预算", "以内", "左右", "到", "至", "以下", "上下")):
+    if not any(marker in text for marker in ("预算", "以内", "左右", "到", "至", "以下", "上下", "以上", "超过")):
         return None
     amount_match = re.search(r"(\d{3,5})\s*(?:以内|以下)", text)
     if amount_match:
         return (0, int(amount_match.group(1)))
+    # 方向反转型预算追问("5000以上的有吗"):此前不解析,导致预算追问轮
+    # 丢失约束继承、全表裸搜(2026-07-04 生产实证 翰皋名府 区域漂移)。
+    amount_match = re.search(r"(?:(\d{3,5})\s*以上|超过\s*(\d{3,5}))", text)
+    if amount_match:
+        amount = int(amount_match.group(1) or amount_match.group(2))
+        return (amount, PRICE_OPEN_UPPER_BOUND)
     amount_match = re.search(r"(\d{3,5})\s*(?:左右|上下)", text)
     if amount_match:
         amount = int(amount_match.group(1))

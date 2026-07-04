@@ -169,3 +169,14 @@ worktree 复验（仅本批 hunk 叠加 HEAD），结果见 commit message。
 | 离线桩接口 | `CaptureWeComKf` 只有单步 `send_video`（批9 拆分后离线 QA 视频全走失败分支） | 补齐 `upload_media`+`send_video_media` 两步接口；新增桩接口对齐守卫测试 | 生产调用面变更时桩必须同步，否则 gate 假红 |
 
 全量 1343 passed；gate 310/310 usable_for_release=true（artifact kf_qa_gate_graph_utf8_20260704_194507）。
+## 生产实证修复批（批13）：预算追问约束继承兜底 + "以上"价格解析
+
+背景：生产实测（2026-07-04 23:57-23:59）"新天地两室5000以内"→"5000以上的有吗"追问轮，LLM1(qwen) 丢失继承约束且 production 理解分支无任何确定性兜底（constraint_proof 恒空、白名单只认本轮原话区域字面词），全表裸搜出东站组一室一厅"翰皋名府8-1403"并被措辞成"新天地的两室"。W04T2 区域漂移家族新变种；离线 gate 测不到（离线 rewrite 桩总产出带区域 proof）。
+
+| 测试/口径 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `_requested_price_range` 方向词 | 无"以上/超过"，方向反转型预算追问 price_range=None，下游继承/精筛/记忆判定全部失明 | `X以上/超过X → (X, 99999)` 开区间（哨兵上限，行价 3-5 位数全覆盖）；房号掩码先行不误判 | 生产实证根因之一；同时点亮 `_is_contextual_condition_followup` 等 legacy 下游 |
+| production 理解兜底（新增安全阀 `_backstop_production_constraint_inheritance`） | production 分支提前 return，constraint_proof 恒空，区域白名单只能靠本轮原话字面区域词触发（结构性缺陷） | 库存检索意图 + proof 无范围约束 + 无词表校验锚点 + 无序号选择时，按 LLM1 packet 声明的 inherited/replaced 约束优先、会话记忆（`_memory_search_context`）兜底补齐 area/layout/budget 空槽；明确 clear 的键与 LLM1 已给值绝不覆盖；落 `constraint_inheritance_backstop` 证据标记 | rag-rule-ownership"固定规则只能做安全阀"边界内实现（LLM1 仍是 owner，只补空槽+打标可审计）；proof.area 补齐后既有 region_whitelist 与 `_filter_rows_by_constraint_proof` 自动圈定区域组 |
+| 新增回归 7 项 | 无 | 生产案例时间线固化（追问继承 area+layout+budget）；显式锚点不注入（词表校验版，防"5000以上的有吗"伪锚点误挡）；LLM1 已给值不覆盖；cleared 键尊重；序号选择跳过；packet 优先于记忆；价格开区间三态（含房号不误判） | 结构债"先固化回归用例"纪律 |
+
+遗留（已挂独立任务卡）：出站校验"户型/区域声称与证据矛盾"拦截（防御纵深，误伤面需口语映射评审）；离线 rewrite 桩增加"丢约束"故障注入窗口（让 gate 能测到本类缺陷）。

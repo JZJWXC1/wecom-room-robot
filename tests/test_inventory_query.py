@@ -181,3 +181,16 @@ def test_anchor_terms_fabrication_is_documented_known_behavior() -> None:
 
     assert query.anchor_terms == ("如果还没来", "还能约看")
     assert query.room_refs == ()
+
+def test_parse_open_upper_budget_directions() -> None:
+    # 回归(2026-07-04 生产实证):"5000以上"此前不解析,预算方向反转追问
+    # 丢失约束继承走全表裸搜(翰皋名府区域漂移)。开区间上限用 99999 哨兵。
+    above_query = parse_inventory_query("5000以上的有吗")
+    assert above_query.price_range == (5000, 99999)
+
+    over_query = parse_inventory_query("超过4000的呢")
+    assert over_query.price_range == (4000, 99999)
+
+    # 房号不得被误解析成价格开区间。
+    room_query = parse_inventory_query("翰皋名府8-1403多少钱")
+    assert room_query.price_range is None
