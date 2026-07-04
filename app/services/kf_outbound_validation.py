@@ -9,6 +9,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from app.services.inventory_query import ROOM_TYPE_GROUPS
 from app.services.kf_contracts import (
     SCHEMA_VERSION,
     CandidateItem,
@@ -20,6 +21,8 @@ from app.services.kf_contracts import (
     StructuredTaskPacket,
     ToolEvidenceBundle,
 )
+from app.services.kf_dual_llm_shadow import ROW_ALIASES
+from app.services.region_inventory_constants import active_area_alias_groups
 
 
 class ValidationLevel(str, Enum):
@@ -155,6 +158,92 @@ UTILITY_MISSING_MARKERS = ("暂无", "暂时没", "暂未", "没有", "未提供
 DEPOSIT_MARKERS = ("deposit", "免押", "无忧住", "押金", "芝麻信用")
 DEPOSIT_CONDITION_MARKERS = ("能免押", "能不能免押", "可以免押", "支不支持免押", "免押条件", "免押金要什么条件")
 DEPOSIT_SELFCHECK_MARKERS = ("自查", "信用额度", "租房板块申请额度", "申请额度", "支付宝：我的", "支付宝-我的", "支付宝 我的")
+
+# 户型/区域声称核验（L3）：只拦"回复声明了且与证据行字段直接矛盾"，不拦"未声明"——
+# LLM2 自检提示词明文允许回复不逐字复述约束，因此否定/回声句段整体豁免，
+# 且声称只在"肯定推荐上下文"（同句含证据行标签或"有一套/这套"类措辞）里计入。
+# 词表单一事实源：户型口语映射=inventory_query.ROOM_TYPE_GROUPS，
+# 区域别名=region_inventory_constants.active_area_alias_groups，
+# 证据行字段键名=kf_dual_llm_shadow.ROW_ALIASES；本模块不得新增同源规则拷贝。
+CLAIM_SENTENCE_SPLIT_PATTERN = re.compile(r"[。；;！!？?\n\r]+")
+CLAIM_NEGATION_MARKERS = (
+    "暂无",
+    "没有",
+    "没得",
+    "没找到",
+    "没查到",
+    "查不到",
+    "找不到",
+    "暂时没",
+    "暂未",
+    "没能",
+    "不满足",
+    "不符合",
+    "不是",
+    "已剔除",
+    "剔除",
+)
+CLAIM_ECHO_MARKERS = (
+    "你要",
+    "您要",
+    "你说",
+    "您说",
+    "你想",
+    "您想",
+    "你之前",
+    "您之前",
+    "你问",
+    "您问",
+    "要求",
+    "需求",
+    "按你",
+    "按您",
+)
+CLAIM_AFFIRMATIVE_MARKERS = (
+    "有一套",
+    "有套",
+    "有一间",
+    "有两套",
+    "有三套",
+    "有几套",
+    "还有",
+    "这套",
+    "这一套",
+    "这间",
+    "这几套",
+    "这边有",
+    "现在有",
+    "查到",
+    "找到",
+    "匹配到",
+    "筛出",
+    "筛选",
+    "推荐",
+)
+LAYOUT_FIELD_KEYS = ROW_ALIASES["layout"] + ROW_ALIASES["layout_description"]
+LAYOUT_LABEL_FIELD_KEYS = ROW_ALIASES["layout"]
+AREA_FIELD_KEYS = ROW_ALIASES["area"]
+ROW_LABEL_FIELD_KEYS = ROW_ALIASES["community"] + ROW_ALIASES["room_no"] + ROW_ALIASES["title"]
+LISTING_HINT_FIELD_KEYS = ROW_LABEL_FIELD_KEYS + LAYOUT_FIELD_KEYS + AREA_FIELD_KEYS + ROW_ALIASES["listing_id"]
+
+
+def _layout_claim_alias_table() -> tuple[tuple[str, str], ...]:
+    # 长别名在前，避免"两室一厅"被"两室"截断；比对统一收敛到 broad 标签（一室/两室/...），
+    # 使"两室"对"两室一厅/两室两厅"按包含关系放行（误伤面一：泛称包含）。
+    pairs: dict[str, str] = {}
+    for label, query_aliases, match_aliases, broad_label in ROOM_TYPE_GROUPS:
+        for alias in (label, *query_aliases, *match_aliases):
+            pairs.setdefault(alias, broad_label)
+    return tuple(sorted(pairs.items(), key=lambda item: (-len(item[0]), item[0])))
+
+
+def _area_claim_alias_table() -> tuple[tuple[str, str], ...]:
+    pairs = {alias: " ".join(parts) for alias, parts in active_area_alias_groups().items()}
+    return tuple(sorted(pairs.items(), key=lambda item: (-len(item[0]), item[0])))
+
+
+LAYOUT_CLAIM_ALIAS_TABLE = _layout_claim_alias_table()
+AREA_CLAIM_ALIAS_TABLE = _area_claim_alias_table()
 
 URL_PATTERN = re.compile(r"\b(?:https?://|www\.)\S+", re.IGNORECASE)
 PASSWORD_CODE_PATTERN = re.compile(r"(?<![A-Za-z0-9])\d{3,8}#(?![A-Za-z0-9])")
@@ -514,6 +603,7 @@ def _validate_l3(package: PreparedOutboundPackage, context: OutboundValidationCo
                 allow_missing_media_text=allow_missing_media_text,
             )
         )
+        issues.extend(_validate_reply_claims_against_evidence(package))
     for index, caption in enumerate(package.action_captions):
         action = _action_for_caption(caption.action_id, package)
         caption_has_media_action = _is_media_action(action) if action is not None else False
@@ -606,6 +696,154 @@ def _action_for_caption(action_id: str, package: PreparedOutboundPackage) -> Sen
         if action.action_id == action_id:
             return action
     return None
+
+
+@dataclass(frozen=True)
+class _ReplyClaimSupport:
+    layout_broads: frozenset[str]
+    layout_labels: tuple[str, ...]
+    area_groups: frozenset[str]
+    row_labels: tuple[str, ...]
+    evidence_text: str
+
+
+def _validate_reply_claims_against_evidence(package: PreparedOutboundPackage) -> list[ValidationIssue]:
+    text = str(package.reply_text or "")
+    if not text.strip():
+        return []
+    support = _reply_claim_support(package)
+    # 证据行没有对应字段（或字段值不在共享词表内）时该维度不校验：核验只能以证据为基准，fail-open。
+    if not support.layout_broads and not support.area_groups:
+        return []
+    conflicting_layouts: dict[str, str] = {}
+    conflicting_areas: dict[str, str] = {}
+    for sentence in CLAIM_SENTENCE_SPLIT_PATTERN.split(text):
+        segment = sentence.strip()
+        if not segment:
+            continue
+        if _contains_any(segment, CLAIM_NEGATION_MARKERS) or _contains_any(segment, CLAIM_ECHO_MARKERS):
+            continue
+        if not _sentence_presents_evidence_rows(segment, support):
+            continue
+        if support.layout_broads:
+            for alias, broad_label in _claim_tokens(segment, LAYOUT_CLAIM_ALIAS_TABLE):
+                if broad_label in support.layout_broads or alias in support.evidence_text:
+                    continue
+                conflicting_layouts[alias] = broad_label
+        if support.area_groups:
+            for alias, area_group in _claim_tokens(segment, AREA_CLAIM_ALIAS_TABLE):
+                if area_group in support.area_groups or alias in support.evidence_text:
+                    continue
+                conflicting_areas[alias] = area_group
+    issues: list[ValidationIssue] = []
+    if conflicting_layouts:
+        claimed = "/".join(sorted(conflicting_layouts))
+        supported = "/".join(sorted(set(support.layout_labels))[:5]) or "unknown"
+        issues.append(
+            _issue(
+                ValidationLevel.L3,
+                "l3.layout_claim_mismatch",
+                f"Reply claims layout '{claimed}' but evidence rows only support '{supported}'; rewrite using evidence layout only.",
+                "reply_text",
+            )
+        )
+    if conflicting_areas:
+        claimed = "/".join(sorted(conflicting_areas))
+        supported = "/".join(sorted(support.area_groups)[:4]) or "unknown"
+        issues.append(
+            _issue(
+                ValidationLevel.L3,
+                "l3.area_claim_mismatch",
+                f"Reply claims area '{claimed}' but evidence rows only support '{supported}'; rewrite using evidence area only.",
+                "reply_text",
+            )
+        )
+    return issues
+
+
+def _reply_claim_support(package: PreparedOutboundPackage) -> _ReplyClaimSupport:
+    layout_broads: set[str] = set()
+    layout_labels: list[str] = []
+    area_groups: set[str] = set()
+    row_labels: list[str] = []
+    evidence_chunks: list[str] = []
+    for values, summary in _listing_like_evidence_payloads(package):
+        layout_text = " ".join(_field_text_values(values, LAYOUT_FIELD_KEYS))
+        if layout_text:
+            for alias, broad_label in LAYOUT_CLAIM_ALIAS_TABLE:
+                if alias in layout_text:
+                    layout_broads.add(broad_label)
+            layout_labels.extend(_field_text_values(values, LAYOUT_LABEL_FIELD_KEYS))
+        area_text = " ".join(_field_text_values(values, AREA_FIELD_KEYS))
+        if area_text:
+            for alias, area_group in AREA_CLAIM_ALIAS_TABLE:
+                if alias in area_text:
+                    area_groups.add(area_group)
+        for label in _field_text_values(values, ROW_LABEL_FIELD_KEYS):
+            if len(label) >= 2:
+                row_labels.append(label)
+        evidence_chunks.append(" ".join(str(item or "").strip() for item in _flatten_values(values) if str(item or "").strip()))
+        if summary:
+            evidence_chunks.append(summary)
+    for item in _candidate_items(package.candidate_set):
+        for label in (item.community, item.room_no, item.title):
+            label_text = str(label or "").strip()
+            if len(label_text) >= 2:
+                row_labels.append(label_text)
+                evidence_chunks.append(label_text)
+    return _ReplyClaimSupport(
+        layout_broads=frozenset(layout_broads),
+        layout_labels=tuple(dict.fromkeys(layout_labels)),
+        area_groups=frozenset(area_groups),
+        row_labels=tuple(dict.fromkeys(row_labels)),
+        evidence_text=" ".join(chunk for chunk in evidence_chunks if chunk),
+    )
+
+
+def _listing_like_evidence_payloads(package: PreparedOutboundPackage) -> Iterable[tuple[Mapping[str, Any], str]]:
+    # 支持面只取"像房源行"的证据（有 listing_id 或带行字段键），规则卡/错误码类证据
+    # 不得为户型/区域声称背书；task_packet 约束更不算证据——那正是幻觉的来源。
+    for evidence in _evidence_items(package.evidence_bundle):
+        values = _evidence_field_values(evidence)
+        if not evidence.listing_id and not any(key in values for key in LISTING_HINT_FIELD_KEYS):
+            continue
+        yield values, str(evidence.summary or "")
+
+
+def _sentence_presents_evidence_rows(sentence: str, support: _ReplyClaimSupport) -> bool:
+    if any(label in sentence for label in support.row_labels):
+        return True
+    return _contains_any(sentence, CLAIM_AFFIRMATIVE_MARKERS)
+
+
+def _claim_tokens(text: str, alias_table: tuple[tuple[str, str], ...]) -> list[tuple[str, str]]:
+    found: list[tuple[str, str]] = []
+    occupied: list[tuple[int, int]] = []
+    for alias, mapped in alias_table:
+        start = 0
+        while True:
+            index = text.find(alias, start)
+            if index < 0:
+                break
+            end = index + len(alias)
+            start = end
+            if any(index < taken_end and taken_start < end for taken_start, taken_end in occupied):
+                continue
+            occupied.append((index, end))
+            found.append((alias, mapped))
+    return found
+
+
+def _field_text_values(values: Mapping[str, Any], keys: Sequence[str]) -> list[str]:
+    result: list[str] = []
+    if not isinstance(values, Mapping):
+        return result
+    for key in keys:
+        for item in _flatten_values(values.get(key)):
+            text = str(item or "").strip()
+            if text:
+                result.append(text)
+    return result
 
 
 def _validate_listing_ref(

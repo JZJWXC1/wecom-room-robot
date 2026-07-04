@@ -664,6 +664,172 @@ def test_l3_allows_partial_missing_media_reply_when_evidence_exists() -> None:
     assert "l3.action_tense_error" not in _codes(result)
 
 
+def _inventory_row_package(
+    reply_text: str,
+    *,
+    layout: str = "一室一厅",
+    area: str = "闸弄口 新塘 元宝塘 东站",
+    community: str = "翰皋名府",
+    room_no: str = "8-1403",
+    field_values_override: dict | None = None,
+) -> PreparedOutboundPackage:
+    field_values = {
+        "listing_id": "lst-row-1",
+        "community": community,
+        "room_no": room_no,
+        "area": area,
+        "layout": layout,
+        "rent_pay1": 5300,
+        "rent_pay2": 5000,
+    }
+    if field_values_override is not None:
+        field_values = field_values_override
+    return PreparedOutboundPackage(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        inventory_snapshot_id="snap-1",
+        candidate_set_id="cand-1",
+        reply_text=reply_text,
+        evidence_bundle=ToolEvidenceBundle(
+            inventory_snapshot_id="snap-1",
+            candidate_set_id="cand-1",
+            tool_name="inventory.search",
+            evidence=[
+                EvidenceItem(
+                    evidence_id="evd-row-1",
+                    listing_id="lst-row-1",
+                    inventory_snapshot_id="snap-1",
+                    evidence_type="inventory_candidate",
+                    summary=f"候选1 {community} {room_no} 租金5300",
+                    field_values=field_values,
+                )
+            ],
+        ),
+    )
+
+
+def test_l3_flags_layout_and_area_claims_conflicting_evidence_production_timeline() -> None:
+    # 生产实证固化（2026-07-04 23:58）：证据行=翰皋名府8-1403/东站组/一室一厅，
+    # LLM2 回复却声明"新天地""两室"——户型与区域双重失实必须触发 L3 rewrite，且不升级为 blocking。
+    package = _inventory_row_package(
+        "新天地这边有一套5000元以上的两室：翰皋名府 8-1403，押一付一5300元/月，押二付一5000元/月。"
+    )
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.REWRITE_REQUIRED
+    assert result.facts_passed is True
+    assert result.send_allowed is False
+    assert not result.blocking_issues
+    assert {"l3.layout_claim_mismatch", "l3.area_claim_mismatch"}.issubset(_codes(result))
+    layout_message = next(issue.message for issue in result.issues if issue.code == "l3.layout_claim_mismatch")
+    area_message = next(issue.message for issue in result.issues if issue.code == "l3.area_claim_mismatch")
+    assert "两室" in layout_message and "一室一厅" in layout_message
+    assert "新天地" in area_message
+
+
+def test_l3_allows_broad_layout_claim_covering_specific_evidence_layout() -> None:
+    package = _inventory_row_package("这边有一套两室：翰皋名府 8-1403。", layout="两室一厅")
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.PASS
+    assert "l3.layout_claim_mismatch" not in _codes(result)
+
+
+def test_l3_allows_colloquial_layout_claim_mapped_to_evidence() -> None:
+    package = _inventory_row_package("这套翰皋名府 8-1403 是大两房。", layout="两室一厅")
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.PASS
+    assert "l3.layout_claim_mismatch" not in _codes(result)
+
+
+def test_l3_flags_colloquial_layout_claim_conflicting_evidence() -> None:
+    package = _inventory_row_package("这套翰皋名府 8-1403 是两房一厅。")
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.REWRITE_REQUIRED
+    assert "l3.layout_claim_mismatch" in _codes(result)
+
+
+def test_l3_skips_negated_and_echoed_layout_mentions() -> None:
+    package = _inventory_row_package("你要的两室5000以内暂时没有。这套翰皋名府 8-1403 是一室一厅，要看吗。")
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.PASS
+    assert "l3.layout_claim_mismatch" not in _codes(result)
+
+
+def test_l3_skips_unmapped_colloquial_layout_wording() -> None:
+    package = _inventory_row_package("这套翰皋名府 8-1403 是厅卧一体格局。")
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.PASS
+    assert "l3.layout_claim_mismatch" not in _codes(result)
+
+
+def test_l3_does_not_flag_undeclared_layout_or_area() -> None:
+    # 只拦"声明了且矛盾"，不拦"未声明"：证据行漂移但回复没有复述户型/区域词时不触发
+    package = _inventory_row_package("这边有一套5000以上的：翰皋名府 8-1403，押一付一5300元/月。")
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.PASS
+    assert "l3.layout_claim_mismatch" not in _codes(result)
+    assert "l3.area_claim_mismatch" not in _codes(result)
+
+
+def test_l3_allows_area_alias_of_same_region_group() -> None:
+    package = _inventory_row_package("皋塘这边有一套一室一厅：翰皋名府 8-1403。")
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.PASS
+    assert "l3.area_claim_mismatch" not in _codes(result)
+
+
+def test_l3_skips_area_token_inside_evidence_community_name() -> None:
+    package = _inventory_row_package(
+        "新塘雅苑 3-201 这套是一室一厅。",
+        area="东新园 杭氧 新天地",
+        community="新塘雅苑",
+        room_no="3-201",
+    )
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.PASS
+    assert "l3.area_claim_mismatch" not in _codes(result)
+
+
+def test_l3_skips_claim_checks_when_evidence_lacks_layout_and_area_fields() -> None:
+    package = _inventory_row_package(
+        "这边有一套两室：星河苑 1-101。",
+        field_values_override={"listing_id": "lst-row-1", "community": "星河苑", "room_no": "1-101", "rent_pay1": 4200},
+    )
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.PASS
+    assert "l3.layout_claim_mismatch" not in _codes(result)
+    assert "l3.area_claim_mismatch" not in _codes(result)
+
+
+def test_l3_flags_only_affirmative_sentence_in_mixed_reply() -> None:
+    package = _inventory_row_package("新天地的两室暂时没有。这边有一套两室：翰皋名府 8-1403。")
+
+    result = validate_prepared_outbound_package(package)
+
+    assert result.status == ValidationStatus.REWRITE_REQUIRED
+    assert "l3.layout_claim_mismatch" in _codes(result)
+    assert "l3.area_claim_mismatch" not in _codes(result)
+
+
 def test_legacy_claim_without_structured_value_still_uses_evidence_refs() -> None:
     package = _base_package()
     package.claims = [
