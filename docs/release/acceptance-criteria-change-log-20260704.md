@@ -159,3 +159,13 @@ worktree 复验（仅本批 hunk 叠加 HEAD），结果见 commit message。
 | 转码链路文本口径（`test_video_upload_failure_transcodes_with_ffmpeg_and_retries` 等 2 项断言更新） | 上传超限转码期间客户零感知（静默 30 秒~数分钟） | 确认转码且无缓存时先发受控提示「视频有点大，正在压缩，请稍等。」；缓存命中秒回不发（新增 `test_transcode_cache_hit_skips_wait_notice`）；重复回调重放不重发 | 用户需求①；文案已逐条核验避开出站校验 HARD_FORBIDDEN/FUTURE_SEND/IMMEDIATE 三组正则与 QA BAD_TEXT 表；发送层确定性过程文本沿欢迎语/批9 失败纠正话术先例 |
 | 原视频链接证据口径 | `original_video_urls` 仅来自素材库 manifest 的 kind=original_video 条目（生产恒空，回复固定"没有原视频/高清下载链接"） | manifest 无链接证据时，对已绑定视频源文件生成 HMAC 签名直链兜底（`/wecom/media/original`，默认 48h 时效，上限 3 条）；manifest 有链接仍优先；密钥未配置整体关闭回到原口径（三态测试锁定） | 用户需求②；下游展示（"原视频链接："模板）/LLM2 字段白名单/判分器"有 URL 证据即放行"全部现成，本批只补数据生产端 |
 | 新增回源端点 `/wecom/media/original` | 无 | GET+签名校验回源 room_database 内文件；签名/时效/路径边界任一失败一律 404（fail-closed，4 项路由测试） | 复用既有 nginx /wecom/ 转发零配置；密钥仅存服务器 .env（已于部署授权下就地生成） |
+## 批9 回归修复（批11）：pending 记忆序列化与离线桩接口对齐
+
+部署前 gate 拦截的批9 回归（两后台会话 pytest 小样未覆盖全量 gate）：
+
+| 测试/口径 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| pending_video_sends store 口径（`test_pending_video_sends_are_deduped_and_clearable` 断言 2 处更新） | store 内 paths 为原生 Path 对象（批9 失败重放首次真正写入，上下文 json 持久化与 QA 快照直接崩） | store 一律存字符串，消费端按需 Path() 化；新增 JSON 可序列化回归 | 记忆 owner 的存储形态必须可持久化；gate 实证 `WindowsPath is not JSON serializable` |
+| 离线桩接口 | `CaptureWeComKf` 只有单步 `send_video`（批9 拆分后离线 QA 视频全走失败分支） | 补齐 `upload_media`+`send_video_media` 两步接口；新增桩接口对齐守卫测试 | 生产调用面变更时桩必须同步，否则 gate 假红 |
+
+全量 1343 passed；gate 310/310 usable_for_release=true（artifact kf_qa_gate_graph_utf8_20260704_194507）。

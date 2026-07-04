@@ -1,1 +1,1 @@
-﻿/opt/wecom-room-robot/releases/20260704-p1video-hotfix-165500
+﻿/opt/wecom-room-robot/releases/20260704-dedup-media-links-191731
