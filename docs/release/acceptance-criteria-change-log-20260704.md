@@ -73,3 +73,13 @@
 | 新增回归用例 | 无 | resolver 3 项（复数序号+pending 单行不绑/无序号续发仍绑/复数指代+单套 confirmed 不绑）；记忆 2 项（看房追问空搜不清空/已知小区空搜仍清空）；词表锚点 1 项（伪词拒绝+真实/错别字小区放行）；分词伪词现状留痕 1 项 | 结构债"先固化回归用例再动刀"的前置固化（清空 bug 家族 + 本次窗口时间线） |
 
 注：`_anchor_terms` 分词伪造（删词拼接伪词）尝试过空格占位修复，实测破坏既有小区提及契约（短语碎片通过 2-8 字过滤），已回滚并以 `test_anchor_terms_fabrication_is_documented_known_behavior` 锁定现状；分词口径的彻底修复归入记忆生命周期单 owner 重构批次（结构债 2026-07-05）。
+
+## P0-2 fixture 对真再生（批7）
+
+按批3 附注流程执行：服务器缓存经 RagCacheSync 实时刷新（飞书拉取，status=success）后
+再生 fixture——40 行（source_snapshot_time=2026-07-02 15:12:23，fixture_version=da9cf10fc9f74a5d）
+→ 35 行（source_snapshot_time=2026-07-04 15:12:51，fixture_version=f9078b8158fa2995），
+房源上下架自然变动。批3 实体锚点（兴业杨家府/杨家新雅苑/杨乐府北区/南区/皋塘运都 communities，
+棠润府15-2-801B/皋塘运都16-1-2206 labels）与存在性探针（9-402B 全局不存在、高塘运都/
+华丰欣苑14-2-901 缺席）全部存活，无断言需要更新；守卫+锚点 83 passed，全量 1292 passed。
+无口径变更。
