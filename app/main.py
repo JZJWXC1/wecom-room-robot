@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
@@ -74,6 +74,7 @@ from app.services.rewrite_inventory_index import (
     slice_rewrite_inventory_index,
     write_rewrite_inventory_index,
 )
+from app.services.media_link_signer import build_signed_media_url, verify_signed_media_request
 from app.services.region_inventory_constants import canonical_area_parts
 from app.services.video_transcoder import cached_wecom_video, prepare_wecom_video
 from app.services.wecom_kf import (
@@ -7039,6 +7040,44 @@ def _original_video_sources_for_paths(paths: list[Path]) -> dict[str, Any]:
     return dict(handler(paths) or {})
 
 
+KF_SIGNED_ORIGINAL_VIDEO_URL_LIMIT = 3
+
+
+def _signed_original_video_urls(paths: list[Path]) -> list[str]:
+    # 素材库无原视频链接证据时的兜底:对已绑定的本地视频源文件生成签名直链。
+    # 密钥或 public_base_url 未配置即整体关闭(返回空,回复保持"没有原视频链接"口径);
+    # 文件必须落在 room_database 内,越界/相对化失败的路径直接跳过。
+    secret = str(getattr(settings, "kf_media_link_secret", "") or "").strip()
+    base_url = str(getattr(settings, "public_base_url", "") or "").strip()
+    if not secret or not base_url:
+        return []
+    try:
+        media_root = Path(settings.room_database_path).resolve()
+    except OSError:
+        return []
+    ttl_seconds = int(getattr(settings, "kf_media_link_ttl_seconds", 0) or 0)
+    urls: list[str] = []
+    for raw_path in paths:
+        if len(urls) >= KF_SIGNED_ORIGINAL_VIDEO_URL_LIMIT:
+            break
+        try:
+            rel_path = Path(raw_path).resolve().relative_to(media_root)
+        except (OSError, ValueError):
+            continue
+        try:
+            urls.append(
+                build_signed_media_url(
+                    public_base_url=base_url,
+                    rel_path=str(rel_path).replace("\\", "/"),
+                    secret=secret,
+                    ttl_seconds=ttl_seconds,
+                )
+            )
+        except ValueError:
+            continue
+    return list(dict.fromkeys(urls))
+
+
 def _memory_reducer_meta(evidence: dict[str, Any]) -> dict[str, Any]:
     meta = evidence.setdefault("memory_reducer", {})
     if not isinstance(meta, dict):
@@ -7481,6 +7520,7 @@ async def _execute_tools(
                 row_listing_id=_row_listing_id,
                 rows_with_listing_ids=_rows_with_listing_ids,
                 rows_with_candidate_numbers=_rows_with_candidate_numbers,
+                signed_original_video_urls=_signed_original_video_urls,
             ),
             actions=actions,
             content=content,
@@ -12352,6 +12392,13 @@ def _video_send_observability_metadata(
 KF_VIDEO_SEND_FAILURE_NOTICE_WITH_LABEL = "{label}的视频这边暂时没发出去，你稍后再让我发一次。"
 KF_VIDEO_SEND_FAILURE_NOTICE_FALLBACK = "刚才这条视频暂时没发出去，你稍后再让我发一次。"
 
+# 客户可见的转码等待提示（受控模板层，禁止改为 LLM 生成）：
+# 仅在上传超限触发 ffmpeg 转码且无转码缓存（真的要等）时发送。
+# 文案红线：严禁在"稍等"后 12 字内出现 发/发送/确认/回复/同步（出站校验
+# HARD_FORBIDDEN 正则），严禁"马上/立即+发+视频"（IMMEDIATE claim）与
+# "稍后/等下/待会/晚点+发"（FUTURE_SEND）组合。
+KF_VIDEO_TRANSCODE_WAIT_NOTICE = "视频有点大，正在压缩，请稍等。"
+
 
 def _video_send_failure_notice_text(label: str) -> str:
     normalized_label = str(label or "").strip()
@@ -12754,6 +12801,36 @@ async def _send_videos_with_receipts(
                     raise
                 transcode_retry = True
                 transcode_cache_hit = cached_wecom_video(path) is not None
+                if not transcode_cache_hit:
+                    # 真正要等 ffmpeg 压缩时才提示客户;缓存命中秒回不打扰。
+                    # 提示是尽力而为的过程话术,发送失败不阻断转码与视频送达。
+                    try:
+                        notice_metadata = {
+                            "position": position,
+                            "related_action_id": action_id,
+                            "related_action_type": "video",
+                            "transaction": "upload_then_caption_then_video",
+                        }
+                        context, _notice_sent, _notice_receipt = await _send_text_with_receipt(
+                            open_kfid=open_kfid,
+                            external_userid=external_userid,
+                            context=context,
+                            text=KF_VIDEO_TRANSCODE_WAIT_NOTICE,
+                            action_id=f"{action_id}-transcode-notice",
+                            text_role="video_transcode_wait_notice",
+                            msgids=msgids,
+                            extra_payload=notice_metadata,
+                            extra_metadata=notice_metadata,
+                            listing_id=fact_binding.get("listing_id", ""),
+                            evidence_id=fact_binding.get("evidence_id", ""),
+                            inventory_snapshot_id=fact_binding.get("inventory_snapshot_id", ""),
+                            source_hash=fact_binding.get("source_hash", ""),
+                            media_id=fact_binding.get("media_id", ""),
+                            sha256=fact_binding.get("sha256", ""),
+                            stale_guard=stale_guard,
+                        )
+                    except Exception as notice_error:
+                        logger.warning("video transcode wait notice send failed: %s", notice_error)
                 failure_stage = "transcode"
                 transcode_start = time.perf_counter()
                 try:
@@ -14202,6 +14279,27 @@ async def receive_wecom_kf_callback(
                 label="KF callback enter_session event",
             )
     return "success"
+
+
+@app.get("/wecom/media/original")
+async def download_original_media(
+    file: str = Query(...),
+    expires: str = Query(...),
+    token: str = Query(...),
+) -> FileResponse:
+    # 原视频签名直链回源:签名/时效/room_database 边界任一校验失败一律 404,
+    # 不泄漏失败差异;密钥未配置(kf_media_link_secret 为空)时整个端点等效关闭。
+    try:
+        target = verify_signed_media_request(
+            rel_path=file,
+            expires=expires,
+            token=token,
+            secret=str(getattr(settings, "kf_media_link_secret", "") or "").strip(),
+            media_root=Path(settings.room_database_path),
+        )
+    except ValueError:
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(target, media_type="video/mp4", filename=target.name)
 
 
 @app.post("/debug/message")

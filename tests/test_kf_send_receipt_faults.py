@@ -168,8 +168,12 @@ def test_video_upload_failure_transcodes_with_ffmpeg_and_retries() -> None:
     assert transcode_calls == [video_path]
     assert fake.video_attempts == [video_path, transcoded_path]
     assert fake.videos == ["media-2"]
-    # 话术在上传成功之后、视频消息之前发出
-    assert fake.texts == ["这是星河苑1-101的视频。"]
+    # 口径变更(批10):上传超限且无转码缓存时,先发转码等待提示,
+    # 再转码重传;caption 仍在上传成功之后、视频消息之前发出。
+    assert fake.texts == [
+        "视频有点大，正在压缩，请稍等。",
+        "这是星河苑1-101的视频。",
+    ]
     assert result["sent_actions"] == [
         {
             "type": "video",
@@ -296,9 +300,77 @@ def test_successful_transcode_send_blocks_duplicate_callback_without_recompressi
     ]
     assert second["sent_actions"] == []
     assert fake.video_attempts == [video_path, transcoded_path]
-    assert len(fake.texts) == 1
+    # 口径变更(批10):首轮=转码等待提示+caption 两条;重复回调重放不得新增任何文本。
+    assert fake.texts == [
+        "视频有点大，正在压缩，请稍等。",
+        "这是星河苑1-101的视频。",
+    ]
     assert transcode_calls == [video_path]
     assert second["context"]["send_receipts"]["receipts"][-1]["status"] == "skipped_duplicate"
+
+
+def test_transcode_cache_hit_skips_wait_notice() -> None:
+    # 口径(批10):转码缓存命中时秒回,不发"正在压缩,请稍等"提示,避免无谓打扰。
+    class FakeWeComKf:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+            self.video_attempts: list[str] = []
+            self.videos: list[str] = []
+
+        def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+            self.texts.append(text)
+            return {"errcode": 0}
+
+        def upload_media(self, path: Path, media_type: str = "video") -> str:
+            self.video_attempts.append(str(path))
+            if len(self.video_attempts) == 1:
+                raise RuntimeError("video upload failed: invalid video size")
+            return f"media-{len(self.video_attempts)}"
+
+        def send_video_media(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+            self.videos.append(str(media_id))
+            return {"errcode": 0, "msgid": "video-cached"}
+
+    async def run_case() -> tuple[dict, FakeWeComKf]:
+        fake = FakeWeComKf()
+        original_wecom = main.wecom_kf
+        original_prepare = main.prepare_wecom_video
+        main.wecom_kf = fake
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                video_path = Path(directory) / "room.mp4"
+                video_path.write_bytes(b"original-video")
+                cache_dir = Path(directory) / ".wecom_cache"
+                cache_dir.mkdir()
+                cached_path = cache_dir / "room.wecom.mp4"
+                cached_path.write_bytes(b"cached-video")
+
+                def fake_prepare(path: Path, *, force: bool = False, **kwargs) -> Path:
+                    return cached_path
+
+                main.prepare_wecom_video = fake_prepare
+                result = await main._send_final_actions(
+                    open_kfid="kf",
+                    external_userid="wm",
+                    context=_context(),
+                    final_reply="",
+                    tool_evidence={
+                        "video_paths": [str(video_path)],
+                        "video_rows": [{"小区": "星河苑", "房号": "1-101"}],
+                    },
+                    msgids=["msg-video-cache-hit"],
+                )
+                return result, fake
+        finally:
+            main.wecom_kf = original_wecom
+            main.prepare_wecom_video = original_prepare
+
+    result, fake = asyncio.run(run_case())
+
+    assert fake.texts == ["这是星河苑1-101的视频。"]
+    receipt = result["context"]["send_receipts"]["receipts"][-1]
+    assert receipt["metadata"]["transcode_cache_hit"] is True
+    assert receipt["status"] == "sent"
 
 
 def test_video_auth_failure_does_not_transcode_retry(caplog) -> None:

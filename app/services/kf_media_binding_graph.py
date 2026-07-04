@@ -58,6 +58,9 @@ class KfMediaBindingGraphDeps:
     row_listing_id: Callable[[dict[str, Any]], str]
     rows_with_listing_ids: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]
     rows_with_candidate_numbers: Callable[[list[dict[str, Any]], list[int]], list[dict[str, Any]]]
+    # 素材库无原视频链接证据时的兜底:对已绑定的本地视频文件生成签名直链
+    # (None 或返回空列表即不兜底,保持原"无链接"语义)。
+    signed_original_video_urls: Callable[[list[Path]], list[str]] | None = None
 
 
 def build_kf_media_binding_graph_app(*, checkpointer: Any | None = None) -> Any:
@@ -388,8 +391,21 @@ def _original_video_source_summary(
             for row in deps.rows_with_listing_ids(matched_rows)
             if deps.row_listing_id(row)
         ]
-        return deps.original_video_sources_for_listings(listing_ids)
-    return deps.original_video_sources_for_paths(paths)
+        summary = deps.original_video_sources_for_listings(listing_ids)
+    else:
+        summary = deps.original_video_sources_for_paths(paths)
+    if (
+        deps.signed_original_video_urls is not None
+        and paths
+        and not (summary.get("original_video_urls") or summary.get("material_page_urls"))
+    ):
+        # 素材库没有原视频链接证据时,退回对已绑定视频文件生成签名直链;
+        # 签名生成失败/密钥未配置返回空列表,保持原"无链接"语义不放大声称。
+        signed_urls = [str(url) for url in deps.signed_original_video_urls(paths) if str(url or "").strip()]
+        if signed_urls:
+            summary = dict(summary)
+            summary["original_video_urls"] = signed_urls
+    return summary
 
 
 def _suggest_pending_video_memory(

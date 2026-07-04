@@ -188,6 +188,16 @@ class Settings(BaseSettings):
         default=3.5,
         alias="KF_HUMANIZED_TYPING_DELAY_CAP_SECONDS",
     )
+    # 原视频签名直链:密钥缺省为空即整个功能关闭(fail-closed),
+    # 生产密钥只存在服务器 .env,不入库。
+    kf_media_link_secret: str = Field(
+        default="",
+        alias="KF_MEDIA_LINK_SECRET",
+    )
+    kf_media_link_ttl_seconds: int = Field(
+        default=48 * 3600,
+        alias="KF_MEDIA_LINK_TTL_SECONDS",
+    )
 
     dashscope_api_key: str = Field(default="", alias="DASHSCOPE_API_KEY")
     dashscope_base_url: str = Field(

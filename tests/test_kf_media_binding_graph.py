@@ -227,3 +227,72 @@ def test_media_binding_graph_collect_failure_becomes_blocking_evidence() -> None
         assert evidence["media_status"]["video"]["sent_count"] == 0
 
     run(run_case())
+
+
+def _summary_deps(
+    *,
+    sources: dict[str, Any],
+    signed_urls: list[str] | None,
+) -> KfMediaBindingGraphDeps:
+    async def _collect(rows, *, media_kind, limit):
+        return ([], [], [], {})
+
+    return KfMediaBindingGraphDeps(
+        resolve_tool_targets=lambda **_kwargs: None,
+        collect_room_media=_collect,
+        original_video_sources_for_listings=lambda listing_ids: dict(sources),
+        original_video_sources_for_paths=lambda paths: dict(sources),
+        row_labeler=_row_label,
+        row_listing_id=_row_listing_id,
+        rows_with_listing_ids=_rows_with_listing_ids,
+        rows_with_candidate_numbers=_rows_with_candidate_numbers,
+        signed_original_video_urls=(None if signed_urls is None else (lambda paths: list(signed_urls))),
+    )
+
+
+def test_original_video_summary_falls_back_to_signed_urls_when_no_manifest_links() -> None:
+    # 口径(批10):素材库无原视频链接证据时,用已绑定视频文件的签名直链兜底,
+    # original_video_urls 非空 -> has_original_source 判真,回复可给链接。
+    from app.services.kf_media_binding_graph import _original_video_source_summary
+
+    empty_sources = {"original_video_paths": [], "original_video_urls": [], "material_page_urls": [], "source_records": []}
+    signed = ["https://ynzyqbot.cn/wecom/media/original?file=videos%2Fa.mp4&expires=1&token=t"]
+
+    summary = _original_video_source_summary(
+        _summary_deps(sources=empty_sources, signed_urls=signed),
+        paths=[Path("C:/tmp/room-a.mp4")],
+        matched_rows=[{"listing_id": "lst-a"}],
+        dual_llm_production=True,
+    )
+    assert summary["original_video_urls"] == signed
+
+
+def test_original_video_summary_prefers_manifest_links_over_signed_fallback() -> None:
+    from app.services.kf_media_binding_graph import _original_video_source_summary
+
+    manifest_sources = {
+        "original_video_paths": [],
+        "original_video_urls": ["https://drive.example/manifest-original.mp4"],
+        "material_page_urls": [],
+        "source_records": [],
+    }
+    summary = _original_video_source_summary(
+        _summary_deps(sources=manifest_sources, signed_urls=["https://ynzyqbot.cn/should-not-be-used"]),
+        paths=[Path("C:/tmp/room-a.mp4")],
+        matched_rows=[{"listing_id": "lst-a"}],
+        dual_llm_production=True,
+    )
+    assert summary["original_video_urls"] == ["https://drive.example/manifest-original.mp4"]
+
+
+def test_original_video_summary_keeps_no_link_semantics_without_fallback() -> None:
+    from app.services.kf_media_binding_graph import _original_video_source_summary
+
+    empty_sources = {"original_video_paths": [], "original_video_urls": [], "material_page_urls": [], "source_records": []}
+    summary = _original_video_source_summary(
+        _summary_deps(sources=empty_sources, signed_urls=None),
+        paths=[Path("C:/tmp/room-a.mp4")],
+        matched_rows=[{"listing_id": "lst-a"}],
+        dual_llm_production=True,
+    )
+    assert summary["original_video_urls"] == []
