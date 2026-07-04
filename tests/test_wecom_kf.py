@@ -3418,14 +3418,19 @@ def test_send_videos_production_blocks_paths_without_manifest_evidence(monkeypat
         class FakeWeComKf:
             def __init__(self) -> None:
                 self.texts: list[str] = []
+                self.uploads: list[str] = []
                 self.videos: list[str] = []
 
             def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
                 self.texts.append(text)
                 return {"errcode": 0}
 
-            def send_video(self, open_kfid: str, external_userid: str, path: Path) -> dict:
-                self.videos.append(str(path))
+            def upload_media(self, path: Path, media_type: str = "video") -> str:
+                self.uploads.append(str(path))
+                return f"media-{len(self.uploads)}"
+
+            def send_video_media(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+                self.videos.append(str(media_id))
                 return {"errcode": 0}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -3451,6 +3456,7 @@ def test_send_videos_production_blocks_paths_without_manifest_evidence(monkeypat
                 main.settings.kf_dual_llm_mode = original_mode
 
             assert fake.texts == []
+            assert fake.uploads == []
             assert fake.videos == []
             assert sent == [{"type": "video_blocked", "path": str(video_path), "reason": "missing_media_manifest_evidence"}]
             receipt = context["send_receipts"]["receipts"][-1]
@@ -3466,14 +3472,19 @@ def test_send_videos_production_uses_manifest_evidence_in_receipt(monkeypatch) -
         class FakeWeComKf:
             def __init__(self) -> None:
                 self.texts: list[str] = []
+                self.uploads: list[str] = []
                 self.videos: list[str] = []
 
             def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
                 self.texts.append(text)
                 return {"errcode": 0}
 
-            def send_video(self, open_kfid: str, external_userid: str, path: Path) -> dict:
-                self.videos.append(str(path))
+            def upload_media(self, path: Path, media_type: str = "video") -> str:
+                self.uploads.append(str(path))
+                return f"media-{len(self.uploads)}"
+
+            def send_video_media(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+                self.videos.append(str(media_id))
                 return {"errcode": 0, "msgid": "video-1"}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -3517,7 +3528,8 @@ def test_send_videos_production_uses_manifest_evidence_in_receipt(monkeypatch) -
                 main.settings.room_database_path = previous_room_database_path
 
             assert fake.texts == ["PACKAGE 视频说明。"]
-            assert fake.videos == [str(video_path)]
+            assert fake.uploads == [str(video_path)]
+            assert fake.videos == ["media-1"]
             assert sent == [{"type": "video", "path": str(video_path), "room": "星河苑1-101", "count": 1}]
             receipt = context["send_receipts"]["receipts"][-1]
             assert receipt["status"] == "sent"
@@ -3534,14 +3546,19 @@ def test_send_videos_production_blocks_manifest_room_outside_allowed_rooms(monke
         class FakeWeComKf:
             def __init__(self) -> None:
                 self.texts: list[str] = []
+                self.uploads: list[str] = []
                 self.videos: list[str] = []
 
             def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
                 self.texts.append(text)
                 return {"errcode": 0}
 
-            def send_video(self, open_kfid: str, external_userid: str, path: Path) -> dict:
-                self.videos.append(str(path))
+            def upload_media(self, path: Path, media_type: str = "video") -> str:
+                self.uploads.append(str(path))
+                return f"media-{len(self.uploads)}"
+
+            def send_video_media(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+                self.videos.append(str(media_id))
                 return {"errcode": 0, "msgid": "video-1"}
 
         with tempfile.TemporaryDirectory() as directory:
@@ -3583,12 +3600,136 @@ def test_send_videos_production_blocks_manifest_room_outside_allowed_rooms(monke
                 main.settings.room_database_path = previous_room_database_path
 
             assert fake.texts == []
+            assert fake.uploads == []
             assert fake.videos == []
             assert sent == [{"type": "video_blocked", "path": str(video_path), "reason": "room_not_allowed_for_media_send"}]
             receipt = context["send_receipts"]["receipts"][-1]
             assert receipt["status"] == "failed"
             assert receipt["metadata"]["blocked"] is True
             assert receipt["metadata"]["allowed_rooms_required"] is True
+
+    asyncio.run(run_case())
+
+
+def _prepared_video_package_tool_evidence(video_path: Path, listing_id: str, media_evidence: dict, reply_text: str) -> dict:
+    row = {"小区": "星河苑", "房号": "1-101", "listing_id": listing_id}
+    return {
+        "video_paths": [str(video_path)],
+        "video_rows": [row],
+        "allowed_rooms": {"listing_ids": [listing_id], "source": "unit"},
+        "video_media_manifest_evidence": [media_evidence],
+        "llm2_production_outbound_package": {
+            "reply_text": reply_text,
+            "reply_source": "kf_llm2_outbound_production",
+            "send_actions": [
+                {
+                    "action_id": "pkg-video-1",
+                    "action_type": "video",
+                    "payload": {"kind": "video", "local_path": str(video_path), "media_number": 1},
+                }
+            ],
+            "action_captions": [
+                {
+                    "action_id": "pkg-video-1",
+                    "caption_id": "cap-video-1",
+                    "text": "这是星河苑1-101的视频。",
+                    "display_order": 1,
+                }
+            ],
+        },
+    }
+
+
+class _SplitVideoFakeWeComKf:
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.uploads: list[str] = []
+        self.videos: list[str] = []
+
+    def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
+        self.texts.append(text)
+        return {"errcode": 0, "msgid": f"text-{len(self.texts)}"}
+
+    def upload_media(self, path: Path, media_type: str = "video") -> str:
+        self.uploads.append(str(path))
+        return f"media-{len(self.uploads)}"
+
+    def send_video_media(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
+        self.videos.append(str(media_id))
+        return {"errcode": 0, "msgid": f"video-{len(self.videos)}"}
+
+
+def test_send_final_actions_prepared_dedups_merged_reply_into_captions(monkeypatch) -> None:
+    async def run_case() -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "room_database"
+            listing_id = generate_listing_id("星河苑", "1-101")
+            video_path = root / "video" / listing_id / "exact.mp4"
+            video_path.parent.mkdir(parents=True)
+            video_path.write_bytes(b"video")
+            _manifest, media_evidence = _write_manifest_evidence_for_send(root, listing_id, video_path, MEDIA_KIND_VIDEO)
+            fake = _SplitVideoFakeWeComKf()
+            tool_evidence = _prepared_video_package_tool_evidence(
+                video_path,
+                listing_id,
+                media_evidence,
+                reply_text="这是星河苑1-101的视频。",
+            )
+            monkeypatch.setattr(main, "wecom_kf", fake)
+            monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+            monkeypatch.setattr(main.settings, "room_database_path", root)
+            result = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context=kf_context_memory.empty_context(),
+                final_reply="这是星河苑1-101的视频。",
+                tool_evidence=tool_evidence,
+                msgids=["msg-prepared-dedup"],
+            )
+
+            # 合并版最终话术与逐条 caption 完全重复：只发 caption+视频，不再单发合并文本
+            assert tool_evidence["final_reply_deduped_into_captions"] is True
+            assert fake.texts == ["这是星河苑1-101的视频。"]
+            assert fake.uploads == [str(video_path)]
+            assert fake.videos == ["media-1"]
+            assert [action["type"] for action in result["sent_actions"]] == ["video"]
+
+    asyncio.run(run_case())
+
+
+def test_send_final_actions_prepared_keeps_merged_reply_with_extra_information(monkeypatch) -> None:
+    async def run_case() -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "room_database"
+            listing_id = generate_listing_id("星河苑", "1-101")
+            video_path = root / "video" / listing_id / "exact.mp4"
+            video_path.parent.mkdir(parents=True)
+            video_path.write_bytes(b"video")
+            _manifest, media_evidence = _write_manifest_evidence_for_send(root, listing_id, video_path, MEDIA_KIND_VIDEO)
+            fake = _SplitVideoFakeWeComKf()
+            reply_text = "这是星河苑1-101的视频，需要约看房随时说。"
+            tool_evidence = _prepared_video_package_tool_evidence(
+                video_path,
+                listing_id,
+                media_evidence,
+                reply_text=reply_text,
+            )
+            monkeypatch.setattr(main, "wecom_kf", fake)
+            monkeypatch.setattr(main.settings, "kf_dual_llm_mode", "production")
+            monkeypatch.setattr(main.settings, "room_database_path", root)
+            result = await main._send_final_actions(
+                open_kfid="kf",
+                external_userid="wm",
+                context=kf_context_memory.empty_context(),
+                final_reply=reply_text,
+                tool_evidence=tool_evidence,
+                msgids=["msg-prepared-keep-reply"],
+            )
+
+            # 合并话术带有 caption 之外的信息（约看房提示）时必须照常发送
+            assert "final_reply_deduped_into_captions" not in tool_evidence
+            assert fake.texts == [reply_text, "这是星河苑1-101的视频。"]
+            assert [action["type"] for action in result["sent_actions"]] == ["text", "video"]
 
     asyncio.run(run_case())
 
@@ -17419,13 +17560,18 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
         class FakeWeComKf:
             def __init__(self) -> None:
                 self.texts: list[str] = []
+                self.uploads: list[str] = []
                 self.videos: list[str] = []
 
             def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
                 self.texts.append(text)
                 return {"errcode": 0}
 
-            def send_video(self, open_kfid: str, external_userid: str, media_id: str, title: str = "") -> dict:
+            def upload_media(self, path: Path, media_type: str = "video") -> str:
+                self.uploads.append(str(path))
+                return f"media-{len(self.uploads)}"
+
+            def send_video_media(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
                 self.videos.append(str(media_id))
                 return {"errcode": 0, "msgid": f"video-{len(self.videos)}"}
 
@@ -17469,7 +17615,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(fake.texts), 1)
         self.assertIn("视频", fake.texts[0])
-        self.assertEqual(fake.videos, [video_path])
+        self.assertEqual(fake.uploads, [video_path])
+        self.assertEqual(fake.videos, ["media-1"])
         self.assertEqual(len(first["sent_actions"]), 1)
         self.assertEqual(second["sent_actions"], [])
         statuses = [item["status"] for item in second["context"]["send_receipts"]["receipts"]]
@@ -17480,6 +17627,7 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             def __init__(self) -> None:
                 self.texts: list[str] = []
                 self.images: list[str] = []
+                self.uploads: list[str] = []
                 self.videos: list[str] = []
 
             def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict:
@@ -17490,7 +17638,11 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.images.append(str(media_id))
                 return {"errcode": 0, "msgid": f"image-{len(self.images)}"}
 
-            def send_video(self, open_kfid: str, external_userid: str, media_id: str, title: str = "") -> dict:
+            def upload_media(self, path: Path, media_type: str = "video") -> str:
+                self.uploads.append(str(path))
+                return f"media-{len(self.uploads)}"
+
+            def send_video_media(self, open_kfid: str, external_userid: str, media_id: str) -> dict:
                 self.videos.append(str(media_id))
                 return {"errcode": 0, "msgid": f"video-{len(self.videos)}"}
 
@@ -17614,7 +17766,8 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
             main.wecom_kf = original_wecom
 
         self.assertEqual(fake.texts, ["PACKAGE 正文。", "PACKAGE 视频说明。", "PACKAGE 图片说明。", "PACKAGE 房源表说明。"])
-        self.assertEqual(fake.videos, [str(video_path)])
+        self.assertEqual(fake.uploads, [str(video_path)])
+        self.assertEqual(fake.videos, ["media-1"])
         self.assertEqual(fake.images, [str(image_path), str(sheet_path)])
         self.assertNotIn("这句旧 final_reply 不应该发送。", fake.texts)
         self.assertFalse(any("这是星河苑" in text for text in fake.texts))

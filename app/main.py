@@ -12239,35 +12239,6 @@ async def _send_images(open_kfid: str, external_userid: str, paths: list[str]) -
     return sent
 
 
-async def _send_videos(
-    open_kfid: str,
-    external_userid: str,
-    paths: list[str],
-    rows: list[dict[str, Any]],
-    captions: list[str] | None = None,
-) -> list[dict[str, Any]]:
-    sent: list[dict[str, Any]] = []
-    for index, raw_path in enumerate(paths[:KF_VIDEO_SEND_LIMIT]):
-        path = Path(raw_path)
-        if not path.exists():
-            continue
-        label = _normalize_customer_visible_reply_text_before_selfcheck(
-            _row_label(rows[index]) if index < len(rows) else path.stem
-        )
-        caption = str(captions[index] if captions and index < len(captions) else "").strip()
-        if caption:
-            await _send_text(open_kfid, external_userid, caption)
-        try:
-            await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, path))
-            sent.append({"type": "video", "path": str(path), "room": label, "count": 1})
-        except WeComKfSendLimitError:
-            raise
-        except Exception as exc:
-            logger.warning("send video failed: %s", kf_send_receipts.safe_failure_reason(exc))
-            sent.append({"type": "video_failed", "path": str(path), "room": label, "reason": kf_send_receipts.safe_failure_reason(exc)})
-    return sent
-
-
 def _video_error_allows_transcode_retry(error: Exception) -> bool:
     text = str(error).lower()
     retry_markers = (
@@ -12345,6 +12316,7 @@ def _video_send_observability_metadata(
     first_upload_ms: int | None,
     transcode_ms: int | None,
     retry_upload_ms: int | None,
+    video_msg_ms: int | None,
     send_total_ms: int | None,
     transcode_cache_hit: bool,
     fact_binding: dict[str, Any],
@@ -12360,6 +12332,7 @@ def _video_send_observability_metadata(
         "first_upload_ms": first_upload_ms,
         "transcode_ms": transcode_ms,
         "retry_upload_ms": retry_upload_ms,
+        "video_msg_ms": video_msg_ms,
         "send_total_ms": send_total_ms,
         "original_file_name": source_path.name,
         "sent_file_name": sent_path.name,
@@ -12373,24 +12346,18 @@ def _video_send_observability_metadata(
     }
 
 
-def _video_send_failure_stage(
-    *,
-    caption_sent: bool,
-    transcode_retry: bool,
-    first_upload_ms: int | None,
-    transcode_ms: int | None,
-    retry_upload_ms: int | None,
-) -> str:
-    if not caption_sent:
-        return "caption"
-    if transcode_retry:
-        if retry_upload_ms is not None:
-            return "retry_upload"
-        if transcode_ms is not None:
-            return "transcode"
-    if first_upload_ms is not None:
-        return "first_upload"
-    return "video_send"
+# 客户可见的视频发送失败纠正话术（受控模板层，禁止改为 LLM 生成）：
+# 视频在上传或发送阶段确定失败时，用它向客户说明视频未送达，
+# 替代 2026-07-04 生产实证中"话术已发、视频丢失"的孤儿话术形态。
+KF_VIDEO_SEND_FAILURE_NOTICE_WITH_LABEL = "{label}的视频这边暂时没发出去，你稍后再让我发一次。"
+KF_VIDEO_SEND_FAILURE_NOTICE_FALLBACK = "刚才这条视频暂时没发出去，你稍后再让我发一次。"
+
+
+def _video_send_failure_notice_text(label: str) -> str:
+    normalized_label = str(label or "").strip()
+    if normalized_label:
+        return KF_VIDEO_SEND_FAILURE_NOTICE_WITH_LABEL.format(label=normalized_label)
+    return KF_VIDEO_SEND_FAILURE_NOTICE_FALLBACK
 
 
 async def _send_images_with_receipts(
@@ -12726,7 +12693,7 @@ async def _send_videos_with_receipts(
                 "position": position,
                 "caption_hash": kf_send_receipts.text_hash(caption),
                 "caption_id": caption_id,
-                "transaction": "caption_then_video",
+                "transaction": "upload_then_caption_then_video",
                 "media_evidence_profile": fact_binding.get("media_evidence_profile", ""),
                 "media_adapter_mode": fact_binding.get("media_adapter_mode", ""),
             },
@@ -12764,7 +12731,44 @@ async def _send_videos_with_receipts(
         first_upload_ms: int | None = None
         transcode_ms: int | None = None
         retry_upload_ms: int | None = None
+        video_msg_ms: int | None = None
+        video_media_id = ""
+        # 逐段记录失败发生的阶段；视频消息阶段之前的失败都意味着客户必然没收到视频
+        failure_stage = "first_upload"
         try:
+            # 先上传素材拿到 media_id，上传成功前不发任何客户可见话术：
+            # 2026-07-04 生产实证里上传超限（40011）时话术已发出，客户看到
+            # "这是XX的视频。"却收不到视频，本顺序调整从结构上消灭该孤儿话术。
+            try:
+                first_upload_start = time.perf_counter()
+                try:
+                    if stale_guard is not None:
+                        stale_guard()
+                    video_media_id = str(await _await_if_needed(wecom_kf.upload_media(sent_path, "video")))
+                finally:
+                    first_upload_ms = _elapsed_ms_since(first_upload_start)
+            except WeComKfSendLimitError:
+                raise
+            except Exception as exc:
+                if not _video_error_allows_transcode_retry(exc):
+                    raise
+                transcode_retry = True
+                transcode_cache_hit = cached_wecom_video(path) is not None
+                failure_stage = "transcode"
+                transcode_start = time.perf_counter()
+                try:
+                    sent_path = await asyncio.to_thread(prepare_wecom_video, path, force=True)
+                finally:
+                    transcode_ms = _elapsed_ms_since(transcode_start)
+                failure_stage = "retry_upload"
+                retry_upload_start = time.perf_counter()
+                try:
+                    if stale_guard is not None:
+                        stale_guard()
+                    video_media_id = str(await _await_if_needed(wecom_kf.upload_media(sent_path, "video")))
+                finally:
+                    retry_upload_ms = _elapsed_ms_since(retry_upload_start)
+            failure_stage = "caption"
             if caption:
                 caption_metadata = {
                     "position": position,
@@ -12772,9 +12776,9 @@ async def _send_videos_with_receipts(
                     "related_action_id": action_id,
                     "related_action_type": "video",
                     "caption_hash": kf_send_receipts.text_hash(caption),
-                    "transaction": "caption_then_video",
+                    "transaction": "upload_then_caption_then_video",
                 }
-                context, _did_send_caption, _caption_receipt = await _send_text_with_receipt(
+                context, did_send_caption, _caption_receipt = await _send_text_with_receipt(
                     open_kfid=open_kfid,
                     external_userid=external_userid,
                     context=context,
@@ -12792,34 +12796,17 @@ async def _send_videos_with_receipts(
                     sha256=fact_binding.get("sha256", ""),
                     stale_guard=stale_guard,
                 )
-                caption_sent = True
+                caption_sent = bool(did_send_caption)
+            failure_stage = "video_message"
+            video_msg_start = time.perf_counter()
             try:
-                first_upload_start = time.perf_counter()
-                try:
-                    if stale_guard is not None:
-                        stale_guard()
-                    provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, sent_path))
-                finally:
-                    first_upload_ms = _elapsed_ms_since(first_upload_start)
-            except WeComKfSendLimitError:
-                raise
-            except Exception as exc:
-                if not _video_error_allows_transcode_retry(exc):
-                    raise
-                transcode_retry = True
-                transcode_cache_hit = cached_wecom_video(path) is not None
-                transcode_start = time.perf_counter()
-                try:
-                    sent_path = await asyncio.to_thread(prepare_wecom_video, path, force=True)
-                finally:
-                    transcode_ms = _elapsed_ms_since(transcode_start)
-                retry_upload_start = time.perf_counter()
-                try:
-                    if stale_guard is not None:
-                        stale_guard()
-                    provider_result = await _await_if_needed(wecom_kf.send_video(open_kfid, external_userid, sent_path))
-                finally:
-                    retry_upload_ms = _elapsed_ms_since(retry_upload_start)
+                if stale_guard is not None:
+                    stale_guard()
+                provider_result = await _await_if_needed(
+                    wecom_kf.send_video_media(open_kfid, external_userid, video_media_id)
+                )
+            finally:
+                video_msg_ms = _elapsed_ms_since(video_msg_start)
             receipt = kf_send_receipts.build_sent_receipt(
                 action,
                 idempotency_key=idempotency_key,
@@ -12833,6 +12820,7 @@ async def _send_videos_with_receipts(
                     first_upload_ms=first_upload_ms,
                     transcode_ms=transcode_ms,
                     retry_upload_ms=retry_upload_ms,
+                    video_msg_ms=video_msg_ms,
                     send_total_ms=_elapsed_ms_since(send_total_start),
                     transcode_cache_hit=transcode_cache_hit,
                     fact_binding=fact_binding,
@@ -12865,17 +12853,12 @@ async def _send_videos_with_receipts(
                     first_upload_ms=first_upload_ms,
                     transcode_ms=transcode_ms,
                     retry_upload_ms=retry_upload_ms,
+                    video_msg_ms=video_msg_ms,
                     send_total_ms=_elapsed_ms_since(send_total_start),
                     transcode_cache_hit=transcode_cache_hit,
                     fact_binding=fact_binding,
                     outbox_attempt=outbox_decision.attempt,
-                    failure_stage=_video_send_failure_stage(
-                        caption_sent=caption_sent,
-                        transcode_retry=transcode_retry,
-                        first_upload_ms=first_upload_ms,
-                        transcode_ms=transcode_ms,
-                        retry_upload_ms=retry_upload_ms,
-                    ),
+                    failure_stage=failure_stage,
                 ),
             )
             context = kf_send_receipts.append_receipt(context, receipt)
@@ -12887,32 +12870,40 @@ async def _send_videos_with_receipts(
             )
             raise
         except Exception as exc:
-            receipt = _build_send_error_receipt(
-                action,
-                idempotency_key=idempotency_key,
-                error=exc,
-                metadata=_video_send_observability_metadata(
-                    position=position,
-                    caption_sent=caption_sent,
-                    transcode_retry=transcode_retry,
-                    source_path=path,
-                    sent_path=sent_path,
-                    first_upload_ms=first_upload_ms,
-                    transcode_ms=transcode_ms,
-                    retry_upload_ms=retry_upload_ms,
-                    send_total_ms=_elapsed_ms_since(send_total_start),
-                    transcode_cache_hit=transcode_cache_hit,
-                    fact_binding=fact_binding,
-                    outbox_attempt=outbox_decision.attempt,
-                    failure_stage=_video_send_failure_stage(
-                        caption_sent=caption_sent,
-                        transcode_retry=transcode_retry,
-                        first_upload_ms=first_upload_ms,
-                        transcode_ms=transcode_ms,
-                        retry_upload_ms=retry_upload_ms,
-                    ),
-                ),
+            failure_metadata = _video_send_observability_metadata(
+                position=position,
+                caption_sent=caption_sent,
+                transcode_retry=transcode_retry,
+                source_path=path,
+                sent_path=sent_path,
+                first_upload_ms=first_upload_ms,
+                transcode_ms=transcode_ms,
+                retry_upload_ms=retry_upload_ms,
+                video_msg_ms=video_msg_ms,
+                send_total_ms=_elapsed_ms_since(send_total_start),
+                transcode_cache_hit=transcode_cache_hit,
+                fact_binding=fact_binding,
+                outbox_attempt=outbox_decision.attempt,
+                failure_stage=failure_stage,
             )
+            # 视频消息之前（上传/转码/话术阶段）的失败意味着视频必然未送达：
+            # 记确定失败、允许后续重放；send_uncertain 语义只保留给视频消息本身
+            # （例如写入请求体后超时，消息可能已送达，不能自动重放也不能误发纠正话术）。
+            video_definitely_not_delivered = failure_stage != "video_message" or not kf_outbox.send_error_is_uncertain(exc)
+            if failure_stage == "video_message":
+                receipt = _build_send_error_receipt(
+                    action,
+                    idempotency_key=idempotency_key,
+                    error=exc,
+                    metadata=failure_metadata,
+                )
+            else:
+                receipt = kf_send_receipts.build_failed_receipt(
+                    action,
+                    idempotency_key=idempotency_key,
+                    error=exc,
+                    metadata=failure_metadata,
+                )
             context = kf_send_receipts.append_receipt(context, receipt)
             _record_persistent_send_receipt(
                 receipt,
@@ -12922,7 +12913,117 @@ async def _send_videos_with_receipts(
             )
             logger.warning("send video failed: %s", kf_send_receipts.safe_failure_reason(exc))
             sent.append({"type": "video_failed", "path": str(path), "room": label, "reason": kf_send_receipts.safe_failure_reason(exc)})
+            if video_definitely_not_delivered:
+                # 确定失败才补发纠正话术：向客户说明视频未送达，
+                # 覆盖"话术已发视频丢失"（video_message 确定失败）与"客户被静默晾着"（上传失败）两种残留形态
+                notice_metadata = {
+                    "position": position,
+                    "related_action_id": action_id,
+                    "related_action_type": "video",
+                    "notice_kind": "video_send_failure",
+                    "failure_stage": failure_stage,
+                }
+                did_send_notice = False
+                try:
+                    context, did_send_notice, _notice_receipt = await _send_text_with_receipt(
+                        open_kfid=open_kfid,
+                        external_userid=external_userid,
+                        context=context,
+                        text=_video_send_failure_notice_text(label),
+                        action_id=f"{action_id}-failure-notice",
+                        text_role="video_send_failure_notice",
+                        msgids=msgids,
+                        extra_payload=notice_metadata,
+                        extra_metadata=notice_metadata,
+                        listing_id=fact_binding.get("listing_id", ""),
+                        evidence_id=fact_binding.get("evidence_id", ""),
+                        inventory_snapshot_id=fact_binding.get("inventory_snapshot_id", ""),
+                        source_hash=fact_binding.get("source_hash", ""),
+                        media_id=fact_binding.get("media_id", ""),
+                        sha256=fact_binding.get("sha256", ""),
+                        stale_guard=stale_guard,
+                    )
+                except WeComKfSendLimitError:
+                    raise
+                except Exception as notice_exc:
+                    logger.warning(
+                        "send video failure notice failed: %s",
+                        kf_send_receipts.safe_failure_reason(notice_exc),
+                    )
+                if did_send_notice:
+                    sent.append({"type": "text", "subtype": "video_send_failure_notice", "count": 1})
     return sent, context
+
+
+_CUSTOMER_TEXT_CLAUSE_SPLIT_RE = re.compile(r"[。！？!?；;，,、\n\r]+")
+_CUSTOMER_TEXT_CLAUSE_STRIP_RE = re.compile(r"[\s。！？!?；;，,、~～]+")
+
+
+def _normalized_caption_clauses(text: str) -> list[str]:
+    clauses: list[str] = []
+    for part in _CUSTOMER_TEXT_CLAUSE_SPLIT_RE.split(str(text or "")):
+        normalized = _CUSTOMER_TEXT_CLAUSE_STRIP_RE.sub("", part)
+        if normalized:
+            clauses.append(normalized)
+    return clauses
+
+
+def _final_reply_fully_covered_by_media_captions(final_reply: str, captions: list[str]) -> bool:
+    """判断合并版最终话术是否被将要外发的逐条媒体 caption 完全覆盖。
+
+    逐子句精确匹配（去掉空白与中英文标点后相等才算覆盖）；只要有一个子句
+    携带 caption 之外的信息，合并话术就照常发送，避免误删客户可见内容。
+    """
+    caption_clauses: set[str] = set()
+    for caption in captions:
+        caption_clauses.update(_normalized_caption_clauses(caption))
+    if not caption_clauses:
+        return False
+    reply_clauses = _normalized_caption_clauses(final_reply)
+    if not reply_clauses:
+        return False
+    return all(clause in caption_clauses for clause in reply_clauses)
+
+
+def _captions_planned_for_media_send(
+    outbound_package: dict[str, Any],
+    tool_evidence: dict[str, Any],
+    *,
+    using_prepared_package: bool,
+) -> list[str]:
+    """收集本轮真正会随媒体外发的 caption 文本，供合并话术去重使用。
+
+    只统计文件存在、会进入发送循环的 caption；文件缺失的动作其 caption
+    不会外发，不参与去重，防止把客户可见内容删没。
+    """
+    captions: list[str] = []
+    if using_prepared_package:
+        for prepared_action in outbound_package.get("prepared_actions") or []:
+            if not isinstance(prepared_action, dict):
+                continue
+            caption = str(prepared_action.get("caption") or "").strip()
+            path = str(prepared_action.get("path") or "").strip()
+            if caption and path and Path(path).exists():
+                captions.append(caption)
+        return captions
+    inventory_explanation = str(outbound_package.get("inventory_explanation") or "").strip()
+    if inventory_explanation and any(
+        Path(str(item)).exists() for item in tool_evidence.get("inventory_images") or []
+    ):
+        captions.append(inventory_explanation)
+    # 旧链路的图片说明是无条件逐条外发的独立文本，全部计入
+    captions.extend(
+        str(item).strip()
+        for item in outbound_package.get("image_explanations") or []
+        if str(item).strip()
+    )
+    video_paths = [str(item) for item in tool_evidence.get("video_paths") or []]
+    video_explanations = [str(item) for item in outbound_package.get("video_explanations") or []]
+    for index, video_path in enumerate(video_paths[:KF_VIDEO_SEND_LIMIT]):
+        caption = video_explanations[index].strip() if index < len(video_explanations) else ""
+        if caption and Path(video_path).exists():
+            captions.append(caption)
+    return captions
 
 
 async def _send_final_actions(
@@ -12961,6 +13062,19 @@ async def _send_final_actions(
         final_reply = str(outbound_package.get("text") or "")
     final_reply = _normalize_customer_visible_reply_text_before_selfcheck(final_reply)
     suppress_actions = bool(tool_evidence.get("suppress_actions"))
+    if not suppress_actions and final_reply:
+        planned_captions = _captions_planned_for_media_send(
+            outbound_package if isinstance(outbound_package, dict) else {},
+            tool_evidence,
+            using_prepared_package=using_prepared_package,
+        )
+        if _final_reply_fully_covered_by_media_captions(final_reply, planned_captions):
+            # 合并版话术与逐条 caption 完全重复时收敛为一处：caption 随媒体逐条外发，
+            # 不再单独发送合并文本（2026-07-04 生产实证：一次视频请求外发 3 条重复文本）。
+            # caption 契约不变：production_missing_action_caption 守卫与 require_captions
+            # 仍要求每个媒体动作必须带 caption，去重只影响合并文本这一条。
+            tool_evidence["final_reply_deduped_into_captions"] = True
+            final_reply = ""
     context, sent_text_count, _receipt = await _send_final_reply_text_with_receipts(
         open_kfid=open_kfid,
         external_userid=external_userid,

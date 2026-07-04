@@ -121,3 +121,31 @@ msgid 推成新轮次，同一条"房源表"请求被完整处理两次、房源
 口径。本批按并行会话共存协议只提交回调去重所属文件与 `app/main.py` 的
 `_restart_kf_turn` hunk（批1 commit 9d601d7、批2 commit 955b1c7），未夹带批9 改动。
 不部署、不 push。
+
+## 发送顺序与话术收敛批（批9，架构级修复移交会话）：视频先传后发 + 失败纠正话术 + 合并话术去重
+
+背景：生产实证 2026-07-04 16:06（与批8 同一轮真实对话）。客户要视频时链路先发
+"这是XXX的视频。"再上传视频，40011 上传超限时话术已发出，客户看到"这是视频"却收不到
+视频（孤儿话术，转码标记漏配已在批8 修复，但发送顺序缺陷独立存在）；同时 LLM2 合并版
+话术（"这是A的视频，这是B的视频。"）与逐条 caption 重复，一次视频请求对客外发 3 条文本。
+与"回调重复投递防线批"（回调去重批1/2）为并行移交会话，工作区同期双批开发；
+回调批已先行提交，本批经临时索引仅提交本会话变更，不含对方在途暂存内容。
+
+| 测试/口径 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| 视频发送顺序（`_send_videos_with_receipts`） | 先发 caption 文本，再 `wecom_kf.send_video`（上传+发消息合并调用），上传失败=孤儿话术 | 先 `upload_media` 取 media_id（含既有转码重试链，转码后重传），上传成功后才发 caption，再 `send_video_media` 发视频消息；配套动作元数据 `transaction=upload_then_caption_then_video`、新增 `video_msg_ms` 计时 | 上传失败时客户不再收到任何"这是视频"式承诺，从顺序结构上消灭孤儿话术；企微 media 上传与 send_msg 本就是两个平台接口（平台能力，非本项目虚构），拆开不引入新依赖 |
+| 视频失败客户可见口径 | 失败仅记回执，客户被静默晾着或被孤儿话术误导 | 确定失败（上传/转码/caption 阶段任何失败，或视频消息确定失败）补发受控模板纠正话术："{房源}的视频这边暂时没发出去，你稍后再让我发一次。"；`send_uncertain`（视频消息可能已送达）禁止补发 | 纠正话术属受控模板层（同"房源表发你了"先例），不经 LLM；未决场景补发会对可能已收到视频的客户构成误导 |
+| 视频失败回执与重放语义 | 所有异常统一按 `send_error_is_uncertain` 分类，上传阶段超时也记 `send_uncertain` 并阻断重放 | 视频消息发出前（first_upload/transcode/retry_upload/caption 阶段）的失败一律 `build_failed_receipt`（确定失败，允许重放补发）；仅 `video_message` 阶段保留未决语义 | 上传超时≠送达未决：send_msg 从未调用，消息必然没发出；旧口径把可补发的失败错误地永久阻断 |
+| `failure_stage` 口径 | 由时长字段事后推断（`_video_send_failure_stage`，caption 先发假设） | 发送过程中显式跟踪：first_upload/transcode/retry_upload/caption/video_message | 新顺序下时长推断不再成立；显式跟踪消除歧义，`caption` 阶段语义从"话术未发"变为"上传成功后发话术时失败" |
+| 合并话术 vs 逐条 caption（`_send_final_actions`） | 合并版最终话术与逐条 caption 同时外发（视频请求 3 条文本） | 合并话术逐子句（去空白与中英文标点后精确匹配）均被"计划外发"的 caption 覆盖时不再单发，收敛为 caption 一处（`final_reply_deduped_into_captions` 落 tool_evidence 备查）；任一子句含 caption 之外信息则照常发送；prepared 与 legacy 两条链路同规则 | 媒体叙述唯一客户可见来源=caption。评估结论：`kf_llm2_outbound` claim/caption 契约与 `production_missing_action_caption`、`require_captions`、`llm2_output_missing_visible_reply` 守卫口径全部不变（caption 仍强制、LLM2 仍须产出非空 reply_text），收敛点放在发送层而非 compose 置空 reply_text——后者会触发 main 验收门（非空 reply 硬条件）连锁重试，影响面见 DECISIONS 比选 |
+| 去重安全边界 | — | 只统计文件存在的动作 caption；`suppress_actions` 或空 caption 集不触发去重；生产守卫拦截媒体动作时 caption 与合并文本都不外发（静默留回执） | 防止把客户可见内容删没；守卫拦截场景"静默+回执"优于"这是视频"式假承诺（正是本次事故形态） |
+| 死代码清理 | `main._send_videos`（caption 先发旧实现）无任何调用方仍留存 | 删除 | 防"改一处漏一处"（main.py 拆分结构债 2026-07-08 的同源风险） |
+| 新增/改造回归 | 视频链路测试桩为合并式 `send_video(path)` | 桩统一拆为 `upload_media`+`send_video_media`；新增 9 项：上传失败无孤儿话术+纠正话术+重放（改造）、视频消息确定失败补纠正话术+重放、上传超时按确定失败可重放、未决不补话术（改造）、prepared 去重/带增量信息保留、legacy 去重/带增量信息保留、子句覆盖规则单测 | 生产实证三形态（孤儿话术/静默/重复文本）全部固化为回归 |
+
+残留与后续：图片链路（`_send_images_with_receipts` + `wecom_kf.send_image`）仍是
+caption 先发、上传+发送合并调用，存在同构孤儿话术风险（图片体积小、上传失败率低，
+生产未实证），需要 `send_image_media` 拆分后同规则收口，留独立批次。
+
+验证记录：全量 `python -m pytest -q` 1333 passed / 1 skipped（既有 Windows ACL 跳过）/
+3 deselected（既有标记），含并行回调批工作区变更的混合状态；本批提交内容另在隔离
+worktree 复验（仅本批 hunk 叠加 HEAD），结果见 commit message。
