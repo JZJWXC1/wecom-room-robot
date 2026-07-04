@@ -421,11 +421,12 @@ def test_pending_video_sends_are_deduped_and_clearable() -> None:
     )
 
     pending = kf_context_memory.pending_video_sends(context, now=lambda: 11)
-    assert pending["paths"] == [Path("a.mp4"), Path("b.mp4"), Path("c.mp4")]
+    # 口径变更(批11):store 内 paths 一律存字符串(JSON 可序列化),消费端按需 Path() 化。
+    assert pending["paths"] == ["a.mp4", "b.mp4", "c.mp4"]
     assert pending["requested_count"] == 3
 
     context = kf_context_memory.clear_pending_video_sends(context, sent_paths=[Path("a.mp4")], now=lambda: 11)
-    assert kf_context_memory.pending_video_sends(context, now=lambda: 11)["paths"] == [Path("b.mp4"), Path("c.mp4")]
+    assert kf_context_memory.pending_video_sends(context, now=lambda: 11)["paths"] == ["b.mp4", "c.mp4"]
 
 
 def test_structured_memory_records_minimal_turn_records_and_assistant_summary() -> None:
@@ -524,3 +525,24 @@ def test_structured_memory_summary_keeps_recent_black_box_fields() -> None:
         "a10",
         "a11",
     ]
+
+
+def test_pending_video_store_is_json_serializable_with_path_inputs() -> None:
+    # 回归(2026-07-04 gate 实证):失败重放路径把原生 Path 写入 pending 记忆,
+    # 上下文持久化与 QA 快照 json.dumps 直接崩;store 必须存字符串。
+    import json
+    from pathlib import Path as _Path
+
+    normalized = kf_context_memory.normalize_pending_video_sends(
+        {
+            "paths": [_Path("room_database/video/石桥铭苑6-1102/553.mp4")],
+            "labels": ["石桥铭苑6-1102"],
+            "requested_count": 2,
+        }
+    )
+
+    assert normalized["paths"] == ["room_database\\video\\石桥铭苑6-1102\\553.mp4".replace("\\", "\\")] or all(
+        isinstance(item, str) for item in normalized["paths"]
+    )
+    assert all(isinstance(item, str) for item in normalized["paths"])
+    json.dumps(normalized, ensure_ascii=False)

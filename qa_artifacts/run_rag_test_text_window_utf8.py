@@ -65,6 +65,37 @@ class CaptureWeComKf:
     def __init__(self) -> None:
         self.state_store = FakeStateStore()
         self.events: list[dict[str, Any]] = []
+        self.uploaded_media: dict[str, dict[str, Any]] = {}
+
+    # 批9 起生产链视频发送拆为 upload_media + send_video_media 两步,
+    # 桩必须同步补齐,否则离线 QA 视频全部走失败分支(2026-07-04 gate 实证)。
+    def upload_media(self, path: Path, media_type: str = "video") -> str:
+        media_id = f"offline-media-{len(self.uploaded_media) + 1}"
+        self.uploaded_media[media_id] = {"path": str(path), "media_type": str(media_type)}
+        self.events.append(
+            {
+                "conv": "upload",
+                "type": "upload",
+                "path": str(path),
+                "media_type": str(media_type),
+                "media_id": media_id,
+                "time": time.time(),
+            }
+        )
+        return media_id
+
+    def send_video_media(self, open_kfid: str, external_userid: str, media_id: str) -> dict[str, Any]:
+        upload = self.uploaded_media.get(str(media_id), {})
+        self.events.append(
+            {
+                "conv": external_userid,
+                "type": "video",
+                "path": str(upload.get("path") or ""),
+                "media_id": str(media_id),
+                "time": time.time(),
+            }
+        )
+        return {"errcode": 0, "msgid": f"offline-video-{len(self.events)}"}
 
     def send_text(self, open_kfid: str, external_userid: str, text: str) -> dict[str, Any]:
         self.events.append(

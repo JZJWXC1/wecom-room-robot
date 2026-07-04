@@ -295,7 +295,10 @@ def normalize_pending_video_sends(
     if not isinstance(value, dict):
         return {}
     current_time = now()
-    paths = [Path(item) for item in value.get("paths") or [] if item]
+    # 店内存储必须是 JSON 可序列化的字符串:store 会被上下文持久化与 QA 快照
+    # 直接 json.dumps,存原生 Path 对象会崩(2026-07-04 gate 实证);消费端
+    # (_remove_successful_videos_from_pending/主链路)本就按 str/Path() 兼容消费。
+    paths = [str(item).strip() for item in value.get("paths") or [] if str(item or "").strip()]
     labels = [str(item).strip() for item in value.get("labels") or [] if str(item).strip()]
     if not paths and not labels:
         return {}

@@ -1540,3 +1540,19 @@ def test_production_smoke_is_contract_only_and_send_guarded() -> None:
     assert "send_text(" not in script
     assert "send_image(" not in script
     assert "send_video(" not in script
+
+
+def test_offline_capture_stub_covers_video_send_interface() -> None:
+    # 回归(2026-07-04 gate 实证):生产链视频发送拆为 upload_media+send_video_media
+    # 后,离线桩缺方法导致离线 QA 视频全走失败分支;桩接口必须与生产调用面对齐。
+    from qa_artifacts.run_rag_test_text_window_utf8 import CaptureWeComKf
+
+    stub = CaptureWeComKf()
+    for method in ("send_text", "send_image", "upload_media", "send_video_media", "send_welcome_text_on_event"):
+        assert callable(getattr(stub, method, None)), method
+
+    media_id = stub.upload_media(Path("room_database/video/x/1.mp4"), "video")
+    result = stub.send_video_media("kf", "wm", media_id)
+    assert result.get("errcode") == 0
+    video_events = [event for event in stub.events if event.get("type") == "video"]
+    assert video_events and video_events[0]["path"].endswith("1.mp4")
