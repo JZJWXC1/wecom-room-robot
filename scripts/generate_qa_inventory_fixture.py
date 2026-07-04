@@ -55,6 +55,7 @@ DEFAULT_SOURCE = PROJECT_ROOT / "data" / "inventory_cache.csv"
 DEFAULT_SOURCE_META = PROJECT_ROOT / "data" / "inventory_cache_meta.json"
 DEFAULT_OUTPUT = PROJECT_ROOT / "tests" / "fixtures" / "qa" / "test_inventory_cache.csv"
 DEFAULT_PROVENANCE = PROJECT_ROOT / "tests" / "fixtures" / "qa" / "test_inventory_cache_provenance.json"
+DEFAULT_INDEX = PROJECT_ROOT / "tests" / "fixtures" / "qa" / "test_rewrite_inventory_index.json"
 
 
 def scrub_secret_tokens(value: str) -> str:
@@ -160,9 +161,34 @@ def generate(
     if VIEWING_PASSWORD_RE.search(provenance_text):
         raise SystemExit("溯源 meta 命中看房密码样式,拒绝写出")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(fixture_text, encoding="utf-8")
-    provenance_path.write_text(provenance_text, encoding="utf-8")
+    # newline="" 禁用平台换行翻译:fixture_sha256 的口径是 LF 规范文本,
+    # 守卫测试重算时也按 LF 规范化,双方对 git autocrlf 均免疫
+    output_path.write_text(fixture_text, encoding="utf-8", newline="")
+    provenance_path.write_text(provenance_text, encoding="utf-8", newline="")
     return provenance
+
+
+def regenerate_index(fixture_path: Path, index_path: Path) -> dict[str, Any]:
+    """从生成的 fixture 再生 QA 重写索引(复用生产同源的索引构建器,含密码脱敏)。"""
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+    from app.services.rewrite_inventory_index import (
+        DEFAULT_AREA_ALIASES,
+        write_rewrite_inventory_index,
+    )
+
+    rows = list(csv.DictReader(io.StringIO(fixture_path.read_text(encoding="utf-8-sig"))))
+    return write_rewrite_inventory_index(
+        rows,
+        path=index_path,
+        area_aliases=DEFAULT_AREA_ALIASES,
+        cache_meta={
+            "source": "qa_fixture",
+            "source_detail": "tests/fixtures/qa/test_inventory_cache.csv",
+            "status": "success",
+            "row_count": len(rows),
+        },
+    )
 
 
 def main() -> None:
@@ -171,19 +197,24 @@ def main() -> None:
     parser.add_argument("--source-meta", type=Path, default=DEFAULT_SOURCE_META)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--provenance", type=Path, default=DEFAULT_PROVENANCE)
+    parser.add_argument("--index", type=Path, default=DEFAULT_INDEX)
+    parser.add_argument("--skip-index", action="store_true", help="只生成 fixture,不再生重写索引")
     args = parser.parse_args()
     provenance = generate(args.source, args.source_meta, args.output, args.provenance)
-    print(
-        json.dumps(
-            {
-                "output": args.output.as_posix(),
-                "fixture_version": provenance["fixture_version"],
-                "fixture_row_count": provenance["fixture_row_count"],
-                "source_snapshot_time": provenance["source_snapshot_time"],
-            },
-            ensure_ascii=False,
-        )
-    )
+    summary = {
+        "output": args.output.as_posix(),
+        "fixture_version": provenance["fixture_version"],
+        "fixture_row_count": provenance["fixture_row_count"],
+        "source_snapshot_time": provenance["source_snapshot_time"],
+    }
+    if not args.skip_index:
+        index = regenerate_index(args.output, args.index)
+        if VIEWING_PASSWORD_RE.search(args.index.read_text(encoding="utf-8")):
+            raise SystemExit("再生索引命中看房密码样式,拒绝保留")
+        summary["index"] = args.index.as_posix()
+        summary["index_row_count"] = int(index.get("row_count") or 0)
+        summary["index_signature"] = str(index.get("signature") or "")
+    print(json.dumps(summary, ensure_ascii=False))
 
 
 if __name__ == "__main__":

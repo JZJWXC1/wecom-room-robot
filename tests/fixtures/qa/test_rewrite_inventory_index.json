@@ -1,14 +1,14 @@
 {
   "source": "latest_inventory_rows",
-  "generated_at": "2026-06-27T13:08:19+08:00",
-  "signature": "52692caf0e05a5369765d95499a7ee3280fbcc39fb6dd7fe34c92e812558602a",
+  "generated_at": "2026-07-04T10:53:40+08:00",
+  "signature": "a11a2b5958004bfa3de4a162cdbd02d84dbd09fb3619fe7e86029e7f5afaa3a6",
   "cache_meta": {
     "source": "qa_fixture",
     "source_detail": "tests/fixtures/qa/test_inventory_cache.csv",
     "status": "success",
-    "row_count": 14
+    "row_count": 40
   },
-  "row_count": 14,
+  "row_count": 40,
   "primary_key": "小区 + 房号",
   "field_semantics": {
     "区域": "房源所在区域/板块，用于区域筛选和区域别名归一。",
@@ -163,6 +163,15 @@
       "ambiguity": false
     },
     {
+      "alias": "北软",
+      "normalized_alias": "北软",
+      "canonical": "拱墅万达 北部软件园 城北万象城",
+      "canonical_area": "拱墅万达 北部软件园 城北万象城",
+      "provenance": "business_shorthand",
+      "status": "active",
+      "ambiguity": false
+    },
+    {
       "alias": "北部软件园",
       "normalized_alias": "北部软件园",
       "canonical": "拱墅万达 北部软件园 城北万象城",
@@ -271,6 +280,24 @@
       "ambiguity": false
     },
     {
+      "alias": "皋塘",
+      "normalized_alias": "皋塘",
+      "canonical": "闸弄口 新塘 元宝塘 东站",
+      "canonical_area": "闸弄口 新塘 元宝塘 东站",
+      "provenance": "business_shorthand",
+      "status": "active",
+      "ambiguity": false
+    },
+    {
+      "alias": "皋塘东站",
+      "normalized_alias": "皋塘东站",
+      "canonical": "闸弄口 新塘 元宝塘 东站",
+      "canonical_area": "闸弄口 新塘 元宝塘 东站",
+      "provenance": "business_shorthand",
+      "status": "active",
+      "ambiguity": false
+    },
+    {
       "alias": "石桥",
       "normalized_alias": "石桥",
       "canonical": "石桥街道 华丰 石桥 永佳 半山",
@@ -328,86 +355,131 @@
   "areas": [
     {
       "name": "东新园 杭氧 新天地",
-      "count": 2,
+      "count": 9,
       "communities": [
-        "东新园",
-        "新柠长木府"
+        "东方茂商业中心T",
+        "新柠长木府",
+        "杨乐府北区",
+        "杨乐府南区",
+        "白田畈龙吟府",
+        "长岳王马府",
+        "长浜龙吟轩"
       ],
       "layouts": {
-        "两室一厅": 2
+        "三室一厅": 2,
+        "两室一厅": 4,
+        "一室一厅": 3
       },
       "price_range": [
-        3900,
-        4300
+        1800,
+        6300
       ]
     },
     {
       "name": "拱墅万达 北部软件园 城北万象城",
-      "count": 4,
+      "count": 13,
       "communities": [
-        "合嵣悦府",
+        "大华海派风景",
+        "小洋坝家园一区",
+        "小洋坝家园二区",
         "星桥锦绣嘉苑",
-        "棠润府"
+        "杭行荟",
+        "棠润府",
+        "瑷颐湾",
+        "臻棠樾府"
       ],
       "layouts": {
-        "一室一厅": 3,
-        "单间": 1
+        "一室一厅": 7,
+        "两室一厅": 3,
+        "一室": 3
       },
       "price_range": [
-        1400,
-        2600
-      ]
-    },
-    {
-      "name": "杨家牌楼 文教",
-      "count": 6,
-      "communities": [
-        "兴业杨家府",
-        "杨乐府",
-        "杨家新雅苑"
-      ],
-      "layouts": {
-        "一室一厅": 2,
-        "两室一厅": 1,
-        "三室一厅": 2,
-        "三室两厅": 1
-      },
-      "price_range": [
-        3700,
-        5600
+        600,
+        4300
       ]
     },
     {
       "name": "石桥街道 华丰 石桥 永佳 半山",
-      "count": 2,
+      "count": 13,
       "communities": [
-        "华丰欣苑",
+        "兴业杨家府",
+        "华丰新苑",
+        "杨家新雅苑",
+        "永佳新苑",
+        "永佳欣苑",
         "石桥铭苑"
       ],
       "layouts": {
+        "一室一厅": 7,
+        "两室一厅": 4,
+        "三室一厅": 2
+      },
+      "price_range": [
+        2300,
+        5500
+      ]
+    },
+    {
+      "name": "闸弄口 新塘 元宝塘 东站",
+      "count": 5,
+      "communities": [
+        "京漾东韵府",
+        "琬秋铭府",
+        "皋塘运都",
+        "范瑾和府",
+        "骏塘名庭"
+      ],
+      "layouts": {
+        "一室": 3,
         "两室一厅": 2
       },
       "price_range": [
-        4300,
-        4900
+        1300,
+        4500
       ]
     }
   ],
   "communities": [
     {
-      "name": "东新园",
-      "normalized": "东新园",
+      "name": "东方茂商业中心T",
+      "normalized": "东方茂商业中心t",
       "count": 1,
       "area": "东新园 杭氧 新天地",
       "rooms": [
-        "8-1201"
+        "3-1540"
       ],
       "layouts": {
-        "两室一厅": 1
+        "一室一厅": 1
       },
       "price_range": [
-        3900,
-        4100
+        3500,
+        3800
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "京漾东韵府",
+      "normalized": "京漾东韵府",
+      "count": 1,
+      "area": "闸弄口 新塘 元宝塘 东站",
+      "rooms": [
+        "4-2-601D"
+      ],
+      "layouts": {
+        "一室": 1
+      },
+      "price_range": [
+        1400,
+        1700
       ],
       "viewing_summary": {
         "has_viewing_text": 1,
@@ -423,46 +495,44 @@
     {
       "name": "兴业杨家府",
       "normalized": "兴业杨家府",
-      "count": 3,
-      "area": "杨家牌楼 文教",
+      "count": 2,
+      "area": "石桥街道 华丰 石桥 永佳 半山",
       "rooms": [
-        "3-601",
-        "4-1502",
-        "10-1-1205"
+        "4-1-1502",
+        "8-1203"
       ],
       "layouts": {
-        "一室一厅": 2,
-        "两室一厅": 1
+        "一室一厅": 2
       },
       "price_range": [
-        3700,
-        4600
+        3999,
+        4300
       ],
       "viewing_summary": {
-        "has_viewing_text": 3,
+        "has_viewing_text": 2,
         "has_password": 0,
-        "needs_contact": 3,
+        "needs_contact": 2,
         "has_empty_out_hint": 0,
         "unknown": 0
       },
       "availability_summary": {
-        "needs_contact": 3
+        "needs_contact": 2
       }
     },
     {
       "name": "华丰欣苑",
-      "normalized": "华丰欣苑",
+      "normalized": "华丰新苑",
       "count": 1,
       "area": "石桥街道 华丰 石桥 永佳 半山",
       "rooms": [
-        "14-2-901"
+        "20-1-504"
       ],
       "layouts": {
         "两室一厅": 1
       },
       "price_range": [
-        4500,
-        4900
+        3500,
+        3800
       ],
       "viewing_summary": {
         "has_viewing_text": 1,
@@ -476,19 +546,71 @@
       }
     },
     {
-      "name": "合嵣悦府",
-      "normalized": "合嵣悦府",
+      "name": "大华海派风景",
+      "normalized": "大华海派风景",
       "count": 1,
       "area": "拱墅万达 北部软件园 城北万象城",
       "rooms": [
-        "6-1-1204B"
+        "6-703-2"
+      ],
+      "layouts": {
+        "一室": 1
+      },
+      "price_range": [
+        1200,
+        1300
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "小洋坝家园一区",
+      "normalized": "小洋坝家园一区",
+      "count": 1,
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "rooms": [
+        "6-201C"
+      ],
+      "layouts": {
+        "一室": 1
+      },
+      "price_range": [
+        1500,
+        1600
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "小洋坝家园二区",
+      "normalized": "小洋坝家园二区",
+      "count": 1,
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "rooms": [
+        "7-1001E"
       ],
       "layouts": {
         "一室一厅": 1
       },
       "price_range": [
-        1400,
-        1500
+        1700,
+        1800
       ],
       "viewing_summary": {
         "has_viewing_text": 1,
@@ -504,43 +626,72 @@
     {
       "name": "新柠长木府",
       "normalized": "新柠长木府",
-      "count": 1,
+      "count": 2,
       "area": "东新园 杭氧 新天地",
       "rooms": [
-        "3-1002B"
+        "3-1002A",
+        "7-303"
       ],
       "layouts": {
-        "两室一厅": 1
+        "两室一厅": 2
       },
       "price_range": [
-        4000,
-        4300
+        4200,
+        4500
       ],
       "viewing_summary": {
-        "has_viewing_text": 1,
+        "has_viewing_text": 2,
         "has_password": 0,
-        "needs_contact": 1,
+        "needs_contact": 2,
         "has_empty_out_hint": 1,
         "unknown": 0
       },
       "availability_summary": {
-        "has_empty_out_hint": 1
+        "has_empty_out_hint": 1,
+        "needs_contact": 1
       }
     },
     {
       "name": "星桥锦绣嘉苑",
       "normalized": "星桥锦绣嘉苑",
-      "count": 1,
+      "count": 2,
       "area": "拱墅万达 北部软件园 城北万象城",
       "rooms": [
-        "20-1606A"
+        "20-1606A",
+        "20-1606B"
       ],
       "layouts": {
-        "单间": 1
+        "一室一厅": 2
       },
       "price_range": [
-        1600,
-        1800
+        1800,
+        2000
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 2,
+        "has_password": 0,
+        "needs_contact": 2,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 2
+      }
+    },
+    {
+      "name": "杨乐府北区",
+      "normalized": "杨乐府北区",
+      "count": 1,
+      "area": "东新园 杭氧 新天地",
+      "rooms": [
+        "9-1002"
+      ],
+      "layouts": {
+        "一室一厅": 1
+      },
+      "price_range": [
+        4100,
+        4300
       ],
       "viewing_summary": {
         "has_viewing_text": 1,
@@ -554,19 +705,19 @@
       }
     },
     {
-      "name": "杨乐府",
-      "normalized": "杨乐府",
+      "name": "杨乐府南区",
+      "normalized": "杨乐府南区",
       "count": 1,
-      "area": "杨家牌楼 文教",
+      "area": "东新园 杭氧 新天地",
       "rooms": [
-        "9-604B"
+        "7-803"
       ],
       "layouts": {
         "三室一厅": 1
       },
       "price_range": [
-        4900,
-        5200
+        6000,
+        6300
       ],
       "viewing_summary": {
         "has_viewing_text": 1,
@@ -582,18 +733,375 @@
     {
       "name": "杨家新雅苑",
       "normalized": "杨家新雅苑",
-      "count": 2,
-      "area": "杨家牌楼 文教",
+      "count": 5,
+      "area": "石桥街道 华丰 石桥 永佳 半山",
       "rooms": [
         "15-603",
-        "36-1102"
+        "36-1-1102",
+        "48-701A",
+        "48-701B",
+        "49-1002"
+      ],
+      "layouts": {
+        "三室一厅": 2,
+        "两室一厅": 1,
+        "一室一厅": 2
+      },
+      "price_range": [
+        2300,
+        5500
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 5,
+        "has_password": 0,
+        "needs_contact": 5,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 5
+      }
+    },
+    {
+      "name": "杭行荟",
+      "normalized": "杭行荟",
+      "count": 1,
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "rooms": [
+        "5-710"
+      ],
+      "layouts": {
+        "一室一厅": 1
+      },
+      "price_range": [
+        2600,
+        2800
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "棠润府",
+      "normalized": "棠润府",
+      "count": 3,
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "rooms": [
+        "15-2-801B",
+        "15-2-1901B",
+        "17-1004A"
+      ],
+      "layouts": {
+        "一室一厅": 2,
+        "两室一厅": 1
+      },
+      "price_range": [
+        1400,
+        3000
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 3,
+        "has_password": 0,
+        "needs_contact": 3,
+        "has_empty_out_hint": 1,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "has_empty_out_hint": 1,
+        "needs_contact": 2
+      }
+    },
+    {
+      "name": "永佳新苑",
+      "normalized": "永佳新苑",
+      "count": 1,
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "rooms": [
+        "2-703"
+      ],
+      "layouts": {
+        "一室一厅": 1
+      },
+      "price_range": [
+        3999,
+        4300
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "永佳欣苑",
+      "normalized": "永佳欣苑",
+      "count": 1,
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "rooms": [
+        "6-603"
+      ],
+      "layouts": {
+        "两室一厅": 1
+      },
+      "price_range": [
+        3600,
+        3900
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "琬秋铭府",
+      "normalized": "琬秋铭府",
+      "count": 1,
+      "area": "闸弄口 新塘 元宝塘 东站",
+      "rooms": [
+        "3-702A"
+      ],
+      "layouts": {
+        "一室": 1
+      },
+      "price_range": [
+        1700,
+        1900
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "瑷颐湾",
+      "normalized": "瑷颐湾",
+      "count": 1,
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "rooms": [
+        "13-1-402A"
+      ],
+      "layouts": {
+        "一室": 1
+      },
+      "price_range": [
+        600,
+        600
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "白田畈龙吟府",
+      "normalized": "白田畈龙吟府",
+      "count": 1,
+      "area": "东新园 杭氧 新天地",
+      "rooms": [
+        "4-902B"
+      ],
+      "layouts": {
+        "一室一厅": 1
+      },
+      "price_range": [
+        1800,
+        2100
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "皋塘运都",
+      "normalized": "皋塘运都",
+      "count": 1,
+      "area": "闸弄口 新塘 元宝塘 东站",
+      "rooms": [
+        "16-1-2206"
+      ],
+      "layouts": {
+        "两室一厅": 1
+      },
+      "price_range": [
+        4200,
+        4500
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "石桥铭苑",
+      "normalized": "石桥铭苑",
+      "count": 3,
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "rooms": [
+        "6-1102",
+        "21-1201A",
+        "21-1201B"
+      ],
+      "layouts": {
+        "一室一厅": 2,
+        "两室一厅": 1
+      },
+      "price_range": [
+        2300,
+        4600
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 3,
+        "has_password": 0,
+        "needs_contact": 3,
+        "has_empty_out_hint": 1,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 2,
+        "has_empty_out_hint": 1
+      }
+    },
+    {
+      "name": "臻棠樾府",
+      "normalized": "臻棠樾府",
+      "count": 3,
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "rooms": [
+        "7-2-2401",
+        "6-1-1702",
+        "4-603"
+      ],
+      "layouts": {
+        "两室一厅": 2,
+        "一室一厅": 1
+      },
+      "price_range": [
+        3700,
+        4300
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 3,
+        "has_password": 1,
+        "needs_contact": 2,
+        "has_empty_out_hint": 1,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1,
+        "has_empty_out_hint": 1,
+        "password_available": 1
+      }
+    },
+    {
+      "name": "范瑾和府",
+      "normalized": "范瑾和府",
+      "count": 1,
+      "area": "闸弄口 新塘 元宝塘 东站",
+      "rooms": [
+        "8-504B"
+      ],
+      "layouts": {
+        "两室一厅": 1
+      },
+      "price_range": [
+        3500,
+        3800
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 0,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "needs_contact": 1
+      }
+    },
+    {
+      "name": "长岳王马府",
+      "normalized": "长岳王马府",
+      "count": 1,
+      "area": "东新园 杭氧 新天地",
+      "rooms": [
+        "2-604B"
+      ],
+      "layouts": {
+        "两室一厅": 1
+      },
+      "price_range": [
+        3300,
+        3600
+      ],
+      "viewing_summary": {
+        "has_viewing_text": 1,
+        "has_password": 0,
+        "needs_contact": 1,
+        "has_empty_out_hint": 1,
+        "unknown": 0
+      },
+      "availability_summary": {
+        "has_empty_out_hint": 1
+      }
+    },
+    {
+      "name": "长浜龙吟轩",
+      "normalized": "长浜龙吟轩",
+      "count": 2,
+      "area": "东新园 杭氧 新天地",
+      "rooms": [
+        "9-901",
+        "11-1603"
       ],
       "layouts": {
         "三室一厅": 1,
-        "三室两厅": 1
+        "两室一厅": 1
       },
       "price_range": [
-        5000,
+        3800,
         5600
       ],
       "viewing_summary": {
@@ -608,47 +1116,19 @@
       }
     },
     {
-      "name": "棠润府",
-      "normalized": "棠润府",
-      "count": 2,
-      "area": "拱墅万达 北部软件园 城北万象城",
-      "rooms": [
-        "15-2-801B",
-        "10-1004C"
-      ],
-      "layouts": {
-        "一室一厅": 2
-      },
-      "price_range": [
-        1400,
-        2600
-      ],
-      "viewing_summary": {
-        "has_viewing_text": 2,
-        "has_password": 2,
-        "needs_contact": 1,
-        "has_empty_out_hint": 1,
-        "unknown": 0
-      },
-      "availability_summary": {
-        "has_empty_out_hint": 1,
-        "needs_contact": 1
-      }
-    },
-    {
-      "name": "石桥铭苑",
-      "normalized": "石桥铭苑",
+      "name": "骏塘名庭",
+      "normalized": "骏塘名庭",
       "count": 1,
-      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "area": "闸弄口 新塘 元宝塘 东站",
       "rooms": [
-        "6-1102"
+        "8-1101A"
       ],
       "layouts": {
-        "两室一厅": 1
+        "一室": 1
       },
       "price_range": [
-        4300,
-        4800
+        1300,
+        1500
       ],
       "viewing_summary": {
         "has_viewing_text": 1,
@@ -664,60 +1144,108 @@
   ],
   "room_index": [
     {
-      "key": "兴业杨家府3-601",
-      "area": "杨家牌楼 文教",
-      "community": "兴业杨家府",
-      "room_no": "3-601",
+      "key": "棠润府15-2-801B",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "棠润府",
+      "room_no": "15-2-801B",
       "layout": "一室一厅",
-      "layout_description": "一室一厅民用水电",
-      "price_yayi": "4600",
-      "price_yaer": "4300",
+      "layout_description": "一室一厅阳台",
+      "price_yayi": "1600",
+      "price_yaer": "1400",
       "has_viewing_text": true,
       "has_password": false,
       "needs_contact": true,
-      "has_empty_out_hint": false,
+      "has_empty_out_hint": true,
       "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
         "has_password": false,
         "needs_contact": true,
-        "has_empty_out_hint": false,
+        "has_empty_out_hint": true,
         "viewing_mode": "contact_required"
       },
-      "availability": "needs_contact",
-      "utilities": "民用水电"
+      "availability": "has_empty_out_hint",
+      "utilities": "水30/月，电1元/度"
     },
     {
-      "key": "兴业杨家府4-1502",
-      "area": "杨家牌楼 文教",
-      "community": "兴业杨家府",
-      "room_no": "4-1502",
-      "layout": "一室一厅",
-      "layout_description": "一室一厅民用水电",
-      "price_yayi": "4500",
-      "price_yaer": "4200",
-      "has_viewing_text": true,
-      "has_password": false,
-      "needs_contact": true,
-      "has_empty_out_hint": false,
-      "viewing_mode": "contact_required",
-      "viewing_summary": {
-        "has_viewing_text": true,
-        "has_password": false,
-        "needs_contact": true,
-        "has_empty_out_hint": false,
-        "viewing_mode": "contact_required"
-      },
-      "availability": "needs_contact",
-      "utilities": "民用水电"
-    },
-    {
-      "key": "兴业杨家府10-1-1205",
-      "area": "杨家牌楼 文教",
-      "community": "兴业杨家府",
-      "room_no": "10-1-1205",
+      "key": "棠润府15-2-1901B",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "棠润府",
+      "room_no": "15-2-1901B",
       "layout": "两室一厅",
-      "layout_description": "两室一厅民用水电",
+      "layout_description": "两室一厅独立厨卫",
+      "price_yayi": "3000",
+      "price_yaer": "2800",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "棠润府17-1004A",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "棠润府",
+      "room_no": "17-1004A",
+      "layout": "一室一厅",
+      "layout_description": "一室一厅独立厨卫带阳台",
+      "price_yayi": "2300",
+      "price_yaer": "2000",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "杭行荟5-710",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "杭行荟",
+      "room_no": "5-710",
+      "layout": "一室一厅",
+      "layout_description": "（整） 整租40方loft一室一厅",
+      "price_yayi": "2800",
+      "price_yaer": "2600",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "臻棠樾府7-2-2401",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "臻棠樾府",
+      "room_no": "7-2-2401",
+      "layout": "两室一厅",
+      "layout_description": "（整） 72㎡整租边套两室一厅业主自主精装修",
       "price_yayi": "3900",
       "price_yaer": "3700",
       "has_viewing_text": true,
@@ -736,60 +1264,300 @@
       "utilities": "民用水电"
     },
     {
+      "key": "臻棠樾府6-1-1702",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "臻棠樾府",
+      "room_no": "6-1-1702",
+      "layout": "一室一厅",
+      "layout_description": "（整） 72㎡整租一室一厅业主自主精装修",
+      "price_yayi": "4300",
+      "price_yaer": "4000",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": true,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": true,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "has_empty_out_hint",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "臻棠樾府4-603",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "臻棠樾府",
+      "room_no": "4-603",
+      "layout": "两室一厅",
+      "layout_description": "（整） 72㎡整租两室一厅业主自主精装修",
+      "price_yayi": "4200",
+      "price_yaer": "3800",
+      "has_viewing_text": true,
+      "has_password": true,
+      "needs_contact": false,
+      "has_empty_out_hint": false,
+      "viewing_mode": "password_available",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": true,
+        "needs_contact": false,
+        "has_empty_out_hint": false,
+        "viewing_mode": "password_available"
+      },
+      "availability": "password_available",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "星桥锦绣嘉苑20-1606A",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "星桥锦绣嘉苑",
+      "room_no": "20-1606A",
+      "layout": "一室一厅",
+      "layout_description": "一室一厅独立厨卫带阳台",
+      "price_yayi": "1900",
+      "price_yaer": "1800",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "星桥锦绣嘉苑20-1606B",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "星桥锦绣嘉苑",
+      "room_no": "20-1606B",
+      "layout": "一室一厅",
+      "layout_description": "一室一厅独立厨卫带燃气",
+      "price_yayi": "2000",
+      "price_yaer": "1900",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "瑷颐湾13-1-402A",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "瑷颐湾",
+      "room_no": "13-1-402A",
+      "layout": "一室",
+      "layout_description": "一室两户用公卫",
+      "price_yayi": "600",
+      "price_yaer": "600",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "小洋坝家园一区6-201C",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "小洋坝家园一区",
+      "room_no": "6-201C",
+      "layout": "一室",
+      "layout_description": "朝南一室主卧独卫",
+      "price_yayi": "1600",
+      "price_yaer": "1500",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "小洋坝家园二区7-1001E",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "小洋坝家园二区",
+      "room_no": "7-1001E",
+      "layout": "一室一厅",
+      "layout_description": "一室一厅独立厨卫",
+      "price_yayi": "1800",
+      "price_yaer": "1700",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "大华海派风景6-703-2",
+      "area": "拱墅万达 北部软件园 城北万象城",
+      "community": "大华海派风景",
+      "room_no": "6-703-2",
+      "layout": "一室",
+      "layout_description": "一室朝南主卧独立厨卫",
+      "price_yayi": "1300",
+      "price_yaer": "1200",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "石桥铭苑6-1102",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "community": "石桥铭苑",
+      "room_no": "6-1102",
+      "layout": "一室一厅",
+      "layout_description": "（整） 65㎡月球星空主题厅卧一体一室一厅",
+      "price_yayi": "4600",
+      "price_yaer": "4300",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "石桥铭苑21-1201A",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "community": "石桥铭苑",
+      "room_no": "21-1201A",
+      "layout": "两室一厅",
+      "layout_description": "边套大横厅两室带燃气厨房",
+      "price_yayi": "4500",
+      "price_yaer": "4200",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "石桥铭苑21-1201B",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "community": "石桥铭苑",
+      "room_no": "21-1201B",
+      "layout": "一室一厅",
+      "layout_description": "一室一厅朝南带阳台",
+      "price_yayi": "2500",
+      "price_yaer": "2300",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": true,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": true,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "has_empty_out_hint",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "华丰新苑20-1-504",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "community": "华丰新苑",
+      "room_no": "20-1-504",
+      "layout": "两室一厅",
+      "layout_description": "（整） 65㎡精装整租两室一厅",
+      "price_yayi": "3800",
+      "price_yaer": "3500",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
       "key": "杨家新雅苑15-603",
-      "area": "杨家牌楼 文教",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
       "community": "杨家新雅苑",
       "room_no": "15-603",
       "layout": "三室一厅",
-      "layout_description": "三室一厅整租",
-      "price_yayi": "5300",
-      "price_yaer": "5000",
-      "has_viewing_text": true,
-      "has_password": false,
-      "needs_contact": true,
-      "has_empty_out_hint": false,
-      "viewing_mode": "contact_required",
-      "viewing_summary": {
-        "has_viewing_text": true,
-        "has_password": false,
-        "needs_contact": true,
-        "has_empty_out_hint": false,
-        "viewing_mode": "contact_required"
-      },
-      "availability": "needs_contact",
-      "utilities": "民用水电"
-    },
-    {
-      "key": "杨家新雅苑36-1102",
-      "area": "杨家牌楼 文教",
-      "community": "杨家新雅苑",
-      "room_no": "36-1102",
-      "layout": "三室两厅",
-      "layout_description": "三室两厅整租",
-      "price_yayi": "5600",
-      "price_yaer": "5300",
-      "has_viewing_text": true,
-      "has_password": false,
-      "needs_contact": true,
-      "has_empty_out_hint": false,
-      "viewing_mode": "contact_required",
-      "viewing_summary": {
-        "has_viewing_text": true,
-        "has_password": false,
-        "needs_contact": true,
-        "has_empty_out_hint": false,
-        "viewing_mode": "contact_required"
-      },
-      "availability": "needs_contact",
-      "utilities": "民用水电"
-    },
-    {
-      "key": "杨乐府9-604B",
-      "area": "杨家牌楼 文教",
-      "community": "杨乐府",
-      "room_no": "9-604B",
-      "layout": "三室一厅",
-      "layout_description": "三室一厅整租",
+      "layout_description": "100方三房两卫客厅带阳台",
       "price_yayi": "5200",
       "price_yaer": "4900",
       "has_viewing_text": true,
@@ -808,62 +1576,86 @@
       "utilities": "民用水电"
     },
     {
-      "key": "棠润府15-2-801B",
-      "area": "拱墅万达 北部软件园 城北万象城",
-      "community": "棠润府",
-      "room_no": "15-2-801B",
-      "layout": "一室一厅",
-      "layout_description": "一室一厅独立厨卫",
-      "price_yayi": "1600",
-      "price_yaer": "1400",
+      "key": "杨家新雅苑36-1-1102",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "community": "杨家新雅苑",
+      "room_no": "36-1-1102",
+      "layout": "三室一厅",
+      "layout_description": "100方三房两卫客厅带阳台",
+      "price_yayi": "5500",
+      "price_yaer": "5200",
       "has_viewing_text": true,
-      "has_password": true,
-      "needs_contact": false,
-      "has_empty_out_hint": true,
-      "viewing_mode": "password_available",
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
-        "has_password": true,
-        "needs_contact": false,
-        "has_empty_out_hint": true,
-        "viewing_mode": "password_available"
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
       },
-      "availability": "has_empty_out_hint",
-      "utilities": "水30/月 电1元/度"
+      "availability": "needs_contact",
+      "utilities": "民用水电"
     },
     {
-      "key": "棠润府10-1004C",
-      "area": "拱墅万达 北部软件园 城北万象城",
-      "community": "棠润府",
-      "room_no": "10-1004C",
+      "key": "杨家新雅苑48-701A",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "community": "杨家新雅苑",
+      "room_no": "48-701A",
+      "layout": "两室一厅",
+      "layout_description": "边套两室一厅带燃气",
+      "price_yayi": "3500",
+      "price_yaer": "3200",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "杨家新雅苑48-701B",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "community": "杨家新雅苑",
+      "room_no": "48-701B",
       "layout": "一室一厅",
-      "layout_description": "一室一厅独立厨卫",
-      "price_yayi": "2600",
+      "layout_description": "一室一厅朝南带阳台",
+      "price_yayi": "2500",
       "price_yaer": "2300",
       "has_viewing_text": true,
-      "has_password": true,
+      "has_password": false,
       "needs_contact": true,
       "has_empty_out_hint": false,
-      "viewing_mode": "password_available",
+      "viewing_mode": "contact_required",
       "viewing_summary": {
         "has_viewing_text": true,
-        "has_password": true,
+        "has_password": false,
         "needs_contact": true,
         "has_empty_out_hint": false,
-        "viewing_mode": "password_available"
+        "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
-      "utilities": "水30/月 电1元/度"
+      "utilities": "水30/月，电1元/度"
     },
     {
-      "key": "石桥铭苑6-1102",
+      "key": "杨家新雅苑49-1002",
       "area": "石桥街道 华丰 石桥 永佳 半山",
-      "community": "石桥铭苑",
-      "room_no": "6-1102",
-      "layout": "两室一厅",
-      "layout_description": "两室一厅整租",
-      "price_yayi": "4800",
-      "price_yaer": "4300",
+      "community": "杨家新雅苑",
+      "room_no": "49-1002",
+      "layout": "一室一厅",
+      "layout_description": "（整） 65㎡法式奶油中古风整租一室一厅",
+      "price_yayi": "4500",
+      "price_yaer": "4200",
       "has_viewing_text": true,
       "has_password": false,
       "needs_contact": true,
@@ -880,14 +1672,14 @@
       "utilities": "民用水电"
     },
     {
-      "key": "华丰欣苑14-2-901",
+      "key": "兴业杨家府4-1-1502",
       "area": "石桥街道 华丰 石桥 永佳 半山",
-      "community": "华丰欣苑",
-      "room_no": "14-2-901",
-      "layout": "两室一厅",
-      "layout_description": "两室一厅整租",
-      "price_yayi": "4900",
-      "price_yaer": "4500",
+      "community": "兴业杨家府",
+      "room_no": "4-1-1502",
+      "layout": "一室一厅",
+      "layout_description": "（整） 65㎡法式奶油中古风整租一室一厅",
+      "price_yayi": "4300",
+      "price_yaer": "3999",
       "has_viewing_text": true,
       "has_password": false,
       "needs_contact": true,
@@ -904,14 +1696,158 @@
       "utilities": "民用水电"
     },
     {
-      "key": "新柠长木府3-1002B",
+      "key": "兴业杨家府8-1203",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "community": "兴业杨家府",
+      "room_no": "8-1203",
+      "layout": "一室一厅",
+      "layout_description": "（整） 65㎡法式奶油中古风整租一室一厅",
+      "price_yayi": "4300",
+      "price_yaer": "3999",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "永佳新苑2-703",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "community": "永佳新苑",
+      "room_no": "2-703",
+      "layout": "一室一厅",
+      "layout_description": "（整） 65㎡精装整租一室一厅",
+      "price_yayi": "4300",
+      "price_yaer": "3999",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "永佳欣苑6-603",
+      "area": "石桥街道 华丰 石桥 永佳 半山",
+      "community": "永佳欣苑",
+      "room_no": "6-603",
+      "layout": "两室一厅",
+      "layout_description": "（整） 65㎡精装整租两室一厅",
+      "price_yayi": "3900",
+      "price_yaer": "3600",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "长浜龙吟轩9-901",
+      "area": "东新园 杭氧 新天地",
+      "community": "长浜龙吟轩",
+      "room_no": "9-901",
+      "layout": "三室一厅",
+      "layout_description": "（整） 100㎡精装整租三室一厅中央空调智能马桶",
+      "price_yayi": "5600",
+      "price_yaer": "5500",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "长浜龙吟轩11-1603",
+      "area": "东新园 杭氧 新天地",
+      "community": "长浜龙吟轩",
+      "room_no": "11-1603",
+      "layout": "两室一厅",
+      "layout_description": "（整） 65㎡精装整租两室一厅",
+      "price_yayi": "4000",
+      "price_yaer": "3800",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "杨乐府北区9-1002",
+      "area": "东新园 杭氧 新天地",
+      "community": "杨乐府北区",
+      "room_no": "9-1002",
+      "layout": "一室一厅",
+      "layout_description": "（整） 65㎡精装整租一室一厅",
+      "price_yayi": "4300",
+      "price_yaer": "4100",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "新柠长木府3-1002A",
       "area": "东新园 杭氧 新天地",
       "community": "新柠长木府",
-      "room_no": "3-1002B",
+      "room_no": "3-1002A",
       "layout": "两室一厅",
       "layout_description": "两室一厅朝南带阳台",
-      "price_yayi": "4300",
-      "price_yaer": "4000",
+      "price_yayi": "4500",
+      "price_yaer": "4200",
       "has_viewing_text": true,
       "has_password": false,
       "needs_contact": true,
@@ -925,17 +1861,17 @@
         "viewing_mode": "contact_required"
       },
       "availability": "has_empty_out_hint",
-      "utilities": "水30/月 电1元/度"
+      "utilities": "水30/月，电1元/度"
     },
     {
-      "key": "东新园8-1201",
+      "key": "新柠长木府7-303",
       "area": "东新园 杭氧 新天地",
-      "community": "东新园",
-      "room_no": "8-1201",
+      "community": "新柠长木府",
+      "room_no": "7-303",
       "layout": "两室一厅",
-      "layout_description": "两室一厅",
-      "price_yayi": "4100",
-      "price_yaer": "3900",
+      "layout_description": "（整） 65㎡精装整租两室一厅",
+      "price_yayi": "4500",
+      "price_yaer": "4200",
       "has_viewing_text": true,
       "has_password": false,
       "needs_contact": true,
@@ -952,13 +1888,133 @@
       "utilities": "民用水电"
     },
     {
-      "key": "合嵣悦府6-1-1204B",
-      "area": "拱墅万达 北部软件园 城北万象城",
-      "community": "合嵣悦府",
-      "room_no": "6-1-1204B",
+      "key": "东方茂商业中心T3-1540",
+      "area": "东新园 杭氧 新天地",
+      "community": "东方茂商业中心T",
+      "room_no": "3-1540",
       "layout": "一室一厅",
-      "layout_description": "一室一厅独立厨卫",
+      "layout_description": "（整） 70㎡精装整租一室一厅LOFT",
+      "price_yayi": "3800",
+      "price_yaer": "3500",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "白田畈龙吟府4-902B",
+      "area": "东新园 杭氧 新天地",
+      "community": "白田畈龙吟府",
+      "room_no": "4-902B",
+      "layout": "一室一厅",
+      "layout_description": "一室朝南独厨独卫带阳台",
+      "price_yayi": "2100",
+      "price_yaer": "1800",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "长岳王马府2-604B",
+      "area": "东新园 杭氧 新天地",
+      "community": "长岳王马府",
+      "room_no": "2-604B",
+      "layout": "两室一厅",
+      "layout_description": "边套两室一厅带燃气",
+      "price_yayi": "3600",
+      "price_yaer": "3300",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": true,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": true,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "has_empty_out_hint",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "杨乐府南区7-803",
+      "area": "东新园 杭氧 新天地",
+      "community": "杨乐府南区",
+      "room_no": "7-803",
+      "layout": "三室一厅",
+      "layout_description": "（整） 100㎡精装整租三室一厅中央空调智能马桶",
+      "price_yayi": "6300",
+      "price_yaer": "6000",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民用水电"
+    },
+    {
+      "key": "骏塘名庭8-1101A",
+      "area": "闸弄口 新塘 元宝塘 东站",
+      "community": "骏塘名庭",
+      "room_no": "8-1101A",
+      "layout": "一室",
+      "layout_description": "一室独立厨卫",
       "price_yayi": "1500",
+      "price_yaer": "1300",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "京漾东韵府4-2-601D",
+      "area": "闸弄口 新塘 元宝塘 东站",
+      "community": "京漾东韵府",
+      "room_no": "4-2-601D",
+      "layout": "一室",
+      "layout_description": "一室朝南带阳台单间",
+      "price_yayi": "1700",
       "price_yaer": "1400",
       "has_viewing_text": true,
       "has_password": false,
@@ -973,17 +2029,17 @@
         "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
-      "utilities": "水30/月 电1元/度"
+      "utilities": "水30/月，电1元/度"
     },
     {
-      "key": "星桥锦绣嘉苑20-1606A",
-      "area": "拱墅万达 北部软件园 城北万象城",
-      "community": "星桥锦绣嘉苑",
-      "room_no": "20-1606A",
-      "layout": "单间",
-      "layout_description": "单间独卫",
-      "price_yayi": "1800",
-      "price_yaer": "1600",
+      "key": "琬秋铭府3-702A",
+      "area": "闸弄口 新塘 元宝塘 东站",
+      "community": "琬秋铭府",
+      "room_no": "3-702A",
+      "layout": "一室",
+      "layout_description": "一室朝南带阳台独立厨卫",
+      "price_yayi": "1900",
+      "price_yaer": "1700",
       "has_viewing_text": true,
       "has_password": false,
       "needs_contact": true,
@@ -997,7 +2053,55 @@
         "viewing_mode": "contact_required"
       },
       "availability": "needs_contact",
-      "utilities": "民用水电"
+      "utilities": "水30/月，电1元/度"
+    },
+    {
+      "key": "皋塘运都16-1-2206",
+      "area": "闸弄口 新塘 元宝塘 东站",
+      "community": "皋塘运都",
+      "room_no": "16-1-2206",
+      "layout": "两室一厅",
+      "layout_description": "（整） 整租70平两室一厅朝南",
+      "price_yayi": "4500",
+      "price_yaer": "4200",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "民水民电"
+    },
+    {
+      "key": "范瑾和府8-504B",
+      "area": "闸弄口 新塘 元宝塘 东站",
+      "community": "范瑾和府",
+      "room_no": "8-504B",
+      "layout": "两室一厅",
+      "layout_description": "边套两室一厅带燃气",
+      "price_yayi": "3800",
+      "price_yaer": "3500",
+      "has_viewing_text": true,
+      "has_password": false,
+      "needs_contact": true,
+      "has_empty_out_hint": false,
+      "viewing_mode": "contact_required",
+      "viewing_summary": {
+        "has_viewing_text": true,
+        "has_password": false,
+        "needs_contact": true,
+        "has_empty_out_hint": false,
+        "viewing_mode": "contact_required"
+      },
+      "availability": "needs_contact",
+      "utilities": "水30/月，电1元/度"
     }
   ],
   "similar_communities": [
@@ -1006,13 +2110,67 @@
       "normalized": "兴业杨家府",
       "options": [
         {
-          "name": "杨乐府",
-          "normalized": "杨乐府",
+          "name": "杨乐府北区",
+          "normalized": "杨乐府北区",
+          "score": 0.4
+        },
+        {
+          "name": "杨乐府南区",
+          "normalized": "杨乐府南区",
+          "score": 0.4
+        },
+        {
+          "name": "杨家新雅苑",
+          "normalized": "杨家新雅苑",
+          "score": 0.4
+        }
+      ]
+    },
+    {
+      "name": "华丰新苑",
+      "normalized": "华丰新苑",
+      "options": [
+        {
+          "name": "永佳新苑",
+          "normalized": "永佳新苑",
           "score": 0.5
         },
         {
           "name": "杨家新雅苑",
           "normalized": "杨家新雅苑",
+          "score": 0.444
+        }
+      ]
+    },
+    {
+      "name": "小洋坝家园一区",
+      "normalized": "小洋坝家园一区",
+      "options": [
+        {
+          "name": "小洋坝家园二区",
+          "normalized": "小洋坝家园二区",
+          "score": 0.857
+        }
+      ]
+    },
+    {
+      "name": "小洋坝家园二区",
+      "normalized": "小洋坝家园二区",
+      "options": [
+        {
+          "name": "小洋坝家园一区",
+          "normalized": "小洋坝家园一区",
+          "score": 0.857
+        }
+      ]
+    },
+    {
+      "name": "新柠长木府",
+      "normalized": "新柠长木府",
+      "options": [
+        {
+          "name": "长岳王马府",
+          "normalized": "长岳王马府",
           "score": 0.4
         }
       ]
@@ -1029,13 +2187,34 @@
       ]
     },
     {
-      "name": "杨乐府",
-      "normalized": "杨乐府",
+      "name": "杨乐府北区",
+      "normalized": "杨乐府北区",
       "options": [
+        {
+          "name": "杨乐府南区",
+          "normalized": "杨乐府南区",
+          "score": 0.8
+        },
         {
           "name": "兴业杨家府",
           "normalized": "兴业杨家府",
-          "score": 0.5
+          "score": 0.4
+        }
+      ]
+    },
+    {
+      "name": "杨乐府南区",
+      "normalized": "杨乐府南区",
+      "options": [
+        {
+          "name": "杨乐府北区",
+          "normalized": "杨乐府北区",
+          "score": 0.8
+        },
+        {
+          "name": "兴业杨家府",
+          "normalized": "兴业杨家府",
+          "score": 0.4
         }
       ]
     },
@@ -1044,9 +2223,73 @@
       "normalized": "杨家新雅苑",
       "options": [
         {
+          "name": "华丰新苑",
+          "normalized": "华丰新苑",
+          "score": 0.444
+        },
+        {
+          "name": "永佳新苑",
+          "normalized": "永佳新苑",
+          "score": 0.444
+        },
+        {
           "name": "兴业杨家府",
           "normalized": "兴业杨家府",
           "score": 0.4
+        }
+      ]
+    },
+    {
+      "name": "棠润府",
+      "normalized": "棠润府",
+      "options": [
+        {
+          "name": "臻棠樾府",
+          "normalized": "臻棠樾府",
+          "score": 0.571
+        }
+      ]
+    },
+    {
+      "name": "永佳新苑",
+      "normalized": "永佳新苑",
+      "options": [
+        {
+          "name": "永佳欣苑",
+          "normalized": "永佳欣苑",
+          "score": 0.75
+        },
+        {
+          "name": "华丰新苑",
+          "normalized": "华丰新苑",
+          "score": 0.5
+        },
+        {
+          "name": "杨家新雅苑",
+          "normalized": "杨家新雅苑",
+          "score": 0.444
+        }
+      ]
+    },
+    {
+      "name": "永佳欣苑",
+      "normalized": "永佳欣苑",
+      "options": [
+        {
+          "name": "永佳新苑",
+          "normalized": "永佳新苑",
+          "score": 0.75
+        }
+      ]
+    },
+    {
+      "name": "白田畈龙吟府",
+      "normalized": "白田畈龙吟府",
+      "options": [
+        {
+          "name": "长浜龙吟轩",
+          "normalized": "长浜龙吟轩",
+          "score": 0.364
         }
       ]
     },
@@ -1060,29 +2303,63 @@
           "score": 0.4
         }
       ]
+    },
+    {
+      "name": "臻棠樾府",
+      "normalized": "臻棠樾府",
+      "options": [
+        {
+          "name": "棠润府",
+          "normalized": "棠润府",
+          "score": 0.571
+        }
+      ]
+    },
+    {
+      "name": "长岳王马府",
+      "normalized": "长岳王马府",
+      "options": [
+        {
+          "name": "新柠长木府",
+          "normalized": "新柠长木府",
+          "score": 0.4
+        }
+      ]
+    },
+    {
+      "name": "长浜龙吟轩",
+      "normalized": "长浜龙吟轩",
+      "options": [
+        {
+          "name": "白田畈龙吟府",
+          "normalized": "白田畈龙吟府",
+          "score": 0.364
+        }
+      ]
     }
   ],
   "media_summary": {
     "source": "inventory_row_media_fields_if_present",
     "note": "只有源数据含图片/视频字段时才标记；没有字段时状态为 unknown，不推测。",
-    "room_count": 14,
-    "known_image_status_count": 14,
-    "known_video_status_count": 14,
+    "room_count": 40,
+    "known_image_status_count": 40,
+    "known_video_status_count": 40,
     "unknown_image_status_count": 0,
     "unknown_video_status_count": 0,
     "rooms_with_images": [],
     "rooms_with_videos": []
   },
   "viewing_summary": {
-    "has_viewing_text": 14,
-    "has_password": 2,
-    "needs_contact": 13,
-    "has_empty_out_hint": 2,
+    "has_viewing_text": 40,
+    "has_password": 1,
+    "needs_contact": 39,
+    "has_empty_out_hint": 5,
     "unknown": 0
   },
   "availability_summary": {
-    "needs_contact": 12,
-    "has_empty_out_hint": 2
+    "has_empty_out_hint": 5,
+    "needs_contact": 34,
+    "password_available": 1
   },
   "rules": {
     "payment_fields": "押一付一/押二付一是对应付款方式下的月租价格，不是押金金额。",

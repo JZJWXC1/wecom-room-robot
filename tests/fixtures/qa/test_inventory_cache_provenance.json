@@ -1,0 +1,16 @@
+{
+  "fixture": "tests/fixtures/qa/test_inventory_cache.csv",
+  "fixture_version": "da9cf10fc9f74a5d",
+  "fixture_sha256": "da9cf10fc9f74a5de8e31b01f3ec5e6c952c519c01e04389e19bc90697c2e38e",
+  "fixture_row_count": 40,
+  "generated_at": "2026-07-04T10:53:40+08:00",
+  "generator": "scripts/generate_qa_inventory_fixture.py",
+  "generator_version": "1.0.0",
+  "source": "feishu_bitable",
+  "source_detail": "spreadsheet:H7f8sxOrUhYCK8tev29cwSimnsl",
+  "source_path": "C:/Users/吴志坚/Documents/自动回复逻辑/data/inventory_cache.csv",
+  "source_sha256": "1939460d5c788c7ac980499af76052dfb65dd0ea946b5e9460b0f1e1b622291e",
+  "source_row_count": 40,
+  "source_snapshot_time": "2026-07-02 15:12:23",
+  "scrub_rule": "全字段移除 \\d{4,}# 看房密码 token;看房方式密码列为空时回填「看房提前联系」"
+}

@@ -5,11 +5,15 @@ from __future__ import annotations
 守卫对象是生成器逻辑本身(合成源数据 → tmp 输出),不依赖本地 data/ 运行时缓存,
 干净检出也能跑。fixture 换血落地(批3)后,另有针对已提交 fixture 的守卫。
 
-存在性 gate 探针约定:
-- NONEXISTENT_ROOM_PROBE(高塘运都 9-402B)是验收剧本「不存在房源必须反问」
-  场景的唯一指定房号,守卫测试证明它不可能出现在生成产物中;
-- SEMANTIC_REVERSAL_PROBE(华丰欣苑 14-2-901)是旧 fixture 语义反转事故的
-  纪念探针——它曾以"存在"身份进入合成 fixture,而真实房源表并无此小区。
+存在性 gate 探针约定(双探针,防华丰欣苑式语义反转):
+- ROOM_LEVEL_PROBE(皋塘运都 9-402B):小区真实存在、房号不存在——最锋利的
+  存在性测试。守卫同时证明「小区在产物中」与「该房号不在产物中」,任何一半
+  失效都说明 fixture 或剧本口径漂移;
+- TYPO_COMMUNITY_PROBE(高塘运都):真实小区「皋塘运都」的同音错别字变体,
+  必须整小区不存在——防止剧本作者把探针写成错别字后被检索模糊匹配救活;
+- SEMANTIC_REVERSAL_PROBE(华丰欣苑 14-2-901):旧 fixture 语义反转事故的
+  纪念探针——它曾以"存在"身份进入合成 fixture,而真实房源表只有一字之差的
+  「华丰新苑」。
 """
 
 import csv
@@ -24,7 +28,8 @@ import pytest
 
 VIEWING_PASSWORD_RE = re.compile(r"\d{4,}#")
 
-NONEXISTENT_ROOM_PROBE = ("高塘运都", "9-402B")
+ROOM_LEVEL_PROBE = ("皋塘运都", "9-402B")
+TYPO_COMMUNITY_PROBE = "高塘运都"
 SEMANTIC_REVERSAL_PROBE = ("华丰欣苑", "14-2-901")
 
 
@@ -66,12 +71,23 @@ SOURCE_ROWS = [
     },
     {
         "区域": "闸弄口 新塘 元宝塘 东站",
-        "小区": "春晖庭",
+        "小区": "骏塘名庭",
         "房号": "8-1101A",
         "户型描述": "一室一厅",
         "户型分类": "一室一厅",
-        "押一付一": "2300",
-        "押二付一": "2100",
+        "押一付一": "1500",
+        "押二付一": "1300",
+        "看房方式密码": "看房提前联系",
+        "备注": "民用水电",
+    },
+    {
+        "区域": "闸弄口 新塘 元宝塘 东站",
+        "小区": "皋塘运都",
+        "房号": "16-1-2206",
+        "户型描述": "两室一厅整租",
+        "户型分类": "两室一厅",
+        "押一付一": "4500",
+        "押二付一": "4200",
         "看房方式密码": "看房提前联系",
         "备注": "民用水电",
     },
@@ -150,17 +166,26 @@ def test_provenance_carries_source_snapshot_time_and_counts(tmp_path: Path) -> N
     ).hexdigest()
 
 
+def _assert_existence_gate_probes(rows: list[dict[str, str]]) -> None:
+    communities = {row["小区"] for row in rows}
+    labels = {(row["小区"], row["房号"]) for row in rows}
+
+    # 房号级探针:小区必须存在(探针保持锋利),该房号必须不存在
+    assert ROOM_LEVEL_PROBE[0] in communities
+    assert ROOM_LEVEL_PROBE not in labels
+    # 错别字小区探针:整小区不得存在
+    assert TYPO_COMMUNITY_PROBE not in communities
+    # 语义反转纪念探针:整小区不得存在
+    assert SEMANTIC_REVERSAL_PROBE[0] not in communities
+    assert SEMANTIC_REVERSAL_PROBE not in labels
+
+
 def test_existence_gate_probes_absent_from_generated_fixture(tmp_path: Path) -> None:
     output_path, _, _ = _generate(tmp_path)
 
     rows = list(csv.DictReader(io.StringIO(output_path.read_text(encoding="utf-8"))))
-    communities = {row["小区"] for row in rows}
-    labels = {(row["小区"], row["房号"]) for row in rows}
 
-    assert NONEXISTENT_ROOM_PROBE[0] not in communities
-    assert NONEXISTENT_ROOM_PROBE not in labels
-    assert SEMANTIC_REVERSAL_PROBE[0] not in communities
-    assert SEMANTIC_REVERSAL_PROBE not in labels
+    _assert_existence_gate_probes(rows)
 
 
 def test_generated_fixture_columns_match_consumer_contract(tmp_path: Path) -> None:
@@ -191,6 +216,46 @@ def test_generation_is_deterministic_for_same_snapshot(tmp_path: Path) -> None:
     assert first_output.read_bytes() == second_output.read_bytes()
     assert first_provenance["fixture_version"] == second_provenance["fixture_version"]
     assert first_provenance["fixture_sha256"] == second_provenance["fixture_sha256"]
+
+
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures" / "qa"
+
+
+def test_committed_fixture_artifacts_contain_no_viewing_password_tokens() -> None:
+    fixture_text = (FIXTURES_DIR / "test_inventory_cache.csv").read_text(encoding="utf-8-sig")
+    provenance_text = (FIXTURES_DIR / "test_inventory_cache_provenance.json").read_text(encoding="utf-8")
+    index_text = (FIXTURES_DIR / "test_rewrite_inventory_index.json").read_text(encoding="utf-8")
+
+    assert not VIEWING_PASSWORD_RE.search(fixture_text)
+    assert not VIEWING_PASSWORD_RE.search(provenance_text)
+    assert not VIEWING_PASSWORD_RE.search(index_text)
+
+
+def test_committed_fixture_respects_existence_gate_probes() -> None:
+    fixture_text = (FIXTURES_DIR / "test_inventory_cache.csv").read_text(encoding="utf-8-sig")
+    rows = list(csv.DictReader(io.StringIO(fixture_text)))
+
+    _assert_existence_gate_probes(rows)
+
+
+def test_committed_fixture_matches_provenance_and_index_counts() -> None:
+    fixture_bytes = (FIXTURES_DIR / "test_inventory_cache.csv").read_bytes()
+    rows = list(csv.DictReader(io.StringIO(fixture_bytes.decode("utf-8-sig"))))
+    provenance = json.loads(
+        (FIXTURES_DIR / "test_inventory_cache_provenance.json").read_text(encoding="utf-8")
+    )
+    index = json.loads(
+        (FIXTURES_DIR / "test_rewrite_inventory_index.json").read_text(encoding="utf-8")
+    )
+
+    # fixture_sha256 口径 = LF 规范文本(生成器与守卫同口径,对 autocrlf 免疫)
+    canonical_text = fixture_bytes.decode("utf-8-sig").replace("\r\n", "\n")
+
+    assert provenance["fixture_row_count"] == len(rows)
+    assert index["row_count"] == len(rows)
+    assert provenance["fixture_sha256"] == hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
+    assert str(provenance["source_snapshot_time"]).strip()
+    assert index["cache_meta"]["source_detail"] == provenance["fixture"]
 
 
 def test_generator_rejects_source_hash_mismatch(tmp_path: Path) -> None:

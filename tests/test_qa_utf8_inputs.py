@@ -99,8 +99,11 @@ def test_l4_qa_inventory_fixture_contains_required_entities() -> None:
 
     assert "兴业杨家府" in communities
     assert "杨家新雅苑" in communities
-    assert "杨乐府" in communities
+    assert "杨乐府北区" in communities
+    assert "杨乐府南区" in communities
+    assert "皋塘运都" in communities
     assert "棠润府15-2-801B" in labels
+    assert "皋塘运都16-1-2206" in labels
     assert index["cache_meta"]["source_detail"] == "tests/fixtures/qa/test_inventory_cache.csv"
     assert index["row_count"] == len(rows)
 
