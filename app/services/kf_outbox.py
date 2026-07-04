@@ -89,11 +89,20 @@ class LocalKfOutboxLedger:
         self.path = Path(configured)
         self._process_lock = threading.RLock()
         self._last_diagnostics = OutboxDiagnostics(path=str(self.path))
+        # 增量缓存:reserve 只解析上次同步后新追加的字节,避免每个出站动作
+        # 全量重读台账(台账随运行时间线性增长,全量重读会拖垮发送阶段)。
+        self._cache_offset = 0
+        self._cache_line_number = 0
+        self._cache_signature: tuple[int, int] | None = None
+        self._cache_key_records: dict[str, list[dict[str, Any]]] = {}
+        self._cache_record_count = 0
+        self._cache_corrupted_line_numbers: list[int] = []
+        self._cache_full_resync_count = 0
 
     def reserve(self, action: SendAction, *, idempotency_key: str | None = None) -> OutboxDecision:
         key = idempotency_key or kf_send_receipts.build_idempotency_key(action)
         with self._locked_records():
-            records = self._read_records_unlocked()
+            self._sync_cache_unlocked()
             diagnostics = self._last_diagnostics
             if diagnostics.corruption_count:
                 return OutboxDecision(
@@ -105,7 +114,7 @@ class LocalKfOutboxLedger:
                         **diagnostics.to_safe_dict(),
                     },
                 )
-            state = _summarize_key(records, key)
+            state = _summarize_key(self._cache_key_records.get(key) or [], key)
             blocking = state.get("blocking_receipt")
             if isinstance(blocking, SendReceipt):
                 return OutboxDecision(
@@ -171,6 +180,77 @@ class LocalKfOutboxLedger:
                     yield
                 finally:
                     _unlock_file(lock_handle)
+
+    def _reset_cache_unlocked(self) -> None:
+        self._cache_offset = 0
+        self._cache_line_number = 0
+        self._cache_key_records = {}
+        self._cache_record_count = 0
+        self._cache_corrupted_line_numbers = []
+
+    def _sync_cache_unlocked(self) -> None:
+        # 台账为加锁追加写,持锁期间按字节偏移续读是安全的;文件被替换
+        # (dev/ino 变化)或变短(截断/轮转)时整体重建,保证跨进程一致。
+        if not self.path.exists():
+            self._reset_cache_unlocked()
+            self._cache_signature = None
+            self._last_diagnostics = OutboxDiagnostics(path=str(self.path))
+            return
+        stat = self.path.stat()
+        signature = (stat.st_dev, stat.st_ino)
+        if signature != self._cache_signature or stat.st_size < self._cache_offset:
+            self._reset_cache_unlocked()
+            self._cache_signature = signature
+            self._cache_full_resync_count += 1
+        pending_tail_corruption: list[int] = []
+        if stat.st_size > self._cache_offset:
+            with self.path.open("rb") as handle:
+                handle.seek(self._cache_offset)
+                chunk = handle.read()
+            complete = chunk
+            if complete and not complete.endswith(b"\n"):
+                # 写入方持锁完成整行写入后才释放,残缺尾行只可能来自写入中
+                # 途崩溃;按损坏行 fail-closed,不消费偏移,等待人工修复。
+                cut = complete.rfind(b"\n") + 1
+                complete = complete[:cut]
+                pending_tail_corruption.append(
+                    self._cache_line_number + complete.count(b"\n") + 1
+                )
+            if complete:
+                self._consume_cache_lines_unlocked(complete)
+                self._cache_offset += len(complete)
+        corrupted = list(self._cache_corrupted_line_numbers) + pending_tail_corruption
+        self._last_diagnostics = OutboxDiagnostics(
+            path=str(self.path),
+            record_count=self._cache_record_count,
+            corruption_count=len(corrupted),
+            corrupted_line_numbers=tuple(corrupted),
+            fail_closed=bool(corrupted),
+        )
+
+    def _consume_cache_lines_unlocked(self, chunk: bytes) -> None:
+        for raw_line in chunk.split(b"\n")[:-1]:
+            self._cache_line_number += 1
+            try:
+                line = raw_line.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                self._cache_corrupted_line_numbers.append(self._cache_line_number)
+                continue
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                self._cache_corrupted_line_numbers.append(self._cache_line_number)
+                continue
+            if not isinstance(record, dict):
+                continue
+            safe_record = _safe_outbox_record(record)
+            if not isinstance(safe_record, dict):
+                continue
+            self._cache_record_count += 1
+            key = str(safe_record.get("idempotency_key") or "")
+            self._cache_key_records.setdefault(key, []).append(_trimmed_record(safe_record))
 
     def _read_records_unlocked(self) -> list[dict[str, Any]]:
         if not self.path.exists():
@@ -312,6 +392,22 @@ def _summarize_key(records: list[dict[str, Any]], key: str) -> dict[str, Any]:
 def _outbox_id(idempotency_key: str, action_id: str, attempt: int) -> str:
     digest = _stable_digest({"idempotency_key": idempotency_key, "action_id": action_id, "attempt": attempt})
     return f"outbox:{digest[:24]}"
+
+
+_TRIMMED_RECORD_KEYS = ("idempotency_key", "record_type", "status", "outbox_id", "attempt")
+
+
+def _trimmed_record(record: dict[str, Any]) -> dict[str, Any]:
+    # 常驻缓存只保留 _summarize_key 及其下游消费的字段;receipt 载荷只在
+    # 阻断状态(SENT/UNCERTAIN)时需要还原 SendReceipt,其余一律丢弃。
+    trimmed = {key: record.get(key) for key in _TRIMMED_RECORD_KEYS if key in record}
+    if (
+        str(record.get("record_type") or "") == OUTBOX_RECORD_RECEIPT
+        and str(record.get("status") or "").strip() in _BLOCKING_RECEIPT_STATUSES
+        and isinstance(record.get("receipt"), dict)
+    ):
+        trimmed["receipt"] = record["receipt"]
+    return trimmed
 
 
 def _safe_outbox_record(record: dict[str, Any]) -> dict[str, Any]:

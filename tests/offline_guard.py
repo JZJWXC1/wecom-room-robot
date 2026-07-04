@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -87,6 +88,14 @@ def _ensure_offline_inventory_sheet_fixture(root: Path) -> Path:
     return path
 
 
+def _default_offline_outbox_path(root: Path) -> Path:
+    # 离线 QA 必须使用每进程唯一的出站台账:多个 QA 进程共用
+    # data/kf_send_outbox.jsonl 会互相争抢文件锁(Windows 下 LK_LOCK
+    # 重试约 9 秒后报 OSError),且台账随 QA 轮次无限增长拖垮 send 阶段。
+    base_dir = Path(os.environ.get("TEMP") or root / "data") / "wecom_room_robot_offline_outbox"
+    return base_dir / f"kf_send_outbox_{os.getpid()}_{time.time_ns()}.jsonl"
+
+
 def _guarded_create_connection(address: Any, *args: Any, **kwargs: Any) -> Any:
     host, port = address[:2] if isinstance(address, tuple) else (address, "")
     if not _is_local_host(host):
@@ -132,6 +141,7 @@ def activate_offline_test_mode() -> None:
     os.environ.setdefault("INVENTORY_IMAGE_GLOB", str(_ensure_offline_inventory_sheet_fixture(root)))
     os.environ.setdefault("MEDIA_ROOT", "media/rooms")
     os.environ.setdefault("KF_DIALOGUE_EVENT_LOG_PATH", "data/test_kf_dialogue_events.jsonl")
+    os.environ.setdefault("KF_SEND_OUTBOX_PATH", str(_default_offline_outbox_path(root)))
 
     if _ACTIVATED or allow_real_llm:
         return
