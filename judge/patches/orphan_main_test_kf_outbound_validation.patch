@@ -1,0 +1,30 @@
+diff --git a/tests/test_kf_outbound_validation.py b/tests/test_kf_outbound_validation.py
+index e80e2012..56223b71 100644
+--- a/tests/test_kf_outbound_validation.py
++++ b/tests/test_kf_outbound_validation.py
+@@ -413,6 +413,25 @@ def test_l3_rewrites_generic_waiting_reply_without_blocking_facts() -> None:
+     assert "l3.generic_waiting_reply" in _codes(result)
+ 
+ 
++def test_l3_rewrites_customer_visible_internal_binding_leaks() -> None:
++    bad_replies = [
++        "客户要查询素材，但工具未绑定到具体房源。",
++        "客户选择了第1套、第2套，但上一轮只有 0 套候选。",
++        "候选1 石桥铭苑 21-1201A 租金4500",
++        "星桥锦绣嘉苑20-1606A:图片 暂未找到可发送图片。",
++    ]
++
++    for reply in bad_replies:
++        package = _base_package()
++        package.reply_text = reply
++
++        result = validate_prepared_outbound_package(package)
++
++        assert result.status == ValidationStatus.REWRITE_REQUIRED
++        assert result.facts_passed is True
++        assert "l3.customer_visible_internal_leak" in _codes(result)
++
++
+ def test_l3_allows_partial_missing_media_reply_when_evidence_exists() -> None:
+     package = _base_package()
+     package.reply_text = "这是星河苑1-101的视频，另一套暂时没有视频。"

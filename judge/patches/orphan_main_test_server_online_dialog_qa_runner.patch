@@ -1,0 +1,70 @@
+diff --git a/tests/test_server_online_dialog_qa_runner.py b/tests/test_server_online_dialog_qa_runner.py
+new file mode 100644
+index 00000000..48a1d559
+--- /dev/null
++++ b/tests/test_server_online_dialog_qa_runner.py
+@@ -0,0 +1,64 @@
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++
++
++def _load_runner():
++    path = Path(__file__).resolve().parents[1] / "qa_artifacts" / "server_online_dialog_qa_runner_v2.py"
++    spec = importlib.util.spec_from_file_location("server_online_dialog_qa_runner_v2", path)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++runner = _load_runner()
++
++
++def test_dialog_qa_rejects_customer_visible_internal_leaks() -> None:
++    failures = runner.evaluate(
++        "第一套图片发我",
++        {"reply": "客户要查询素材，但工具未绑定到具体房源。", "tool_evidence": {}, "selfcheck": {"status": "pass"}},
++    )
++
++    assert "internal_visible_leak" in failures
++
++
++def test_dialog_qa_requires_deposit_selfcheck_path_and_rate_tiers() -> None:
++    condition_failures = runner.evaluate(
++        "免押条件",
++        {"reply": "免押是支付宝无忧住芝麻信用评估，不是免费免押。", "tool_evidence": {}, "selfcheck": {"status": "pass"}},
++    )
++    fee_failures = runner.evaluate(
++        "免押服务费多少",
++        {"reply": "免押是支付宝无忧住芝麻信用评估，服务费5.5%-8%。", "tool_evidence": {}, "selfcheck": {"status": "pass"}},
++    )
++
++    assert "expected_deposit_selfcheck_path" in condition_failures
++    assert "expected_deposit_fee_rate_tiers" in fee_failures
++
++
++def test_dialog_qa_collapses_trace_duplicate_actions_but_flags_real_send_duplicates() -> None:
++    assert runner.actions_from(
++        {
++            "planner_result": {"actions": ["search_inventory", "send_video"]},
++            "tool_evidence": {"actions": ["search_inventory", "send_video"]},
++        }
++    ) == ["search_inventory", "send_video"]
++
++    failures = runner.evaluate(
++        "第一套视频",
++        {
++            "reply": "这是第一套视频。",
++            "selfcheck": {"status": "pass"},
++            "tool_evidence": {
++                "send_actions": [
++                    {"action_type": "video", "action_id": "send-video-1", "evidence_id": "evd-video-1"},
++                    {"action_type": "video", "action_id": "send-video-1", "evidence_id": "evd-video-1"},
++                ]
++            },
++        },
++    )
++
++    assert "duplicate_external_send_actions" in failures

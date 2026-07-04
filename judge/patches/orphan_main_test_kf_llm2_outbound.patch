@@ -1,0 +1,224 @@
+diff --git a/tests/test_kf_llm2_outbound.py b/tests/test_kf_llm2_outbound.py
+index 6db04de5..f87a49b2 100644
+--- a/tests/test_kf_llm2_outbound.py
++++ b/tests/test_kf_llm2_outbound.py
+@@ -433,8 +433,155 @@ def test_deterministic_llm2_fallback_prioritizes_missing_image_media_over_listin
+     validation = validate_prepared_outbound_package(package, task_packet=packet)
+ 
+     assert validation.status == ValidationStatus.PASS
+-    assert "暂未找到" in package.reply_text
++    assert "暂时没找到" in package.reply_text
+     assert "图片" in package.reply_text
++    assert ":" not in package.reply_text
++
++
++def test_deterministic_llm2_fallback_humanizes_colon_missing_media_summary() -> None:
++    packet = StructuredTaskPacket(
++        conversation_id="conv-missing-colon",
++        turn_id="turn-missing-colon",
++        case_id="case-missing-colon",
++        inventory_snapshot_id="snap-missing-colon",
++        response_strategy=ResponseStrategy.SEND_MEDIA,
++        tasks=[
++            TaskAtom(
++                task_id="task-image",
++                task_type="send_image",
++                user_text="这套图片发我",
++                required_tools=["media.image"],
++            )
++        ],
++    )
++    bundle = ToolEvidenceBundle(
++        conversation_id="conv-missing-colon",
++        turn_id="turn-missing-colon",
++        case_id="case-missing-colon",
++        inventory_snapshot_id="snap-missing-colon",
++        tool_name="llm2.test.missing_colon",
++        evidence=[
++            EvidenceItem(
++                evidence_id="evd-missing-media-1",
++                listing_id="lst-1606a",
++                evidence_type="missing_media",
++                summary="星桥锦绣嘉苑20-1606A:图片 暂未找到可发送图片。",
++                field_values={"media_kind": "image", "label": "星桥锦绣嘉苑20-1606A"},
++            ),
++        ],
++        raw_tool_result={"actions": ["search_inventory", "send_image", "explain_missing_media"]},
++    )
++
++    package = compose_kf_outbound(
++        packet,
++        bundle,
++        ResponseStrategy.SEND_MEDIA,
++        llm_output={},
++        send_actions=[],
++        allow_deterministic_fallback=True,
++    )
++    validation = validate_prepared_outbound_package(package, task_packet=packet)
++
++    assert validation.status == ValidationStatus.PASS
++    assert package.reply_text == "星桥锦绣嘉苑20-1606A目前暂时没找到可发的图片，我可以先发已有素材或房源信息。"
++    assert ":图片 暂未找到" not in package.reply_text
++
++
++def test_deterministic_llm2_fallback_humanizes_candidate_selection_error() -> None:
++    packet = StructuredTaskPacket(
++        conversation_id="conv-selection-error",
++        turn_id="turn-selection-error",
++        case_id="case-selection-error",
++        inventory_snapshot_id="snap-selection-error",
++        response_strategy=ResponseStrategy.SEND_MEDIA,
++        tasks=[
++            TaskAtom(
++                task_id="task-video",
++                task_type="send_video",
++                user_text="筛出来的1和2视频发我",
++                required_tools=["media.video"],
++            )
++        ],
++    )
++    bundle = ToolEvidenceBundle(
++        conversation_id="conv-selection-error",
++        turn_id="turn-selection-error",
++        case_id="case-selection-error",
++        inventory_snapshot_id="snap-selection-error",
++        tool_name="llm2.test.selection_error",
++        evidence=[
++            EvidenceItem(
++                evidence_id="evd-selection-error",
++                evidence_type="candidate_selection_error",
++                summary="客户选择了第1套、第2套，但上一轮只有 0 套候选。",
++                field_values={"media_kind": "视频"},
++            ),
++        ],
++        raw_tool_result={"actions": ["search_inventory", "send_video", "generate_reply"]},
++    )
++
++    package = compose_kf_outbound(
++        packet,
++        bundle,
++        ResponseStrategy.SEND_MEDIA,
++        llm_output={},
++        send_actions=[],
++        allow_deterministic_fallback=True,
++    )
++    validation = validate_prepared_outbound_package(package, task_packet=packet)
++
++    assert validation.status == ValidationStatus.PASS
++    assert "上一轮只有" not in package.reply_text
++    assert "候选" not in package.reply_text
++    assert "小区+房号" in package.reply_text
++
++
++def test_deterministic_llm2_fallback_humanizes_candidate_listing_summary() -> None:
++    packet = StructuredTaskPacket(
++        conversation_id="conv-candidate-summary",
++        turn_id="turn-candidate-summary",
++        case_id="case-candidate-summary",
++        inventory_snapshot_id="snap-candidate-summary",
++        response_strategy=ResponseStrategy.TOOL_FIRST,
++        tasks=[
++            TaskAtom(
++                task_id="task-inventory",
++                task_type="inventory_search",
++                user_text="石桥4800左右有两室整租吗？",
++                required_tools=["inventory.search"],
++            )
++        ],
++    )
++    bundle = ToolEvidenceBundle(
++        conversation_id="conv-candidate-summary",
++        turn_id="turn-candidate-summary",
++        case_id="case-candidate-summary",
++        inventory_snapshot_id="snap-candidate-summary",
++        tool_name="llm2.test.candidate_summary",
++        evidence=[
++            EvidenceItem(
++                evidence_id="evd-candidate-1",
++                listing_id="lst-shiqiao",
++                evidence_type="inventory_candidate",
++                summary="候选1 石桥铭苑 21-1201A 租金4500",
++            ),
++        ],
++        raw_tool_result={"actions": ["search_inventory", "compact_listing", "generate_reply"]},
++    )
++
++    package = compose_kf_outbound(
++        packet,
++        bundle,
++        ResponseStrategy.TOOL_FIRST,
++        llm_output={},
++        send_actions=[],
++        allow_deterministic_fallback=True,
++    )
++    validation = validate_prepared_outbound_package(package, task_packet=packet)
++
++    assert validation.status == ValidationStatus.PASS
++    assert package.reply_text == "石桥铭苑21-1201A，租金4500元。"
++    assert "候选1" not in package.reply_text
+ 
+ 
+ def test_deterministic_llm2_fallback_prioritizes_viewing_guidance_over_listing_summary() -> None:
+@@ -615,9 +762,62 @@ def test_deterministic_llm2_fallback_prioritizes_deposit_policy_over_listing_sum
+ 
+     assert validation.status == ValidationStatus.PASS
+     assert "免押是支付宝无忧住" in package.reply_text
++    assert "芝麻信用" in package.reply_text
++    assert "信用额度" in package.reply_text
++    assert "租房板块" in package.reply_text
+     assert "候选1" not in package.reply_text
+ 
+ 
++def test_deterministic_llm2_deposit_fee_reply_includes_rate_tiers() -> None:
++    packet = StructuredTaskPacket(
++        conversation_id="conv-deposit-fee",
++        turn_id="turn-deposit-fee",
++        case_id="case-deposit-fee",
++        inventory_snapshot_id="snap-deposit-fee",
++        response_strategy=ResponseStrategy.TOOL_FIRST,
++        tasks=[
++            TaskAtom(
++                task_id="task-deposit-fee",
++                task_type="deposit_policy",
++                user_text="免押服务费多少？",
++                required_tools=["policy.deposit"],
++            )
++        ],
++    )
++    bundle = ToolEvidenceBundle(
++        conversation_id="conv-deposit-fee",
++        turn_id="turn-deposit-fee",
++        case_id="case-deposit-fee",
++        inventory_snapshot_id="snap-deposit-fee",
++        tool_name="llm2.test.deposit_fee",
++        evidence=[
++            EvidenceItem(
++                evidence_id="evd-rule-deposit-policy-1",
++                evidence_type="deposit_policy",
++                summary="免押是支付宝无忧住芝麻信用评估，不是免费免押；符合风控后需支付押金金额 5.5%-8% 的免押服务费。",
++                field_values={"platform": "支付宝无忧住", "fee_rate": "5.5%-8%"},
++            ),
++        ],
++        raw_tool_result={"actions": ["send_deposit_policy", "generate_reply"]},
++    )
++
++    package = compose_kf_outbound(
++        packet,
++        bundle,
++        ResponseStrategy.TOOL_FIRST,
++        llm_output={},
++        send_actions=[],
++        allow_deterministic_fallback=True,
++    )
++    validation = validate_prepared_outbound_package(package, task_packet=packet)
++
++    assert validation.status == ValidationStatus.PASS
++    assert "5.5%" in package.reply_text
++    assert "7%" in package.reply_text
++    assert "8%" in package.reply_text
++    assert "支付宝页面" in package.reply_text
++
++
+ def test_deterministic_llm2_fallback_replies_for_greeting_compose_signal() -> None:
+     packet = StructuredTaskPacket(
+         conversation_id="conv-greeting",

@@ -1,0 +1,68 @@
+diff --git a/tests/test_wecom_kf.py b/tests/test_wecom_kf.py
+index 0425e863..8d658488 100644
+--- a/tests/test_wecom_kf.py
++++ b/tests/test_wecom_kf.py
+@@ -8090,6 +8090,63 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
+         self.assertIn("last_candidate_set", context)
+         self.assertEqual(context["last_candidate_set"]["shown_count"], 2)
+ 
++    async def test_empty_candidate_refinement_query_preserves_last_candidate_set(self) -> None:
++        class FakeInventory:
++            @property
++            def cache_meta(self) -> dict:
++                return {"source": "test_property"}
++
++            async def search(self, query: str, limit: int = 10) -> list[dict]:
++                return []
++
++        original_inventory = main.inventory
++        main.inventory = FakeInventory()
++        try:
++            context = kf_context_memory.empty_context()
++            context["last_candidate_set"] = {
++                "query": "北部软件园1800以内一室",
++                "candidates": [
++                    {"区域": "北部软件园", "小区": "棠润府", "房号": "15-2-801B", "户型": "一室一厅独卫", "押一付": "1600"},
++                    {"区域": "北部软件园", "小区": "合嵣悦府", "房号": "6-1-1204B", "户型": "一室一厅", "押一付": "1700"},
++                ],
++                "shown_count": 2,
++                "total_count": 2,
++            }
++            evidence = await main._execute_tools(
++                actions=["search_inventory", "generate_reply"],
++                content="带燃气优先",
++                context=context,
++                understanding={
++                    "intent": "inventory",
++                    "effective_query": "北部软件园1800以内一室 带燃气优先",
++                    "rewritten_query": "上一轮北部软件园1800以内一室里筛选带燃气的房源",
++                    "context_reference": True,
++                    "constraint_proof": {
++                        "area": "北部软件园",
++                        "budget_range": [0, 1800],
++                        "layout": "一室",
++                    },
++                    "structured_task": {
++                        "original_text": "带燃气优先",
++                        "tool_requirements": {"needs_inventory_search": True},
++                    },
++                },
++            )
++        finally:
++            main.inventory = original_inventory
++
++        self.assertEqual(evidence["inventory_rows"], [])
++        self.assertEqual(evidence["candidate_context_preserved"]["reason"], "empty_candidate_refinement")
++        self.assertNotIn("candidate_context_cleared", evidence)
++        self.assertNotIn("clear_room_context", evidence.get("memory_reducer") or {})
++        reduced = kf_context_memory.reduce_turn_context(
++            context,
++            understanding={"query_state": {"intent": "inventory"}},
++            tool_evidence=evidence,
++            final_package={"final_reply": "这几套里暂时没筛到带燃气的。"},
++        )
++        self.assertEqual([row["房号"] for row in reduced["last_candidate_set"]["candidates"]], ["15-2-801B", "6-1-1204B"])
++
+     async def test_single_contextual_inventory_result_replaces_previous_candidate_set(self) -> None:
+         single_row = {
+             "区域": "闸弄口 新塘 元宝塘 东站",

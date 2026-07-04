@@ -1,0 +1,717 @@
+diff --git a/app/main.py b/app/main.py
+index 46615331..fb2a599a 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -2177,6 +2177,8 @@ def _should_clear_room_context_after_empty_inventory_search(
+         return False
+     if _is_contextual_comparison_or_field_followup(query_text):
+         return False
++    if _looks_like_candidate_refinement_query(content, {}):
++        return False
+     if _looks_like_new_scoped_inventory_query(query_text, proof):
+         return True
+     if _has_explicit_inventory_anchor(query_text):
+@@ -2188,6 +2190,44 @@ def _should_clear_room_context_after_empty_inventory_search(
+     return False
+ 
+ 
++def _looks_like_candidate_refinement_query(query_text: str, proof: dict[str, Any] | None = None) -> bool:
++    text = str(query_text or "")
++    if not text:
++        return False
++    if _has_explicit_candidate_selection(text) or _room_refs_from_text(text):
++        return False
++    proof = dict(proof or {})
++    has_new_scope = bool(
++        proof.get("area")
++        or proof.get("communities")
++        or proof.get("budget_range")
++        or proof.get("layout")
++    )
++    parsed = parse_inventory_query(text)
++    has_refine_feature = bool(parsed.feature_aliases) or any(
++        word in text
++        for word in (
++            "优先",
++            "独卫",
++            "独立厨房",
++            "独厨",
++            "厨卫",
++            "阳台",
++            "燃气",
++            "朝南",
++            "装修",
++            "精装",
++            "马上入住",
++            "马上住",
++            "随时入住",
++            "空房",
++            "已空",
++            "现在空",
++        )
++    )
++    return has_refine_feature and not has_new_scope
++
++
+ def _is_short_media_followup_without_scope(text: str) -> bool:
+     value = str(text or "").strip()
+     if not value or _room_refs_from_text(value):
+@@ -6869,6 +6909,7 @@ async def _execute_tools(
+     understanding: dict[str, Any],
+     inventory_read_context: InventoryReadContext | None = None,
+ ) -> dict[str, Any]:
++    actions = list(dict.fromkeys(str(action).strip() for action in actions or [] if str(action).strip()))
+     inventory_read_context = inventory_read_context or _local_inventory_read_context("tools")
+     context = _remember_inventory_read_context(context, inventory_read_context)
+     working_context = dict(context)
+@@ -7014,6 +7055,38 @@ async def _execute_tools(
+                 original_ref_rows = []
+             if original_ref_rows:
+                 rows = original_ref_rows[:10]
++        if _looks_like_candidate_refinement_query(original_room_text, {}):
++            candidate_rows = _candidate_rows(working_context)
++            if candidate_rows:
++                refined_rows = _filter_rows_by_constraint_proof(
++                    candidate_rows,
++                    proof or {"candidate_refinement": True},
++                    query_text=" ".join(
++                        str(part).strip()
++                        for part in (
++                            content,
++                            task.get("original_text"),
++                            understanding.get("effective_query"),
++                            understanding.get("rewritten_query"),
++                        )
++                        if str(part or "").strip()
++                    ),
++                )
++                if refined_rows:
++                    rows = refined_rows[:10]
++                    evidence["candidate_refinement"] = {
++                        "source": "last_candidate_set",
++                        "query": content,
++                        "row_count": len(rows),
++                        "labels": [_row_label(row) for row in rows[:10]],
++                    }
++                elif not rows:
++                    evidence["candidate_context_preserved"] = {
++                        "reason": "empty_candidate_refinement",
++                        "query": content,
++                        "candidate_count": len(candidate_rows),
++                        "labels": [_row_label(row) for row in candidate_rows[:10]],
++                    }
+         if proof.get("wants_utilities") and any(word in content for word in ("这几套", "这几间", "这些", "刚才", "上面")):
+             candidate_rows = _candidate_rows(working_context)
+             if candidate_rows:
+@@ -7178,7 +7251,12 @@ async def _execute_tools(
+             dual_llm_production=_dual_llm_production_enabled(),
+             target_limit=KF_VIDEO_SEND_LIMIT,
+             base_evidence=evidence,
+-            conversation_id=f"media-binding:{hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]}",
++            conversation_id=(
++                "media-binding:"
++                + hashlib.sha256(
++                    f"{working_context.get('conversation_id') or inventory_read_context.request_id}:{content}".encode("utf-8")
++                ).hexdigest()[:16]
++            ),
+         )
+         evidence = dict(media_state.get("evidence") or evidence)
+         evidence["media_binding_trace"] = list(media_state.get("trace") or [])
+diff --git a/app/services/kf_llm2_outbound.py b/app/services/kf_llm2_outbound.py
+index 53241575..a3db6589 100644
+--- a/app/services/kf_llm2_outbound.py
++++ b/app/services/kf_llm2_outbound.py
+@@ -29,6 +29,13 @@ _MONEY_RE = re.compile(
+     r"(?:押一付一|押二付一|月租|租金|价格|房租|预算)[^\d]{0,10}([1-9]\d{2,5})"
+     r"|([1-9]\d{2,5})\s*(?:元|块|/月|每月)"
+ )
++_INTERNAL_VISIBLE_PATTERNS: tuple[re.Pattern[str], ...] = (
++    re.compile(r"工具未绑定"),
++    re.compile(r"上一轮只有\s*\d+\s*套候选"),
++    re.compile(r"^候选\s*\d+\s+\S+\s+\S+\s+租金", re.I),
++    re.compile(r"\S+[:：](?:图片|照片|视频)\s*暂未找到"),
++    re.compile(r"\b(?:packet|planner|tool_evidence|traceback)\b", re.I),
++)
+ 
+ _PRICE_FIELDS = {
+     "rent",
+@@ -396,6 +403,102 @@ def _has_acknowledgement_reply_compose_signal(packet: StructuredTaskPacket) -> b
+     return _is_short_acknowledgement_text(getattr(packet, "rewritten_query", ""))
+ 
+ 
++def _internal_visible_reason(text: Any) -> str:
++    value = str(text or "").strip()
++    if not value:
++        return ""
++    for pattern in _INTERNAL_VISIBLE_PATTERNS:
++        if pattern.search(value):
++            return pattern.pattern
++    return ""
++
++
++def _safe_default_evidence_reply_text(packet: StructuredTaskPacket, item: EvidenceItem) -> str:
++    evidence_type = str(item.evidence_type or "").strip()
++    if evidence_type == "missing_media":
++        return _humanized_missing_media_text(item)
++    if evidence_type in {"candidate_selection_error", "target_error", "field_target_error"}:
++        return _humanized_target_error_text(item)
++    if evidence_type == "deposit_policy":
++        return _humanized_deposit_policy_text(packet, item)
++    if evidence_type in {"inventory_candidate", "inventory_listing"}:
++        return _humanized_inventory_candidate_text(item)
++    summary = str(item.summary or "").strip()
++    if _internal_visible_reason(summary):
++        return ""
++    return summary
++
++
++def _humanized_missing_media_text(item: EvidenceItem) -> str:
++    field_values = dict(item.field_values or {})
++    metadata = dict(item.metadata or {})
++    summary = str(item.summary or "").strip()
++    label = _first_text(field_values, metadata, keys=("label", "room", "room_label", "listing_label", "房源", "房间"))
++    if not label:
++        match = re.match(r"\s*([^:：\s]+)\s*[:：]?\s*(?:图片|照片|视频)", summary)
++        if match:
++            label = match.group(1).strip()
++    media_kind = _first_text(field_values, metadata, keys=("media_kind", "kind", "type", "素材类型"))
++    text_for_kind = f"{media_kind} {summary}".lower()
++    if "image" in text_for_kind or "图片" in text_for_kind or "照片" in text_for_kind:
++        media_label = "图片"
++    elif "video" in text_for_kind or "视频" in text_for_kind:
++        media_label = "视频"
++    else:
++        media_label = "素材"
++    if label:
++        return f"{label}目前暂时没找到可发的{media_label}，我可以先发已有素材或房源信息。"
++    return f"这套房源目前暂时没找到可发的{media_label}，你发一下小区和房号我再精确查。"
++
++
++def _humanized_target_error_text(item: EvidenceItem) -> str:
++    field_values = dict(item.field_values or {})
++    metadata = dict(item.metadata or {})
++    requested = _first_text(field_values, metadata, keys=("requested_label", "requested", "field", "media_kind"))
++    if requested:
++        return f"这条还没绑定到具体房源，暂时不能直接查{requested}。你可以发小区+房号，或者按上一条可见列表说第几套。"
++    return "这条还没绑定到具体房源。你可以发小区+房号，或者按上一条可见列表说第几套，我再帮你查。"
++
++
++def _humanized_deposit_policy_text(packet: StructuredTaskPacket, item: EvidenceItem) -> str:
++    task_text = _packet_task_search_text(packet)
++    asks_fee = any(marker in task_text for marker in ("服务费", "比例", "费率", "多少", "怎么算", "免费"))
++    asks_condition = any(marker in task_text for marker in ("能不能", "能免押", "免押条件", "条件", "怎么回", "芝麻分"))
++    base = "免押是支付宝无忧住芝麻信用评估，不是免费免押。"
++    self_check = "让客户先在支付宝自查：支付宝 -> 芝麻信用 -> 信用额度 -> 租房板块，页面显示可用后再申请。"
++    fee = "服务费按免押金额和租期收，3个月约5.5%，3-6个月约7%，6-12个月约8%，最终以支付宝页面为准。"
++    if asks_fee and asks_condition:
++        return base + self_check + fee
++    if asks_fee:
++        return base + fee
++    if asks_condition:
++        return base + self_check
++    summary = str(item.summary or "").strip()
++    if summary and not _internal_visible_reason(summary):
++        return summary
++    return base + self_check
++
++
++def _humanized_inventory_candidate_text(item: EvidenceItem) -> str:
++    field_values = dict(item.field_values or {})
++    metadata = dict(item.metadata or {})
++    community = _first_text(field_values, metadata, keys=("community", "小区", "community_name"))
++    room_no = _first_text(field_values, metadata, keys=("room_no", "房号", "room"))
++    rent = _first_text(field_values, metadata, keys=("rent_pay1", "rent", "押一付一", "租金", "price"))
++    if not (community or room_no):
++        match = re.match(r"\s*候选\s*\d+\s+(\S+)\s+(\S+)(?:\s+租金\s*([0-9]+))?", str(item.summary or ""))
++        if match:
++            community, room_no, rent = match.group(1), match.group(2), match.group(3) or rent
++    label = f"{community}{room_no}".strip() or community or room_no
++    if label and rent:
++        suffix = "元" if str(rent).isdigit() else ""
++        return f"{label}，租金{rent}{suffix}。"
++    if label:
++        return f"{label}这套可以看下。"
++    summary = str(item.summary or "").strip()
++    return "" if _internal_visible_reason(summary) else summary
++
++
+ def _default_reply_text(
+     packet: StructuredTaskPacket,
+     bundle: ToolEvidenceBundle,
+@@ -423,8 +526,9 @@ def _default_reply_text(
+     if prioritized:
+         return prioritized
+     for item in bundle.evidence:
+-        if item.summary:
+-            return item.summary
++        reply = _safe_default_evidence_reply_text(packet, item)
++        if reply:
++            return reply
+     raw_tool_result = bundle.raw_tool_result if isinstance(bundle.raw_tool_result, dict) else {}
+     actions = set(_string_list(raw_tool_result.get("actions")))
+     if (
+@@ -451,7 +555,7 @@ def _priority_evidence_reply_text(packet: StructuredTaskPacket, bundle: ToolEvid
+     for evidence_type in preferred_types:
+         for item in bundle.evidence:
+             if str(item.evidence_type or "").strip() == evidence_type and str(item.summary or "").strip():
+-                return str(item.summary or "").strip()
++                return _safe_default_evidence_reply_text(packet, item)
+     return ""
+ 
+ 
+diff --git a/app/services/kf_outbound_validation.py b/app/services/kf_outbound_validation.py
+index 677e9079..c61829c5 100644
+--- a/app/services/kf_outbound_validation.py
++++ b/app/services/kf_outbound_validation.py
+@@ -158,6 +158,11 @@ INTERNAL_LEAK_PATTERN = re.compile(
+     r"PreparedOutboundPackage|ToolEvidenceBundle|StructuredTaskPacket|inventory\.search|dual_llm_shadow|LLM2|Planner)\b",
+     re.IGNORECASE,
+ )
++CUSTOMER_VISIBLE_INTERNAL_PATTERN = re.compile(
++    r"(?:工具未绑定|上一轮只有\s*\d+\s*套候选|^候选\s*\d+\s+\S+\s+\S+\s+租金|"
++    r"\S+[:：](?:图片|照片|视频)\s*暂未找到|\b(?:packet|planner|tool_evidence|traceback)\b)",
++    re.IGNORECASE,
++)
+ TEMPLATE_PATTERN = re.compile(r"(?:XX|某某|某小区|某房号|TODO|\{\{|\}\}|<小区>|<房号>|例如某套|示例房源)")
+ FUTURE_SEND_PATTERN = re.compile(r"(?:稍后|等下|待会|晚点|之后).{0,8}(?:发|传)|(?:可以|能|会).{0,4}发你")
+ PAST_SENT_PATTERN = re.compile(r"(?:已发|发你了|已经发|给你发过去了|这是.{0,16}(?:视频|图片|房源表))")
+@@ -525,6 +530,10 @@ def _validate_l3_text(
+         issues.append(
+             _issue(ValidationLevel.L3, "l3.internal_name_leak", "Reply leaks internal field/tool names; regenerate wording only.", path)
+         )
++    if CUSTOMER_VISIBLE_INTERNAL_PATTERN.search(text):
++        issues.append(
++            _issue(ValidationLevel.L3, "l3.customer_visible_internal_leak", "Reply leaks internal binding or evidence wording; regenerate wording only.", path)
++        )
+     if HARD_FORBIDDEN_HUMAN_PATTERN.search(text):
+         issues.append(
+             _issue(ValidationLevel.L3, "l3.forbidden_human_phrase", "Reply contains a hard-forbidden customer-service phrase; regenerate wording only.", path)
+@@ -819,7 +828,7 @@ def _has_target_error_answer(package: PreparedOutboundPackage, indexes: _Package
+         metadata = evidence.metadata if isinstance(evidence.metadata, Mapping) else {}
+         field_values = evidence.field_values if isinstance(evidence.field_values, Mapping) else {}
+         code = str(metadata.get("controlled_error_code") or field_values.get("error_code") or "").strip().lower()
+-        if evidence_type in {"selection_error", "field_target_error", "missing_target"}:
++        if evidence_type in {"selection_error", "candidate_selection_error", "target_error", "field_target_error", "missing_target"}:
+             return True
+         if code in {"selection_error", "field_target_error", "missing_target", "original_video_target_error"}:
+             return True
+diff --git a/qa_artifacts/server_online_dialog_qa_runner_v2.py b/qa_artifacts/server_online_dialog_qa_runner_v2.py
+index 80a230db..c2cdac79 100644
+--- a/qa_artifacts/server_online_dialog_qa_runner_v2.py
++++ b/qa_artifacts/server_online_dialog_qa_runner_v2.py
+@@ -23,6 +23,13 @@ MAX_CONCURRENT_WINDOWS = int(os.environ.get("QA_MAX_CONCURRENT_WINDOWS") or "5")
+ 
+ CONTACT_RE = re.compile(r"(?<!\d)1\d{10}(?!\d)")
+ BAD_TEXT = ("作为AI", "作为 AI", "系统显示", "稍后通知你", "满意度")
++INTERNAL_REPLY_PATTERNS = (
++    re.compile(r"工具未绑定"),
++    re.compile(r"上一轮只有\s*\d+\s*套候选"),
++    re.compile(r"^候选\s*\d+\s+\S+\s+\S+\s+租金"),
++    re.compile(r"\S+[:：](?:图片|照片|视频)\s*暂未找到"),
++    re.compile(r"\b(?:packet|planner|tool_evidence|traceback)\b", re.I),
++)
+ SHEET_TERMS = ("房源表", "表发", "发一下表", "最新表")
+ VIDEO_TERMS = ("视频", "原视频", "原片", "笔记", "视")
+ IMAGE_TERMS = ("图片", "照片", "图")
+@@ -45,6 +52,11 @@ VIEWING_TERMS = (
+ )
+ CONTRACT_TERMS = ("合同", "预定", "订房", "定房", "定金", "联系号码", "联系谁")
+ DEPOSIT_TERMS = ("免押", "服务费", "芝麻", "无忧住")
++DEPOSIT_CONDITION_TERMS = ("能免押", "能不能免押", "免押条件", "芝麻分不够", "怎么回客户")
++DEPOSIT_SELFCHECK_PLATFORM_TERMS = ("支付宝", "芝麻信用")
++DEPOSIT_SELFCHECK_PATH_TERMS = ("信用额度", "租房板块", "自查")
++DEPOSIT_FEE_TERMS = ("服务费", "比例", "多少", "怎么算", "免费")
++DEPOSIT_RATE_TERMS = ("5.5", "7%", "8%")
+ MISSING_TERMS = ("没有", "暂无", "暂时没有", "没找到", "缺")
+ VIEWING_REPLY_TERMS = ("密码", "看房方式", "自己看", "联系", "预约", "确认")
+ DEPOSIT_REPLY_TERMS = ("无忧住", "芝麻", "服务费", "5.5", "8%", "免押")
+@@ -251,7 +263,40 @@ def actions_from(data: dict[str, Any]) -> list[str]:
+     for raw in package.get("send_actions") or []:
+         if isinstance(raw, dict):
+             result.append(str(raw.get("action_type") or raw.get("type") or ""))
+-    return [item for item in result if item]
++    return collapse_repeated_sequence([item for item in result if item])
++
++
++def collapse_repeated_sequence(values: list[str]) -> list[str]:
++    items = [str(item) for item in values if str(item)]
++    if len(items) < 2 or len(items) % 2:
++        return items
++    half = len(items) // 2
++    if items[:half] == items[half:]:
++        return items[:half]
++    return items
++
++
++def action_fingerprint(raw: Any) -> str:
++    if isinstance(raw, dict):
++        action_type = str(raw.get("action_type") or raw.get("type") or raw.get("action") or raw.get("name") or "")
++        action_id = str(raw.get("action_id") or raw.get("id") or "")
++        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
++        evidence_id = str(raw.get("evidence_id") or payload.get("evidence_ref") or "")
++        path = str(raw.get("path") or raw.get("source_record_id") or payload.get("path") or payload.get("source_record") or "")
++        return "|".join([action_type, action_id, evidence_id, path])
++    return str(raw)
++
++
++def has_duplicate_external_send_actions(data: dict[str, Any]) -> bool:
++    tool = data.get("tool_evidence") if isinstance(data.get("tool_evidence"), dict) else {}
++    package = tool.get("outbound_package") if isinstance(tool.get("outbound_package"), dict) else {}
++    for actions in (tool.get("send_actions"), tool.get("outbound_send_actions"), package.get("send_actions")):
++        if not isinstance(actions, list) or len(actions) < 2:
++            continue
++        fingerprints = [action_fingerprint(item) for item in actions if action_fingerprint(item)]
++        if len(fingerprints) != len(set(fingerprints)):
++            return True
++    return False
+ 
+ 
+ def count_value(tool: dict[str, Any], *keys: str) -> int:
+@@ -317,6 +362,9 @@ def evaluate(question: str, data: dict[str, Any]) -> list[str]:
+     for bad in BAD_TEXT:
+         if bad in reply:
+             failures.append("banned_visible_phrase:" + bad)
++    for pattern in INTERNAL_REPLY_PATTERNS:
++        if pattern.search(reply):
++            failures.append("internal_visible_leak")
+     if contains_any(question, SHEET_TERMS):
+         strict_sheet = contains_any(question, STRICT_SHEET_TERMS)
+         if count_value(tool, "inventory_image_count") <= 0 and "send_inventory_sheet" not in action_text and (
+@@ -338,6 +386,15 @@ def evaluate(question: str, data: dict[str, Any]) -> list[str]:
+     if contains_any(question, DEPOSIT_TERMS):
+         if not contains_any(reply, DEPOSIT_REPLY_TERMS):
+             failures.append("expected_deposit_policy")
++        if contains_any(question, DEPOSIT_CONDITION_TERMS) and not (
++            contains_any(reply, DEPOSIT_SELFCHECK_PLATFORM_TERMS)
++            and contains_any(reply, DEPOSIT_SELFCHECK_PATH_TERMS)
++        ):
++            failures.append("expected_deposit_selfcheck_path")
++        if contains_any(question, DEPOSIT_FEE_TERMS) and not all(term in reply for term in DEPOSIT_RATE_TERMS):
++            failures.append("expected_deposit_fee_rate_tiers")
++    if has_duplicate_external_send_actions(data):
++        failures.append("duplicate_external_send_actions")
+     evidence_text = json.dumps(data.get("tool_evidence") or {}, ensure_ascii=False)
+     if "tool_grounded_reply" in evidence_text:
+         failures.append("tool_grounded_reply_fallback_visible")
+diff --git a/tests/test_kf_llm2_outbound.py b/tests/test_kf_llm2_outbound.py
+index 6db04de5..f87a49b2 100644
+--- a/tests/test_kf_llm2_outbound.py
++++ b/tests/test_kf_llm2_outbound.py
+@@ -433,8 +433,155 @@ def test_deterministic_llm2_fallback_prioritizes_missing_image_media_over_listin
+     validation = validate_prepared_outbound_package(package, task_packet=packet)
+ 
+     assert validation.status == ValidationStatus.PASS
+-    assert "暂未找到" in package.reply_text
++    assert "暂时没找到" in package.reply_text
+     assert "图片" in package.reply_text
++    assert ":" not in package.reply_text
++
++
++def test_deterministic_llm2_fallback_humanizes_colon_missing_media_summary() -> None:
++    packet = StructuredTaskPacket(
++        conversation_id="conv-missing-colon",
++        turn_id="turn-missing-colon",
++        case_id="case-missing-colon",
++        inventory_snapshot_id="snap-missing-colon",
++        response_strategy=ResponseStrategy.SEND_MEDIA,
++        tasks=[
++            TaskAtom(
++                task_id="task-image",
++                task_type="send_image",
++                user_text="这套图片发我",
++                required_tools=["media.image"],
++            )
++        ],
++    )
++    bundle = ToolEvidenceBundle(
++        conversation_id="conv-missing-colon",
++        turn_id="turn-missing-colon",
++        case_id="case-missing-colon",
++        inventory_snapshot_id="snap-missing-colon",
++        tool_name="llm2.test.missing_colon",
++        evidence=[
++            EvidenceItem(
++                evidence_id="evd-missing-media-1",
++                listing_id="lst-1606a",
++                evidence_type="missing_media",
++                summary="星桥锦绣嘉苑20-1606A:图片 暂未找到可发送图片。",
++                field_values={"media_kind": "image", "label": "星桥锦绣嘉苑20-1606A"},
++            ),
++        ],
++        raw_tool_result={"actions": ["search_inventory", "send_image", "explain_missing_media"]},
++    )
++
++    package = compose_kf_outbound(
++        packet,
++        bundle,
++        ResponseStrategy.SEND_MEDIA,
++        llm_output={},
++        send_actions=[],
++        allow_deterministic_fallback=True,
++    )
++    validation = validate_prepared_outbound_package(package, task_packet=packet)
++
++    assert validation.status == ValidationStatus.PASS
++    assert package.reply_text == "星桥锦绣嘉苑20-1606A目前暂时没找到可发的图片，我可以先发已有素材或房源信息。"
++    assert ":图片 暂未找到" not in package.reply_text
++
++
++def test_deterministic_llm2_fallback_humanizes_candidate_selection_error() -> None:
++    packet = StructuredTaskPacket(
++        conversation_id="conv-selection-error",
++        turn_id="turn-selection-error",
++        case_id="case-selection-error",
++        inventory_snapshot_id="snap-selection-error",
++        response_strategy=ResponseStrategy.SEND_MEDIA,
++        tasks=[
++            TaskAtom(
++                task_id="task-video",
++                task_type="send_video",
++                user_text="筛出来的1和2视频发我",
++                required_tools=["media.video"],
++            )
++        ],
++    )
++    bundle = ToolEvidenceBundle(
++        conversation_id="conv-selection-error",
++        turn_id="turn-selection-error",
++        case_id="case-selection-error",
++        inventory_snapshot_id="snap-selection-error",
++        tool_name="llm2.test.selection_error",
++        evidence=[
++            EvidenceItem(
++                evidence_id="evd-selection-error",
++                evidence_type="candidate_selection_error",
++                summary="客户选择了第1套、第2套，但上一轮只有 0 套候选。",
++                field_values={"media_kind": "视频"},
++            ),
++        ],
++        raw_tool_result={"actions": ["search_inventory", "send_video", "generate_reply"]},
++    )
++
++    package = compose_kf_outbound(
++        packet,
++        bundle,
++        ResponseStrategy.SEND_MEDIA,
++        llm_output={},
++        send_actions=[],
++        allow_deterministic_fallback=True,
++    )
++    validation = validate_prepared_outbound_package(package, task_packet=packet)
++
++    assert validation.status == ValidationStatus.PASS
++    assert "上一轮只有" not in package.reply_text
++    assert "候选" not in package.reply_text
++    assert "小区+房号" in package.reply_text
++
++
++def test_deterministic_llm2_fallback_humanizes_candidate_listing_summary() -> None:
++    packet = StructuredTaskPacket(
++        conversation_id="conv-candidate-summary",
++        turn_id="turn-candidate-summary",
++        case_id="case-candidate-summary",
++        inventory_snapshot_id="snap-candidate-summary",
++        response_strategy=ResponseStrategy.TOOL_FIRST,
++        tasks=[
++            TaskAtom(
++                task_id="task-inventory",
++                task_type="inventory_search",
++                user_text="石桥4800左右有两室整租吗？",
++                required_tools=["inventory.search"],
++            )
++        ],
++    )
++    bundle = ToolEvidenceBundle(
++        conversation_id="conv-candidate-summary",
++        turn_id="turn-candidate-summary",
++        case_id="case-candidate-summary",
++        inventory_snapshot_id="snap-candidate-summary",
++        tool_name="llm2.test.candidate_summary",
++        evidence=[
++            EvidenceItem(
++                evidence_id="evd-candidate-1",
++                listing_id="lst-shiqiao",
++                evidence_type="inventory_candidate",
++                summary="候选1 石桥铭苑 21-1201A 租金4500",
++            ),
++        ],
++        raw_tool_result={"actions": ["search_inventory", "compact_listing", "generate_reply"]},
++    )
++
++    package = compose_kf_outbound(
++        packet,
++        bundle,
++        ResponseStrategy.TOOL_FIRST,
++        llm_output={},
++        send_actions=[],
++        allow_deterministic_fallback=True,
++    )
++    validation = validate_prepared_outbound_package(package, task_packet=packet)
++
++    assert validation.status == ValidationStatus.PASS
++    assert package.reply_text == "石桥铭苑21-1201A，租金4500元。"
++    assert "候选1" not in package.reply_text
+ 
+ 
+ def test_deterministic_llm2_fallback_prioritizes_viewing_guidance_over_listing_summary() -> None:
+@@ -615,9 +762,62 @@ def test_deterministic_llm2_fallback_prioritizes_deposit_policy_over_listing_sum
+ 
+     assert validation.status == ValidationStatus.PASS
+     assert "免押是支付宝无忧住" in package.reply_text
++    assert "芝麻信用" in package.reply_text
++    assert "信用额度" in package.reply_text
++    assert "租房板块" in package.reply_text
+     assert "候选1" not in package.reply_text
+ 
+ 
++def test_deterministic_llm2_deposit_fee_reply_includes_rate_tiers() -> None:
++    packet = StructuredTaskPacket(
++        conversation_id="conv-deposit-fee",
++        turn_id="turn-deposit-fee",
++        case_id="case-deposit-fee",
++        inventory_snapshot_id="snap-deposit-fee",
++        response_strategy=ResponseStrategy.TOOL_FIRST,
++        tasks=[
++            TaskAtom(
++                task_id="task-deposit-fee",
++                task_type="deposit_policy",
++                user_text="免押服务费多少？",
++                required_tools=["policy.deposit"],
++            )
++        ],
++    )
++    bundle = ToolEvidenceBundle(
++        conversation_id="conv-deposit-fee",
++        turn_id="turn-deposit-fee",
++        case_id="case-deposit-fee",
++        inventory_snapshot_id="snap-deposit-fee",
++        tool_name="llm2.test.deposit_fee",
++        evidence=[
++            EvidenceItem(
++                evidence_id="evd-rule-deposit-policy-1",
++                evidence_type="deposit_policy",
++                summary="免押是支付宝无忧住芝麻信用评估，不是免费免押；符合风控后需支付押金金额 5.5%-8% 的免押服务费。",
++                field_values={"platform": "支付宝无忧住", "fee_rate": "5.5%-8%"},
++            ),
++        ],
++        raw_tool_result={"actions": ["send_deposit_policy", "generate_reply"]},
++    )
++
++    package = compose_kf_outbound(
++        packet,
++        bundle,
++        ResponseStrategy.TOOL_FIRST,
++        llm_output={},
++        send_actions=[],
++        allow_deterministic_fallback=True,
++    )
++    validation = validate_prepared_outbound_package(package, task_packet=packet)
++
++    assert validation.status == ValidationStatus.PASS
++    assert "5.5%" in package.reply_text
++    assert "7%" in package.reply_text
++    assert "8%" in package.reply_text
++    assert "支付宝页面" in package.reply_text
++
++
+ def test_deterministic_llm2_fallback_replies_for_greeting_compose_signal() -> None:
+     packet = StructuredTaskPacket(
+         conversation_id="conv-greeting",
+diff --git a/tests/test_kf_outbound_validation.py b/tests/test_kf_outbound_validation.py
+index e80e2012..56223b71 100644
+--- a/tests/test_kf_outbound_validation.py
++++ b/tests/test_kf_outbound_validation.py
+@@ -413,6 +413,25 @@ def test_l3_rewrites_generic_waiting_reply_without_blocking_facts() -> None:
+     assert "l3.generic_waiting_reply" in _codes(result)
+ 
+ 
++def test_l3_rewrites_customer_visible_internal_binding_leaks() -> None:
++    bad_replies = [
++        "客户要查询素材，但工具未绑定到具体房源。",
++        "客户选择了第1套、第2套，但上一轮只有 0 套候选。",
++        "候选1 石桥铭苑 21-1201A 租金4500",
++        "星桥锦绣嘉苑20-1606A:图片 暂未找到可发送图片。",
++    ]
++
++    for reply in bad_replies:
++        package = _base_package()
++        package.reply_text = reply
++
++        result = validate_prepared_outbound_package(package)
++
++        assert result.status == ValidationStatus.REWRITE_REQUIRED
++        assert result.facts_passed is True
++        assert "l3.customer_visible_internal_leak" in _codes(result)
++
++
+ def test_l3_allows_partial_missing_media_reply_when_evidence_exists() -> None:
+     package = _base_package()
+     package.reply_text = "这是星河苑1-101的视频，另一套暂时没有视频。"
+diff --git a/tests/test_wecom_kf.py b/tests/test_wecom_kf.py
+index 0425e863..8d658488 100644
+--- a/tests/test_wecom_kf.py
++++ b/tests/test_wecom_kf.py
+@@ -8090,6 +8090,63 @@ class MainAgenticRagFlowTests(unittest.IsolatedAsyncioTestCase):
+         self.assertIn("last_candidate_set", context)
+         self.assertEqual(context["last_candidate_set"]["shown_count"], 2)
+ 
++    async def test_empty_candidate_refinement_query_preserves_last_candidate_set(self) -> None:
++        class FakeInventory:
++            @property
++            def cache_meta(self) -> dict:
++                return {"source": "test_property"}
++
++            async def search(self, query: str, limit: int = 10) -> list[dict]:
++                return []
++
++        original_inventory = main.inventory
++        main.inventory = FakeInventory()
++        try:
++            context = kf_context_memory.empty_context()
++            context["last_candidate_set"] = {
++                "query": "北部软件园1800以内一室",
++                "candidates": [
++                    {"区域": "北部软件园", "小区": "棠润府", "房号": "15-2-801B", "户型": "一室一厅独卫", "押一付": "1600"},
++                    {"区域": "北部软件园", "小区": "合嵣悦府", "房号": "6-1-1204B", "户型": "一室一厅", "押一付": "1700"},
++                ],
++                "shown_count": 2,
++                "total_count": 2,
++            }
++            evidence = await main._execute_tools(
++                actions=["search_inventory", "generate_reply"],
++                content="带燃气优先",
++                context=context,
++                understanding={
++                    "intent": "inventory",
++                    "effective_query": "北部软件园1800以内一室 带燃气优先",
++                    "rewritten_query": "上一轮北部软件园1800以内一室里筛选带燃气的房源",
++                    "context_reference": True,
++                    "constraint_proof": {
++                        "area": "北部软件园",
++                        "budget_range": [0, 1800],
++                        "layout": "一室",
++                    },
++                    "structured_task": {
++                        "original_text": "带燃气优先",
++                        "tool_requirements": {"needs_inventory_search": True},
++                    },
++                },
++            )
++        finally:
++            main.inventory = original_inventory
++
++        self.assertEqual(evidence["inventory_rows"], [])
++        self.assertEqual(evidence["candidate_context_preserved"]["reason"], "empty_candidate_refinement")
++        self.assertNotIn("candidate_context_cleared", evidence)
++        self.assertNotIn("clear_room_context", evidence.get("memory_reducer") or {})
++        reduced = kf_context_memory.reduce_turn_context(
++            context,
++            understanding={"query_state": {"intent": "inventory"}},
++            tool_evidence=evidence,
++            final_package={"final_reply": "这几套里暂时没筛到带燃气的。"},
++        )
++        self.assertEqual([row["房号"] for row in reduced["last_candidate_set"]["candidates"]], ["15-2-801B", "6-1-1204B"])
++
+     async def test_single_contextual_inventory_result_replaces_previous_candidate_set(self) -> None:
+         single_row = {
+             "区域": "闸弄口 新塘 元宝塘 东站",

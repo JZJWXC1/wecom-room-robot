@@ -1,0 +1,119 @@
+diff --git a/app/main.py b/app/main.py
+index 46615331..fb2a599a 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -2177,6 +2177,8 @@ def _should_clear_room_context_after_empty_inventory_search(
+         return False
+     if _is_contextual_comparison_or_field_followup(query_text):
+         return False
++    if _looks_like_candidate_refinement_query(content, {}):
++        return False
+     if _looks_like_new_scoped_inventory_query(query_text, proof):
+         return True
+     if _has_explicit_inventory_anchor(query_text):
+@@ -2188,6 +2190,44 @@ def _should_clear_room_context_after_empty_inventory_search(
+     return False
+ 
+ 
++def _looks_like_candidate_refinement_query(query_text: str, proof: dict[str, Any] | None = None) -> bool:
++    text = str(query_text or "")
++    if not text:
++        return False
++    if _has_explicit_candidate_selection(text) or _room_refs_from_text(text):
++        return False
++    proof = dict(proof or {})
++    has_new_scope = bool(
++        proof.get("area")
++        or proof.get("communities")
++        or proof.get("budget_range")
++        or proof.get("layout")
++    )
++    parsed = parse_inventory_query(text)
++    has_refine_feature = bool(parsed.feature_aliases) or any(
++        word in text
++        for word in (
++            "优先",
++            "独卫",
++            "独立厨房",
++            "独厨",
++            "厨卫",
++            "阳台",
++            "燃气",
++            "朝南",
++            "装修",
++            "精装",
++            "马上入住",
++            "马上住",
++            "随时入住",
++            "空房",
++            "已空",
++            "现在空",
++        )
++    )
++    return has_refine_feature and not has_new_scope
++
++
+ def _is_short_media_followup_without_scope(text: str) -> bool:
+     value = str(text or "").strip()
+     if not value or _room_refs_from_text(value):
+@@ -6869,6 +6909,7 @@ async def _execute_tools(
+     understanding: dict[str, Any],
+     inventory_read_context: InventoryReadContext | None = None,
+ ) -> dict[str, Any]:
++    actions = list(dict.fromkeys(str(action).strip() for action in actions or [] if str(action).strip()))
+     inventory_read_context = inventory_read_context or _local_inventory_read_context("tools")
+     context = _remember_inventory_read_context(context, inventory_read_context)
+     working_context = dict(context)
+@@ -7014,6 +7055,38 @@ async def _execute_tools(
+                 original_ref_rows = []
+             if original_ref_rows:
+                 rows = original_ref_rows[:10]
++        if _looks_like_candidate_refinement_query(original_room_text, {}):
++            candidate_rows = _candidate_rows(working_context)
++            if candidate_rows:
++                refined_rows = _filter_rows_by_constraint_proof(
++                    candidate_rows,
++                    proof or {"candidate_refinement": True},
++                    query_text=" ".join(
++                        str(part).strip()
++                        for part in (
++                            content,
++                            task.get("original_text"),
++                            understanding.get("effective_query"),
++                            understanding.get("rewritten_query"),
++                        )
++                        if str(part or "").strip()
++                    ),
++                )
++                if refined_rows:
++                    rows = refined_rows[:10]
++                    evidence["candidate_refinement"] = {
++                        "source": "last_candidate_set",
++                        "query": content,
++                        "row_count": len(rows),
++                        "labels": [_row_label(row) for row in rows[:10]],
++                    }
++                elif not rows:
++                    evidence["candidate_context_preserved"] = {
++                        "reason": "empty_candidate_refinement",
++                        "query": content,
++                        "candidate_count": len(candidate_rows),
++                        "labels": [_row_label(row) for row in candidate_rows[:10]],
++                    }
+         if proof.get("wants_utilities") and any(word in content for word in ("这几套", "这几间", "这些", "刚才", "上面")):
+             candidate_rows = _candidate_rows(working_context)
+             if candidate_rows:
+@@ -7178,7 +7251,12 @@ async def _execute_tools(
+             dual_llm_production=_dual_llm_production_enabled(),
+             target_limit=KF_VIDEO_SEND_LIMIT,
+             base_evidence=evidence,
+-            conversation_id=f"media-binding:{hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]}",
++            conversation_id=(
++                "media-binding:"
++                + hashlib.sha256(
++                    f"{working_context.get('conversation_id') or inventory_read_context.request_id}:{content}".encode("utf-8")
++                ).hexdigest()[:16]
++            ),
+         )
+         evidence = dict(media_state.get("evidence") or evidence)
+         evidence["media_binding_trace"] = list(media_state.get("trace") or [])

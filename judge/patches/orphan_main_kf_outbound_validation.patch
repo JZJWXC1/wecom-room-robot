@@ -1,0 +1,36 @@
+diff --git a/app/services/kf_outbound_validation.py b/app/services/kf_outbound_validation.py
+index 677e9079..c61829c5 100644
+--- a/app/services/kf_outbound_validation.py
++++ b/app/services/kf_outbound_validation.py
+@@ -158,6 +158,11 @@ INTERNAL_LEAK_PATTERN = re.compile(
+     r"PreparedOutboundPackage|ToolEvidenceBundle|StructuredTaskPacket|inventory\.search|dual_llm_shadow|LLM2|Planner)\b",
+     re.IGNORECASE,
+ )
++CUSTOMER_VISIBLE_INTERNAL_PATTERN = re.compile(
++    r"(?:工具未绑定|上一轮只有\s*\d+\s*套候选|^候选\s*\d+\s+\S+\s+\S+\s+租金|"
++    r"\S+[:：](?:图片|照片|视频)\s*暂未找到|\b(?:packet|planner|tool_evidence|traceback)\b)",
++    re.IGNORECASE,
++)
+ TEMPLATE_PATTERN = re.compile(r"(?:XX|某某|某小区|某房号|TODO|\{\{|\}\}|<小区>|<房号>|例如某套|示例房源)")
+ FUTURE_SEND_PATTERN = re.compile(r"(?:稍后|等下|待会|晚点|之后).{0,8}(?:发|传)|(?:可以|能|会).{0,4}发你")
+ PAST_SENT_PATTERN = re.compile(r"(?:已发|发你了|已经发|给你发过去了|这是.{0,16}(?:视频|图片|房源表))")
+@@ -525,6 +530,10 @@ def _validate_l3_text(
+         issues.append(
+             _issue(ValidationLevel.L3, "l3.internal_name_leak", "Reply leaks internal field/tool names; regenerate wording only.", path)
+         )
++    if CUSTOMER_VISIBLE_INTERNAL_PATTERN.search(text):
++        issues.append(
++            _issue(ValidationLevel.L3, "l3.customer_visible_internal_leak", "Reply leaks internal binding or evidence wording; regenerate wording only.", path)
++        )
+     if HARD_FORBIDDEN_HUMAN_PATTERN.search(text):
+         issues.append(
+             _issue(ValidationLevel.L3, "l3.forbidden_human_phrase", "Reply contains a hard-forbidden customer-service phrase; regenerate wording only.", path)
+@@ -819,7 +828,7 @@ def _has_target_error_answer(package: PreparedOutboundPackage, indexes: _Package
+         metadata = evidence.metadata if isinstance(evidence.metadata, Mapping) else {}
+         field_values = evidence.field_values if isinstance(evidence.field_values, Mapping) else {}
+         code = str(metadata.get("controlled_error_code") or field_values.get("error_code") or "").strip().lower()
+-        if evidence_type in {"selection_error", "field_target_error", "missing_target"}:
++        if evidence_type in {"selection_error", "candidate_selection_error", "target_error", "field_target_error", "missing_target"}:
+             return True
+         if code in {"selection_error", "field_target_error", "missing_target", "original_video_target_error"}:
+             return True

@@ -1,0 +1,98 @@
+diff --git a/qa_artifacts/server_online_dialog_qa_runner_v2.py b/qa_artifacts/server_online_dialog_qa_runner_v2.py
+index 80a230db..c2cdac79 100644
+--- a/qa_artifacts/server_online_dialog_qa_runner_v2.py
++++ b/qa_artifacts/server_online_dialog_qa_runner_v2.py
+@@ -23,6 +23,13 @@ MAX_CONCURRENT_WINDOWS = int(os.environ.get("QA_MAX_CONCURRENT_WINDOWS") or "5")
+ 
+ CONTACT_RE = re.compile(r"(?<!\d)1\d{10}(?!\d)")
+ BAD_TEXT = ("作为AI", "作为 AI", "系统显示", "稍后通知你", "满意度")
++INTERNAL_REPLY_PATTERNS = (
++    re.compile(r"工具未绑定"),
++    re.compile(r"上一轮只有\s*\d+\s*套候选"),
++    re.compile(r"^候选\s*\d+\s+\S+\s+\S+\s+租金"),
++    re.compile(r"\S+[:：](?:图片|照片|视频)\s*暂未找到"),
++    re.compile(r"\b(?:packet|planner|tool_evidence|traceback)\b", re.I),
++)
+ SHEET_TERMS = ("房源表", "表发", "发一下表", "最新表")
+ VIDEO_TERMS = ("视频", "原视频", "原片", "笔记", "视")
+ IMAGE_TERMS = ("图片", "照片", "图")
+@@ -45,6 +52,11 @@ VIEWING_TERMS = (
+ )
+ CONTRACT_TERMS = ("合同", "预定", "订房", "定房", "定金", "联系号码", "联系谁")
+ DEPOSIT_TERMS = ("免押", "服务费", "芝麻", "无忧住")
++DEPOSIT_CONDITION_TERMS = ("能免押", "能不能免押", "免押条件", "芝麻分不够", "怎么回客户")
++DEPOSIT_SELFCHECK_PLATFORM_TERMS = ("支付宝", "芝麻信用")
++DEPOSIT_SELFCHECK_PATH_TERMS = ("信用额度", "租房板块", "自查")
++DEPOSIT_FEE_TERMS = ("服务费", "比例", "多少", "怎么算", "免费")
++DEPOSIT_RATE_TERMS = ("5.5", "7%", "8%")
+ MISSING_TERMS = ("没有", "暂无", "暂时没有", "没找到", "缺")
+ VIEWING_REPLY_TERMS = ("密码", "看房方式", "自己看", "联系", "预约", "确认")
+ DEPOSIT_REPLY_TERMS = ("无忧住", "芝麻", "服务费", "5.5", "8%", "免押")
+@@ -251,7 +263,40 @@ def actions_from(data: dict[str, Any]) -> list[str]:
+     for raw in package.get("send_actions") or []:
+         if isinstance(raw, dict):
+             result.append(str(raw.get("action_type") or raw.get("type") or ""))
+-    return [item for item in result if item]
++    return collapse_repeated_sequence([item for item in result if item])
++
++
++def collapse_repeated_sequence(values: list[str]) -> list[str]:
++    items = [str(item) for item in values if str(item)]
++    if len(items) < 2 or len(items) % 2:
++        return items
++    half = len(items) // 2
++    if items[:half] == items[half:]:
++        return items[:half]
++    return items
++
++
++def action_fingerprint(raw: Any) -> str:
++    if isinstance(raw, dict):
++        action_type = str(raw.get("action_type") or raw.get("type") or raw.get("action") or raw.get("name") or "")
++        action_id = str(raw.get("action_id") or raw.get("id") or "")
++        payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
++        evidence_id = str(raw.get("evidence_id") or payload.get("evidence_ref") or "")
++        path = str(raw.get("path") or raw.get("source_record_id") or payload.get("path") or payload.get("source_record") or "")
++        return "|".join([action_type, action_id, evidence_id, path])
++    return str(raw)
++
++
++def has_duplicate_external_send_actions(data: dict[str, Any]) -> bool:
++    tool = data.get("tool_evidence") if isinstance(data.get("tool_evidence"), dict) else {}
++    package = tool.get("outbound_package") if isinstance(tool.get("outbound_package"), dict) else {}
++    for actions in (tool.get("send_actions"), tool.get("outbound_send_actions"), package.get("send_actions")):
++        if not isinstance(actions, list) or len(actions) < 2:
++            continue
++        fingerprints = [action_fingerprint(item) for item in actions if action_fingerprint(item)]
++        if len(fingerprints) != len(set(fingerprints)):
++            return True
++    return False
+ 
+ 
+ def count_value(tool: dict[str, Any], *keys: str) -> int:
+@@ -317,6 +362,9 @@ def evaluate(question: str, data: dict[str, Any]) -> list[str]:
+     for bad in BAD_TEXT:
+         if bad in reply:
+             failures.append("banned_visible_phrase:" + bad)
++    for pattern in INTERNAL_REPLY_PATTERNS:
++        if pattern.search(reply):
++            failures.append("internal_visible_leak")
+     if contains_any(question, SHEET_TERMS):
+         strict_sheet = contains_any(question, STRICT_SHEET_TERMS)
+         if count_value(tool, "inventory_image_count") <= 0 and "send_inventory_sheet" not in action_text and (
+@@ -338,6 +386,15 @@ def evaluate(question: str, data: dict[str, Any]) -> list[str]:
+     if contains_any(question, DEPOSIT_TERMS):
+         if not contains_any(reply, DEPOSIT_REPLY_TERMS):
+             failures.append("expected_deposit_policy")
++        if contains_any(question, DEPOSIT_CONDITION_TERMS) and not (
++            contains_any(reply, DEPOSIT_SELFCHECK_PLATFORM_TERMS)
++            and contains_any(reply, DEPOSIT_SELFCHECK_PATH_TERMS)
++        ):
++            failures.append("expected_deposit_selfcheck_path")
++        if contains_any(question, DEPOSIT_FEE_TERMS) and not all(term in reply for term in DEPOSIT_RATE_TERMS):
++            failures.append("expected_deposit_fee_rate_tiers")
++    if has_duplicate_external_send_actions(data):
++        failures.append("duplicate_external_send_actions")
+     evidence_text = json.dumps(data.get("tool_evidence") or {}, ensure_ascii=False)
+     if "tool_grounded_reply" in evidence_text:
+         failures.append("tool_grounded_reply_fallback_visible")

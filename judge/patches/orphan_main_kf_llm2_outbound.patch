@@ -1,0 +1,142 @@
+diff --git a/app/services/kf_llm2_outbound.py b/app/services/kf_llm2_outbound.py
+index 53241575..a3db6589 100644
+--- a/app/services/kf_llm2_outbound.py
++++ b/app/services/kf_llm2_outbound.py
+@@ -29,6 +29,13 @@ _MONEY_RE = re.compile(
+     r"(?:押一付一|押二付一|月租|租金|价格|房租|预算)[^\d]{0,10}([1-9]\d{2,5})"
+     r"|([1-9]\d{2,5})\s*(?:元|块|/月|每月)"
+ )
++_INTERNAL_VISIBLE_PATTERNS: tuple[re.Pattern[str], ...] = (
++    re.compile(r"工具未绑定"),
++    re.compile(r"上一轮只有\s*\d+\s*套候选"),
++    re.compile(r"^候选\s*\d+\s+\S+\s+\S+\s+租金", re.I),
++    re.compile(r"\S+[:：](?:图片|照片|视频)\s*暂未找到"),
++    re.compile(r"\b(?:packet|planner|tool_evidence|traceback)\b", re.I),
++)
+ 
+ _PRICE_FIELDS = {
+     "rent",
+@@ -396,6 +403,102 @@ def _has_acknowledgement_reply_compose_signal(packet: StructuredTaskPacket) -> b
+     return _is_short_acknowledgement_text(getattr(packet, "rewritten_query", ""))
+ 
+ 
++def _internal_visible_reason(text: Any) -> str:
++    value = str(text or "").strip()
++    if not value:
++        return ""
++    for pattern in _INTERNAL_VISIBLE_PATTERNS:
++        if pattern.search(value):
++            return pattern.pattern
++    return ""
++
++
++def _safe_default_evidence_reply_text(packet: StructuredTaskPacket, item: EvidenceItem) -> str:
++    evidence_type = str(item.evidence_type or "").strip()
++    if evidence_type == "missing_media":
++        return _humanized_missing_media_text(item)
++    if evidence_type in {"candidate_selection_error", "target_error", "field_target_error"}:
++        return _humanized_target_error_text(item)
++    if evidence_type == "deposit_policy":
++        return _humanized_deposit_policy_text(packet, item)
++    if evidence_type in {"inventory_candidate", "inventory_listing"}:
++        return _humanized_inventory_candidate_text(item)
++    summary = str(item.summary or "").strip()
++    if _internal_visible_reason(summary):
++        return ""
++    return summary
++
++
++def _humanized_missing_media_text(item: EvidenceItem) -> str:
++    field_values = dict(item.field_values or {})
++    metadata = dict(item.metadata or {})
++    summary = str(item.summary or "").strip()
++    label = _first_text(field_values, metadata, keys=("label", "room", "room_label", "listing_label", "房源", "房间"))
++    if not label:
++        match = re.match(r"\s*([^:：\s]+)\s*[:：]?\s*(?:图片|照片|视频)", summary)
++        if match:
++            label = match.group(1).strip()
++    media_kind = _first_text(field_values, metadata, keys=("media_kind", "kind", "type", "素材类型"))
++    text_for_kind = f"{media_kind} {summary}".lower()
++    if "image" in text_for_kind or "图片" in text_for_kind or "照片" in text_for_kind:
++        media_label = "图片"
++    elif "video" in text_for_kind or "视频" in text_for_kind:
++        media_label = "视频"
++    else:
++        media_label = "素材"
++    if label:
++        return f"{label}目前暂时没找到可发的{media_label}，我可以先发已有素材或房源信息。"
++    return f"这套房源目前暂时没找到可发的{media_label}，你发一下小区和房号我再精确查。"
++
++
++def _humanized_target_error_text(item: EvidenceItem) -> str:
++    field_values = dict(item.field_values or {})
++    metadata = dict(item.metadata or {})
++    requested = _first_text(field_values, metadata, keys=("requested_label", "requested", "field", "media_kind"))
++    if requested:
++        return f"这条还没绑定到具体房源，暂时不能直接查{requested}。你可以发小区+房号，或者按上一条可见列表说第几套。"
++    return "这条还没绑定到具体房源。你可以发小区+房号，或者按上一条可见列表说第几套，我再帮你查。"
++
++
++def _humanized_deposit_policy_text(packet: StructuredTaskPacket, item: EvidenceItem) -> str:
++    task_text = _packet_task_search_text(packet)
++    asks_fee = any(marker in task_text for marker in ("服务费", "比例", "费率", "多少", "怎么算", "免费"))
++    asks_condition = any(marker in task_text for marker in ("能不能", "能免押", "免押条件", "条件", "怎么回", "芝麻分"))
++    base = "免押是支付宝无忧住芝麻信用评估，不是免费免押。"
++    self_check = "让客户先在支付宝自查：支付宝 -> 芝麻信用 -> 信用额度 -> 租房板块，页面显示可用后再申请。"
++    fee = "服务费按免押金额和租期收，3个月约5.5%，3-6个月约7%，6-12个月约8%，最终以支付宝页面为准。"
++    if asks_fee and asks_condition:
++        return base + self_check + fee
++    if asks_fee:
++        return base + fee
++    if asks_condition:
++        return base + self_check
++    summary = str(item.summary or "").strip()
++    if summary and not _internal_visible_reason(summary):
++        return summary
++    return base + self_check
++
++
++def _humanized_inventory_candidate_text(item: EvidenceItem) -> str:
++    field_values = dict(item.field_values or {})
++    metadata = dict(item.metadata or {})
++    community = _first_text(field_values, metadata, keys=("community", "小区", "community_name"))
++    room_no = _first_text(field_values, metadata, keys=("room_no", "房号", "room"))
++    rent = _first_text(field_values, metadata, keys=("rent_pay1", "rent", "押一付一", "租金", "price"))
++    if not (community or room_no):
++        match = re.match(r"\s*候选\s*\d+\s+(\S+)\s+(\S+)(?:\s+租金\s*([0-9]+))?", str(item.summary or ""))
++        if match:
++            community, room_no, rent = match.group(1), match.group(2), match.group(3) or rent
++    label = f"{community}{room_no}".strip() or community or room_no
++    if label and rent:
++        suffix = "元" if str(rent).isdigit() else ""
++        return f"{label}，租金{rent}{suffix}。"
++    if label:
++        return f"{label}这套可以看下。"
++    summary = str(item.summary or "").strip()
++    return "" if _internal_visible_reason(summary) else summary
++
++
+ def _default_reply_text(
+     packet: StructuredTaskPacket,
+     bundle: ToolEvidenceBundle,
+@@ -423,8 +526,9 @@ def _default_reply_text(
+     if prioritized:
+         return prioritized
+     for item in bundle.evidence:
+-        if item.summary:
+-            return item.summary
++        reply = _safe_default_evidence_reply_text(packet, item)
++        if reply:
++            return reply
+     raw_tool_result = bundle.raw_tool_result if isinstance(bundle.raw_tool_result, dict) else {}
+     actions = set(_string_list(raw_tool_result.get("actions")))
+     if (
+@@ -451,7 +555,7 @@ def _priority_evidence_reply_text(packet: StructuredTaskPacket, bundle: ToolEvid
+     for evidence_type in preferred_types:
+         for item in bundle.evidence:
+             if str(item.evidence_type or "").strip() == evidence_type and str(item.summary or "").strip():
+-                return str(item.summary or "").strip()
++                return _safe_default_evidence_reply_text(packet, item)
+     return ""
+ 
+ 
