@@ -20,7 +20,7 @@ OUTBOX_RECORD_RESERVED = "reserved"
 OUTBOX_RECORD_RECEIPT = "receipt"
 DEFAULT_OUTBOX_PATH = Path("data/kf_send_outbox.jsonl")
 
-_OUTBOX_INTERNAL_KEYS = {"idempotency_key", "outbox_id", "receipt_id"}
+_OUTBOX_INTERNAL_KEYS = {"idempotency_key", "outbox_id", "receipt_id", "msgid_scope_key"}
 _RECEIPT_INTERNAL_KEYS = {"duplicate_of", "idempotency_key", "receipt_id"}
 _BLOCKING_RECEIPT_STATUSES = {
     kf_send_receipts.SENT_STATUS,
@@ -95,6 +95,10 @@ class LocalKfOutboxLedger:
         self._cache_line_number = 0
         self._cache_signature: tuple[int, int] | None = None
         self._cache_key_records: dict[str, list[dict[str, Any]]] = {}
+        # msgid 域外发防重索引:scope_key -> 该域的 reserved/receipt 精简记录。
+        # 幂等键是轮次域(重复回调开新轮后键值全变),本索引按"客户消息集合+
+        # 动作身份"聚合,跨轮次拦截同一 msgid 批次的重复物理外发。
+        self._cache_scope_records: dict[str, list[dict[str, Any]]] = {}
         self._cache_record_count = 0
         self._cache_corrupted_line_numbers: list[int] = []
         self._cache_full_resync_count = 0
@@ -114,6 +118,9 @@ class LocalKfOutboxLedger:
                         **diagnostics.to_safe_dict(),
                     },
                 )
+            scope_decision = self._msgid_scope_decision_unlocked(action, key)
+            if scope_decision is not None:
+                return scope_decision
             state = _summarize_key(self._cache_key_records.get(key) or [], key)
             blocking = state.get("blocking_receipt")
             if isinstance(blocking, SendReceipt):
@@ -146,6 +153,48 @@ class LocalKfOutboxLedger:
                 attempt=attempt,
                 reason="reserved",
             )
+
+    def _msgid_scope_decision_unlocked(self, action: SendAction, key: str) -> OutboxDecision | None:
+        # 跨轮防重:同一 msgid 域的同一逻辑动作,只要已有 SENT/UNCERTAIN
+        # 回执或在途 pending 出自其他幂等键(即另一轮次),一律阻断;
+        # 同键情形交还原有按键逻辑,保持既有语义与 attempt 递增不变。
+        scope_key = kf_send_receipts.msgid_scope_guard_key(action)
+        if not scope_key:
+            return None
+        state = _summarize_scope_records(self._cache_scope_records.get(scope_key) or [])
+        blocking = state.get("blocking_record")
+        if isinstance(blocking, dict) and str(blocking.get("idempotency_key") or "") != key:
+            receipt_payload = blocking.get("receipt")
+            existing = (
+                SendReceipt.from_legacy_dict(receipt_payload)
+                if isinstance(receipt_payload, dict)
+                else None
+            )
+            return OutboxDecision(
+                should_send=False,
+                idempotency_key=key,
+                reason="msgid_scope_blocks_duplicate",
+                duplicate_of=(existing.receipt_id if existing else str(blocking.get("outbox_id") or "")),
+                existing_receipt=existing,
+                metadata={
+                    "blocking_status": str(blocking.get("status") or ""),
+                    "scope_guard": "msgid_scope",
+                },
+            )
+        pending = state.get("pending_record")
+        if isinstance(pending, dict) and str(pending.get("idempotency_key") or "") != key:
+            return OutboxDecision(
+                should_send=False,
+                idempotency_key=key,
+                reason="msgid_scope_pending_blocks_duplicate",
+                duplicate_of=str(pending.get("outbox_id") or ""),
+                attempt=_coerce_attempt(pending.get("attempt")),
+                metadata={
+                    "blocking_status": "pending_outbox",
+                    "scope_guard": "msgid_scope",
+                },
+            )
+        return None
 
     def record_receipt(
         self,
@@ -185,6 +234,7 @@ class LocalKfOutboxLedger:
         self._cache_offset = 0
         self._cache_line_number = 0
         self._cache_key_records = {}
+        self._cache_scope_records = {}
         self._cache_record_count = 0
         self._cache_corrupted_line_numbers = []
 
@@ -250,7 +300,11 @@ class LocalKfOutboxLedger:
                 continue
             self._cache_record_count += 1
             key = str(safe_record.get("idempotency_key") or "")
-            self._cache_key_records.setdefault(key, []).append(_trimmed_record(safe_record))
+            trimmed = _trimmed_record(safe_record)
+            self._cache_key_records.setdefault(key, []).append(trimmed)
+            scope_key = _record_msgid_scope_key(safe_record)
+            if scope_key:
+                self._cache_scope_records.setdefault(scope_key, []).append(trimmed)
 
     def _read_records_unlocked(self) -> list[dict[str, Any]]:
         if not self.path.exists():
@@ -304,6 +358,7 @@ def _reserved_record(action: SendAction, key: str, outbox_id: str, attempt: int)
         "record_type": OUTBOX_RECORD_RESERVED,
         "outbox_id": outbox_id,
         "idempotency_key": key,
+        "msgid_scope_key": kf_send_receipts.msgid_scope_guard_key(action),
         "attempt": attempt,
         "status": "pending",
         "created_at": _utc_now(),
@@ -325,6 +380,7 @@ def _receipt_record(
         "record_type": OUTBOX_RECORD_RECEIPT,
         "outbox_id": outbox_id,
         "idempotency_key": key or receipt.idempotency_key,
+        "msgid_scope_key": kf_send_receipts.msgid_scope_guard_key(action) if action else "",
         "receipt_id": receipt.receipt_id,
         "status": receipt.status,
         "created_at": _utc_now(),
@@ -387,6 +443,43 @@ def _summarize_key(records: list[dict[str, Any]], key: str) -> dict[str, Any]:
         "blocking_receipt": blocking_receipt,
         "pending_record": pending_record,
     }
+
+
+def _summarize_scope_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    # 与 _summarize_key 同构,但按 msgid 域聚合(跨幂等键):终态回执按
+    # outbox_id 对账清掉对应 pending;SENT/UNCERTAIN 回执与在途 pending
+    # 都构成阻断候选,是否真正阻断由调用方按幂等键归属判定。
+    terminal_by_outbox: dict[str, str] = {}
+    blocking_record: dict[str, Any] | None = None
+    for record in records:
+        if str(record.get("record_type") or "") != OUTBOX_RECORD_RECEIPT:
+            continue
+        status = str(record.get("status") or "").strip()
+        outbox_id = str(record.get("outbox_id") or "").strip()
+        if outbox_id and status in _TERMINAL_RECEIPT_STATUSES:
+            terminal_by_outbox[outbox_id] = status
+        if status in _BLOCKING_RECEIPT_STATUSES:
+            blocking_record = record
+
+    pending_record: dict[str, Any] | None = None
+    for record in records:
+        if str(record.get("record_type") or "") != OUTBOX_RECORD_RESERVED:
+            continue
+        outbox_id = str(record.get("outbox_id") or "").strip()
+        if outbox_id and outbox_id in terminal_by_outbox:
+            continue
+        pending_record = record
+
+    return {
+        "blocking_record": blocking_record,
+        "pending_record": pending_record,
+    }
+
+
+def _record_msgid_scope_key(record: dict[str, Any]) -> str:
+    # 域键在写入时由未脱敏的 action 顶层字段算好后随记录落盘(白名单
+    # 内部键);落盘的 action binding 已脱敏,不能用来重建域键。
+    return str(record.get("msgid_scope_key") or "")
 
 
 def _outbox_id(idempotency_key: str, action_id: str, attempt: int) -> str:

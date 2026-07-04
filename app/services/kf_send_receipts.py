@@ -116,6 +116,54 @@ def current_turn_scope(context: dict[str, Any] | None, *, msgids: list[str] | No
     return {"source": "unspecified", "scope_id": "unspecified", "turn_id": "unspecified"}
 
 
+_MSGID_TURN_SCOPE_PREFIX = "msgids:"
+
+
+def msgid_scope_guard_key(action: SendAction, *, channel: str = "wecom_kf") -> str:
+    # msgid 域外发防重键:幂等键含轮次域成分(turn 上下文/payload 哈希),
+    # 重复回调触发新轮次后键值全变,台账按键去重拦不住跨轮重放;本键只由
+    # "客户消息集合摘要 + 动作身份"构成,同一批 msgid 的同一逻辑外发跨
+    # 轮次稳定,新的客户消息(新 msgid 集合)自然产生新键,不会误拦合法
+    # 重复请求。注意:metadata 在合同层已脱敏(turn_scope_id 会变成占位
+    # 符),必须从未脱敏的顶层 turn_id(msgids: 前缀)取域摘要。
+    turn_id = str(action.turn_id or "").strip()
+    if not turn_id.startswith(_MSGID_TURN_SCOPE_PREFIX):
+        return ""
+    return build_msgid_scope_guard_key(
+        turn_scope_source="msgids",
+        turn_scope_id=turn_id[len(_MSGID_TURN_SCOPE_PREFIX) :],
+        conversation_id=action.conversation_id,
+        action_type=action.action_type,
+        action_id=action.action_id,
+        channel=channel,
+    )
+
+
+def build_msgid_scope_guard_key(
+    *,
+    turn_scope_source: str,
+    turn_scope_id: str,
+    conversation_id: str,
+    action_type: str,
+    action_id: str,
+    channel: str = "wecom_kf",
+) -> str:
+    if str(turn_scope_source or "").strip() != "msgids":
+        return ""
+    scope_id = str(turn_scope_id or "").strip()
+    if not scope_id or not str(conversation_id or "").strip() or not str(action_id or "").strip():
+        return ""
+    payload = {
+        "guard": "msgid_scope_outbound",
+        "channel": channel,
+        "conversation_id": str(conversation_id),
+        "turn_scope_id": scope_id,
+        "action_type": str(action_type or ""),
+        "action_id": str(action_id),
+    }
+    return f"scope:{_stable_digest(payload)}"
+
+
 def build_idempotency_key(action: SendAction, *, channel: str = "wecom_kf") -> str:
     safe_payload_hash = payload_hash(action)
     payload = {
