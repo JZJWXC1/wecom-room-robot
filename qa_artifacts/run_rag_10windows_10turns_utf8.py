@@ -1194,6 +1194,141 @@ def build_completion_status(
     }
 
 
+FIXTURE_INVENTORY_RELATIVE = Path("tests/fixtures/qa/test_inventory_cache.csv")
+FIXTURE_PROVENANCE_RELATIVE = Path("tests/fixtures/qa/test_inventory_cache_provenance.json")
+
+
+def _canonical_inventory_sha256(path: Path) -> str:
+    # 口径与 fixture 溯源 meta 一致:UTF-8(去 BOM)+LF 规范化文本,对 git autocrlf 免疫。
+    canonical_text = path.read_bytes().decode("utf-8-sig").replace("\r\n", "\n")
+    return hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
+
+
+def _canonical_inventory_row_count(path: Path) -> int:
+    canonical_text = path.read_bytes().decode("utf-8-sig").replace("\r\n", "\n")
+    lines = [line for line in canonical_text.split("\n") if line.strip()]
+    return max(len(lines) - 1, 0)
+
+
+def build_data_provenance(
+    *,
+    cache_path_text: str | None = None,
+    fixture_csv: Path | None = None,
+    provenance_file: Path | None = None,
+    cache_meta_path_text: str | None = None,
+) -> dict[str, Any]:
+    # 声明本轮 QA 实际消费的房源数据出处(P0-1 要求②):
+    # fixture 模式给出 fixture 版本与快照时间并现场核验哈希,服务器缓存模式给出缓存同步时间。
+    root = repo_root()
+    if cache_path_text is None:
+        cache_path_text = os.environ.get("INVENTORY_CACHE_PATH", "")
+    result: dict[str, Any] = {
+        "schema": "qa_data_provenance.v1",
+        "mode": "unknown",
+        "ok": False,
+        "inventory_cache_path": cache_path_text,
+        "error": "",
+    }
+    if not cache_path_text:
+        result["error"] = "INVENTORY_CACHE_PATH 未设置,无法声明数据出处"
+        return result
+    cache_path = Path(cache_path_text)
+    if not cache_path.is_absolute():
+        cache_path = root / cache_path
+    if not cache_path.is_file():
+        result["error"] = f"库存缓存文件不存在: {cache_path_text}"
+        return result
+    result["inventory_sha256"] = _canonical_inventory_sha256(cache_path)
+    result["inventory_row_count"] = _canonical_inventory_row_count(cache_path)
+
+    fixture_path = fixture_csv if fixture_csv is not None else root / FIXTURE_INVENTORY_RELATIVE
+    provenance_path = (
+        provenance_file if provenance_file is not None else root / FIXTURE_PROVENANCE_RELATIVE
+    )
+    if fixture_path.is_file() and cache_path.resolve() == fixture_path.resolve():
+        result["mode"] = "qa_fixture"
+        if not provenance_path.is_file():
+            result["error"] = f"fixture 溯源 meta 缺失: {provenance_path}"
+            return result
+        try:
+            meta = json.loads(provenance_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            result["error"] = f"fixture 溯源 meta 不可读: {type(error).__name__}"
+            return result
+        result.update(
+            {
+                "fixture_version": str(meta.get("fixture_version") or ""),
+                "declared_fixture_sha256": str(meta.get("fixture_sha256") or ""),
+                "declared_fixture_row_count": int(meta.get("fixture_row_count") or 0),
+                "source_snapshot_time": str(meta.get("source_snapshot_time") or ""),
+                "generated_at": str(meta.get("generated_at") or ""),
+                "generator": str(meta.get("generator") or ""),
+            }
+        )
+        hash_verified = (
+            bool(result["declared_fixture_sha256"])
+            and result["declared_fixture_sha256"] == result["inventory_sha256"]
+        )
+        result["hash_verified"] = hash_verified
+        if not hash_verified:
+            result["error"] = "fixture 内容与溯源 meta 声明的 sha256 不一致"
+            return result
+        if result["declared_fixture_row_count"] != result["inventory_row_count"]:
+            result["error"] = "fixture 行数与溯源 meta 声明不一致"
+            return result
+        if not result["source_snapshot_time"]:
+            result["error"] = "fixture 溯源 meta 缺少 source_snapshot_time"
+            return result
+        result["ok"] = True
+        return result
+
+    result["mode"] = "server_cache"
+    if cache_meta_path_text is None:
+        cache_meta_path_text = os.environ.get(
+            "INVENTORY_CACHE_META_PATH", "data/inventory_cache_meta.json"
+        )
+    meta_path = Path(cache_meta_path_text)
+    if not meta_path.is_absolute():
+        meta_path = root / meta_path
+    result["cache_meta_path"] = cache_meta_path_text
+    if not meta_path.is_file():
+        result["error"] = f"缓存 meta 缺失,无法声明服务器缓存时间: {cache_meta_path_text}"
+        return result
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        result["error"] = f"缓存 meta 不可读: {type(error).__name__}"
+        return result
+    result.update(
+        {
+            "cache_source": str(meta.get("source") or ""),
+            "cache_status": str(meta.get("status") or ""),
+            "cache_synced_at": str(meta.get("synced_at_iso") or ""),
+            "cache_mtime": str(meta.get("cache_mtime_iso") or ""),
+            "cache_row_count": int(meta.get("row_count") or 0),
+        }
+    )
+    if not (result["cache_synced_at"] or result["cache_mtime"]):
+        result["error"] = "缓存 meta 缺少同步时间字段(synced_at_iso/cache_mtime_iso)"
+        return result
+    result["ok"] = True
+    return result
+
+
+def _summary_data_provenance(payload: dict[str, Any]) -> dict[str, Any]:
+    provenance = payload.get("data_provenance") or {}
+    return {
+        "declared": bool(provenance),
+        "ok": bool(provenance.get("ok")),
+        "mode": str(provenance.get("mode") or ""),
+        "fixture_version": str(provenance.get("fixture_version") or ""),
+        "source_snapshot_time": str(provenance.get("source_snapshot_time") or ""),
+        "cache_synced_at": str(provenance.get("cache_synced_at") or ""),
+        "inventory_sha256": str(provenance.get("inventory_sha256") or ""),
+        "error": str(provenance.get("error") or ""),
+    }
+
+
 def build_machine_summary(payload: dict[str, Any]) -> dict[str, Any]:
     quality = payload.get("quality_status") or {}
     passed = bool(quality.get("passed"))
@@ -1201,11 +1336,13 @@ def build_machine_summary(payload: dict[str, Any]) -> dict[str, Any]:
     actual_case_count = int(payload.get("actual_case_count") or payload.get("actual_turn_count") or 0)
     expected_case_count = int(payload.get("expected_case_count") or payload.get("expected_selected_turn_count") or 0)
     full_suite_completed = bool(payload.get("full_suite_completed"))
+    data_provenance = _summary_data_provenance(payload)
     usable_for_release = (
         passed
         and full_suite_completed
         and expected_case_count > 0
         and actual_case_count == expected_case_count
+        and data_provenance["ok"]
     )
     return {
         "schema": "rag_qa_artifact_summary.v1",
@@ -1222,6 +1359,7 @@ def build_machine_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "full_suite_completed": full_suite_completed,
         "business_failure": bool(quality.get("business_failure")),
         "infrastructure_error": bool(quality.get("infrastructure_error")),
+        "data_provenance": data_provenance,
     }
 
 
@@ -1529,6 +1667,8 @@ async def run_all(
     )
     if not integrity["passed"]:
         raise RuntimeError("10窗口QA输入编码或覆盖异常：" + json.dumps(integrity, ensure_ascii=False))
+    # 数据出处整轮只解析一次:同一轮 QA 消费的是同一份库存数据,逐次写盘不得漂移。
+    data_provenance = build_data_provenance()
     ARTIFACT_DIR.mkdir(exist_ok=True)
     artifact = artifact_path_for(artifact_prefix)
     if window_id:
@@ -1564,6 +1704,7 @@ async def run_all(
             "created_at": datetime.now().isoformat(),
             "script_path": _display_path(SCRIPT_PATH),
             "input_integrity": integrity,
+            "data_provenance": data_provenance,
             **completion,
             "window_count": len(selected_windows),
             "turn_timeout": turn_timeout,

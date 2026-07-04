@@ -49,7 +49,14 @@
   免押 gate（`expected_deposit_fee_rate_tiers`/`expected_deposit_selfcheck_path`）与
   重复外发动作检测——需重新实现+测试，严禁 apply 孤儿 patch。
 
-## 待办登记（批5）
+## P0-1 批5 口径变更（验收摘要声明数据出处）
 
-- 验收摘要/manifest 引用 `test_inventory_cache_provenance.json` 的
-  `source_snapshot_time` 与 `fixture_version`（裁决 ②a 的摘要侧落地）。
+落地上一节待办（裁决 ②a 的摘要侧）：验收摘要与 gate 汇总必须声明本轮 QA 实际消费的房源数据出处，无出处或出处失配一律不得放行。
+
+| 测试/口径 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `run_rag_10windows_10turns_utf8` machine summary `usable_for_release` | passed + full_suite_completed + 计数吻合即可放行，摘要不含数据出处 | 新增第 5 条件 `data_provenance.ok`；payload 与 machine summary 均带 `data_provenance`（schema=`qa_data_provenance.v1`），整轮只解析一次防逐次写盘漂移 | 裁决 ②a：验收摘要必须引用快照时间；无出处的验收产物不可用于放行 |
+| 数据出处声明口径（新增约定） | 无 | `qa_fixture` 模式：现场重算 fixture sha256（LF 规范文本口径，与批3 一致）与行数，和溯源 meta 交叉核验，声明 `fixture_version` + `source_snapshot_time`，哈希/行数失配或缺 `source_snapshot_time` 即 ok=false；`server_cache` 模式：必须有缓存 meta 且带同步时间（`synced_at_iso`/`cache_mtime_iso`），声明 `cache_synced_at` | 出处不是自报字段而是现场核验结论——fixture 被篡改或 meta 过期时摘要必须自动失效 |
+| `run_kf_qa_gate_graph_utf8` gate release summary | `usable_for_release` = full_suite_completed + 计数吻合 | 新增 `data_provenance_ok`（两个必跑阶段各自 summary.data_provenance.ok 的合取）并入 `usable_for_release`；透出 `fixed_data_provenance`/`random_data_provenance`；跳过的阶段豁免（由 full_suite_completed 拦截，不重复扣分） | 裁决 ②a 在 gate 聚合层的同口径强制：任一必跑阶段缺出处，整卷不可放行 |
+| `tests/test_qa_fixture_guards.py` 新增 4 项 | 无 | 已提交 fixture 出处声明成立（`declares_committed_fixture`）；哈希失配拒绝（`rejects_fixture_hash_mismatch`）；server_cache 声明同步时间（`server_cache_declares_sync_time`）；缓存 meta 缺失不放行（`server_cache_missing_meta_is_not_ok`） | 出处核验逻辑的四态守卫，干净检出可跑 |
+| `tests/test_qa_utf8_inputs.py` / `tests/test_kf_qa_gate_graph.py` | 三态单测与 gate helper 不感知出处 | 三态单测补出处字段；新增"无出处不得放行"（`machine_summary_requires_data_provenance_for_release`）与"阶段出处失配整卷不放行"（`qa_gate_cli_artifact_not_release_usable_without_stage_data_provenance`） | 摘要层与 gate 层的负向用例，防止条件被静默移除 |

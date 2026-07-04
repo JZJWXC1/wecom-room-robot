@@ -76,6 +76,17 @@ def _optional_stage_accepted(result: dict[str, Any]) -> bool:
     return bool(result.get("skipped")) or _stage_passed(result)
 
 
+def _stage_data_provenance(result: dict[str, Any]) -> dict[str, Any]:
+    return dict((result.get("summary") or {}).get("data_provenance") or {})
+
+
+def _stage_data_provenance_ok(result: dict[str, Any]) -> bool:
+    # 跳过的阶段没有数据出处可声明,交由 full_suite_completed 拦截,不在这里重复扣分。
+    if result.get("skipped"):
+        return True
+    return bool(_stage_data_provenance(result).get("ok"))
+
+
 def _int_value(value: Any) -> int:
     try:
         return int(value or 0)
@@ -96,10 +107,16 @@ def _qa_gate_release_summary(payload: dict[str, Any]) -> dict[str, Any]:
     actual_case_count = sum(_int_value(result.get("actual_case_count")) for result in required_results)
     expected_case_count = sum(_int_value(result.get("expected_case_count")) for result in required_results)
     actual_window_count = sum(_int_value(result.get("actual_window_count")) for result in required_results)
+    data_provenance_ok = all(_stage_data_provenance_ok(result) for result in required_results)
     return {
         "schema": "kf_qa_gate_graph_summary.v1",
         "artifact_role": "pass_transcript" if payload.get("status") == "passed" else "failure_log",
-        "usable_for_release": bool(full_suite_completed and expected_case_count > 0 and actual_case_count == expected_case_count),
+        "usable_for_release": bool(
+            full_suite_completed
+            and expected_case_count > 0
+            and actual_case_count == expected_case_count
+            and data_provenance_ok
+        ),
         "passed": payload.get("status") == "passed",
         "actual_case_count": actual_case_count,
         "expected_case_count": expected_case_count,
@@ -108,6 +125,9 @@ def _qa_gate_release_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "fixed_full_suite_completed": _required_stage_full_suite_completed(fixed),
         "random_full_suite_completed": _required_stage_full_suite_completed(random),
         "historical_accepted": _optional_stage_accepted(historical),
+        "data_provenance_ok": data_provenance_ok,
+        "fixed_data_provenance": _stage_data_provenance(fixed),
+        "random_data_provenance": _stage_data_provenance(random),
     }
 
 

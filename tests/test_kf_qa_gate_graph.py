@@ -26,7 +26,21 @@ def passing_result() -> dict[str, Any]:
     }
 
 
-def complete_artifact_result(stage: str, *, windows: int, cases: int) -> dict[str, Any]:
+def complete_artifact_result(
+    stage: str,
+    *,
+    windows: int,
+    cases: int,
+    data_provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if data_provenance is None:
+        data_provenance = {
+            "declared": True,
+            "ok": True,
+            "mode": "qa_fixture",
+            "fixture_version": "da9cf10fc9f74a5d",
+            "source_snapshot_time": "2026-07-02 15:12:23",
+        }
     return {
         "stage": stage,
         "quality_status": {
@@ -40,6 +54,7 @@ def complete_artifact_result(stage: str, *, windows: int, cases: int) -> dict[st
         "actual_window_count": windows,
         "actual_case_count": cases,
         "expected_case_count": cases,
+        "summary": {"data_provenance": data_provenance},
     }
 
 
@@ -113,6 +128,45 @@ def test_qa_gate_cli_artifact_is_release_usable_when_required_windows_complete()
         assert payload["summary"]["usable_for_release"] is True
         assert payload["summary"]["fixed_full_suite_completed"] is True
         assert payload["summary"]["random_full_suite_completed"] is True
+        assert payload["summary"]["data_provenance_ok"] is True
+        assert payload["summary"]["fixed_data_provenance"]["fixture_version"] == "da9cf10fc9f74a5d"
+        assert payload["summary"]["random_data_provenance"]["source_snapshot_time"] == "2026-07-02 15:12:23"
+    finally:
+        artifact_path.unlink(missing_ok=True)
+
+
+def test_qa_gate_cli_artifact_not_release_usable_without_stage_data_provenance() -> None:
+    artifact_path = Path(
+        qa_gate_cli._write_gate_artifact(
+            seed=7,
+            status="passed",
+            blocked_stage="",
+            failures=[],
+            trace=["qa_gate:fixed_windows", "qa_gate:random_windows", "qa_gate:historical_failures"],
+            fixed_result=complete_artifact_result(
+                "fixed_windows",
+                windows=10,
+                cases=100,
+                data_provenance={"declared": True, "ok": False, "error": "fixture 哈希失配"},
+            ),
+            random_result=complete_artifact_result("random_windows", windows=20, cases=200),
+            historical_result={
+                "stage": "historical_failures",
+                "skipped": True,
+                "quality_status": {
+                    "passed": True,
+                    "high_count": 0,
+                    "medium_count": 0,
+                    "infrastructure_error": False,
+                },
+            },
+        )["path"]
+    )
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        assert payload["full_suite_completed"] is True
+        assert payload["summary"]["data_provenance_ok"] is False
+        assert payload["summary"]["usable_for_release"] is False
     finally:
         artifact_path.unlink(missing_ok=True)
 

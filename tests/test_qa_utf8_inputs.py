@@ -332,6 +332,16 @@ def test_qa_artifact_failure_payload_is_infrastructure_error_not_completed() -> 
     assert failure["summary"]["contains_pass_transcript"] is False
 
 
+_HEALTHY_DATA_PROVENANCE = {
+    "schema": "qa_data_provenance.v1",
+    "mode": "qa_fixture",
+    "ok": True,
+    "fixture_version": "da9cf10fc9f74a5d",
+    "source_snapshot_time": "2026-07-02 15:12:23",
+    "inventory_sha256": "da9cf10fc9f74a5de8e31b01f3ec5e6c952c519c01e04389e19bc90697c2e38e",
+}
+
+
 def test_qa_artifact_machine_summary_separates_pass_transcript_from_failure_log() -> None:
     passed = run_rag_10windows_10turns_utf8.build_machine_summary(
         {
@@ -341,6 +351,7 @@ def test_qa_artifact_machine_summary_separates_pass_transcript_from_failure_log(
             "selected_window_count": 10,
             "full_suite_completed": True,
             "quality_status": {"passed": True, "exit_code": 0},
+            "data_provenance": dict(_HEALTHY_DATA_PROVENANCE),
         }
     )
     failed = run_rag_10windows_10turns_utf8.build_machine_summary(
@@ -351,6 +362,7 @@ def test_qa_artifact_machine_summary_separates_pass_transcript_from_failure_log(
             "selected_window_count": 10,
             "full_suite_completed": False,
             "quality_status": {"passed": False, "exit_code": 3, "business_failure": True},
+            "data_provenance": dict(_HEALTHY_DATA_PROVENANCE),
         }
     )
     partial = run_rag_10windows_10turns_utf8.build_machine_summary(
@@ -361,6 +373,7 @@ def test_qa_artifact_machine_summary_separates_pass_transcript_from_failure_log(
             "selected_window_count": 1,
             "full_suite_completed": False,
             "quality_status": {"passed": True, "exit_code": 0},
+            "data_provenance": dict(_HEALTHY_DATA_PROVENANCE),
         }
     )
 
@@ -369,6 +382,10 @@ def test_qa_artifact_machine_summary_separates_pass_transcript_from_failure_log(
     assert passed["contains_failure_log"] is False
     assert passed["usable_for_release"] is True
     assert passed["actual_case_count"] == 100
+    assert passed["data_provenance"]["ok"] is True
+    assert passed["data_provenance"]["mode"] == "qa_fixture"
+    assert passed["data_provenance"]["fixture_version"] == "da9cf10fc9f74a5d"
+    assert passed["data_provenance"]["source_snapshot_time"] == "2026-07-02 15:12:23"
     assert failed["artifact_role"] == "failure_log"
     assert failed["contains_pass_transcript"] is False
     assert failed["contains_failure_log"] is True
@@ -378,6 +395,40 @@ def test_qa_artifact_machine_summary_separates_pass_transcript_from_failure_log(
     assert partial["passed"] is True
     assert partial["usable_for_release"] is False
     assert partial["full_suite_completed"] is False
+
+
+def test_qa_artifact_machine_summary_requires_data_provenance_for_release() -> None:
+    base_payload = {
+        "actual_case_count": 100,
+        "expected_case_count": 100,
+        "actual_window_count": 10,
+        "selected_window_count": 10,
+        "full_suite_completed": True,
+        "quality_status": {"passed": True, "exit_code": 0},
+    }
+
+    missing = run_rag_10windows_10turns_utf8.build_machine_summary(dict(base_payload))
+    assert missing["passed"] is True
+    assert missing["usable_for_release"] is False
+    assert missing["data_provenance"]["declared"] is False
+    assert missing["data_provenance"]["ok"] is False
+
+    broken = run_rag_10windows_10turns_utf8.build_machine_summary(
+        {
+            **base_payload,
+            "data_provenance": {
+                "schema": "qa_data_provenance.v1",
+                "mode": "qa_fixture",
+                "ok": False,
+                "error": "fixture 内容与溯源 meta 声明的 sha256 不一致",
+            },
+        }
+    )
+    assert broken["passed"] is True
+    assert broken["usable_for_release"] is False
+    assert broken["data_provenance"]["declared"] is True
+    assert broken["data_provenance"]["ok"] is False
+    assert "sha256" in broken["data_provenance"]["error"]
 
 
 def test_qa_canonical_hash_ignores_dynamic_fields_but_keeps_result_content() -> None:

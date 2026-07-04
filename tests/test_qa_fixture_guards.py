@@ -339,3 +339,105 @@ def test_existence_probe_problem_accepts_correction_reply() -> None:
     )
     # 非探针轮不触发
     assert runner._existence_probe_problem("新天地4000左右两室有吗？", [], "有的，发你两套。") == ""
+
+
+# ---- 数据出处声明守卫(P0-1 要求②:验收摘要必须声明数据出处) ----
+
+
+def test_data_provenance_declares_committed_fixture() -> None:
+    from qa_artifacts import run_rag_10windows_10turns_utf8 as runner
+
+    provenance_meta = json.loads(
+        (FIXTURES_DIR / "test_inventory_cache_provenance.json").read_text(encoding="utf-8")
+    )
+    declaration = runner.build_data_provenance(
+        cache_path_text="tests/fixtures/qa/test_inventory_cache.csv"
+    )
+
+    assert declaration["mode"] == "qa_fixture"
+    assert declaration["ok"] is True
+    assert declaration["hash_verified"] is True
+    assert declaration["fixture_version"] == provenance_meta["fixture_version"]
+    assert declaration["source_snapshot_time"] == provenance_meta["source_snapshot_time"]
+    assert declaration["inventory_sha256"] == provenance_meta["fixture_sha256"]
+    assert declaration["inventory_row_count"] == provenance_meta["fixture_row_count"]
+    assert declaration["error"] == ""
+
+
+def test_data_provenance_rejects_fixture_hash_mismatch(tmp_path: Path) -> None:
+    from qa_artifacts import run_rag_10windows_10turns_utf8 as runner
+
+    fixture_csv = tmp_path / "fixture.csv"
+    fixture_csv.write_text("区域,小区,房号\n拱墅,棠润府,15-2-801B\n", encoding="utf-8", newline="")
+    provenance_file = tmp_path / "provenance.json"
+    provenance_file.write_text(
+        json.dumps(
+            {
+                "fixture_version": "deadbeefdeadbeef",
+                "fixture_sha256": "0" * 64,
+                "fixture_row_count": 1,
+                "source_snapshot_time": "2026-07-02 15:12:23",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    declaration = runner.build_data_provenance(
+        cache_path_text=str(fixture_csv),
+        fixture_csv=fixture_csv,
+        provenance_file=provenance_file,
+    )
+
+    assert declaration["mode"] == "qa_fixture"
+    assert declaration["ok"] is False
+    assert declaration["hash_verified"] is False
+    assert "sha256" in declaration["error"]
+
+
+def test_data_provenance_server_cache_declares_sync_time(tmp_path: Path) -> None:
+    from qa_artifacts import run_rag_10windows_10turns_utf8 as runner
+
+    cache_csv = tmp_path / "inventory_cache.csv"
+    cache_csv.write_text("区域,小区,房号\n拱墅,棠润府,15-2-801B\n", encoding="utf-8", newline="")
+    meta_file = tmp_path / "inventory_cache_meta.json"
+    meta_file.write_text(
+        json.dumps(
+            {
+                "source": "feishu_bitable",
+                "status": "success",
+                "synced_at_iso": "2026-07-04 09:00:00",
+                "cache_mtime_iso": "2026-07-04 08:59:58",
+                "row_count": 1,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    declaration = runner.build_data_provenance(
+        cache_path_text=str(cache_csv),
+        cache_meta_path_text=str(meta_file),
+    )
+
+    assert declaration["mode"] == "server_cache"
+    assert declaration["ok"] is True
+    assert declaration["cache_synced_at"] == "2026-07-04 09:00:00"
+    assert declaration["cache_source"] == "feishu_bitable"
+    assert declaration["error"] == ""
+
+
+def test_data_provenance_server_cache_missing_meta_is_not_ok(tmp_path: Path) -> None:
+    from qa_artifacts import run_rag_10windows_10turns_utf8 as runner
+
+    cache_csv = tmp_path / "inventory_cache.csv"
+    cache_csv.write_text("区域,小区,房号\n拱墅,棠润府,15-2-801B\n", encoding="utf-8", newline="")
+
+    declaration = runner.build_data_provenance(
+        cache_path_text=str(cache_csv),
+        cache_meta_path_text=str(tmp_path / "missing_meta.json"),
+    )
+
+    assert declaration["mode"] == "server_cache"
+    assert declaration["ok"] is False
+    assert "缓存 meta 缺失" in declaration["error"]
