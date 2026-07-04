@@ -550,3 +550,100 @@ def test_plural_context_selection_with_only_confirmed_room_returns_selection_err
     assert result.target_rows == []
     assert result.selection_error["reason"] == "missing_current_candidate_set"
     assert result.selection_error["requested_indices"] == [1, 2]
+
+def test_out_of_range_index_with_single_pending_video_returns_selection_error() -> None:
+    # 回归(第二裁判 20260704 P1):pending 只有 1 条时,"第2套原视频"按条数比较
+    # (1>=1)会穿透覆盖检查并错绑唯一一条;必须按最大序号拦截(2>1)。
+    pending_row = {"listing_id": "lst-shiqiao-b", "小区": "石桥铭苑", "房号": "21-1201A"}
+
+    result = resolve_tool_targets(
+        actions=["search_inventory", "send_video", "generate_reply"],
+        content="第2套原视频发我",
+        understanding={
+            "intent": "media",
+            "constraint_proof": {
+                "selected_indices": [2],
+                "wants_video": True,
+                "wants_original_video": True,
+            },
+            "structured_task": {
+                "original_text": "第2套原视频发我",
+                "tool_requirements": {"needs_video": True},
+            },
+        },
+        context={},
+        inventory_rows=[],
+        pending_video={"labels": ["石桥铭苑21-1201A"], "requested_count": 2},
+        pending_video_rows=[pending_row],
+        target_limit=5,
+    )
+
+    assert result.target_rows == []
+    assert result.selection_error["reason"] == "missing_current_candidate_set"
+    assert result.selection_error["requested_indices"] == [2]
+    assert result.candidate_binding["status"] == "error"
+
+
+def test_out_of_range_index_plain_video_with_single_pending_reports_error() -> None:
+    # 回归(第二裁判 20260704 P1 第二半):"第2套视频"(非原视频)同状态下
+    # 此前既无目标也无 selection_error(静默漏报),必须显式报错反问。
+    pending_row = {"listing_id": "lst-shiqiao-b", "小区": "石桥铭苑", "房号": "21-1201A"}
+
+    result = resolve_tool_targets(
+        actions=["search_inventory", "send_video", "generate_reply"],
+        content="第2套视频发我",
+        understanding={
+            "intent": "media",
+            "constraint_proof": {"selected_indices": [2], "wants_video": True},
+            "structured_task": {
+                "original_text": "第2套视频发我",
+                "tool_requirements": {"needs_video": True},
+            },
+        },
+        context={},
+        inventory_rows=[],
+        pending_video={"labels": ["石桥铭苑21-1201A"], "requested_count": 2},
+        pending_video_rows=[pending_row],
+        target_limit=5,
+    )
+
+    assert result.target_rows == []
+    assert result.selection_error["reason"] == "missing_current_candidate_set"
+    assert result.selection_error["requested_indices"] == [2]
+
+
+def test_full_coverage_indices_with_matching_pending_rows_still_bind() -> None:
+    # 正向保护:序号[1,2]配 2 条待发视频记录(原视频跟进),最大序号未越界,
+    # 仍应绑定全部待发行(合法续发场景不受越界拦截影响)。
+    pending_rows = [
+        {"listing_id": "lst-shiqiao-a", "小区": "石桥铭苑", "房号": "6-1102"},
+        {"listing_id": "lst-shiqiao-b", "小区": "石桥铭苑", "房号": "21-1201A"},
+    ]
+
+    result = resolve_tool_targets(
+        actions=["search_inventory", "send_video", "generate_reply"],
+        content="1和2的原视频发我",
+        understanding={
+            "intent": "media",
+            "context_reference": True,
+            "constraint_proof": {
+                "selected_indices": [1, 2],
+                "wants_video": True,
+                "wants_original_video": True,
+            },
+            "structured_task": {
+                "original_text": "1和2的原视频发我",
+                "tool_requirements": {"needs_video": True},
+            },
+        },
+        context={},
+        inventory_rows=[],
+        pending_video={"labels": ["石桥铭苑6-1102", "石桥铭苑21-1201A"], "requested_count": 2},
+        pending_video_rows=pending_rows,
+        target_limit=5,
+    )
+
+    assert [row["房号"] for row in result.target_rows] == ["6-1102", "21-1201A"]
+    assert result.selection_error == {}
+    assert result.candidate_binding["status"] == "bound"
+    assert result.candidate_binding["source"] == "pending_video_labels"

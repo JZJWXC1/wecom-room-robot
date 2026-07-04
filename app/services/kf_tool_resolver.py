@@ -560,15 +560,16 @@ def _pending_rows_cover_selection(
     selected_indices: list[int] | None,
     pending_rows: list[dict[str, Any]] | None,
 ) -> bool:
-    # 待发素材行只有在数量足以覆盖显式序号选择时,才允许充当选择上下文:
-    # 复数序号(如[1,2])不可能由单条待发记录正确满足,半桶水绑定即幻觉绑定。
+    # 待发素材行只有在覆盖显式序号选择的最大序号时,才允许充当选择上下文:
+    # 复数序号(如[1,2])不可能由单条待发记录正确满足;越界序号(如[2]配1条)
+    # 按条数比较会穿透并错绑唯一一条,必须按最大序号拦截(半桶水绑定即幻觉绑定)。
     rows = [row for row in pending_rows or [] if isinstance(row, dict)]
     if not rows:
         return False
     positive = _positive_selected_indices(selected_indices)
     if not positive:
         return True
-    return len(rows) >= len(positive)
+    return max(positive) <= len(rows)
 
 
 def _pending_video_covers_selection(
@@ -585,7 +586,7 @@ def _pending_video_covers_selection(
     positive = _positive_selected_indices(selected_indices)
     if not positive:
         return True
-    return len(labels) >= len(positive)
+    return max(positive) <= len(labels)
 
 
 def _selection_indices_from_text(text: str, *, limit: int = DEFAULT_TARGET_LIMIT) -> list[int]:

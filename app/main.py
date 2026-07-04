@@ -12267,6 +12267,12 @@ def _video_error_allows_transcode_retry(error: Exception) -> bool:
         "file size exceeded",
         "media size exceeded",
         "video size exceeded",
+        # 企业微信临时素材上传超限的实际返回是 errcode 40011 + "invalid video size"
+        # (2026-07-04 生产实测),此前列表只收录了"video size exceeded"等变体,
+        # 漏配导致转码重试不触发、视频静默丢失只剩话术。
+        "invalid video size",
+        "invalid media size",
+        "40011",
         "exceeds file size",
         "exceeds media size",
         "oversize",

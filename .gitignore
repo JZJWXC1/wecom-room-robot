@@ -32,3 +32,7 @@ tmp/
 *.jpg
 *.jpeg
 *.webp
+
+# 第二裁判取证隔离包:含 117 个 viewing_secrets.json 等敏感取证材料,
+# 严禁入库(误 git add -A 即敏感资料事故);复核完成后按台账流程处置。
+qa_artifacts/archive_codex_worktree_20260704/

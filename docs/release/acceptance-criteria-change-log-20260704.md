@@ -83,3 +83,13 @@
 棠润府15-2-801B/皋塘运都16-1-2206 labels）与存在性探针（9-402B 全局不存在、高塘运都/
 华丰欣苑14-2-901 缺席）全部存活，无断言需要更新；守卫+锚点 83 passed，全量 1292 passed。
 无口径变更。
+## P0-2 部署后热修批（批8）：pending 越界拦截 + 视频转码标记补配
+
+背景：第二裁判部署后复审抓到 P1（pending 覆盖检查按条数比较，"第2套原视频"配 1 条待发记录时 1>=1 穿透并错绑唯一一条；"第2套视频"同状态静默漏报）；用户真实对话实测暴露视频发送 40011 后转码重试未触发（话术已发、视频丢失）。
+
+| 测试/口径 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| resolver pending 覆盖口径 | `len(pending) >= len(indices)`（条数比较） | `max(indices) <= len(pending)`（最大序号拦截） | 裁判 P1 实证：越界序号按条数比较会穿透；最大序号口径同时覆盖复数不足与单序号越界两类 |
+| `_video_error_allows_transcode_retry` 标记 | 无 "invalid video size"/"invalid media size"/"40011" | 补配三个标记 | 2026-07-04 生产实测：企业微信临时素材超限实际返回 errcode 40011 + "invalid video size"，旧列表只有"video size exceeded"等变体，漏配导致转码链路（AGENTS.md 规定的 ffmpeg 压缩重试）从不触发 |
+| 新增回归 4 项 | 无 | 越界单 pending 错绑拦截（原视频/普通视频两态）+ 满覆盖序号仍可续发（正向）+ 40011 允许转码而鉴权/频控快败 | 裁判 P1 双注释与生产日志实证的固化 |
+| `.gitignore` | 取证包 `qa_artifacts/archive_codex_worktree_20260704/` 未隔离 | 显式忽略并注释敏感性（117 个 viewing_secrets.json） | 裁判提交卫生告警：防误 `git add -A` 泄密 |

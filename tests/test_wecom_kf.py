@@ -806,6 +806,26 @@ def test_vocabulary_backed_anchor_rejects_pseudo_terms_but_keeps_real_communitie
     assert main._has_vocabulary_backed_inventory_anchor("皋塘运都9-402B还在吗")
 
 
+def test_video_upload_size_error_allows_transcode_retry() -> None:
+    # 回归(2026-07-04 生产实测):企业微信临时素材超限实际返回 errcode 40011
+    # + "invalid video size",此前标记列表漏配导致转码重试不触发、视频静默丢失。
+    production_error = RuntimeError(
+        "企业微信临时素材上传失败：{'errcode': 40011, 'errmsg': 'invalid video size, "
+        "hint: [1783152382197392580434762], from ip: 114.55.168.97'}"
+    )
+    assert main._video_error_allows_transcode_retry(production_error)
+
+    # 快败类错误(鉴权/频控)不得触发转码重试。
+    auth_error = RuntimeError(
+        "企业微信临时素材上传失败：{'errcode': 40014, 'errmsg': 'invalid access_token'}"
+    )
+    assert not main._video_error_allows_transcode_retry(auth_error)
+    rate_error = RuntimeError(
+        "企业微信临时素材上传失败：{'errcode': 45009, 'errmsg': 'api freq out of limit, rate limit'}"
+    )
+    assert not main._video_error_allows_transcode_retry(rate_error)
+
+
 def test_note_followup_prefers_confirmed_room_over_candidate_set(tmp_path: Path) -> None:
     async def run_case() -> None:
         confirmed = {
