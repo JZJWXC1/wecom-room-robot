@@ -93,3 +93,31 @@
 | `_video_error_allows_transcode_retry` 标记 | 无 "invalid video size"/"invalid media size"/"40011" | 补配三个标记 | 2026-07-04 生产实测：企业微信临时素材超限实际返回 errcode 40011 + "invalid video size"，旧列表只有"video size exceeded"等变体，漏配导致转码链路（AGENTS.md 规定的 ffmpeg 压缩重试）从不触发 |
 | 新增回归 4 项 | 无 | 越界单 pending 错绑拦截（原视频/普通视频两态）+ 满覆盖序号仍可续发（正向）+ 40011 允许转码而鉴权/频控快败 | 裁判 P1 双注释与生产日志实证的固化 |
 | `.gitignore` | 取证包 `qa_artifacts/archive_codex_worktree_20260704/` 未隔离 | 显式忽略并注释敏感性（117 个 viewing_secrets.json） | 裁判提交卫生告警：防误 `git add -A` 泄密 |
+
+## 回调重复投递防线批（架构级修复移交会话）：msgid 幂等三层防线
+
+背景：生产实证 2026-07-04 16:01（release 150051，HEAD 7712db6d），企微回调重复投递把同一
+msgid 推成新轮次，同一条"房源表"请求被完整处理两次、房源表图片对客重复外发。根因审计、
+三层修复比选与 LLM 重试链延迟预算评估全文见
+`docs/audit/kf-callback-dedup-latency-budget-20260704.md`。本轮只新增判定约束，
+未修改任何既有测试断言。
+
+| 测试/口径 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `tests/test_kf_callback_dedup.py`（新增 8 项） | 无约束；并发回调可从旧游标重复拉到同一 msgid 并二次全链处理；`_restart_kf_turn` 把纯重复投递当客户追问整轮重放 | sync"读游标-拉取-存游标-认领"临界区必须串行（并发峰值断言=1）；msgid 认领窗口（默认 300s，`WECOM_KF_MSGID_CLAIM_TTL_SECONDS`）内重推与同批分页重叠一律丢弃；纯重复投递不得 bump generation/取消在跑轮次/重放，真实追问（新 msgid）合并重启语义不变；mark_processed 转正永久去重；轮次失败认领过期后放行补处理 | 平台回调是至少一次投递（平台约束，非业务可选项），重复投递不得二次触发 LLM 处理与外发 |
+| `tests/test_kf_outbox_msgid_scope_guard.py`（新增 7 项） | 台账仅按轮次域幂等键去重；重复回调开新轮后证据链 id 全变→键值全变，跨轮重放不拦（本次事故台账失守的直接原因） | 同一 msgid 域（客户消息集合摘要+动作身份，`msgid_scope_key` 随记录落盘）已有 SENT/UNCERTAIN 回执或他键在途 pending 时，新轮次 reserve 必须阻断（`msgid_scope_blocks_duplicate`/`msgid_scope_pending_blocks_duplicate`）；FAILED 放行补发；新客户消息（新 msgid 集合）放行；同键重试 attempt 递增语义不变；冷启动/跨实例决策一致 | 同一批客户消息的同一逻辑外发跨轮次只能物理发生一次，且不误拦客户后续的合法重复请求（幂等键剔除轮次域方案已比选否决，见审计文档） |
+
+关联行为变更（非测试口径，登记备查）：
+- 新配置 `WECOM_KF_MSGID_CLAIM_TTL_SECONDS`（默认 300 秒，覆盖实测 40s 与理论重试链尾部）；
+- `data/wecom_kf_state.json` 新增 `inflight_msgids` 字段（向后兼容，旧文件缺省为空）；
+- 台账记录新增白名单内部键 `msgid_scope_key`（旧记录缺省为空，域防线只对新记录生效，
+  存量重复窗口由入站认领层覆盖）；
+- 孤儿工作包"重复外发动作检测"为 QA runner 判分 gate，与本批生产台账层防线不同层面，
+  未 apply 任何孤儿代码（独立重实现，符合处置台账要求）。
+
+验证记录：本批新增 15 项全绿；关联套件（test_wecom_kf 452 项、outbox 增量缓存、入口图、
+轮次流）全绿；全量 `python -m pytest -q` = 1333 passed / 1 skipped（既有 Windows ACL 跳过）/
+3 deselected（既有标记），为与并行"发送顺序与话术收敛批（批9）"未提交改动共存的合并态
+口径。本批按并行会话共存协议只提交回调去重所属文件与 `app/main.py` 的
+`_restart_kf_turn` hunk（批1 commit 9d601d7、批2 commit 955b1c7），未夹带批9 改动。
+不部署、不 push。
