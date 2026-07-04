@@ -9,7 +9,11 @@ _ENV_FILE = None if os.environ.get("APP_ENV", "").strip().lower() == "test" else
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=_ENV_FILE, env_file_encoding="utf-8")
+    # extra="ignore":允许 .env 先于代码部署新增键(运维常规顺序)。
+    # pydantic-settings 默认 forbid 曾使 KF_MEDIA_LINK_SECRET 先行写入后
+    # 所有消费 Settings 的进程直接 extra_forbidden 崩溃(2026-07-04 19:00 实证);
+    # 键名 typo 的兜底是字段默认值与部署后的无人值守检查,不靠启动崩溃。
+    model_config = SettingsConfigDict(env_file=_ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
     app_env: str = "development"
     public_base_url: str = "http://localhost:8000"
