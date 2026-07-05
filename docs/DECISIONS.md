@@ -65,3 +65,7 @@
 ## 2026-07-05 Settings 未知 env 键容忍(运维配置解耦,批15附)
 
 07-04 19:00 失败实证:.env 先行新增 KF_MEDIA_LINK_SECRET 而代码未部署,pydantic-settings 默认 extra="forbid" 使 Settings 构造直接抛 extra_forbidden,同步进程崩溃,直到代码部署自愈。方案比选:①forbid(现状)——键名 typo 启动即炸看似可防错,但代价是"配置先行于代码"这一常规运维顺序变成致命错误,且炸点覆盖所有消费 Settings 的进程(含主服务重启窗口),否决;②(采纳)ignore——未知键静默忽略,配置与部署顺序解耦,typo 风险由字段默认值兜底并经部署后 UnattendedCheck/健康检查暴露;③allow——未知键存入模型属性空间,污染面大且无收益,否决。验证:tests/test_config_env_tolerance.py 两项(未知键不抛错、已声明键正常解析)。影响范围:全局配置层,行为变化仅"未知键从致命变忽略"。
+
+## 2026-07-05 批14+15 部署与同步链路恢复(收官记录)
+
+经用户 APPROVE_DEPLOY 部署两个 release:主部署 20260705-media-manifest-publish-110448(批14 出站声称拦截+批15 发布策略/包装层/Settings 容忍)与热修 20260705-graph-ready-hotfix-203936(result.ready 键语义修正,线上首轮实证 graph 消费 ready 键导致发布成功仍判 blocked,详见台账批15热修条目)。部署法沿用 cp -a 底座+SFTP 上传+逐文件 sha256 核验+release 内服务器全量 pytest(1366/1367 passed)+原子切 current+重启+健康检查;回滚=软链切回。验证闭环:手动触发同步 run ok=True/graph passed/failures=0,media_manifest.json 恢复发布(status=published_with_quarantine,blocking=0,263 条 send_ready 证据/33 房源),翰皋名府8-1403 图13+视频1 全部经生产读取器哈希核验 send_ready=True;隔离台账 _manual_review/media_manifest_quarantine.json 落盘(874 项历史素材观察项);陈旧候选区已自动清理;video/房源素材 双层残留 189 文件留档(/tmp/removed_wrapper_video_tree_20260705.list)后删除;UnattendedCheck 全绿,timer 下轮 07-06 08:00。边界说明:客户可见的真实外发需真实客户进线触发(企微客服平台限制,机器人不能主动开启会话),本轮验证到生产读取器哈希级证据为止;隔离台账内 6 套在租房源为云盘目录名与表格漂移(如东方茂T3-1540 对表东方茂商业中心T/3-1540),属数据侧待办,改名后下一轮自动绑定。
