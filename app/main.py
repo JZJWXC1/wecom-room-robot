@@ -4455,8 +4455,15 @@ def _backstop_production_constraint_inheritance(
         return None
 
     filled: dict[str, Any] = {}
+    # area 不需要"本轮文本优先":带区域词的追问("东站的呢")在上方锚点门
+    # (_has_vocabulary_backed_inventory_anchor)即提前返回、归 LLM1 own,到不了这里;
+    # 故区域一律取继承值。区域词=词表锚点,户型词不是,两者门控不同。
     area = str(_slot_value("area", memory.get("area")) or "").strip()
-    layout = str(_slot_value("layout", memory.get("layout")) or "").strip()
+    # 户型本轮文本优先(与 budget 对称):"三室的呢"不是词表锚点、会走到兜底,
+    # 客户改口户型的本轮明确表达必须压过记忆旧"两室",否则户型变更追问被
+    # stale 户型覆盖、按错误户型检索(2026-07-05 审计实证:H2)。
+    current_layout = _layout_from_text(text)
+    layout = current_layout or str(_slot_value("layout", memory.get("layout")) or "").strip()
     current_budget = _budget_range_from_text(text)
     budget = (
         current_budget

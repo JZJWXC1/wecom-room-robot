@@ -121,3 +121,33 @@ def test_packet_inherited_constraints_take_priority_over_memory() -> None:
     assert proof.get("area") == "东新园\n杭氧\n新天地"
     assert proof.get("layout") == "两室一厅"
     assert proof.get("budget_range") == [5000, 99999]
+
+
+def test_layout_change_followup_prefers_current_text_over_stale_memory() -> None:
+    # 回归(2026-07-05 审计 H2):production LLM1 违约给空约束时,客户改口户型
+    # ("三室的呢")的本轮明确表达必须压过记忆里的旧"两室",否则户型变更追问
+    # 被 stale 户型覆盖、按错误户型检索。与 budget 的"本轮文本优先"对称。
+    result = main._backstop_production_constraint_inheritance(
+        content="三室的呢",
+        result=_production_result(content="三室的呢"),
+        rewrite_view=_rewrite_view_with_prior_scoped_query(),
+    )
+
+    proof = result["constraint_proof"]
+    assert "三室" in str(proof.get("layout") or ""), proof
+    assert "两室" not in str(proof.get("layout") or "")
+    assert "新天地" in str(proof.get("area") or "")
+
+
+def test_explicit_area_word_followup_gates_out_as_llm1_owned() -> None:
+    # 边界固化(2026-07-05 审计 H2):区域词是词表锚点,"东站的呢"这类带明确区域
+    # 的追问在锚点门即提前返回、归 LLM1 own,不进兜底注入(与户型词门控不同)。
+    # 这解释了为何 H2 的真实缺陷只在 layout:户型词不是锚点、会走到兜底。
+    result = main._backstop_production_constraint_inheritance(
+        content="东站的呢",
+        result=_production_result(content="东站的呢"),
+        rewrite_view=_rewrite_view_with_prior_scoped_query(),
+    )
+
+    assert result["constraint_proof"] == {}
+    assert "constraint_inheritance_backstop" not in result

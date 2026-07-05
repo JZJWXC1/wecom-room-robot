@@ -847,3 +847,26 @@ def test_legacy_claim_without_structured_value_still_uses_evidence_refs() -> Non
 
     assert result.status == ValidationStatus.PASS
     assert not result.issues_for_level(ValidationLevel.L1)
+
+
+def test_l3_flags_hallucinated_layout_in_comma_joined_negation_sentence() -> None:
+    # 回归(2026-07-05 审计 H1):证据行=翰皋名府8-1403/一室一厅。客服高频"有A没有B"
+    # 逗号句式里,幻觉户型"三室"与否定词"没有"落在同一整段;逗号未纳入分句前
+    # 整段命中否定豁免致漏拦。逗号分句后"三室"子句独立受检,否定只豁免其所在子句。
+    package = _inventory_row_package("这套翰皋名府8-1403是三室的，其他房型暂时没有。")
+
+    result = validate_prepared_outbound_package(package)
+
+    assert "l3.layout_claim_mismatch" in _codes(result)
+    layout_message = next(issue.message for issue in result.issues if issue.code == "l3.layout_claim_mismatch")
+    assert "三室" in layout_message and "一室一厅" in layout_message
+
+
+def test_l3_still_exempts_pure_negation_subclause_after_comma_split() -> None:
+    # 正向保护:逗号分句不得误伤——"没有三室"这类纯否定子句仍应豁免,
+    # 合法回复(证据是一室一厅,如实说没有三室)不得被判户型矛盾。
+    package = _inventory_row_package("翰皋名府8-1403是一室一厅，三室的暂时没有。")
+
+    result = validate_prepared_outbound_package(package)
+
+    assert "l3.layout_claim_mismatch" not in _codes(result)

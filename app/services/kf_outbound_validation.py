@@ -165,7 +165,10 @@ DEPOSIT_SELFCHECK_MARKERS = ("自查", "信用额度", "租房板块申请额度
 # 词表单一事实源：户型口语映射=inventory_query.ROOM_TYPE_GROUPS，
 # 区域别名=region_inventory_constants.active_area_alias_groups，
 # 证据行字段键名=kf_dual_llm_shadow.ROW_ALIASES；本模块不得新增同源规则拷贝。
-CLAIM_SENTENCE_SPLIT_PATTERN = re.compile(r"[。；;！!？?\n\r]+")
+# 逗号/顿号必须纳入分句:否则"这套三室的，其他房型暂时没有"这类客服高频
+# "有A没有B"逗号句式会整段命中否定豁免,幻觉户型/区域(三室)随否定词(没有)
+# 一起被跳过而漏拦(2026-07-05 审计实证:H1)。分子句后否定只豁免其所在子句。
+CLAIM_SENTENCE_SPLIT_PATTERN = re.compile(r"[。；;！!？?，,、\n\r]+")
 CLAIM_NEGATION_MARKERS = (
     "暂无",
     "没有",

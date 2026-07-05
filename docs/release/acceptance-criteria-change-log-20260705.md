@@ -43,3 +43,17 @@
 ### 批15热修（同日）：result["ready"] 键语义修正
 
 首次部署后线上实证（07-05 19:11 timer 轮）：manifest 发布成功（published_with_quarantine、blocking=0）但 graph 仍 blocked——`inventory_sync_graph._failures_for_stage` 的通用阶段判定为 `ok is False or ready is False or errors`，**ready 键被 graph 当作"阶段是否放行"消费**，不能挂"完全干净"观察语义。修正：顶层 `ready`=published（跟发布走），完全干净观察指标改用新键 `clean`（=report.ready，报告内层 ready 语义不变）。暴露的测试缺口一并补上：新增 `test_sync_script_graph_passes_when_manifest_published_with_quarantine`（graph 端到端固化"发布成功+存在隔离项 → graph 必须 passed"）。此前本批 graph 测试只 stub 了 refresh_media_manifest 旧契约，未覆盖新契约端到端。
+
+## 审计后修复批（批16）：反幻觉护栏两处高频失效（H1/H2）
+
+背景：2026-07-05 对批9-15（5会话/16提交/1173行生产代码）做全维度独立审计（6维度并行+对抗核验，33 agent），存活三条 high。本批修其中两条低风险高价值项（H1/H2）；H3 因需事实字段分类设计另立任务（见下）。
+
+| 测试/口径 | 改前 | 改后 | 理由 |
+| --- | --- | --- | --- |
+| `kf_outbound_validation.py:168` 分句正则 | `[。；;！!？?\n\r]+`（逗号不分句）→ "有A没有B"逗号句式整段命中否定豁免致幻觉户型/区域漏拦 | 逗号/顿号纳入分句 `[。；;！!？?，,、\n\r]+`，否定只豁免其所在子句 | H1：审计对抗实证五例逗号话术全漏拦，句号版对照全拦住；这是批14反幻觉护栏本要防的对客错发形态 |
+| `main.py` `_backstop_production_constraint_inheritance` layout 取值 | layout 只从记忆取旧值，与 budget 的"本轮文本优先"不对称 → 户型改口追问("三室的呢")被 stale"两室"覆盖 | layout 补 `_layout_from_text(text)` 优先，与 budget 对称 | H2：户型词非词表锚点、会走到兜底；area 无需对称（区域词是锚点，"东站的呢"在锚点门提前返回归 LLM1 own，边界已固化测试） |
+| 新增回归 4 项 | 无 | H1 逗号绕过正反（幻觉三室被拦 / 纯否定子句仍豁免）+ H2 户型改口本轮优先 + area 显式词门控归 LLM1 边界 | revert 修复对应测试精确变红 |
+
+全量 1376 passed；离线 gate 310/310 usable_for_release=true。
+
+遗留（另立独立任务）：**H3** — L1 claim 值核验（`_validate_claim_value_against_evidence`）因只读 legacy_unknown_fields 而对生产一等属性 claim 恒静默失效，结构化字段(面积/朝向/楼层)反幻觉裸奔。已试"回退读一等属性"会误伤控制/状态类 claim（missing_target/免押话术等）致对客无回复（9→收窄后仍7项测试红），根因是数据模型无"事实vs控制"判别位。需先设计事实字段分类再安全启用（Codex 批14 已将其登记为独立待办）。金额/户型/区域幻觉另有 compose 白名单+L3 兜底，残留面为其他结构化字段，风险低于 H1/H2。
