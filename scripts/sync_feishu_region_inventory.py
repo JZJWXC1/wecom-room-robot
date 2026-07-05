@@ -462,7 +462,11 @@ async def refresh_media_manifest(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "ok": published,
         "generated": report.ok,
         "published": published,
-        "ready": report.ready,
+        # ready 被 inventory_sync_graph 的通用阶段判定消费(ready is False 即
+        # 阻塞),语义必须跟发布走;"完全干净"观察指标用 clean(=report.ready)。
+        # 2026-07-05 线上实证:ready 曾误挂观察语义,发布成功仍被 graph 判失败。
+        "ready": published,
+        "clean": report.ready,
         "status": status,
         "blocking_count": media_manifest_blocking_count(report),
         "quarantine_count": report.quarantine_count,

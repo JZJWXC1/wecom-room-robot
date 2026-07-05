@@ -819,7 +819,9 @@ def test_region_inventory_missing_kind_publishes_and_quarantines_missing(
 
     assert result["ok"] is True
     assert result["published"] is True
-    assert result["ready"] is False
+    # ready 跟发布走(graph 阶段判定消费);完全干净观察指标是 clean。
+    assert result["ready"] is True
+    assert result["clean"] is False
     assert result["status"] == "published_with_quarantine"
     assert result["blocking_count"] == 0
     assert result["quarantine_count"] == 1

@@ -232,6 +232,71 @@ def test_sync_script_graph_fail_fast_blocks_after_region_failure(monkeypatch) ->
     run(run_case())
 
 
+def test_sync_script_graph_passes_when_manifest_published_with_quarantine(monkeypatch) -> None:
+    # 2026-07-05 线上实证固化:发布成功但存在隔离项(孤儿/模糊)时,
+    # graph 必须 passed——通用阶段判定消费 ready 键,ready 必须跟发布走,
+    # 完全干净观察指标在 clean/report.ready,不得再挂到 ready 上。
+    async def run_case() -> None:
+        calls: list[str] = []
+
+        async def fake_run_sync(*, dry_run: bool, sync_media: bool) -> dict[str, Any]:
+            calls.append("region")
+            return {"ok": True, "dry_run": dry_run, "sync_media": sync_media}
+
+        async def fake_refresh_rewrite_inventory_index() -> dict[str, Any]:
+            calls.append("rewrite")
+            return {"ok": True, "path": "rewrite-index.json", "row_count": 1}
+
+        class FakeFrame:
+            def fillna(self, _value: str) -> "FakeFrame":
+                return self
+
+            def to_dict(self, *, orient: str) -> list[dict[str, Any]]:
+                assert orient == "records"
+                return [{"小区": "翰皋名府", "房号": "8-1403"}]
+
+        class FakeInventoryService:
+            cache_meta = {"hash": "inventory-hash"}
+
+            async def refresh(self) -> FakeFrame:
+                return FakeFrame()
+
+        async def fake_refresh_media_manifest(rows: list[dict[str, Any]]) -> dict[str, Any]:
+            calls.append("manifest")
+            return {
+                "ok": True,
+                "published": True,
+                "ready": True,
+                "clean": False,
+                "status": "published_with_quarantine",
+                "blocking_count": 0,
+                "quarantine_count": 871,
+                "path": "media_manifest.json",
+            }
+
+        async def fake_cutover_graph(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            calls.append("cutover")
+            return {"status": "passed", "trace": [], "report": {"ok": True}}
+
+        monkeypatch.setattr(sync_script, "run_sync", fake_run_sync)
+        monkeypatch.setattr(sync_script, "refresh_rewrite_inventory_index", fake_refresh_rewrite_inventory_index)
+        monkeypatch.setattr(sync_script, "InventoryService", FakeInventoryService)
+        monkeypatch.setattr(sync_script, "refresh_media_manifest", fake_refresh_media_manifest)
+        monkeypatch.setattr(sync_script.inventory_cutover_graph, "build_local_inventory_cutover_deps", lambda: object())
+        monkeypatch.setattr(sync_script.inventory_cutover_graph, "run_inventory_cutover_graph", fake_cutover_graph)
+
+        result = await sync_script.run_sync_graph_pipeline(dry_run=False, sync_media=True)
+
+        assert "manifest" in calls and "cutover" in calls
+        assert result["ok"] is True
+        assert result["graph"]["status"] == "passed"
+        assert result["graph"]["blocked_stage"] == ""
+        assert result["media_manifest"]["status"] == "published_with_quarantine"
+        assert result["media_manifest"]["quarantine_count"] == 871
+
+    run(run_case())
+
+
 def test_sync_script_graph_success_preserves_runtime_artifact_fields(monkeypatch) -> None:
     async def run_case() -> None:
         calls: list[str] = []

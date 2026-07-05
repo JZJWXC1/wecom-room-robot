@@ -39,3 +39,7 @@
 验证：全量 pytest + 离线 gate 结果见本文件后续更新与 DECISIONS.md 批15 条目。
 
 不部署、不 push（部署与线上验证等用户 APPROVE_DEPLOY）。
+
+### 批15热修（同日）：result["ready"] 键语义修正
+
+首次部署后线上实证（07-05 19:11 timer 轮）：manifest 发布成功（published_with_quarantine、blocking=0）但 graph 仍 blocked——`inventory_sync_graph._failures_for_stage` 的通用阶段判定为 `ok is False or ready is False or errors`，**ready 键被 graph 当作"阶段是否放行"消费**，不能挂"完全干净"观察语义。修正：顶层 `ready`=published（跟发布走），完全干净观察指标改用新键 `clean`（=report.ready，报告内层 ready 语义不变）。暴露的测试缺口一并补上：新增 `test_sync_script_graph_passes_when_manifest_published_with_quarantine`（graph 端到端固化"发布成功+存在隔离项 → graph 必须 passed"）。此前本批 graph 测试只 stub 了 refresh_media_manifest 旧契约，未覆盖新契约端到端。
