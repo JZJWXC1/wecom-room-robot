@@ -1,1 +1,1 @@
-/opt/wecom-room-robot/releases/20260705-graph-ready-hotfix-203936
+﻿/opt/wecom-room-robot/releases/20260705-audit-h1h2-232841
