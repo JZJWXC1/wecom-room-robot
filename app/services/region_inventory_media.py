@@ -12,6 +12,10 @@ from app.services.region_inventory_constants import DRIVE_UPLOAD_SAFE_VIDEO_BYTE
 from app.services.region_inventory_utils import safe_name
 
 
+FEISHU_URL_RE = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
+DOCX_URL_RE = re.compile(r"https?://[^\s<>\"']+/docx/([A-Za-z0-9]+)(?:[?][^\s<>\"']*)?")
+
+
 def should_transcode_mov_upload_fallback(suffix: str, exc: BaseException) -> bool:
     if suffix.casefold() not in VIDEO_EXTENSIONS:
         return False
@@ -160,19 +164,24 @@ def resolve_ffmpeg_executable() -> str:
 def extract_note_links(record: dict[str, Any]) -> list[str]:
     links: list[str] = []
 
+    def add_links(text: Any) -> None:
+        value = str(text or "")
+        for match in FEISHU_URL_RE.finditer(value):
+            link = match.group(0).rstrip(".,;:!?，。；：！？、)]】")
+            if "feishu.cn" in link or "larksuite.com" in link:
+                links.append(link)
+
     def walk(value: Any) -> None:
         if isinstance(value, dict):
             for key in ("link", "url", "href"):
-                link = str(value.get(key) or "")
-                if "feishu.cn" in link or "larksuite.com" in link:
-                    links.append(link)
+                add_links(value.get(key))
             for item in value.values():
                 walk(item)
         elif isinstance(value, list):
             for item in value:
                 walk(item)
-        elif isinstance(value, str) and ("feishu.cn" in value or "larksuite.com" in value):
-            links.append(value)
+        elif isinstance(value, str):
+            add_links(value)
 
     walk(record.get("fields") or {})
     return list(dict.fromkeys(links))
@@ -181,22 +190,61 @@ def extract_note_links(record: dict[str, Any]) -> list[str]:
 def extract_docx_mentions(record: dict[str, Any]) -> list[dict[str, str]]:
     documents: dict[str, dict[str, str]] = {}
 
+    def add_document(*, token: str, title: str = "", url: str = "") -> None:
+        token = str(token or "").strip()
+        if not token or token in documents:
+            return
+        documents[token] = {
+            "token": token,
+            "title": str(title or "").strip(),
+            "url": str(url or "").strip(),
+        }
+
+    def clean_docx_title(text: str, url: str) -> str:
+        value = str(text or "").strip()
+        bracket_match = re.search(r"【([^】]{1,80})】", value)
+        if bracket_match:
+            return bracket_match.group(1).strip()
+        if url and url in value:
+            value = value.split(url, 1)[0].strip()
+        value = re.sub(r"^快来查看我用飞书分享的", "", value).strip(" \t\r\n👉：:，,。、")
+        if not value or value.startswith(("http://", "https://")):
+            return ""
+        return value[-80:].strip()
+
+    def add_docx_urls(text: str, *, title_hint: str = "") -> None:
+        value = str(text or "")
+        for match in DOCX_URL_RE.finditer(value):
+            url = match.group(0)
+            title = clean_docx_title(title_hint, url) or clean_docx_title(value, url)
+            add_document(
+                token=match.group(1),
+                title=title,
+                url=url,
+            )
+
     def walk(value: Any) -> None:
         if isinstance(value, dict):
             mention_type = str(value.get("mentionType") or value.get("realMentionType") or "")
             token = str(value.get("token") or "")
             if mention_type == "Docx" and token:
-                documents[token] = {
-                    "token": token,
-                    "title": str(value.get("text") or token),
-                    "url": str(value.get("link") or value.get("url") or ""),
-                }
+                add_document(
+                    token=token,
+                    title=str(value.get("text") or token),
+                    url=str(value.get("link") or value.get("url") or ""),
+                )
                 return
+            title_hint = str(value.get("text") or value.get("name") or "").strip()
+            for key in ("link", "url", "href"):
+                add_docx_urls(str(value.get(key) or ""), title_hint=title_hint)
+            add_docx_urls(str(value.get("text") or ""))
             for item in value.values():
                 walk(item)
         elif isinstance(value, list):
             for item in value:
                 walk(item)
+        elif isinstance(value, str):
+            add_docx_urls(value)
 
     walk(record.get("fields") or {})
     return list(documents.values())

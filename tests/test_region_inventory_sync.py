@@ -7,7 +7,7 @@ from unittest.mock import patch
 from app.config import settings
 from app.services.feishu import FeishuClient
 from app.services.region_inventory_constants import DRIVE_UPLOAD_SAFE_VIDEO_BYTES
-from app.services.region_inventory_media import calculate_target_video_bitrate_kbps
+from app.services.region_inventory_media import calculate_target_video_bitrate_kbps, extract_note_links
 from app.services.region_inventory_sync import (
     ExistingMediaIndex,
     RegionInventoryRow,
@@ -1167,6 +1167,66 @@ class RegionInventorySyncTests(unittest.IsolatedAsyncioTestCase):
             [
                 {"name": "棠润府1-602A-图片01.jpg", "file_token": "image_token"},
                 {"name": "看房视频.mp4", "file_token": "video_token"},
+            ],
+        )
+
+    def test_extracts_docx_mentions_from_plain_note_links(self) -> None:
+        record = {
+            "fields": {
+                "房源笔记": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "快来查看我用飞书分享的【兴业杨家府5-802】👉"
+                            "https://ccn9urs7d60k.feishu.cn/docx/Xyj5dNc2uoVwBGxi2gycMLQbncg"
+                        ),
+                    },
+                    {
+                        "type": "url",
+                        "link": "https://ccn9urs7d60k.feishu.cn/docx/QHrpdnGjZo86lHxidDOcvFBqnJb?from=from_copylink",
+                        "text": "杨家新雅苑49-1002",
+                    },
+                    {
+                        "type": "url",
+                        "link": "https://ccn9urs7d60k.feishu.cn/docx/EViqd8uKeotWJcxilqScmuain0f",
+                    },
+                    {
+                        "type": "mention",
+                        "mentionType": "Docx",
+                        "token": "Xyj5dNc2uoVwBGxi2gycMLQbncg",
+                        "text": "重复 mention 不应重复同步",
+                        "link": "https://ccn9urs7d60k.feishu.cn/docx/Xyj5dNc2uoVwBGxi2gycMLQbncg",
+                    },
+                ]
+            }
+        }
+
+        self.assertEqual(
+            extract_docx_mentions(record),
+            [
+                {
+                    "token": "Xyj5dNc2uoVwBGxi2gycMLQbncg",
+                    "title": "兴业杨家府5-802",
+                    "url": "https://ccn9urs7d60k.feishu.cn/docx/Xyj5dNc2uoVwBGxi2gycMLQbncg",
+                },
+                {
+                    "token": "QHrpdnGjZo86lHxidDOcvFBqnJb",
+                    "title": "杨家新雅苑49-1002",
+                    "url": "https://ccn9urs7d60k.feishu.cn/docx/QHrpdnGjZo86lHxidDOcvFBqnJb?from=from_copylink",
+                },
+                {
+                    "token": "EViqd8uKeotWJcxilqScmuain0f",
+                    "title": "",
+                    "url": "https://ccn9urs7d60k.feishu.cn/docx/EViqd8uKeotWJcxilqScmuain0f",
+                },
+            ],
+        )
+        self.assertEqual(
+            extract_note_links(record),
+            [
+                "https://ccn9urs7d60k.feishu.cn/docx/Xyj5dNc2uoVwBGxi2gycMLQbncg",
+                "https://ccn9urs7d60k.feishu.cn/docx/QHrpdnGjZo86lHxidDOcvFBqnJb?from=from_copylink",
+                "https://ccn9urs7d60k.feishu.cn/docx/EViqd8uKeotWJcxilqScmuain0f",
             ],
         )
 
