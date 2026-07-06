@@ -201,6 +201,117 @@ def test_l1_checks_claim_value_listing_snapshot_and_sensitive_slots() -> None:
     assert all("example.test" not in issue.message for issue in result.issues)
 
 
+def _fact_evidence_bundle() -> ToolEvidenceBundle:
+    return ToolEvidenceBundle(
+        inventory_snapshot_id="snap-1",
+        tool_name="inventory.search",
+        evidence=[
+            EvidenceItem(
+                evidence_id="evd-fact",
+                listing_id="lst-1",
+                inventory_snapshot_id="snap-1",
+                evidence_type="inventory_listing",
+                summary="翰皋名府 8-1403 拱墅区 三室一厅 押一付一 4200",
+                field_values={
+                    "community": "翰皋名府",
+                    "room_no": "8-1403",
+                    "area": "拱墅区",
+                    "layout": "三室一厅",
+                    "rent_pay1": "4200",
+                },
+            )
+        ],
+    )
+
+
+def _fact_claim_package(field: str, value) -> PreparedOutboundPackage:
+    return PreparedOutboundPackage(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        inventory_snapshot_id="snap-1",
+        reply_text="翰皋名府 8-1403 的情况我按证据说。",
+        evidence_bundle=_fact_evidence_bundle(),
+        claims=[
+            Claim(
+                claim_id="claim-fact",
+                listing_id="lst-1",
+                evidence_id="evd-fact",
+                inventory_snapshot_id="snap-1",
+                field=field,
+                value=value,
+                support=["evd-fact"],
+                text=f"{field} {value}",
+            )
+        ],
+    )
+
+
+def test_l1_claim_value_check_blocks_fabricated_first_class_fact_values() -> None:
+    # H3 正向回归:一等属性 schema(claim.field/claim.value,legacy_unknown_fields 为空,
+    # 即生产 LLM2 的规范形态)下,伪造的结构化事实值必须被 l1.claim_value_not_in_evidence 拦下。
+    # 覆盖:值凭空编造、值搬到错误字段(字段作用域)、中文别名字段名(经 ROW_ALIASES 归一)。
+    fabricated_cases = [
+        ("area", "西湖区"),          # 证据 area=拱墅区,编造区域
+        ("rent_pay1", "9999"),       # 证据 rent_pay1=4200,编造租金
+        ("layout", "拱墅区"),        # 把 area 的值安到 layout 字段,字段作用域应拦
+        ("押一付一", "9999"),        # 中文别名 -> rent_pay1,同样编造租金
+    ]
+    for field, value in fabricated_cases:
+        result = validate_prepared_outbound_package(_fact_claim_package(field, value))
+        assert "l1.claim_value_not_in_evidence" in _codes(result), f"expected block for {field}={value}"
+
+    # 真值(含中文别名与整数)必须放行,不得误报。
+    for field, value in [("area", "拱墅区"), ("rent_pay1", 4200), ("layout", "三室一厅"), ("押一付一", "4200")]:
+        result = validate_prepared_outbound_package(_fact_claim_package(field, value))
+        assert "l1.claim_value_not_in_evidence" not in _codes(result), f"unexpected block for {field}={value}"
+
+
+def test_l1_claim_value_check_exempts_control_claims_with_matching_flag_key() -> None:
+    # H3 误伤防线:控制/兜底类 claim(field=missing_target,value 是话术)不得被当事实核验,
+    # 即便其引用的控制证据 field_values 恰好带同名状态标志键(missing_target=True)——这正是
+    # 2026-07-05 审计 H3 修复(2)之所以仍红的碰撞点(控制证据 field_values 带控制字段名)。
+    # field 不在 ROW_ALIASES(归一为空)即豁免,保证对客有回复而非 send_allowed=False。
+    package = PreparedOutboundPackage(
+        conversation_id="conv-1",
+        turn_id="turn-1",
+        inventory_snapshot_id="snap-1",
+        reply_text="这条我还没法直接发视频，先帮我确认具体哪一套。",
+        evidence_bundle=ToolEvidenceBundle(
+            inventory_snapshot_id="snap-1",
+            tool_name="context_tools",
+            evidence=[
+                EvidenceItem(
+                    evidence_id="evd-target-missing",
+                    inventory_snapshot_id="snap-1",
+                    evidence_type="missing_target",
+                    summary="还没定位到具体房源。",
+                    field_values={
+                        "error_code": "missing_target",
+                        "missing_target": True,
+                        "reason": "media_target_unbound",
+                        "requires_customer_room_ref": True,
+                    },
+                )
+            ],
+        ),
+        claims=[
+            Claim(
+                claim_id="claim-missing-target",
+                evidence_id="evd-target-missing",
+                inventory_snapshot_id="snap-1",
+                field="missing_target",
+                value="需要先确认具体房源",
+                support=["evd-target-missing"],
+                text="需要先确认具体房源",
+            )
+        ],
+    )
+
+    result = validate_prepared_outbound_package(package)
+
+    assert "l1.claim_value_not_in_evidence" not in _codes(result)
+
+
 def test_l2_checks_task_completion_video_only_candidate_bounds_and_password_request() -> None:
     task_packet = StructuredTaskPacket(
         conversation_id="conv-1",

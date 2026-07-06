@@ -948,19 +948,39 @@ def _validate_candidate_ref_bounds(package: PreparedOutboundPackage, indexes: _P
 
 
 def _validate_claim_value_against_evidence(claim: Claim, indexes: _PackageIndexes, path: str) -> list[ValidationIssue]:
-    raw_value = _first_legacy_value(claim, CLAIM_VALUE_KEYS)
+    # H3(2026-07-05 审计):本校验只应拦"LLM2 编造的结构化事实值不在证据里",不得核验
+    # 控制/兜底类 claim(field=missing_target/deposit_policy/viewing_contact/selection_error
+    # 等,value 是话术不是事实)——否则话术不在证据 field_values 里会被误判、send_allowed=False
+    # 致对客无回复(naive 回退一等属性曾实证 9 项测试红)。
+    # 事实 claim 判别位(两条同时满足):
+    #   1) claim 声称的 field 经 ROW_ALIASES 归一命中"已知库存行字段"(area/layout/rent_pay1/
+    #      community/room_no/utilities/candidate_number 等)——控制 claim 的 field
+    #      (missing_target/deposit_policy/viewing_contact/selection_error 等)不在 ROW_ALIASES,
+    #      归一为空即豁免。注意:控制证据的 field_values 会带同名状态标志键(如 missing_target=True),
+    #      故不能只靠"字段名是证据键"判别(2026-07-05 审计 H3 修复(2)之所以仍红的根因)。
+    #   2) 该行字段被引用证据的 field_values 结构化承载(经 ROW_ALIASES 归一到同键)——只在证据
+    #      确有该字段结构化值时才做字段作用域值核验,证据没有该字段则无从比对,豁免。
+    # 值/字段读取兼容一等属性(生产/规范 schema:claim.value/claim.field)与 legacy_unknown_fields(旧形态)。
+    field_name = _claim_fact_field(claim)
+    if not _canonical_field_key(field_name):
+        return []
+    raw_value = _claim_fact_value(claim)
     if raw_value is None:
         return []
-    field_name = _first_legacy_value(claim, CLAIM_FIELD_KEYS)
-    issues: list[ValidationIssue] = []
     referenced_evidence = _referenced_evidence(claim, indexes)
     if not referenced_evidence:
-        return issues
+        return []
+    fact_evidence = [
+        evidence for evidence in referenced_evidence if _evidence_carries_claim_field(evidence, field_name)
+    ]
+    if not fact_evidence:
+        return []
+    issues: list[ValidationIssue] = []
     for value in _as_sequence(raw_value):
         normalized_value = _normalize_fact_value(value)
         if not normalized_value:
             continue
-        if not any(_evidence_field_values_contain(evidence, normalized_value, field_name) for evidence in referenced_evidence):
+        if not any(_evidence_field_scoped_contains(evidence, normalized_value, field_name) for evidence in fact_evidence):
             issues.append(
                 _issue(
                     ValidationLevel.L1,
@@ -1293,15 +1313,61 @@ def _first_legacy_value(model: Any, keys: Sequence[str]) -> Any:
     return None
 
 
-def _evidence_field_values_contain(evidence: EvidenceItem, expected: str, field_name: Any) -> bool:
-    values = _evidence_field_values(evidence)
-    if not values:
-        return False
-    field_text = str(field_name or "").strip()
-    if field_text and field_text in values:
-        return expected in {_normalize_fact_value(item) for item in _flatten_values(values[field_text])}
-    haystack = {_normalize_fact_value(item) for item in _flatten_values(values)}
-    return expected in haystack
+# 事实 claim 判别用的字段规范化(H3):把 claim.field 与证据 field_values 键统一到
+# kf_dual_llm_shadow.ROW_ALIASES 的行字段规范键(单一事实源,不新增同源拷贝,硬规则5)。
+# 惰性构建(依赖后定义的 _normalize_fact_value,避免模块加载期前向引用)。
+_ROW_ALIAS_CANONICAL: dict[str, str] = {}
+
+
+def _canonical_field_key(name: Any) -> str:
+    if not _ROW_ALIAS_CANONICAL:
+        for canonical, aliases in ROW_ALIASES.items():
+            for alias in aliases:
+                _ROW_ALIAS_CANONICAL[_normalize_fact_value(alias)] = canonical
+    return _ROW_ALIAS_CANONICAL.get(_normalize_fact_value(name), "")
+
+
+def _claim_fact_field(claim: Claim) -> Any:
+    field = str(getattr(claim, "field", "") or "").strip()
+    if field:
+        return field
+    return _first_legacy_value(claim, CLAIM_FIELD_KEYS)
+
+
+def _claim_fact_value(claim: Claim) -> Any:
+    value = getattr(claim, "value", None)
+    if value is not None:
+        return value
+    return _first_legacy_value(claim, CLAIM_VALUE_KEYS)
+
+
+def _evidence_field_keys_for(field_values: Mapping[str, Any], field_name: Any) -> list[str]:
+    """证据 field_values 中与 claim 声称字段对应的键:直接同名(归一后)或经 ROW_ALIASES 同规范键。"""
+    target_norm = _normalize_fact_value(field_name)
+    if not target_norm or not field_values:
+        return []
+    target_canonical = _canonical_field_key(field_name)
+    matches: list[str] = []
+    for key in field_values:
+        key_norm = _normalize_fact_value(key)
+        if key_norm and key_norm == target_norm:
+            matches.append(key)
+            continue
+        if target_canonical and _canonical_field_key(key) == target_canonical:
+            matches.append(key)
+    return matches
+
+
+def _evidence_carries_claim_field(evidence: EvidenceItem, field_name: Any) -> bool:
+    return bool(_evidence_field_keys_for(_evidence_field_values(evidence), field_name))
+
+
+def _evidence_field_scoped_contains(evidence: EvidenceItem, expected: str, field_name: Any) -> bool:
+    field_values = _evidence_field_values(evidence)
+    for key in _evidence_field_keys_for(field_values, field_name):
+        if expected in {_normalize_fact_value(item) for item in _flatten_values(field_values[key])}:
+            return True
+    return False
 
 
 def _evidence_field_values(evidence: EvidenceItem) -> Mapping[str, Any]:
