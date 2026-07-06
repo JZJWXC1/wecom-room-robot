@@ -1,1 +1,1 @@
-﻿/opt/wecom-room-robot/releases/20260705-audit-h1h2-232841
+﻿/opt/wecom-room-robot/releases/20260706-audit-h3-outbound-173852
