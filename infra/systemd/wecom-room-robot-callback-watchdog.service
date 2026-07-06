@@ -1,0 +1,9 @@
+[Unit]
+Description=WeCom KF callback route watchdog (detect Certbot-induced IP:80 /wecom 404 regression)
+After=network.target nginx.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/wecom-callback-watchdog.sh
+# 探测失败(exit 1)不视为服务崩溃，避免 systemd 反复告警噪音；告警已进 journal+状态文件
+SuccessExitStatus=0 1

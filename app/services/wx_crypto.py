@@ -35,7 +35,12 @@ class WeComCrypto:
         message_length = struct.unpack("!I", decrypted[16:20])[0]
         message = decrypted[20 : 20 + message_length]
         receive_id = decrypted[20 + message_length :].decode("utf-8")
-        if receive_id != self.corp_id:
+        # 空 receiveid 放行：企业微信「智能机器人」URL 回调在做地址验证时，
+        # echostr 里的 receiveid 是空字符串（实证 2026-07-06，与自建应用/微信客服
+        # 携带 CorpID 的行为不同）。签名(Token)校验已保证请求真实性，此处只在
+        # receiveid 非空时才要求它等于本企业 CorpID，既让验证握手通过，又保留
+        # 对真实消息（携带 CorpID）的跨企业重放防护，安全不弱化。
+        if receive_id and receive_id != self.corp_id:
             raise WeComCryptoError("企业微信 CorpID 不匹配")
         return message.decode("utf-8")
 

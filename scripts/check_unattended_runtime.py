@@ -101,6 +101,58 @@ def _health_payload_status(payload_text: str) -> str:
     return "ok"
 
 
+CALLBACK_PROBE_URL = "http://127.0.0.1/wecom/kf/callback"
+CALLBACK_PROBE_HOST = "114.55.168.97"
+CALLBACK_HEALTHY_CODES = {"200", "422"}
+
+
+def _classify_callback_code(code: str) -> str:
+    """归类企微客服回调路由探测的 HTTP 状态码。
+
+    背景：企微 KF 回调 URL 走 http://114.55.168.97/wecom/kf/callback（IP 主机 + 端口 80）。
+    若 nginx 的 `listen 80` 块被 Certbot 重写抹掉 /wecom/ 转发，IP:80 /wecom 会落到
+    `return 404` → 回调对客失聪（2026-07-04、2026-07-06 两次实证）。
+    判据：404 = 路由已断（坏）；200 或 422 = 已路由到应用
+    （422 为缺签名参数的裸探测，属正常）。
+    """
+    text = str(code).strip()
+    if not text:
+        return "no_code"
+    if text == "404":
+        return "route_404"
+    if text in CALLBACK_HEALTHY_CODES:
+        return "ok"
+    return f"unexpected:{text}"
+
+
+def _callback_route_status(url: str, host_header: str) -> str:
+    try:
+        completed = subprocess.run(
+            [
+                "curl",
+                "-s",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "-H",
+                f"Host: {host_header}",
+                url,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        return f"error:{exc.__class__.__name__}"
+    if completed.returncode != 0:
+        return (
+            completed.stderr or completed.stdout or f"exit:{completed.returncode}"
+        ).strip() or f"exit:{completed.returncode}"
+    return _classify_callback_code(completed.stdout)
+
+
 def _systemd_environment_value(service_name: str, key: str) -> str:
     service_path = Path("/etc/systemd/system") / service_name
     if not service_path.exists():
@@ -167,6 +219,9 @@ def main() -> int:
     parser.add_argument("--health-url", default="http://127.0.0.1:8000/health")
     parser.add_argument("--skip-systemd", action="store_true")
     parser.add_argument("--skip-health", action="store_true")
+    parser.add_argument("--skip-callback", action="store_true")
+    parser.add_argument("--callback-url", default=CALLBACK_PROBE_URL)
+    parser.add_argument("--callback-host", default=CALLBACK_PROBE_HOST)
     args = parser.parse_args()
 
     project_dir = Path(args.project_dir).resolve()
@@ -208,6 +263,12 @@ def main() -> int:
         print(f"health={health}")
         if health != "ok":
             problems.append(f"health:{health}")
+
+    if not args.skip_callback:
+        callback_status = _callback_route_status(args.callback_url, args.callback_host)
+        print(f"callback_route={callback_status}")
+        if callback_status != "ok":
+            problems.append(f"callback_route:{callback_status}")
 
     if problems:
         print("unattended_check=failed")
